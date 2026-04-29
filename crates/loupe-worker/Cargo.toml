@@ -1,0 +1,28 @@
+[package]
+name = "loupe-worker"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "loupe scan/verify worker — leases jobs, clones repos, runs scanners, reports findings."
+publish = false
+
+[[bin]]
+name = "loupe-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+git2 = { workspace = true }
+loupe-core = { path = "../loupe-core" }
+loupe-proto = { path = "../loupe-proto" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
