@@ -1,5 +1,19 @@
 //! Shared domain types for loupe.
 //!
-//! Intentionally empty in the scaffolding commit — types land in the
-//! follow-up commit that introduces `Finding`, `Severity`, `RepoSpec`,
-//! `JobState`, and `Verdict`.
+//! These types are the lingua franca between `loupe-server`, `loupe-worker`,
+//! and `loupe-cli`. They deliberately know nothing about storage layout or
+//! wire framing — those concerns live in `loupe-storage` and `loupe-proto`.
+
+mod error;
+mod finding;
+mod job;
+mod repo;
+mod severity;
+mod verdict;
+
+pub use error::{Error, Result};
+pub use finding::Finding;
+pub use job::{JobKind, JobState};
+pub use repo::{RepoSpec, ReportingDestination};
+pub use severity::Severity;
+pub use verdict::Verdict;

@@ -8,5 +8,12 @@ rust-version.workspace = true
 description = "Shared domain types for loupe (security-scanning harness)."
 publish = false
 
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
