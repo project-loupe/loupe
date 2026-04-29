@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true }
 git2 = { workspace = true }
 loupe-core = { path = "../loupe-core" }
@@ -22,6 +23,7 @@ loupe-proto = { path = "../loupe-proto" }
 loupe-tls = { path = "../loupe-tls" }
 regex = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
