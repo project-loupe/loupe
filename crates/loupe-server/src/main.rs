@@ -103,7 +103,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		ca_key_pem,
 	};
 	let db = Db::open(&args.db).with_context(|| format!("opening db at {}", args.db.display()))?;
-	let state = AppState::new(Arc::new(db), Arc::new(ca));
+	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
+	let state = AppState::new(Arc::new(db), Arc::new(ca), github);
 
 	let handle = serve(cfg, state).await?;
 	tracing::info!(addr = %handle.local_addr, "loupe-server listening");

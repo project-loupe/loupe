@@ -73,7 +73,11 @@ async fn bring_up() -> Fixture {
 		ca_key_pem,
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
-	let state = AppState::new(db, Arc::new(ca));
+	let state = AppState::new(
+		db,
+		Arc::new(ca),
+		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
+	);
 	let handle = serve(cfg, state).await.unwrap();
 	let addr = handle.local_addr;
 

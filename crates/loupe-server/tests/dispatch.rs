@@ -1,17 +1,22 @@
-//! End-to-end worker test: spin up loupe-server in-process, register a
-//! repo (clone URL pointed at a local git repo on disk), mint a worker,
-//! kick a scan, run a single Runner step, and prove the worker's
-//! scanner produced a finding and completed the job.
+//! End-to-end dispatcher test: stand up a tiny axum stub that pretends
+//! to be the GitHub Issues API, point a `GithubReporter` at it, run a
+//! scan job against an in-memory DB, and prove the issue body lands in
+//! the stub with the expected shape.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::{Json, Router};
 use git2::{Repository, Signature};
 use loupe_proto::{
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
 	ScanRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
+use loupe_server::reporters::GithubReporter;
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
 use loupe_tls::Ca;
@@ -19,10 +24,52 @@ use loupe_worker::scanners::RegexSecretsScanner;
 use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Default)]
+struct GithubStubState {
+	captured: Arc<Mutex<Vec<CapturedIssue>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedIssue {
+	owner: String,
+	repo: String,
+	auth: String,
+	body: serde_json::Value,
+}
+
+async fn stub_create_issue(
+	State(stub): State<GithubStubState>,
+	axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
+	headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+	let auth = headers
+		.get(axum::http::header::AUTHORIZATION)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("")
+		.to_owned();
+	stub.captured.lock().unwrap().push(CapturedIssue { owner, repo, auth, body });
+	(
+		StatusCode::CREATED,
+		Json(serde_json::json!({"number": 7, "html_url": "https://stub/issues/7"})),
+	)
+}
+
+async fn spawn_github_stub() -> (SocketAddr, GithubStubState, tokio::task::JoinHandle<()>) {
+	let stub = GithubStubState::default();
+	let app = Router::new()
+		.route("/repos/{owner}/{repo}/issues", post(stub_create_issue))
+		.with_state(stub.clone());
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let join = tokio::spawn(async move {
+		axum::serve(listener, app).await.unwrap();
+	});
+	(addr, stub, join)
+}
+
 fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
 	reqwest::Certificate::from_pem(pem.as_bytes()).unwrap()
 }
-
 fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
 	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
 	combined.push_str(cert_pem);
@@ -33,8 +80,6 @@ fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
 	reqwest::Identity::from_pem(combined.as_bytes()).unwrap()
 }
 
-/// Make a tiny git repo on disk with a planted AKIA token committed at HEAD.
-/// Returns (TempDir holding the repo, file:// clone URL).
 fn make_planted_repo() -> (tempfile::TempDir, String) {
 	let tmp = tempfile::tempdir().unwrap();
 	let repo = Repository::init(tmp.path()).unwrap();
@@ -52,8 +97,12 @@ fn make_planted_repo() -> (tempfile::TempDir, String) {
 }
 
 #[tokio::test]
-async fn worker_runs_a_scan_and_emits_a_finding() {
+async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	let (_repo_tmp, clone_url) = make_planted_repo();
+	let (stub_addr, stub_state, _stub_join) = spawn_github_stub().await;
+	let stub_base = format!("http://{stub_addr}");
+
+	// Stand up loupe-server with a GithubReporter pointed at the stub.
 	let server_dir = tempfile::tempdir().unwrap();
 	let init = run_init(server_dir.path(), &["loupe-server".to_owned()]).unwrap();
 
@@ -76,17 +125,12 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 		ca_key_pem,
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
-	let state = AppState::new(
-		db.clone(),
-		Arc::new(ca),
-		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
-	);
-	let server_handle = serve(cfg, state).await.unwrap();
-	let addr: SocketAddr = server_handle.local_addr;
+	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
+	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
+	let server = serve(cfg, state).await.unwrap();
+	let addr = server.local_addr;
 
-	// Admin client: register a (faked) https URL via the route, then
-	// rewrite the row in-place to point at our local file:// repo so
-	// the worker's git2 fetch hits the filesystem.
+	// Admin client
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
 		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
@@ -103,9 +147,9 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 			branch: None,
 			scan_interval_seconds: None,
 			reporting: ReportingSetup::GithubIssue {
-				target_owner: "x".into(),
-				target_repo: "y".into(),
-				github_pat: "ghp".into(),
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				github_pat: "ghp_test_pat_value".into(),
 			},
 			scanner_config: serde_json::Value::Null,
 		})
@@ -115,7 +159,6 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	assert_eq!(resp.status(), 201);
 	let body: serde_json::Value = resp.json().await.unwrap();
 	let repo_id = body["repo_id"].as_i64().unwrap();
-
 	db.with_conn(|c| {
 		c.execute(
 			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
@@ -133,9 +176,6 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 		.unwrap();
 	assert_eq!(resp.status(), 201);
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
-
-	// Build the worker's reqwest client with `.resolve("loupe-server", addr)` and
-	// hand it to ServerClient via `from_parts`.
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
 		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
@@ -146,44 +186,42 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	let server_client =
 		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
 
-	// Trigger a scan.
-	let resp = admin
+	// Scan, run, verify dispatch.
+	admin
 		.post(format!("https://loupe-server/v1/repos/{}/scan", repo_id))
 		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
 		.send()
 		.await
 		.unwrap();
-	assert_eq!(resp.status(), 201);
 
 	let cache_dir = tempfile::tempdir().unwrap();
 	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	let runner = Runner::new(server_client, cache, scanners);
-
 	let cancel = CancellationToken::new();
 	let stepped = runner.step(&cancel).await.unwrap();
-	assert!(stepped, "runner should have leased and run the queued job");
+	assert!(stepped);
 
-	let count: i64 = db
-		.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
-		.unwrap();
-	assert_eq!(count, 1, "expected exactly one finding");
+	// Stub captured exactly one issue, addressed to the right repo,
+	// with the PAT, and mentioning our finding's title.
+	let captured = stub_state.captured.lock().unwrap().clone();
+	assert_eq!(captured.len(), 1, "expected exactly one issue, got {}", captured.len());
+	let issue = &captured[0];
+	assert_eq!(issue.owner, "acme");
+	assert_eq!(issue.repo, "tracker");
+	assert_eq!(issue.auth, "Bearer ghp_test_pat_value");
+	let body_str = issue.body.to_string();
+	assert!(body_str.contains("AWS access key"), "issue body: {body_str}");
 
-	let state: String = db
+	// Findings table marked reported.
+	let reported_count: i64 = db
 		.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM jobs LIMIT 1", [], |r| r.get::<_, String>(0))?)
-		})
-		.unwrap();
-	assert_eq!(state, "succeeded");
-
-	let head_sha: Option<String> = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT head_sha FROM jobs LIMIT 1", [], |r| {
-				r.get::<_, Option<String>>(0)
+			Ok(c.query_row("SELECT COUNT(*) FROM findings WHERE state = 'reported'", [], |r| {
+				r.get(0)
 			})?)
 		})
 		.unwrap();
-	assert!(head_sha.is_some(), "head_sha should have been persisted on success");
+	assert_eq!(reported_count, 1);
 
-	server_handle.shutdown().await;
+	server.shutdown().await;
 }

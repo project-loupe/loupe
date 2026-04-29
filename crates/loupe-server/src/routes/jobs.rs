@@ -27,9 +27,10 @@ use loupe_proto::{
 	PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
-use loupe_storage::{findings, repos};
+use loupe_storage::{findings, repos, secrets};
 
 use crate::auth::AuthedWorker;
+use crate::reporters;
 use crate::state::AppState;
 
 fn now_secs() -> i64 {
@@ -369,5 +370,78 @@ pub async fn complete(
 		})?
 		.then_some(())
 		.ok_or((StatusCode::CONFLICT, "lease reaped before complete".into()))?;
+
+	if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan {
+		if let Err(e) = dispatch_for_job(&state, job.repo_id, job.id, now).await {
+			// Dispatch failures don't roll back the job — operators can
+			// retry by re-running the scan, and we'll notice via metrics.
+			tracing::warn!(job_id = job.id, error = %e, "dispatch failed");
+		}
+	}
 	Ok(StatusCode::NO_CONTENT)
+}
+
+/// After a scan succeeds, ferry its findings through the appropriate
+/// reporter. Marks `findings.reported_at` on success so later scans
+/// that re-emit the same fingerprint don't re-notify (UNIQUE(repo_id,
+/// fingerprint) already prevents the row insert; reported_at is the
+/// "we told someone" stamp).
+async fn dispatch_for_job(
+	state: &AppState, repo_id: i64, job_id: i64, now: i64,
+) -> anyhow::Result<()> {
+	use loupe_core::{Finding, ReportingDestination};
+
+	let repo = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, repo_id)?))?
+		.ok_or_else(|| anyhow::anyhow!("repo {repo_id} disappeared before dispatch"))?;
+	let pat_secret_id = match &repo.reporting {
+		ReportingDestination::GithubIssue { pat_secret_id, .. } => *pat_secret_id,
+	};
+	let pat_bytes = state
+		.db
+		.with_conn(|c| Ok(secrets::read(c, pat_secret_id)?))?
+		.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
+	let pat = String::from_utf8(pat_bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?;
+
+	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;
+	let findings_for_report: Vec<Finding> = rows
+		.into_iter()
+		.filter(|r| r.state != "reported")
+		.map(|r| Finding {
+			scanner_id: r.scanner_id,
+			severity: r.severity,
+			title: r.title,
+			description: r.description,
+			file_path: r.file_path,
+			line_start: r.line_start,
+			line_end: r.line_end,
+			cwe: r.cwe,
+			patch_unified: r.patch_unified,
+			fingerprint: r.fingerprint,
+		})
+		.collect();
+	if findings_for_report.is_empty() {
+		return Ok(());
+	}
+
+	let reporter = reporters::select(&repo, state.github_reporter.clone())
+		.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
+	let receipt = reporter.dispatch(&repo, &findings_for_report, &pat).await?;
+	tracing::info!(
+		job_id,
+		count = findings_for_report.len(),
+		external_id = receipt.external_id.as_deref(),
+		"dispatched findings"
+	);
+
+	state.db.with_conn(|c| {
+		c.execute(
+			"UPDATE findings SET reported_at = ?1, state = 'reported'
+			 WHERE job_id = ?2 AND state != 'reported'",
+			(now, job_id),
+		)?;
+		Ok(())
+	})?;
+	Ok(())
 }

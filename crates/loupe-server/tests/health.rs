@@ -40,7 +40,11 @@ async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) 
 		ca_key_pem,
 	};
 	let db = Arc::new(Db::open_in_memory().unwrap());
-	let state = AppState::new(db, Arc::new(ca));
+	let state = AppState::new(
+		db,
+		Arc::new(ca),
+		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
+	);
 	let handle = serve(cfg, state).await.unwrap();
 	let local = handle.local_addr;
 

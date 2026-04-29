@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod config;
 pub mod init;
+pub mod reporters;
 pub mod router;
 pub mod routes;
 pub mod state;
