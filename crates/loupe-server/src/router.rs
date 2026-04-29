@@ -66,11 +66,14 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Handle returned by [`serve`]. Drop or call `shutdown` to stop the
-/// server.
+/// server. The handle owns the http listener task plus the scheduler
+/// and reaper background tasks.
 pub struct ServeHandle {
 	pub local_addr: SocketAddr,
 	shutdown_tx: Option<oneshot::Sender<()>>,
-	join: Option<tokio::task::JoinHandle<()>>,
+	cancel: tokio_util::sync::CancellationToken,
+	http_join: Option<tokio::task::JoinHandle<()>>,
+	bg_joins: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ServeHandle {
@@ -78,25 +81,44 @@ impl ServeHandle {
 		if let Some(tx) = self.shutdown_tx.take() {
 			let _ = tx.send(());
 		}
-		if let Some(join) = self.join.take() {
+		self.cancel.cancel();
+		if let Some(join) = self.http_join.take() {
 			let _ = join.await;
+		}
+		for j in self.bg_joins.drain(..) {
+			let _ = j.await;
 		}
 	}
 }
 
 /// Bind to `cfg.bind_addr` and serve over mTLS. Returns once the listener
-/// is bound so callers can read `local_addr` synchronously.
+/// is bound so callers can read `local_addr` synchronously. Spawns the
+/// scheduler + reaper alongside the listener; both shut down with the
+/// handle.
 pub async fn serve(cfg: Config, state: AppState) -> Result<ServeHandle> {
 	let rustls_cfg = tls::build(&cfg)?;
 	let acceptor = TlsAcceptor::from(Arc::new(rustls_cfg));
 	let listener = TcpListener::bind(cfg.bind_addr).await.context("binding loupe-server")?;
 	let local_addr = listener.local_addr().context("local_addr on bound listener")?;
+	let db = state.db.clone();
 	let app = router(state);
 
 	let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-	let join = tokio::spawn(serve_loop(listener, acceptor, app, shutdown_rx));
+	let http_join = tokio::spawn(serve_loop(listener, acceptor, app, shutdown_rx));
 
-	Ok(ServeHandle { local_addr, shutdown_tx: Some(shutdown_tx), join: Some(join) })
+	let cancel = tokio_util::sync::CancellationToken::new();
+	let bg_joins = vec![
+		crate::background::spawn_scheduler(db.clone(), cancel.clone()),
+		crate::background::spawn_reaper(db, cancel.clone()),
+	];
+
+	Ok(ServeHandle {
+		local_addr,
+		shutdown_tx: Some(shutdown_tx),
+		cancel,
+		http_join: Some(http_join),
+		bg_joins,
+	})
 }
 
 async fn serve_loop(

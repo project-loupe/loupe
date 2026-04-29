@@ -4,6 +4,7 @@
 //! wrapper that loads config and spins up [`serve`].
 
 pub mod auth;
+pub mod background;
 pub mod config;
 pub mod init;
 pub mod reporters;

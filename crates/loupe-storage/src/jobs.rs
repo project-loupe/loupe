@@ -159,6 +159,18 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<JobRow>> {
 	Ok(rows)
 }
 
+/// Count scan jobs for `repo_id` that are still queued or leased.
+/// Used by the scheduler to avoid piling up duplicate scans for the
+/// same repo.
+pub fn count_active_scans_for_repo(conn: &Connection, repo_id: i64) -> rusqlite::Result<i64> {
+	conn.query_row(
+		"SELECT COUNT(*) FROM jobs
+		 WHERE repo_id = ?1 AND kind = 'scan' AND state IN ('queued','leased')",
+		params![repo_id],
+		|r| r.get(0),
+	)
+}
+
 /// Reap leases that have expired. For each, transitions back to
 /// `queued` if `attempts < MAX_ATTEMPTS`, else `failed` with an error
 /// message. Returns the number of rows affected.

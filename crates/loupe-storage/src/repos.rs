@@ -69,6 +69,22 @@ pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	Ok(n > 0)
 }
 
+/// Repos that have a scan interval set and whose next scan is due
+/// (i.e. `last_scanned_at + scan_interval_seconds < now`, or
+/// `last_scanned_at` is NULL meaning "never scanned"). Disabled repos
+/// are skipped. Returns full rows so the caller can decide whether to
+/// pass `since_sha` for incremental.
+pub fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<RepoRow>> {
+	let mut stmt = conn.prepare(&format!(
+		"{SELECT_REPO_COLUMNS}
+		 WHERE scan_interval_seconds IS NOT NULL
+		   AND disabled_at IS NULL
+		   AND (last_scanned_at IS NULL OR last_scanned_at + scan_interval_seconds < ?1)"
+	))?;
+	let rows = stmt.query_map(params![now], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
+	Ok(rows)
+}
+
 const SELECT_REPO_COLUMNS: &str = r#"
 SELECT id, clone_url, host, owner, repo, default_branch, scan_interval_seconds,
        scanner_config, reporting, last_scanned_sha, last_scanned_at, created_at, disabled_at
@@ -169,5 +185,82 @@ mod tests {
 	fn delete_missing_returns_false() {
 		let db = Db::open_in_memory().unwrap();
 		assert!(!db.with_conn(|c| Ok(delete(c, 9_999)?)).unwrap());
+	}
+
+	#[test]
+	fn list_due_picks_unscanned_and_overdue_repos() {
+		let db = Db::open_in_memory().unwrap();
+		let sid = db
+			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
+			.unwrap();
+		// Repo A: never scanned, interval=60. Due immediately.
+		let a = NewRepo {
+			clone_url: "https://github.com/a/a.git".into(),
+			host: "github.com".into(),
+			owner: "a".into(),
+			repo: "a".into(),
+			default_branch: None,
+			scan_interval_seconds: Some(60),
+			scanner_config: serde_json::Value::Null,
+			reporting: ReportingDestination::GithubIssue {
+				target_owner: "x".into(),
+				target_repo: "y".into(),
+				pat_secret_id: sid,
+			},
+		};
+		// Repo B: scanned at t=1000, interval=60. Due at t=1060.
+		let b = NewRepo {
+			clone_url: "https://github.com/a/b.git".into(),
+			repo: "b".into(),
+			..a.clone()
+		};
+		// Repo C: no interval — never picked up.
+		let no_interval = NewRepo {
+			clone_url: "https://github.com/a/c.git".into(),
+			repo: "c".into(),
+			scan_interval_seconds: None,
+			..a.clone()
+		};
+		db.with_conn(|conn| Ok(insert(conn, &a, 0)?)).unwrap();
+		let b_id = db.with_conn(|conn| Ok(insert(conn, &b, 0)?)).unwrap();
+		db.with_conn(|conn| Ok(insert(conn, &no_interval, 0)?)).unwrap();
+		// Stamp B's last_scanned_at via raw SQL.
+		db.with_conn(|c| {
+			c.execute(
+				"UPDATE registered_repos SET last_scanned_at = 1000 WHERE id = ?1",
+				params![b_id],
+			)?;
+			Ok(())
+		})
+		.unwrap();
+
+		// At t=500: A is due (never scanned), B is not (1000+60>500), C never.
+		let due = db.with_conn(|c| Ok(list_due_for_scan(c, 500)?)).unwrap();
+		let names: Vec<&str> = due.iter().map(|r| r.repo.as_str()).collect();
+		assert_eq!(names, vec!["a"]);
+
+		// At t=2000: A and B both due, C still skipped.
+		let due = db.with_conn(|c| Ok(list_due_for_scan(c, 2000)?)).unwrap();
+		let mut names: Vec<&str> = due.iter().map(|r| r.repo.as_str()).collect();
+		names.sort();
+		assert_eq!(names, vec!["a", "b"]);
+	}
+
+	#[test]
+	fn list_due_skips_disabled_repos() {
+		let db = Db::open_in_memory().unwrap();
+		let sid = db
+			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
+			.unwrap();
+		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(sid), 0)?)).unwrap();
+		// Originally `fake_repo` has scan_interval=3600 set, so it'd
+		// otherwise be due. Disable it and confirm it drops out.
+		db.with_conn(|c| {
+			c.execute("UPDATE registered_repos SET disabled_at = 1 WHERE id = ?1", params![id])?;
+			Ok(())
+		})
+		.unwrap();
+		let due = db.with_conn(|c| Ok(list_due_for_scan(c, 1_000_000)?)).unwrap();
+		assert!(due.is_empty(), "disabled repo must not appear as due");
 	}
 }
