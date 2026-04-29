@@ -51,6 +51,40 @@ pub struct RepoCache {
 	max_cache_bytes: u64,
 	access_log: Mutex<HashMap<RepoKey, SystemTime>>,
 	repo_locks: Mutex<HashMap<RepoKey, Arc<AsyncMutex<()>>>>,
+	/// Per-repo refcount of in-flight workers using the bare clone as
+	/// the alternate for a worktree. Eviction skips any key with a
+	/// non-zero refcount so a running scan doesn't get its alternate
+	/// yanked out from underneath it.
+	refcounts: Mutex<HashMap<RepoKey, u32>>,
+}
+
+/// RAII pin returned by [`RepoCache::pin`] (also held inside
+/// [`EnsuredRepo`]). While alive, eviction will skip the underlying
+/// repo. Drops decrement the refcount.
+pub struct PinGuard {
+	cache: Arc<RepoCache>,
+	key: RepoKey,
+}
+
+impl Drop for PinGuard {
+	fn drop(&mut self) {
+		if let Ok(mut refs) = self.cache.refcounts.lock() {
+			if let Some(n) = refs.get_mut(&self.key) {
+				*n = n.saturating_sub(1);
+				if *n == 0 {
+					refs.remove(&self.key);
+				}
+			}
+		}
+	}
+}
+
+/// Result of `ensure_repo`: the bare clone path plus a pin that holds
+/// off eviction for the lifetime of the scan. Keep the guard alive
+/// until you're done reading from the worktree.
+pub struct EnsuredRepo {
+	pub path: PathBuf,
+	pub _pin: PinGuard,
 }
 
 impl RepoCache {
@@ -70,7 +104,21 @@ impl RepoCache {
 			max_cache_bytes,
 			access_log: Mutex::new(access_log),
 			repo_locks: Mutex::new(HashMap::new()),
+			refcounts: Mutex::new(HashMap::new()),
 		})
+	}
+
+	/// Pin a repo so it survives an eviction pass. Returns an RAII
+	/// guard; while alive the entry is skipped by `evict_if_needed`.
+	pub fn pin(self: &Arc<Self>, key: &RepoKey) -> PinGuard {
+		if let Ok(mut refs) = self.refcounts.lock() {
+			*refs.entry(key.clone()).or_insert(0) += 1;
+		}
+		PinGuard { cache: Arc::clone(self), key: key.clone() }
+	}
+
+	fn is_pinned(&self, key: &RepoKey) -> bool {
+		self.refcounts.lock().map(|r| r.get(key).copied().unwrap_or(0) > 0).unwrap_or(false)
 	}
 
 	fn scan_existing(cache_dir: &Path, access_log: &mut HashMap<RepoKey, SystemTime>) {
@@ -117,12 +165,13 @@ impl RepoCache {
 		map.entry(key.clone()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
 	}
 
-	/// Ensure the bare clone for `key` is present and up-to-date. Returns
-	/// the on-disk path. Concurrent calls for the same `key` are
-	/// serialised so two leases don't race the clone/fetch.
+	/// Ensure the bare clone for `key` is present and up-to-date.
+	/// Returns the on-disk path *plus* a pin that prevents eviction
+	/// while the caller is using it. Concurrent calls for the same
+	/// `key` are serialised so two leases don't race the clone/fetch.
 	pub async fn ensure_repo(
-		&self, key: &RepoKey, clone_url: &str, token: Option<&str>,
-	) -> Result<PathBuf> {
+		self: &Arc<Self>, key: &RepoKey, clone_url: &str, token: Option<&str>,
+	) -> Result<EnsuredRepo> {
 		let path = self.repo_path(key);
 		let lock = self.repo_lock(key);
 		let _guard = lock.lock().await;
@@ -156,7 +205,8 @@ impl RepoCache {
 		if let Ok(mut log) = self.access_log.lock() {
 			log.insert(key.clone(), SystemTime::now());
 		}
-		Ok(path)
+		let pin = self.pin(key);
+		Ok(EnsuredRepo { path, _pin: pin })
 	}
 
 	async fn do_clone(&self, path: &Path, clone_url: &str, token: Option<&str>) -> Result<()> {
@@ -250,6 +300,9 @@ impl RepoCache {
 		let mut entries: Vec<(RepoKey, SystemTime, u64)> = Vec::new();
 		if let Ok(log) = self.access_log.lock() {
 			for (key, &access_time) in log.iter() {
+				if self.is_pinned(key) {
+					continue;
+				}
 				let path = self.repo_path(key);
 				if path.exists() {
 					entries.push((key.clone(), access_time, dir_size(&path)));
@@ -396,6 +449,46 @@ mod tests {
 		cache.evict_if_needed().unwrap();
 		assert!(!p1.exists(), "LRU entry should have been evicted");
 		assert!(p2.exists(), "more-recent entry should survive");
+	}
+
+	#[test]
+	fn evict_skips_pinned_entries() {
+		let tmp = tempfile::tempdir().unwrap();
+		let cache_dir = tmp.path().to_path_buf();
+		let key1 = RepoKey::new("github.com", "owner1", "repo1");
+		let key2 = RepoKey::new("github.com", "owner2", "repo2");
+		let p1 = cache_dir.join("github.com").join("owner1").join("repo1.git");
+		let p2 = cache_dir.join("github.com").join("owner2").join("repo2.git");
+		std::fs::create_dir_all(&p1).unwrap();
+		std::fs::create_dir_all(&p2).unwrap();
+		std::fs::write(p1.join("data"), vec![0u8; 1000]).unwrap();
+		std::fs::write(p2.join("data"), vec![0u8; 1000]).unwrap();
+
+		let cache = std::sync::Arc::new(RepoCache::new(cache_dir, 1500).unwrap());
+		{
+			let mut log = cache.access_log.lock().unwrap();
+			log.insert(key1.clone(), SystemTime::UNIX_EPOCH);
+			log.insert(key2.clone(), SystemTime::now());
+		}
+		// Pin the LRU entry; eviction must skip it and pick the other.
+		let _pin = cache.pin(&key1);
+		cache.evict_if_needed().unwrap();
+		assert!(p1.exists(), "pinned entry must survive even when LRU");
+		assert!(!p2.exists(), "an unpinned entry must be evicted instead");
+	}
+
+	#[test]
+	fn pin_drop_releases_refcount() {
+		let tmp = tempfile::tempdir().unwrap();
+		let cache =
+			std::sync::Arc::new(RepoCache::new(tmp.path().to_path_buf(), u64::MAX).unwrap());
+		let key = RepoKey::new("github.com", "a", "b");
+		assert!(!cache.is_pinned(&key));
+		{
+			let _pin = cache.pin(&key);
+			assert!(cache.is_pinned(&key));
+		}
+		assert!(!cache.is_pinned(&key), "drop must decrement");
 	}
 
 	#[test]

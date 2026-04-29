@@ -27,12 +27,17 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// mid-wait. The server still answers immediately if a job is already
 /// queued, so this doesn't cost anything when the queue is hot.
 const LEASE_WAIT_SECONDS: u32 = 25;
+/// Default ceiling on the worktree size; 5 GB matches the bkb-ingest
+/// per-repo default. The runner fails the job rather than fill the
+/// worker host. Operators can override per-runner.
+pub const DEFAULT_MAX_WORKDIR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 pub struct Runner {
 	client: Arc<ServerClient>,
 	cache: Arc<RepoCache>,
 	scanners: Vec<Arc<dyn Scanner>>,
 	capabilities: Vec<String>,
+	max_workdir_bytes: u64,
 }
 
 impl Runner {
@@ -43,7 +48,14 @@ impl Runner {
 			.iter()
 			.flat_map(|s| s.capabilities().iter().map(|c| (*c).to_owned()))
 			.collect();
-		Self { client, cache, scanners, capabilities }
+		Self { client, cache, scanners, capabilities, max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES }
+	}
+
+	/// Override the per-job workdir size cap. A scan whose checkout
+	/// exceeds this size fails immediately; the host's disk stays safe.
+	pub fn with_max_workdir_bytes(mut self, bytes: u64) -> Self {
+		self.max_workdir_bytes = bytes;
+		self
 	}
 
 	/// Run one iteration: long-poll for a job and, if one arrives, run
@@ -123,8 +135,12 @@ impl Runner {
 		&self, env: LeaseEnvelope, cancel: CancellationToken,
 	) -> Result<(String, usize)> {
 		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
-		let bare =
+		let ensured =
 			self.cache.ensure_repo(&key, &env.repo.clone_url, env.github_pat.as_deref()).await?;
+		let bare = ensured.path.clone();
+		// `ensured` (and its pin) lives until the end of this fn; the
+		// repo cache won't evict the bare clone while the worktree
+		// alternate is still in use.
 
 		match env.payload {
 			LeasePayload::Verify { .. } => {
@@ -135,6 +151,13 @@ impl Runner {
 			},
 			LeasePayload::Scan { since_sha } => {
 				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
+				let workdir_size = crate::repo_cache::dir_size(workdir.path());
+				if workdir_size > self.max_workdir_bytes {
+					anyhow::bail!(
+						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
+						self.max_workdir_bytes
+					);
+				}
 				let ctx = ScanContext {
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
