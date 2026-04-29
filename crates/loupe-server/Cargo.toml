@@ -15,8 +15,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
-axum-server = { workspace = true }
 clap = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
 loupe-core = { path = "../loupe-core" }
 loupe-proto = { path = "../loupe-proto" }
 loupe-storage = { path = "../loupe-storage" }

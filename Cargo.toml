@@ -24,8 +24,9 @@ all = { level = "warn", priority = -1 }
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.8"
-axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 clap = { version = "4", features = ["derive", "env"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "server"] }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
