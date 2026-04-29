@@ -126,6 +126,12 @@ pub async fn get(
 /// intermediary to kill it.
 const MAX_LEASE_WAIT_SECS: u32 = 60;
 
+/// How long a finding can sit in `validating` before the deadline
+/// reaper steps in. 1 hour is a healthy budget for an LLM verifier;
+/// large enough to absorb queue backpressure, small enough that a
+/// stuck finding doesn't sit invisible for days.
+const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 3_600;
+
 /// `POST /v1/jobs/lease` — worker pulls the next available job. Honours
 /// `wait_seconds` for server-side long-polling: when the queue is empty
 /// the server waits on `state.job_arrived` for up to that many seconds
@@ -280,12 +286,28 @@ pub async fn submit_findings(
 		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
 	}
 
+	// Look up the repo's verification policy so the inserted findings
+	// carry the right verification_required flag.
+	let repo = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".to_owned()))?;
+	let verification_required = repo.verification_enabled;
+
 	state
 		.db
 		.with_conn(|c| {
 			let tx = c.transaction()?;
 			for f in &batch.findings {
-				findings::insert_or_ignore(&tx, row.repo_id, row.id, f, now)?;
+				findings::insert_or_ignore(
+					&tx,
+					row.repo_id,
+					row.id,
+					f,
+					verification_required,
+					now,
+				)?;
 			}
 			tx.commit()?;
 			Ok(())
@@ -406,6 +428,37 @@ pub async fn complete(
 						now,
 					),
 				)?;
+
+				// Transition each finding produced by this scan into
+				// either `confirmed` (auto-pass; dispatcher picks up
+				// later) or `validating` (verify job enqueued for a
+				// verifier worker to confirm or reject).
+				tx.execute(
+					"UPDATE findings
+					   SET state = 'confirmed', confirmed_at = ?1
+					 WHERE job_id = ?2 AND verification_required = 0 AND state = 'pending'",
+					(now, job_id),
+				)?;
+				tx.execute(
+					"UPDATE findings
+					   SET state = 'validating', validating_deadline = ?1
+					 WHERE job_id = ?2 AND verification_required = 1 AND state = 'pending'",
+					(now + DEFAULT_VALIDATING_BUDGET_SECS, job_id),
+				)?;
+
+				// Enqueue one verify job per finding now in 'validating'
+				// for this scan. We use a stand-alone INSERT…SELECT so
+				// the verify-job rows go in inside the same transaction
+				// as the state flips.
+				tx.execute(
+					"INSERT INTO jobs
+					   (repo_id, kind, state, incremental, parent_job_id,
+					    target_finding_id, enqueued_at)
+					 SELECT ?1, 'verify', 'queued', 0, ?2, id, ?3
+					 FROM findings
+					 WHERE job_id = ?2 AND state = 'validating'",
+					(job.repo_id, job_id, now),
+				)?;
 			}
 			tx.commit()?;
 			Ok(true)
@@ -417,6 +470,10 @@ pub async fn complete(
 		.ok_or((StatusCode::CONFLICT, "lease reaped before complete".into()))?;
 
 	if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan {
+		// Wake long-pollers in case any verify jobs were just enqueued
+		// (also covers the auto-confirmed-only case — extra notify is
+		// harmless).
+		state.job_arrived.notify_waiters();
 		if let Err(e) = dispatch_for_job(&state, job.repo_id, job.id, now).await {
 			// Dispatch failures don't roll back the job — operators can
 			// retry by re-running the scan, and we'll notice via metrics.
@@ -454,7 +511,12 @@ async fn dispatch_for_job(
 	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;
 	let findings_for_report: Vec<Finding> = rows
 		.into_iter()
-		.filter(|r| r.state != "reported")
+		// Only dispatch findings that have been confirmed (auto-confirm
+		// for repos with verification_enabled = false, or successful
+		// verify-job verdict for repos with it on). Findings still in
+		// `validating` will be picked up by the verdict handler when
+		// they flip to `confirmed`. Already-reported findings are skipped.
+		.filter(|r| r.state == "confirmed")
 		.map(|r| Finding {
 			scanner_id: r.scanner_id,
 			severity: r.severity,

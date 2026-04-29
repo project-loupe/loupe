@@ -97,6 +97,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 			github_pat: "ghp".into(),
 		},
 		scanner_config: serde_json::Value::Null,
+		verification_enabled: false,
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
 	assert_eq!(resp.status(), 201);

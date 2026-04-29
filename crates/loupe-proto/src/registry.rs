@@ -39,6 +39,12 @@ pub struct RegisterRepoRequest {
 	pub reporting: ReportingSetup,
 	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
 	pub scanner_config: serde_json::Value,
+	/// When `true`, scan findings for this repo go through the verify
+	/// flow before being dispatched. Defaults to `false` so simple
+	/// scanners that don't have a verifier worker pool to back them
+	/// dispatch immediately.
+	#[serde(default)]
+	pub verification_enabled: bool,
 }
 
 impl RegisterRepoRequest {
@@ -50,6 +56,7 @@ impl RegisterRepoRequest {
 			scan_interval_seconds: None,
 			reporting,
 			scanner_config: serde_json::Value::Null,
+			verification_enabled: false,
 		}
 	}
 }
@@ -124,6 +131,7 @@ mod tests {
 				github_pat: "ghp_xxx".into(),
 			},
 			scanner_config: json!({"regex": {"enabled": true}}),
+			verification_enabled: true,
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();

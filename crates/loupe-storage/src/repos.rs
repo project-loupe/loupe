@@ -14,6 +14,7 @@ pub struct RepoRow {
 	pub scan_interval_seconds: Option<i64>,
 	pub scanner_config: serde_json::Value,
 	pub reporting: ReportingDestination,
+	pub verification_enabled: bool,
 	pub last_scanned_sha: Option<String>,
 	pub last_scanned_at: Option<i64>,
 	pub created_at: i64,
@@ -30,14 +31,15 @@ pub struct NewRepo {
 	pub scan_interval_seconds: Option<i64>,
 	pub scanner_config: serde_json::Value,
 	pub reporting: ReportingDestination,
+	pub verification_enabled: bool,
 }
 
 pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i64> {
 	conn.execute(
 		"INSERT INTO registered_repos
 		   (clone_url, host, owner, repo, default_branch, scan_interval_seconds,
-		    scanner_config, reporting, created_at)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+		    scanner_config, reporting, verification_enabled, created_at)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
 		params![
 			new.clone_url,
 			new.host,
@@ -47,6 +49,7 @@ pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i6
 			new.scan_interval_seconds,
 			serde_json::to_string(&new.scanner_config).unwrap_or_else(|_| "{}".into()),
 			serde_json::to_string(&new.reporting).expect("reporting is always serialisable"),
+			new.verification_enabled as i64,
 			now,
 		],
 	)?;
@@ -87,7 +90,8 @@ pub fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Re
 
 const SELECT_REPO_COLUMNS: &str = r#"
 SELECT id, clone_url, host, owner, repo, default_branch, scan_interval_seconds,
-       scanner_config, reporting, last_scanned_sha, last_scanned_at, created_at, disabled_at
+       scanner_config, reporting, verification_enabled, last_scanned_sha, last_scanned_at,
+       created_at, disabled_at
 FROM registered_repos
 "#;
 
@@ -109,10 +113,11 @@ fn row_to_repo(row: &rusqlite::Row) -> rusqlite::Result<RepoRow> {
 		scan_interval_seconds: row.get(6)?,
 		scanner_config,
 		reporting,
-		last_scanned_sha: row.get(9)?,
-		last_scanned_at: row.get(10)?,
-		created_at: row.get(11)?,
-		disabled_at: row.get(12)?,
+		verification_enabled: row.get::<_, i64>(9)? != 0,
+		last_scanned_sha: row.get(10)?,
+		last_scanned_at: row.get(11)?,
+		created_at: row.get(12)?,
+		disabled_at: row.get(13)?,
 	})
 }
 
@@ -138,6 +143,7 @@ mod tests {
 				target_repo: "tracker".into(),
 				pat_secret_id: secret_id,
 			},
+			verification_enabled: false,
 		}
 	}
 
@@ -210,6 +216,7 @@ mod tests {
 				target_repo: "y".into(),
 				pat_secret_id: sid,
 			},
+			verification_enabled: false,
 		};
 		// Repo B: scanned at t=1000, interval=60. Due at t=1060.
 		let b = NewRepo {

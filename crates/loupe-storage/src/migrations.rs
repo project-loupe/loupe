@@ -116,6 +116,12 @@ CREATE TABLE registered_repos (
     scan_interval_seconds   INTEGER,
     scanner_config          TEXT    NOT NULL DEFAULT '{}',
     reporting               TEXT    NOT NULL,
+    -- When non-zero, findings from this repo must be confirmed by a
+    -- verifier-capable worker before they're dispatched. Default off
+    -- so the simple regex / first-pass LLM scanners don't pay an
+    -- extra round-trip for repos that don't have a verifier worker
+    -- pool to pick the verify jobs up.
+    verification_enabled    INTEGER NOT NULL DEFAULT 0,
     last_scanned_sha        TEXT,
     last_scanned_at         INTEGER,
     created_at              INTEGER NOT NULL,

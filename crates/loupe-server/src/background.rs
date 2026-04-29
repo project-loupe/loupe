@@ -148,6 +148,7 @@ mod tests {
 							target_repo: "y".into(),
 							pat_secret_id: secret_id,
 						},
+						verification_enabled: false,
 					},
 					0,
 				)?)

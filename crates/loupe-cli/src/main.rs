@@ -76,6 +76,11 @@ struct RepoAddArgs {
 	/// command line in shared shells.
 	#[arg(long, env = "LOUPE_TRACKER_PAT")]
 	pat: String,
+	/// Route findings through the verify flow before dispatching. Off
+	/// by default; turn on for repos where you want a second-opinion
+	/// verifier worker to confirm each finding.
+	#[arg(long, default_value_t = false)]
+	verification_enabled: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,6 +169,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 			github_pat: a.pat,
 		},
 		scanner_config: serde_json::Value::Null,
+		verification_enabled: a.verification_enabled,
 	};
 	let resp = client.post(url(base, "/v1/repos")).json(&req).send().await?;
 	let status = resp.status();

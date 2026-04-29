@@ -20,21 +20,28 @@ pub struct FindingRow {
 	pub poc_unified: Option<String>,
 	pub fingerprint: String,
 	pub state: String,
+	pub verification_required: bool,
 	pub created_at: i64,
 }
 
 /// Insert a finding produced by a scan job. Idempotent on
 /// `UNIQUE(repo_id, fingerprint)`: a duplicate insert returns `None`
 /// rather than erroring, so the worker can retry safely.
+///
+/// `verification_required` controls whether the finding starts in
+/// `validating` (the verify flow will confirm or dismiss it) or goes
+/// straight through. The state column itself is still left at the
+/// schema default `'pending'`; the complete handler is what flips it.
 pub fn insert_or_ignore(
-	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding, now: i64,
+	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding, verification_required: bool,
+	now: i64,
 ) -> rusqlite::Result<Option<i64>> {
 	let n = conn.execute(
 		"INSERT OR IGNORE INTO findings
 		   (repo_id, job_id, scanner_id, severity, title, description,
 		    file_path, line_start, line_end, cwe, patch_unified,
-		    poc_unified, fingerprint, created_at)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+		    poc_unified, fingerprint, verification_required, created_at)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
 		params![
 			repo_id,
 			job_id,
@@ -49,6 +56,7 @@ pub fn insert_or_ignore(
 			&f.patch_unified,
 			&f.poc_unified,
 			&f.fingerprint,
+			verification_required as i64,
 			now,
 		],
 	)?;
@@ -59,7 +67,7 @@ pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<Find
 	let mut stmt = conn.prepare(
 		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
 		        file_path, line_start, line_end, cwe, patch_unified,
-		        poc_unified, fingerprint, state, created_at
+		        poc_unified, fingerprint, state, verification_required, created_at
 		 FROM findings WHERE job_id = ?1 ORDER BY id ASC",
 	)?;
 	let rows = stmt.query_map(params![job_id], row_to_finding)?;
@@ -72,7 +80,7 @@ pub fn get_for_repo(
 	conn.query_row(
 		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
 		        file_path, line_start, line_end, cwe, patch_unified,
-		        poc_unified, fingerprint, state, created_at
+		        poc_unified, fingerprint, state, verification_required, created_at
 		 FROM findings WHERE repo_id = ?1 AND fingerprint = ?2",
 		params![repo_id, fingerprint],
 		row_to_finding,
@@ -101,7 +109,8 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 		poc_unified: row.get(12)?,
 		fingerprint: row.get(13)?,
 		state: row.get(14)?,
-		created_at: row.get(15)?,
+		verification_required: row.get::<_, i64>(15)? != 0,
+		created_at: row.get(16)?,
 	})
 }
 
@@ -137,6 +146,7 @@ mod tests {
 							target_repo: "t".into(),
 							pat_secret_id: secret_id,
 						},
+						verification_enabled: false,
 					},
 					0,
 				)?)
@@ -181,8 +191,10 @@ mod tests {
 	fn insert_then_list_round_trip() {
 		let (db, repo_id, job_id) = fixture();
 		let f = sample("fp1");
-		let id =
-			db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, 100)?)).unwrap().unwrap();
+		let id = db
+			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 100)?))
+			.unwrap()
+			.unwrap();
 		let listed = db.with_conn(|c| Ok(list_for_job(c, job_id)?)).unwrap();
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, id);
@@ -194,8 +206,10 @@ mod tests {
 	fn duplicate_fingerprint_is_idempotent() {
 		let (db, repo_id, job_id) = fixture();
 		let f = sample("dup");
-		let first = db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, 100)?)).unwrap();
-		let second = db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, 200)?)).unwrap();
+		let first =
+			db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 100)?)).unwrap();
+		let second =
+			db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 200)?)).unwrap();
 		assert!(first.is_some());
 		assert!(second.is_none(), "second insert must be ignored");
 		assert_eq!(db.with_conn(|c| Ok(list_for_job(c, job_id)?)).unwrap().len(), 1);

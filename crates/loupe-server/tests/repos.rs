@@ -101,6 +101,7 @@ async fn admin_can_register_list_and_delete_a_repo() {
 			github_pat: "ghp_secret_value".into(),
 		},
 		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
+		verification_enabled: false,
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
 	assert_eq!(resp.status(), 201, "create repo: {}", resp.status());
@@ -174,6 +175,7 @@ async fn registering_with_non_https_clone_url_400s() {
 			github_pat: "ghp".into(),
 		},
 		scanner_config: serde_json::Value::Null,
+		verification_enabled: false,
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
 	assert_eq!(resp.status(), 400);
