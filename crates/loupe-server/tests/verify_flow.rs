@@ -1,0 +1,291 @@
+//! End-to-end verification flow: LLM discovery scanner finds a bug,
+//! validates it internally, ships the finding to the server. The
+//! server, because the repo has `verification_enabled = true`, marks
+//! the finding `validating` and enqueues a verify job. The same
+//! Runner picks the verify job up (it advertises `verify:llm`), runs
+//! `LlmVerifierScanner::verify`, and POSTs a verdict. The server
+//! flips the finding to `confirmed` and the dispatcher fires only
+//! then — proving the gate-on-confirmed semantics.
+//!
+//! Two scenarios: confirmed (issue lands) and dismissed (no issue).
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::{Json, Router};
+use git2::{Repository, Signature};
+use loupe_proto::{
+	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
+	ScanRequest, PROTOCOL_VERSION,
+};
+use loupe_server::init::run_init;
+use loupe_server::reporters::GithubReporter;
+use loupe_server::{serve, AppState, Config};
+use loupe_storage::Db;
+use loupe_tls::Ca;
+use loupe_worker::llm::testing::StubLlmBackend;
+use loupe_worker::llm::LlmRequest;
+use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner};
+use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Default)]
+struct GithubStubState {
+	captured: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+async fn stub_create_issue(
+	State(stub): State<GithubStubState>,
+	axum::extract::Path((_owner, _repo)): axum::extract::Path<(String, String)>,
+	Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+	stub.captured.lock().unwrap().push(body);
+	(
+		StatusCode::CREATED,
+		Json(serde_json::json!({"number": 1, "html_url": "https://stub/issues/1"})),
+	)
+}
+
+async fn spawn_github_stub() -> (SocketAddr, GithubStubState) {
+	let stub = GithubStubState::default();
+	let app = Router::new()
+		.route("/repos/{owner}/{repo}/issues", post(stub_create_issue))
+		.with_state(stub.clone());
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	(addr, stub)
+}
+
+fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
+	reqwest::Certificate::from_pem(pem.as_bytes()).unwrap()
+}
+fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
+	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
+	combined.push_str(cert_pem);
+	if !cert_pem.ends_with('\n') {
+		combined.push('\n');
+	}
+	combined.push_str(key_pem);
+	reqwest::Identity::from_pem(combined.as_bytes()).unwrap()
+}
+
+fn make_planted_repo() -> (tempfile::TempDir, String) {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = Repository::init(tmp.path()).unwrap();
+	std::fs::write(
+		tmp.path().join("Cargo.toml"),
+		"[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+	)
+	.unwrap();
+	std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+	std::fs::write(
+		tmp.path().join("src/lib.rs"),
+		"pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }\n",
+	)
+	.unwrap();
+	let mut index = repo.index().unwrap();
+	index.add_path(std::path::Path::new("Cargo.toml")).unwrap();
+	index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+	index.write().unwrap();
+	let tree_oid = index.write_tree().unwrap();
+	let tree = repo.find_tree(tree_oid).unwrap();
+	let sig = Signature::now("loupe-test", "loupe-test@example.com").unwrap();
+	repo.commit(Some("HEAD"), &sig, &sig, "plant", &tree, &[]).unwrap();
+	let url = format!("file://{}", tmp.path().display());
+	(tmp, url)
+}
+
+/// Run the verify flow end-to-end. `verify_response` controls what the
+/// stub backend returns for the VERIFY prompt; pass a confirmed
+/// payload for the happy-path test or a dismissed payload for the
+/// rejection test.
+async fn run_flow(
+	verify_response: &'static str,
+) -> (Arc<Db>, GithubStubState, loupe_server::ServeHandle) {
+	let (_repo_tmp, clone_url) = make_planted_repo();
+	let (stub_addr, stub_state) = spawn_github_stub().await;
+	let stub_base = format!("http://{stub_addr}");
+
+	let server_dir = tempfile::tempdir().unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()]).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
+		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
+	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+
+	let cfg = Config {
+		bind_addr: "127.0.0.1:0".parse().unwrap(),
+		db_path: init.layout.db_path.clone(),
+		server_cert_pem,
+		server_key_pem,
+		ca_cert_pem: ca_cert_pem.clone(),
+		ca_key_pem,
+	};
+	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
+	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
+	let server = serve(cfg, state).await.unwrap();
+	let addr = server.local_addr;
+
+	let admin = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+
+	let resp = admin
+		.post("https://loupe-server/v1/repos")
+		.json(&RegisterRepoRequest {
+			protocol_version: PROTOCOL_VERSION,
+			clone_url: "https://github.com/loupe/test-target.git".into(),
+			branch: None,
+			scan_interval_seconds: None,
+			reporting: ReportingSetup::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				github_pat: "ghp_pat".into(),
+			},
+			scanner_config: serde_json::Value::Null,
+			verification_enabled: true,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let body: serde_json::Value = resp.json().await.unwrap();
+	let repo_id = body["repo_id"].as_i64().unwrap();
+	db.with_conn(|c| {
+		c.execute(
+			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
+			(&clone_url, repo_id),
+		)?;
+		Ok(())
+	})
+	.unwrap();
+
+	let resp = admin
+		.post("https://loupe-server/v1/workers")
+		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: "w1".into() })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
+	let raw = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+	let server_client =
+		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
+
+	admin
+		.post(format!("https://loupe-server/v1/repos/{}/scan", repo_id))
+		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
+		.send()
+		.await
+		.unwrap();
+
+	// Single stub backend used for both discovery and verification —
+	// keys on prompt content. Three branches:
+	//   * VALIDATE prompt (has the "validating a vulnerability report"
+	//     phrase): confirm with a tiny PoC diff.
+	//   * Anything else with "second opinion" phrasing → caller-supplied
+	//     verify_response.
+	//   * Otherwise: discovery — return one finding.
+	let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+		if req.prompt.contains("validating a vulnerability report") {
+			Ok(r#"{"verdict":"confirmed","notes":"reproduced","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+#[test] fn oob() { idx(&[], 0); }\n"}"#.to_owned())
+		} else if req.prompt.contains("independent second opinion") {
+			Ok(verify_response.to_owned())
+		} else {
+			Ok(r#"{"found":true,"severity":"high","title":"OOB index","file":"src/lib.rs","line_start":1,"line_end":1,"description":"unchecked index","cwe":"CWE-129"}"#.to_owned())
+		}
+	}));
+
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let scanners: Vec<Arc<dyn Scanner>> = vec![
+		Arc::new(LlmCodeReviewScanner::new(backend.clone())),
+		Arc::new(LlmVerifierScanner::new(backend)),
+	];
+	let runner = Runner::new(server_client, cache, scanners);
+	let cancel = CancellationToken::new();
+
+	// Step 1: scan job → discovery + validation → finding lands as
+	// validating, verify job enqueued.
+	assert!(runner.step(&cancel).await.unwrap(), "scan step ran");
+	// Step 2: verify job → verdict submitted; on confirm the finding
+	// flips and dispatches.
+	assert!(runner.step(&cancel).await.unwrap(), "verify step ran");
+
+	(db, stub_state, server)
+}
+
+#[tokio::test]
+async fn confirmed_verdict_dispatches_the_finding() {
+	let (db, stub, server) =
+		run_flow(r#"{"verdict":"confirmed","notes":"OOB confirmed on empty slice"}"#).await;
+
+	// Finding is reported (the dispatch path stamps state='reported').
+	let state: String = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT state FROM findings LIMIT 1", [], |r| r.get::<_, String>(0))?)
+		})
+		.unwrap();
+	assert_eq!(state, "reported");
+
+	// Verifications row recorded the verdict (with the verifier's
+	// real job_id, not NULL — that's the reaper's signature).
+	let (count, with_job): (i64, i64) = db
+		.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT COUNT(*), SUM(CASE WHEN job_id IS NOT NULL THEN 1 ELSE 0 END)
+				 FROM finding_verifications",
+				[],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)?)
+		})
+		.unwrap();
+	assert_eq!(count, 1);
+	assert_eq!(with_job, 1, "verifier-issued verdict must carry a job_id");
+
+	// GitHub stub captured exactly one issue.
+	let captured = stub.captured.lock().unwrap().clone();
+	assert_eq!(captured.len(), 1);
+	assert!(captured[0]["title"].as_str().unwrap().contains("high finding"));
+
+	server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dismissed_verdict_blocks_dispatch() {
+	let (db, stub, server) =
+		run_flow(r#"{"verdict":"dismissed","notes":"false positive — ignore"}"#).await;
+
+	let state: String = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT state FROM findings LIMIT 1", [], |r| r.get::<_, String>(0))?)
+		})
+		.unwrap();
+	assert_eq!(state, "dismissed");
+
+	// And no issue was dispatched.
+	let captured = stub.captured.lock().unwrap().clone();
+	assert!(captured.is_empty(), "dismissed verdict must NOT dispatch; got: {captured:?}");
+
+	server.shutdown().await;
+}
