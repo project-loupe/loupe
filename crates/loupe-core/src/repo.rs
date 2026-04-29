@@ -17,10 +17,10 @@ pub struct RepoSpec {
 
 /// How a confirmed finding should be reported.
 ///
-/// Tagged so future variants (`Email`, `GithubPr`, ...) can be added
-/// without an `unknown variant` error breaking older clients — readers
-/// that don't know a variant should mark the destination invalid rather
-/// than crash. See `loupe-storage::repos` for that handling.
+/// Tagged so future variants (`GithubPr`, ...) can be added without an
+/// `unknown variant` error breaking older clients — readers that don't
+/// know a variant should mark the destination invalid rather than
+/// crash. See `loupe-storage::repos` for that handling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReportingDestination {
@@ -32,6 +32,15 @@ pub enum ReportingDestination {
 		/// itself never travels in serialized `RepoSpec`/`ReportingDestination`
 		/// payloads.
 		pat_secret_id: i64,
+	},
+	/// Send an email to one or more recipients via the server's
+	/// configured `sendmail` binary.
+	Email {
+		to: Vec<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		from: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		subject_prefix: Option<String>,
 	},
 }
 

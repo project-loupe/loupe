@@ -11,8 +11,10 @@ use anyhow::Result;
 use loupe_core::{Finding, ReportingDestination};
 use loupe_storage::repos::RepoRow;
 
+pub mod email;
 pub mod github;
 
+pub use email::EmailReporter;
 pub use github::GithubReporter;
 
 /// Result of a successful dispatch — opaque receipt the caller can stamp
@@ -34,8 +36,11 @@ pub trait Reporter: Send + Sync {
 /// Pick the right reporter for `repo.reporting`. Returns `None` if the
 /// destination is one this build doesn't understand (forward
 /// compatibility — older builds shouldn't crash on a future variant).
-pub fn select(repo: &RepoRow, github: Arc<GithubReporter>) -> Option<Arc<dyn Reporter>> {
+pub fn select(
+	repo: &RepoRow, github: Arc<GithubReporter>, email: Arc<EmailReporter>,
+) -> Option<Arc<dyn Reporter>> {
 	match &repo.reporting {
 		ReportingDestination::GithubIssue { .. } => Some(github),
+		ReportingDestination::Email { .. } => Some(email),
 	}
 }

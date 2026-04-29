@@ -439,14 +439,16 @@ async fn dispatch_for_job(
 		.db
 		.with_conn(|c| Ok(repos::get(c, repo_id)?))?
 		.ok_or_else(|| anyhow::anyhow!("repo {repo_id} disappeared before dispatch"))?;
-	let pat_secret_id = match &repo.reporting {
-		ReportingDestination::GithubIssue { pat_secret_id, .. } => *pat_secret_id,
+	let pat = match &repo.reporting {
+		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
+			let bytes = state
+				.db
+				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id, state.master_key.as_deref())?))?
+				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
+			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
+		},
+		ReportingDestination::Email { .. } => String::new(),
 	};
-	let pat_bytes = state
-		.db
-		.with_conn(|c| Ok(secrets::read(c, pat_secret_id, state.master_key.as_deref())?))?
-		.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
-	let pat = String::from_utf8(pat_bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?;
 
 	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;
 	let findings_for_report: Vec<Finding> = rows
@@ -469,8 +471,9 @@ async fn dispatch_for_job(
 		return Ok(());
 	}
 
-	let reporter = reporters::select(&repo, state.github_reporter.clone())
-		.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
+	let reporter =
+		reporters::select(&repo, state.github_reporter.clone(), state.email_reporter.clone())
+			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
 	let receipt = reporter.dispatch(&repo, &findings_for_report, &pat).await?;
 	tracing::info!(
 		job_id,

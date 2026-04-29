@@ -11,7 +11,20 @@ use crate::version::PROTOCOL_VERSION;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReportingSetup {
-	GithubIssue { target_owner: String, target_repo: String, github_pat: String },
+	GithubIssue {
+		target_owner: String,
+		target_repo: String,
+		github_pat: String,
+	},
+	/// Send findings as email via the server's `sendmail` binary. No
+	/// secret material is required — the binary handles transport.
+	Email {
+		to: Vec<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		from: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		subject_prefix: Option<String>,
+	},
 }
 
 /// Body of `POST /v1/repos`.

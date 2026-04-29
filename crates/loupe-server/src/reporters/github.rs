@@ -59,6 +59,7 @@ impl Reporter for GithubReporter {
 			ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
 				(target_owner.as_str(), target_repo.as_str())
 			},
+			_ => anyhow::bail!("GithubReporter dispatched against a non-github destination"),
 		};
 		if findings.is_empty() {
 			return Ok(DispatchReceipt { kind: self.kind(), external_id: None });

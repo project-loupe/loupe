@@ -162,6 +162,9 @@ mod tests {
 			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 				assert_eq!(pat_secret_id, secret_id)
 			},
+			ReportingDestination::Email { .. } => {
+				panic!("fixture builds a github_issue destination")
+			},
 		}
 
 		assert!(db.with_conn(|c| Ok(delete(c, id)?)).unwrap());
