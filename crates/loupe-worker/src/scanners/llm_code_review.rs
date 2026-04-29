@@ -23,18 +23,22 @@ const SCANNER_ID: &str = "llm-code-review";
 const CAPABILITIES: &[&str] = &["scan:llm"];
 
 /// Config knobs operators can set via the repo's `scanner_config`
-/// JSON. Defaults are tuned for "scan a small Rust crate end-to-end
-/// without breaking the bank".
+/// JSON. Defaults cover Rust, C/C++, JS/TS, Python, Go, Ruby, PHP, and
+/// JVM/Swift sources, plus a broad excludelist that drops common
+/// build / vendor / test dirs across those ecosystems. Tighten or
+/// loosen per-repo by sending a partial JSON override (see
+/// `ScannerConfigPatch`).
 #[derive(Debug, Clone)]
 pub struct ScannerConfig {
 	pub max_concurrent_files: usize,
 	pub max_file_bytes: u64,
 	pub per_request_timeout: Duration,
 	/// File extensions the walk will consider, lower-cased and without
-	/// the leading dot (e.g. `["rs"]`).
+	/// the leading dot (e.g. `["rs", "cpp"]`).
 	pub include_extensions: Vec<String>,
-	/// Substrings in path components that disqualify a file (e.g.
-	/// `tests`, `test`, `examples`).
+	/// Substrings that disqualify a path. We match against the full
+	/// path string (forward-slash form on Unix), so `/target` matches
+	/// `…/target/release/foo.rs` and `node_modules` matches anywhere.
 	pub exclude_path_substrings: Vec<String>,
 }
 
@@ -44,10 +48,106 @@ impl Default for ScannerConfig {
 			max_concurrent_files: 8,
 			max_file_bytes: 64 * 1024,
 			per_request_timeout: DEFAULT_REQUEST_TIMEOUT,
-			include_extensions: vec!["rs".into()],
-			exclude_path_substrings: vec!["tests".into(), "/test".into(), "examples".into()],
+			include_extensions: default_extensions(),
+			exclude_path_substrings: default_excludes(),
 		}
 	}
+}
+
+/// Partial override applied on top of `ScannerConfig::default()` (or a
+/// constructor-supplied baseline) when the server passes a non-null
+/// `scanner_config` in the lease envelope. `None` for any field means
+/// "leave the baseline alone"; `Some(...)` replaces the field
+/// wholesale.
+///
+/// Replacing rather than merging is intentional: when an operator
+/// writes `{"include_extensions":["c","h"]}` for a C-only repo they
+/// almost always *don't* want our default Rust/JS/Python/etc.
+/// extensions silently appended.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct ScannerConfigPatch {
+	pub max_concurrent_files: Option<usize>,
+	pub max_file_bytes: Option<u64>,
+	pub per_request_timeout_seconds: Option<u64>,
+	pub include_extensions: Option<Vec<String>>,
+	pub exclude_path_substrings: Option<Vec<String>>,
+}
+
+impl ScannerConfig {
+	pub(crate) fn apply_patch(&mut self, p: ScannerConfigPatch) {
+		if let Some(v) = p.max_concurrent_files {
+			self.max_concurrent_files = v;
+		}
+		if let Some(v) = p.max_file_bytes {
+			self.max_file_bytes = v;
+		}
+		if let Some(v) = p.per_request_timeout_seconds {
+			self.per_request_timeout = Duration::from_secs(v);
+		}
+		if let Some(v) = p.include_extensions {
+			self.include_extensions = v;
+		}
+		if let Some(v) = p.exclude_path_substrings {
+			self.exclude_path_substrings = v;
+		}
+	}
+}
+
+fn default_extensions() -> Vec<String> {
+	[
+		// Rust.
+		"rs", // C / C++ / Obj-C.
+		"c", "h", "cc", "hh", "cpp", "hpp", "cxx", "hxx", "m", "mm", // JS / TS.
+		"js", "jsx", "mjs", "cjs", "ts", "tsx", // Python.
+		"py",  // Go.
+		"go",  // Ruby.
+		"rb",  // PHP.
+		"php", // JVM family.
+		"java", "kt", "kts", "scala", "groovy", // Swift.
+		"swift",  // Misc.
+		"dart", "ex", "exs", "rs.in",
+	]
+	.into_iter()
+	.map(String::from)
+	.collect()
+}
+
+fn default_excludes() -> Vec<String> {
+	[
+		// Rust / Java / general "tests" dirs and matching filename suffixes.
+		"tests",
+		"/test",
+		"examples",
+		"__tests__",
+		"/test_",
+		"_test.",
+		".test.",
+		".spec.",
+		// Build artefacts across ecosystems.
+		"/target",
+		"/build",
+		"/dist",
+		"/out",
+		"/.next",
+		"/.nuxt",
+		"/coverage",
+		// Vendored deps.
+		"node_modules",
+		"/vendor",
+		"/.venv",
+		"/venv",
+		"/env",
+		// Caches.
+		"__pycache__",
+		"/.tox",
+		"/.gradle",
+		"/.mypy_cache",
+		"/.pytest_cache",
+	]
+	.into_iter()
+	.map(String::from)
+	.collect()
 }
 
 pub struct LlmCodeReviewScanner {
@@ -77,7 +177,19 @@ impl Scanner for LlmCodeReviewScanner {
 	}
 
 	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding>> {
-		let files = walk_source_files(&ctx.workdir, &self.config);
+		// Apply any per-repo overrides from the lease envelope on top
+		// of our baseline config.
+		let mut cfg = self.config.clone();
+		if !ctx.config.is_null() {
+			match serde_json::from_value::<ScannerConfigPatch>(ctx.config.clone()) {
+				Ok(patch) => cfg.apply_patch(patch),
+				Err(e) => {
+					tracing::warn!(error = %e, "ignoring scanner_config: not a ScannerConfigPatch");
+				},
+			}
+		}
+
+		let files = walk_source_files(&ctx.workdir, &cfg);
 		if files.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -87,13 +199,13 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting discovery"
 		);
 
-		let discovered = self.discover_all(&ctx.workdir, &files, &ctx.cancel).await;
+		let discovered = self.discover_all(&cfg, &ctx.workdir, &files, &ctx.cancel).await;
 		// Dedup slot: no-op for now. When server-side prior-findings
 		// arrive (see LOUPE.md), this is where we'd drop matches.
 		let after_dedup = discovered;
 		tracing::info!(candidates = after_dedup.len(), "llm-code-review entering validation");
 
-		let validated = self.validate_all(&ctx.workdir, after_dedup, &ctx.cancel).await;
+		let validated = self.validate_all(&cfg, &ctx.workdir, after_dedup, &ctx.cancel).await;
 		tracing::info!(emitted = validated.len(), "llm-code-review finished");
 
 		Ok(validated.into_iter().map(|v| build_finding(&self.backend, v, &ctx.head_sha)).collect())
@@ -122,9 +234,9 @@ struct Validated {
 
 impl LlmCodeReviewScanner {
 	async fn discover_all(
-		&self, workdir: &Path, files: &[PathBuf], cancel: &CancellationToken,
+		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], cancel: &CancellationToken,
 	) -> Vec<Discovered> {
-		let sem = Arc::new(Semaphore::new(self.config.max_concurrent_files));
+		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
 			if cancel.is_cancelled() {
@@ -132,13 +244,13 @@ impl LlmCodeReviewScanner {
 			}
 			let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
 			let backend = self.backend.clone();
-			let cfg = self.config.clone();
+			let cfg_owned = cfg.clone();
 			let workdir = workdir.to_path_buf();
 			let path = path.clone();
 			let cancel = cancel.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				discover_one(backend, &workdir, &path, &cfg, cancel).await
+				discover_one(backend, &workdir, &path, &cfg_owned, cancel).await
 			}));
 		}
 
@@ -154,9 +266,10 @@ impl LlmCodeReviewScanner {
 	}
 
 	async fn validate_all(
-		&self, workdir: &Path, discovered: Vec<Discovered>, cancel: &CancellationToken,
+		&self, cfg: &ScannerConfig, workdir: &Path, discovered: Vec<Discovered>,
+		cancel: &CancellationToken,
 	) -> Vec<Validated> {
-		let sem = Arc::new(Semaphore::new(self.config.max_concurrent_files));
+		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(discovered.len());
 		for d in discovered {
 			if cancel.is_cancelled() {
@@ -164,12 +277,12 @@ impl LlmCodeReviewScanner {
 			}
 			let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
 			let backend = self.backend.clone();
-			let cfg = self.config.clone();
+			let cfg_owned = cfg.clone();
 			let workdir = workdir.to_path_buf();
 			let cancel = cancel.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				validate_one(backend, &workdir, d, &cfg, cancel).await
+				validate_one(backend, &workdir, d, &cfg_owned, cancel).await
 			}));
 		}
 		let mut out = Vec::new();
@@ -566,6 +679,96 @@ mod tests {
 			}
 			std::fs::write(p, body).unwrap();
 		}
+	}
+
+	#[test]
+	fn defaults_cover_common_languages() {
+		let cfg = ScannerConfig::default();
+		for ext in ["rs", "c", "cpp", "h", "hpp", "js", "ts", "py", "go", "java", "swift"] {
+			assert!(cfg.include_extensions.iter().any(|e| e == ext), "missing: {ext}");
+		}
+		// node_modules and target are excluded out of the box.
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "node_modules"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "/target"));
+	}
+
+	#[test]
+	fn patch_overrides_only_the_fields_present() {
+		let mut cfg = ScannerConfig::default();
+		let original_excludes = cfg.exclude_path_substrings.clone();
+		let patch: ScannerConfigPatch =
+			serde_json::from_str(r#"{"include_extensions":["c","h"]}"#).unwrap();
+		cfg.apply_patch(patch);
+		assert_eq!(cfg.include_extensions, vec!["c".to_owned(), "h".to_owned()]);
+		assert_eq!(cfg.exclude_path_substrings, original_excludes);
+	}
+
+	#[test]
+	fn walk_picks_up_non_rust_files_without_cargo_toml() {
+		let tmp = tempfile::tempdir().unwrap();
+		// No Cargo.toml here — fallback walks the workdir.
+		std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+		std::fs::write(tmp.path().join("src/main.cpp"), "// stub\n").unwrap();
+		std::fs::write(tmp.path().join("src/util.h"), "// stub\n").unwrap();
+		std::fs::write(tmp.path().join("src/app.py"), "# stub\n").unwrap();
+		std::fs::write(tmp.path().join("src/page.tsx"), "// stub\n").unwrap();
+
+		let cfg = ScannerConfig::default();
+		let files = walk_source_files(tmp.path(), &cfg);
+		let names: Vec<String> = files
+			.iter()
+			.map(|p| p.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned())
+			.collect();
+		for expected in ["src/main.cpp", "src/util.h", "src/app.py", "src/page.tsx"] {
+			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+		}
+	}
+
+	#[test]
+	fn walk_excludes_node_modules_and_build_dirs_by_default() {
+		let tmp = tempfile::tempdir().unwrap();
+		// Real source.
+		std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+		std::fs::write(tmp.path().join("src/index.js"), "// real\n").unwrap();
+		// Vendored deps and build artefacts that must be skipped.
+		std::fs::create_dir_all(tmp.path().join("node_modules/lodash")).unwrap();
+		std::fs::write(tmp.path().join("node_modules/lodash/index.js"), "// vendored\n").unwrap();
+		std::fs::create_dir_all(tmp.path().join("dist")).unwrap();
+		std::fs::write(tmp.path().join("dist/bundle.js"), "// built\n").unwrap();
+
+		let files = walk_source_files(tmp.path(), &ScannerConfig::default());
+		let names: Vec<String> = files
+			.iter()
+			.map(|p| p.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned())
+			.collect();
+		assert!(names.iter().any(|n| n == "src/index.js"), "real source missing: {names:?}");
+		assert!(names.iter().all(|n| !n.contains("node_modules")), "leak: {names:?}");
+		assert!(names.iter().all(|n| !n.starts_with("dist/")), "leak: {names:?}");
+	}
+
+	#[tokio::test]
+	async fn ctx_config_override_changes_walked_extensions() {
+		// A C-only repo overrides include_extensions so a `.c` file is
+		// picked up even though the project has no Cargo.toml.
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::write(tmp.path().join("widget.c"), "/* stub */\n").unwrap();
+
+		// Stub backend that always reports a finding so we can tell
+		// whether the file was visited.
+		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
+			if req.prompt.contains("validating a vulnerability report") {
+				Ok(r#"{"verdict":"confirmed","notes":"x","poc_unified":"--- diff ---"}"#.to_owned())
+			} else {
+				Ok(r#"{"found":true,"severity":"low","title":"stub","file":"widget.c","line_start":1,"line_end":1,"description":"d"}"#.to_owned())
+			}
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+
+		let mut ctx = make_ctx(tmp.path());
+		ctx.config = serde_json::json!({"include_extensions":["c"]});
+		let findings = scanner.scan(&ctx).await.unwrap();
+		assert_eq!(findings.len(), 1, "ctx.config override should have caught widget.c");
+		assert_eq!(findings[0].file_path.as_deref(), Some("widget.c"));
 	}
 
 	#[test]
