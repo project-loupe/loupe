@@ -49,5 +49,5 @@ tokio-rustls = "0.26"
 tower = "0.5"
 rand_core = "0.6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 walkdir = "2"

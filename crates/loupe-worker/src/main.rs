@@ -34,7 +34,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	tracing_subscriber::fmt::init();
+	init_tracing();
 	let args = Args::parse();
 
 	let ca_cert_pem = std::fs::read_to_string(&args.ca_cert)
@@ -61,4 +61,18 @@ async fn main() -> Result<()> {
 	tracing::info!("loupe-worker running");
 	runner.run_forever(cancel).await?;
 	Ok(())
+}
+
+/// Initialise tracing. Defaults to the human-readable formatter; set
+/// `LOUPE_LOG_JSON=1` to switch to structured JSON output. Filter level
+/// is taken from `RUST_LOG`.
+fn init_tracing() {
+	let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+	let json = std::env::var_os("LOUPE_LOG_JSON").map(|v| !v.is_empty()).unwrap_or(false);
+	if json {
+		tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+	} else {
+		tracing_subscriber::fmt().with_env_filter(env_filter).init();
+	}
 }

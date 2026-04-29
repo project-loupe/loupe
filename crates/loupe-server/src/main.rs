@@ -57,7 +57,7 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	tracing_subscriber::fmt::init();
+	init_tracing();
 	let cli = Cli::parse();
 	match cli.cmd {
 		Cmd::Init(args) => run_init_cmd(args),
@@ -123,6 +123,21 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	tracing::info!("loupe-server shutting down");
 	handle.shutdown().await;
 	Ok(())
+}
+
+/// Initialise tracing. Defaults to the human-readable formatter; set
+/// `LOUPE_LOG_JSON=1` (or any non-empty value) to switch to structured
+/// JSON output for log aggregators. Filter level is taken from
+/// `RUST_LOG` as usual.
+fn init_tracing() {
+	let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+	let json = std::env::var_os("LOUPE_LOG_JSON").map(|v| !v.is_empty()).unwrap_or(false);
+	if json {
+		tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+	} else {
+		tracing_subscriber::fmt().with_env_filter(env_filter).init();
+	}
 }
 
 /// Parse a 32-byte master key from base64 in `LOUPE_MASTER_KEY`. Returns
