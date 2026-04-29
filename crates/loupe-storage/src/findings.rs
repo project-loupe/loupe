@@ -108,6 +108,34 @@ pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Resul
 	Ok(stale.len())
 }
 
+/// List findings for one repo, most recent first. `limit` caps the
+/// page size (callers should pass something reasonable, e.g. 100).
+pub fn list_for_repo(
+	conn: &Connection, repo_id: i64, limit: i64,
+) -> rusqlite::Result<Vec<FindingRow>> {
+	let mut stmt = conn.prepare(
+		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
+		        file_path, line_start, line_end, cwe, patch_unified,
+		        poc_unified, fingerprint, state, verification_required, created_at
+		 FROM findings WHERE repo_id = ?1 ORDER BY id DESC LIMIT ?2",
+	)?;
+	let rows = stmt.query_map(params![repo_id, limit], row_to_finding)?;
+	rows.collect()
+}
+
+/// Fetch one finding by id. Returns `None` if it doesn't exist.
+pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<FindingRow>> {
+	conn.query_row(
+		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
+		        file_path, line_start, line_end, cwe, patch_unified,
+		        poc_unified, fingerprint, state, verification_required, created_at
+		 FROM findings WHERE id = ?1",
+		params![id],
+		row_to_finding,
+	)
+	.optional()
+}
+
 pub fn get_for_repo(
 	conn: &Connection, repo_id: i64, fingerprint: &str,
 ) -> rusqlite::Result<Option<FindingRow>> {

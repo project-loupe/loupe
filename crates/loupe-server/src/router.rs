@@ -29,8 +29,10 @@ pub struct PeerCert(pub CertificateDer<'static>);
 pub fn router(state: AppState) -> Router {
 	let admin_only = Router::new()
 		.route("/v1/repos", post(routes::repos::create).get(routes::repos::list))
-		.route("/v1/repos/{id}", delete(routes::repos::delete))
+		.route("/v1/repos/{id}", delete(routes::repos::delete).patch(routes::repos::update))
 		.route("/v1/repos/{id}/scan", post(routes::jobs::enqueue_scan))
+		.route("/v1/repos/{id}/findings", get(routes::findings_admin::list_for_repo))
+		.route("/v1/findings/{id}", get(routes::findings_admin::get))
 		.route("/v1/workers", post(routes::workers::create))
 		.route("/v1/workers/{id}", delete(routes::workers::revoke))
 		.route("/v1/jobs", get(routes::jobs::list))

@@ -8,9 +8,9 @@ use axum::Json;
 use loupe_core::ReportingDestination;
 use loupe_proto::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RepoSummary, ReportingSetup,
-	PROTOCOL_VERSION,
+	UpdateRepoRequest, PROTOCOL_VERSION,
 };
-use loupe_storage::repos::{self, NewRepo, RepoRow};
+use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
 
 use crate::state::AppState;
@@ -125,6 +125,38 @@ pub async fn list(
 		protocol_version: PROTOCOL_VERSION,
 		repos: rows.into_iter().map(row_to_summary).collect(),
 	}))
+}
+
+/// `PATCH /v1/repos/:id` — admin only. Toggles `disabled`, swaps the
+/// scan interval, or flips the verification flag. Each field is
+/// independently optional; absent fields are left alone. The clone URL
+/// and reporting destination are intentionally not patchable — those
+/// would silently change where new findings get filed, so re-register
+/// the repo instead.
+pub async fn update(
+	State(state): State<AppState>, Path(id): Path<i64>, Json(req): Json<UpdateRepoRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	if req.protocol_version != PROTOCOL_VERSION {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			format!("unsupported protocol_version {}", req.protocol_version),
+		));
+	}
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+	let patch = RepoUpdate {
+		disabled: req.disabled,
+		scan_interval_seconds: req.scan_interval_seconds.map(|v| v as i64),
+		verification_enabled: req.verification_enabled,
+	};
+	let updated = state
+		.db
+		.with_conn(|c| Ok(repos::update(c, id, &patch, now)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("update repo: {e}")))?;
+	if updated {
+		Ok(StatusCode::NO_CONTENT)
+	} else {
+		Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")))
+	}
 }
 
 /// `DELETE /v1/repos/:id` — admin only. CASCADEs onto jobs, findings,

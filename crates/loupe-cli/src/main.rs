@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
-	JobInfo, ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest,
-	RegisterWorkerResponse, ReportingSetup, ScanRequest, ScanResponse, PROTOCOL_VERSION,
+	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
+	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
+	ScanRequest, ScanResponse, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -41,6 +42,8 @@ enum Cmd {
 	Worker(WorkerCmd),
 	#[command(subcommand)]
 	Job(JobCmd),
+	#[command(subcommand)]
+	Finding(FindingCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -51,12 +54,37 @@ enum RepoCmd {
 	List,
 	/// Deregister a repo (cascades to its jobs and findings).
 	Rm { id: i64 },
+	/// Patch a repo's scheduling / verification settings. Each flag is
+	/// optional and only present fields are applied.
+	Update(RepoUpdateArgs),
 	/// Trigger a scan now.
 	Scan {
 		id: i64,
 		#[arg(long, default_value_t = false)]
 		incremental: bool,
 	},
+}
+
+#[derive(Debug, Args)]
+struct RepoUpdateArgs {
+	id: i64,
+	/// Stop the scheduler from picking this repo. Triggered scans
+	/// (`loupectl repo scan`) still go through.
+	#[arg(long, conflicts_with = "enable")]
+	disable: bool,
+	/// Re-enable a previously disabled repo.
+	#[arg(long, conflicts_with = "disable")]
+	enable: bool,
+	/// Set the scan interval (seconds). Pass 0 to leave it as-is — use
+	/// `--disable` if you want to stop scheduled scans.
+	#[arg(long)]
+	interval: Option<u64>,
+	/// Route findings through the verify flow before dispatching.
+	#[arg(long, conflicts_with = "no_verification")]
+	verification_enabled: bool,
+	/// Dispatch findings immediately on insert; skip the verify flow.
+	#[arg(long, conflicts_with = "verification_enabled")]
+	no_verification: bool,
 }
 
 #[derive(Debug, Args)]
@@ -102,6 +130,14 @@ enum JobCmd {
 	Get { id: i64 },
 }
 
+#[derive(Debug, Subcommand)]
+enum FindingCmd {
+	/// List recent findings for a repo (newest first, capped server-side).
+	List { repo_id: i64 },
+	/// Print a single finding in full detail (description + PoC + patch).
+	Get { id: i64 },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 	let cli = Cli::parse();
@@ -111,6 +147,7 @@ async fn main() -> Result<()> {
 			RepoCmd::Add(a) => repo_add(&client, &cli.conn.server_url, a).await,
 			RepoCmd::List => repo_list(&client, &cli.conn.server_url).await,
 			RepoCmd::Rm { id } => repo_rm(&client, &cli.conn.server_url, id).await,
+			RepoCmd::Update(a) => repo_update(&client, &cli.conn.server_url, a).await,
 			RepoCmd::Scan { id, incremental } => {
 				repo_scan(&client, &cli.conn.server_url, id, incremental).await
 			},
@@ -124,6 +161,12 @@ async fn main() -> Result<()> {
 		Cmd::Job(c) => match c {
 			JobCmd::List => job_list(&client, &cli.conn.server_url).await,
 			JobCmd::Get { id } => job_get(&client, &cli.conn.server_url, id).await,
+		},
+		Cmd::Finding(c) => match c {
+			FindingCmd::List { repo_id } => {
+				finding_list(&client, &cli.conn.server_url, repo_id).await
+			},
+			FindingCmd::Get { id } => finding_get(&client, &cli.conn.server_url, id).await,
 		},
 	}
 }
@@ -199,6 +242,33 @@ async fn repo_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Resu
 	Ok(())
 }
 
+async fn repo_update(
+	client: &reqwest::Client, base: &reqwest::Url, a: RepoUpdateArgs,
+) -> Result<()> {
+	let disabled = match (a.disable, a.enable) {
+		(true, false) => Some(true),
+		(false, true) => Some(false),
+		_ => None,
+	};
+	let verification_enabled = match (a.verification_enabled, a.no_verification) {
+		(true, false) => Some(true),
+		(false, true) => Some(false),
+		_ => None,
+	};
+	let req = UpdateRepoRequest {
+		protocol_version: PROTOCOL_VERSION,
+		disabled,
+		scan_interval_seconds: a.interval,
+		verification_enabled,
+	};
+	let resp = client.patch(url(base, &format!("/v1/repos/{}", a.id))).json(&req).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("update repo: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
 async fn repo_scan(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64, incremental: bool,
 ) -> Result<()> {
@@ -262,5 +332,36 @@ async fn job_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Resu
 	let resp = client.get(url(base, &format!("/v1/jobs/{id}"))).send().await?;
 	let job: JobInfo = resp.error_for_status()?.json().await?;
 	println!("{}", serde_json::to_string_pretty(&job)?);
+	Ok(())
+}
+
+async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i64) -> Result<()> {
+	let resp = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))).send().await?;
+	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
+	for f in body.findings {
+		let loc = match (f.file_path.as_deref(), f.line_start) {
+			(Some(p), Some(l)) => format!("{p}:{l}"),
+			(Some(p), None) => p.to_string(),
+			_ => "-".into(),
+		};
+		println!(
+			"{:>5}\tjob={}\t{:?}\t{}\tstate={}\tverify={}\t{}\t{}",
+			f.id,
+			f.job_id,
+			f.severity,
+			f.scanner_id,
+			f.state,
+			f.verification_required,
+			loc,
+			f.title,
+		);
+	}
+	Ok(())
+}
+
+async fn finding_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client.get(url(base, &format!("/v1/findings/{id}"))).send().await?;
+	let detail: FindingDetail = resp.error_for_status()?.json().await?;
+	println!("{}", serde_json::to_string_pretty(&detail)?);
 	Ok(())
 }

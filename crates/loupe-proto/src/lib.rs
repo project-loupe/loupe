@@ -6,19 +6,21 @@
 //! `X-Loupe-Protocol` response header are the other two layers — see the
 //! plan for the full versioning strategy.
 
+mod findings_admin;
 mod job_io;
 mod lease;
 mod registry;
 mod scan;
 mod version;
 
+pub use findings_admin::{FindingDetail, FindingSummary, ListFindingsResponse};
 pub use job_io::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatResponse, VerdictSubmission,
 };
 pub use lease::{LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse};
 pub use registry::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest,
-	RegisterWorkerResponse, RepoSummary, ReportingSetup,
+	RegisterWorkerResponse, RepoSummary, ReportingSetup, UpdateRepoRequest,
 };
 pub use scan::{JobInfo, ScanRequest, ScanResponse};
 pub use version::{check_protocol_version, ProtocolMismatch, PROTOCOL_VERSION};

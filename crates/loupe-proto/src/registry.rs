@@ -67,6 +67,23 @@ pub struct RegisterRepoResponse {
 	pub repo_id: i64,
 }
 
+/// Body of `PATCH /v1/repos/:id`. All fields are optional — only the
+/// ones present in the JSON are applied. `disabled = Some(true)` stamps
+/// `disabled_at = now`; `disabled = Some(false)` clears it. The repo's
+/// reporting destination, clone URL, and PAT cannot be patched: those
+/// are register-time inputs, and changing them would silently affect
+/// where new findings get filed. Re-register the repo for that.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UpdateRepoRequest {
+	pub protocol_version: u16,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub disabled: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub scan_interval_seconds: Option<u64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub verification_enabled: Option<bool>,
+}
+
 /// Response body of `GET /v1/repos`. `RepoSummary` deliberately omits
 /// the storage-only `reporting` JSON — clients don't need it, and it
 /// would leak `pat_secret_id` references that have no meaning to them.

@@ -72,6 +72,48 @@ pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	Ok(n > 0)
 }
 
+/// Optional patches to apply to a registered repo. `None` means "leave
+/// the existing value alone". Toggling `disabled` to `Some(true)` stamps
+/// `disabled_at = now`; `Some(false)` clears it. Returns `Ok(true)` if a
+/// row matched, `Ok(false)` if `id` is unknown.
+#[derive(Debug, Default, Clone)]
+pub struct RepoUpdate {
+	pub disabled: Option<bool>,
+	pub scan_interval_seconds: Option<i64>,
+	pub verification_enabled: Option<bool>,
+}
+
+pub fn update(conn: &Connection, id: i64, patch: &RepoUpdate, now: i64) -> rusqlite::Result<bool> {
+	if patch.disabled.is_none()
+		&& patch.scan_interval_seconds.is_none()
+		&& patch.verification_enabled.is_none()
+	{
+		return Ok(get(conn, id)?.is_some());
+	}
+	let mut sets: Vec<&str> = Vec::new();
+	let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+	if let Some(d) = patch.disabled {
+		if d {
+			sets.push("disabled_at = ?");
+			binds.push(now.into());
+		} else {
+			sets.push("disabled_at = NULL");
+		}
+	}
+	if let Some(secs) = patch.scan_interval_seconds {
+		sets.push("scan_interval_seconds = ?");
+		binds.push(secs.into());
+	}
+	if let Some(v) = patch.verification_enabled {
+		sets.push("verification_enabled = ?");
+		binds.push((v as i64).into());
+	}
+	binds.push(id.into());
+	let sql = format!("UPDATE registered_repos SET {} WHERE id = ?", sets.join(", "),);
+	let n = conn.execute(&sql, rusqlite::params_from_iter(binds.iter()))?;
+	Ok(n > 0)
+}
+
 /// Repos that have a scan interval set and whose next scan is due
 /// (i.e. `last_scanned_at + scan_interval_seconds < now`, or
 /// `last_scanned_at` is NULL meaning "never scanned"). Disabled repos
@@ -254,6 +296,50 @@ mod tests {
 		let mut names: Vec<&str> = due.iter().map(|r| r.repo.as_str()).collect();
 		names.sort();
 		assert_eq!(names, vec!["a", "b"]);
+	}
+
+	#[test]
+	fn update_toggles_disabled_and_changes_interval() {
+		let db = Db::open_in_memory().unwrap();
+		let sid = db
+			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
+			.unwrap();
+		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(sid), 0)?)).unwrap();
+
+		// Disable.
+		let updated = db
+			.with_conn(|c| {
+				Ok(update(c, id, &RepoUpdate { disabled: Some(true), ..Default::default() }, 123)?)
+			})
+			.unwrap();
+		assert!(updated);
+		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		assert_eq!(row.disabled_at, Some(123));
+
+		// Re-enable + change interval + flip verification.
+		let updated = db
+			.with_conn(|c| {
+				Ok(update(
+					c,
+					id,
+					&RepoUpdate {
+						disabled: Some(false),
+						scan_interval_seconds: Some(7200),
+						verification_enabled: Some(true),
+					},
+					456,
+				)?)
+			})
+			.unwrap();
+		assert!(updated);
+		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		assert_eq!(row.disabled_at, None);
+		assert_eq!(row.scan_interval_seconds, Some(7200));
+		assert!(row.verification_enabled);
+
+		// Empty patch on missing id returns false.
+		let touched = db.with_conn(|c| Ok(update(c, 9_999, &RepoUpdate::default(), 0)?)).unwrap();
+		assert!(!touched);
 	}
 
 	#[test]
