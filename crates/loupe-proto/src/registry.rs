@@ -1,10 +1,20 @@
-use loupe_core::ReportingDestination;
 use serde::{Deserialize, Serialize};
 
 use crate::version::PROTOCOL_VERSION;
 
-/// Body of `POST /v1/repos`. The `pat_secret_id` referenced inside
-/// `reporting` must already exist in the server's `secrets` table.
+/// Wire-only reporting setup. Carries the GitHub PAT inline so the
+/// admin can register a repo in a single round-trip; the server moves
+/// the PAT into the `secrets` table and persists a
+/// `loupe_core::ReportingDestination` referencing the resulting
+/// `pat_secret_id`. PAT material never travels back out of the server
+/// in any response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReportingSetup {
+	GithubIssue { target_owner: String, target_repo: String, github_pat: String },
+}
+
+/// Body of `POST /v1/repos`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRepoRequest {
 	pub protocol_version: u16,
@@ -13,13 +23,13 @@ pub struct RegisterRepoRequest {
 	pub branch: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub scan_interval_seconds: Option<u64>,
-	pub reporting: ReportingDestination,
+	pub reporting: ReportingSetup,
 	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
 	pub scanner_config: serde_json::Value,
 }
 
 impl RegisterRepoRequest {
-	pub fn new(clone_url: impl Into<String>, reporting: ReportingDestination) -> Self {
+	pub fn new(clone_url: impl Into<String>, reporting: ReportingSetup) -> Self {
 		Self {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: clone_url.into(),
@@ -35,6 +45,33 @@ impl RegisterRepoRequest {
 pub struct RegisterRepoResponse {
 	pub protocol_version: u16,
 	pub repo_id: i64,
+}
+
+/// Response body of `GET /v1/repos`. `RepoSummary` deliberately omits
+/// the storage-only `reporting` JSON — clients don't need it, and it
+/// would leak `pat_secret_id` references that have no meaning to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReposResponse {
+	pub protocol_version: u16,
+	pub repos: Vec<RepoSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSummary {
+	pub id: i64,
+	pub clone_url: String,
+	pub host: String,
+	pub owner: String,
+	pub repo: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub default_branch: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub scan_interval_seconds: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_scanned_sha: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_scanned_at: Option<i64>,
+	pub created_at: i64,
 }
 
 /// Body of `POST /v1/workers` (admin-only). Returns the freshly-minted
@@ -57,7 +94,6 @@ pub struct RegisterWorkerResponse {
 
 #[cfg(test)]
 mod tests {
-	use loupe_core::ReportingDestination;
 	use serde_json::json;
 
 	use super::*;
@@ -69,16 +105,18 @@ mod tests {
 			clone_url: "https://github.com/acme/widget.git".into(),
 			branch: Some("main".into()),
 			scan_interval_seconds: Some(3600),
-			reporting: ReportingDestination::GithubIssue {
+			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "security".into(),
-				pat_secret_id: 1,
+				github_pat: "ghp_xxx".into(),
 			},
 			scanner_config: json!({"regex": {"enabled": true}}),
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
 		assert_eq!(req, back);
+		// Sanity check: the wire form does not leak `pat_secret_id`.
+		assert!(!s.contains("pat_secret_id"));
 	}
 
 	#[test]

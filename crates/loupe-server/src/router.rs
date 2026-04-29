@@ -28,6 +28,8 @@ pub struct PeerCert(pub CertificateDer<'static>);
 /// integration tests can mount it without spinning up TLS.
 pub fn router(state: AppState) -> Router {
 	let admin_only = Router::new()
+		.route("/v1/repos", post(routes::repos::create).get(routes::repos::list))
+		.route("/v1/repos/{id}", delete(routes::repos::delete))
 		.route("/v1/workers", post(routes::workers::create))
 		.route("/v1/workers/{id}", delete(routes::workers::revoke))
 		.route_layer(axum::middleware::from_fn(auth::require_admin));
