@@ -14,14 +14,26 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
 git2 = { workspace = true }
 loupe-core = { path = "../loupe-core" }
 loupe-proto = { path = "../loupe-proto" }
+loupe-tls = { path = "../loupe-tls" }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
+loupe-server = { path = "../loupe-server" }
+loupe-storage = { path = "../loupe-storage" }
 tempfile = { workspace = true }
 
 [lints]
