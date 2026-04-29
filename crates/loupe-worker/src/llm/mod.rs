@@ -49,11 +49,14 @@ pub trait LlmBackend: Send + Sync {
 	async fn run(&self, req: LlmRequest) -> Result<LlmResponse>;
 }
 
-#[cfg(test)]
 pub mod testing {
-	//! Stub backend for unit-testing scanners without invoking a real
-	//! LLM CLI / API. Tests pass a closure that produces canned
-	//! responses based on the request's prompt or workdir.
+	//! Stub backend for testing scanners without invoking a real LLM
+	//! CLI / API. Tests pass a closure that produces canned responses
+	//! based on the request's prompt or workdir.
+	//!
+	//! Lives outside `#[cfg(test)]` so integration tests in sibling
+	//! crates (e.g. `loupe-server/tests/llm_dispatch.rs`) can reach it.
+	//! Not intended for production wiring.
 
 	use std::sync::Arc;
 
