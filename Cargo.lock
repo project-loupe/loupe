@@ -902,6 +902,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "loupe-cli"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "loupe-proto",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "loupe-core"
 version = "0.0.0"
 dependencies = [

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/loupe-cli",
     "crates/loupe-core",
     "crates/loupe-proto",
     "crates/loupe-server",
