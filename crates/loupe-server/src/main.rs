@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use loupe_server::init::{run_init, DataDirLayout};
 use loupe_server::{serve, AppState, Config};
+use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
 use loupe_tls::Ca;
 
@@ -104,7 +106,15 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	};
 	let db = Db::open(&args.db).with_context(|| format!("opening db at {}", args.db.display()))?;
 	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
-	let state = AppState::new(Arc::new(db), Arc::new(ca), github);
+	let mut state = AppState::new(Arc::new(db), Arc::new(ca), github);
+	if let Some(key) = read_master_key_from_env()? {
+		state = state.with_master_key(key);
+		tracing::info!("loupe-server: master key loaded; secrets will be encrypted at rest");
+	} else {
+		tracing::warn!(
+			"loupe-server: LOUPE_MASTER_KEY not set; secrets will be stored as plaintext"
+		);
+	}
 
 	let handle = serve(cfg, state).await?;
 	tracing::info!(addr = %handle.local_addr, "loupe-server listening");
@@ -113,4 +123,17 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	tracing::info!("loupe-server shutting down");
 	handle.shutdown().await;
 	Ok(())
+}
+
+/// Parse a 32-byte master key from base64 in `LOUPE_MASTER_KEY`. Returns
+/// `Ok(None)` when the env var is unset (server runs in plaintext mode).
+fn read_master_key_from_env() -> Result<Option<MasterKey>> {
+	let Ok(b64) = std::env::var("LOUPE_MASTER_KEY") else { return Ok(None) };
+	let decoded = base64::engine::general_purpose::STANDARD
+		.decode(b64.trim())
+		.context("LOUPE_MASTER_KEY must be base64-encoded 32 bytes")?;
+	let bytes: [u8; 32] = decoded
+		.try_into()
+		.map_err(|_| anyhow::anyhow!("LOUPE_MASTER_KEY must decode to exactly 32 bytes"))?;
+	Ok(Some(MasterKey::from_bytes(bytes)))
 }

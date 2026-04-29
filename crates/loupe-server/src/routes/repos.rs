@@ -52,6 +52,7 @@ pub async fn create(
 		},
 	};
 
+	let master_key = state.master_key.clone();
 	let new_repo_id = state
 		.db
 		.with_conn(|c| {
@@ -59,13 +60,23 @@ pub async fn create(
 			// a failed repo insert.
 			let tx = c.transaction()?;
 			let secret_label = format!("pat:{}:{}/{}", parsed.0, target_owner, target_repo);
-			let secret_id = secrets::insert_plaintext(
-				&tx,
-				SecretKind::GithubPat,
-				&secret_label,
-				github_pat.as_bytes(),
-				now,
-			)?;
+			let secret_id = match master_key.as_deref() {
+				Some(key) => secrets::insert_encrypted(
+					&tx,
+					SecretKind::GithubPat,
+					&secret_label,
+					github_pat.as_bytes(),
+					key,
+					now,
+				)?,
+				None => secrets::insert_plaintext(
+					&tx,
+					SecretKind::GithubPat,
+					&secret_label,
+					github_pat.as_bytes(),
+					now,
+				)?,
+			};
 			let reporting = ReportingDestination::GithubIssue {
 				target_owner: target_owner.clone(),
 				target_repo: target_repo.clone(),

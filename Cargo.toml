@@ -26,6 +26,8 @@ all = { level = "warn", priority = -1 }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service", "server"] }
@@ -45,6 +47,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
 tower = "0.5"
+rand_core = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"

@@ -444,7 +444,7 @@ async fn dispatch_for_job(
 	};
 	let pat_bytes = state
 		.db
-		.with_conn(|c| Ok(secrets::read(c, pat_secret_id)?))?
+		.with_conn(|c| Ok(secrets::read(c, pat_secret_id, state.master_key.as_deref())?))?
 		.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
 	let pat = String::from_utf8(pat_bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?;
 

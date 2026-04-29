@@ -126,7 +126,10 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
-	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
+	// Master key turned on so the PAT round-trips through encrypted
+	// storage on the dispatch path.
+	let master_key = loupe_storage::secrets::MasterKey::from_bytes([7u8; 32]);
+	let state = AppState::new(db.clone(), Arc::new(ca), reporter).with_master_key(master_key);
 	let server = serve(cfg, state).await.unwrap();
 	let addr = server.local_addr;
 
@@ -222,6 +225,21 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 		})
 		.unwrap();
 	assert_eq!(reported_count, 1);
+
+	// Storage check: the PAT must be at record_version=2 (encrypted),
+	// and the on-disk ciphertext column must NOT contain the plaintext.
+	let (rv, ct): (i64, Vec<u8>) = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT record_version, ciphertext FROM secrets LIMIT 1", [], |r| {
+				Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+			})?)
+		})
+		.unwrap();
+	assert_eq!(rv, 2, "secret must be encrypted at rest");
+	assert!(
+		!ct.windows(b"ghp_test_pat_value".len()).any(|w| w == b"ghp_test_pat_value"),
+		"plaintext PAT must not survive in ciphertext column"
+	);
 
 	server.shutdown().await;
 }
