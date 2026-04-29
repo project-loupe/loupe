@@ -1,6 +1,7 @@
 //! `loupe-worker` library surface.
 
 pub mod client;
+pub mod llm;
 pub mod repo_cache;
 pub mod runner;
 pub mod sandbox;
