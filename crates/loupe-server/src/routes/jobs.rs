@@ -346,20 +346,80 @@ pub async fn submit_verdict(
 		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone()),
 		loupe_core::Verdict::Inconclusive { reason } => ("inconclusive", Some(reason.clone())),
 	};
-	state
+	// Insert the verdict + apply the rollup policy in a single
+	// transaction so a concurrent verdict from a second verifier
+	// can't catch us mid-state-flip and observe "confirmed AND
+	// dismissed" simultaneously.
+	let new_state: Option<&str> = state
 		.db
 		.with_conn(|c| {
-			c.execute(
+			let tx = c.transaction()?;
+			tx.execute(
 				"INSERT INTO finding_verifications
 				   (finding_id, job_id, verdict, notes, created_at)
 				 VALUES (?1, ?2, ?3, ?4, ?5)",
 				(target_finding_id, row.id, verdict_str, &notes, now),
 			)?;
-			Ok(())
+			// Bail out early if the finding was already terminal — a
+			// concurrent reaper or earlier verdict beat us here.
+			let current: String = tx.query_row(
+				"SELECT state FROM findings WHERE id = ?1",
+				[target_finding_id],
+				|r| r.get(0),
+			)?;
+			if current != "validating" {
+				tx.commit()?;
+				return Ok(None);
+			}
+			// Default rollup policy:
+			//   any 'dismissed'  ⇒ dismissed
+			//   else any 'confirmed' ⇒ confirmed
+			//   else stay 'validating' (waiting for more verdicts or
+			//        the deadline reaper).
+			let any_dismissed: bool = tx.query_row(
+				"SELECT EXISTS(SELECT 1 FROM finding_verifications
+				                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
+				[target_finding_id],
+				|r| r.get(0),
+			)?;
+			let next_state: Option<&'static str> = if any_dismissed {
+				Some("dismissed")
+			} else {
+				let any_confirmed: bool = tx.query_row(
+					"SELECT EXISTS(SELECT 1 FROM finding_verifications
+					                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
+					[target_finding_id],
+					|r| r.get(0),
+				)?;
+				if any_confirmed {
+					Some("confirmed")
+				} else {
+					None
+				}
+			};
+			if let Some(s) = next_state {
+				let stamp_col = if s == "confirmed" { "confirmed_at" } else { "dismissed_at" };
+				tx.execute(
+					&format!("UPDATE findings SET state = ?1, {stamp_col} = ?2 WHERE id = ?3"),
+					(s, now, target_finding_id),
+				)?;
+			}
+			tx.commit()?;
+			Ok(next_state)
 		})
 		.map_err(|e: loupe_storage::Error| {
 			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit verdict: {e}"))
 		})?;
+
+	if matches!(new_state, Some("confirmed")) {
+		if let Err(e) = dispatch_finding(&state, target_finding_id, now).await {
+			tracing::warn!(
+				finding_id = target_finding_id,
+				error = %e,
+				"dispatch on verdict-confirm failed"
+			);
+		}
+	}
 	Ok(StatusCode::NO_CONTENT)
 }
 
@@ -483,11 +543,79 @@ pub async fn complete(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// After a scan succeeds, ferry its findings through the appropriate
-/// reporter. Marks `findings.reported_at` on success so later scans
-/// that re-emit the same fingerprint don't re-notify (UNIQUE(repo_id,
-/// fingerprint) already prevents the row insert; reported_at is the
-/// "we told someone" stamp).
+/// Dispatch a single finding that has just transitioned to `confirmed`
+/// (typical caller: the verdict handler after a verify worker confirms
+/// it). Skips findings that aren't in the right state — defends
+/// against double-dispatch races.
+async fn dispatch_finding(state: &AppState, finding_id: i64, now: i64) -> anyhow::Result<()> {
+	use loupe_core::{Finding, ReportingDestination};
+
+	let row = state
+		.db
+		.with_conn(|c| {
+			Ok(findings::list_for_job(
+				c,
+				c.query_row(
+					"SELECT job_id FROM findings WHERE id = ?1 AND state = 'confirmed'",
+					[finding_id],
+					|r| r.get::<_, i64>(0),
+				)?,
+			)?)
+		})?
+		.into_iter()
+		.find(|r| r.id == finding_id)
+		.ok_or_else(|| {
+			anyhow::anyhow!("finding {finding_id} disappeared between confirm and dispatch")
+		})?;
+	let repo = state.db.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?.ok_or_else(|| {
+		anyhow::anyhow!("repo {} for finding {} missing", row.repo_id, finding_id)
+	})?;
+	let pat = match &repo.reporting {
+		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
+			let bytes = state
+				.db
+				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id, state.master_key.as_deref())?))?
+				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
+			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
+		},
+		ReportingDestination::Email { .. } => String::new(),
+	};
+
+	let f = Finding {
+		scanner_id: row.scanner_id.clone(),
+		severity: row.severity,
+		title: row.title.clone(),
+		description: row.description.clone(),
+		file_path: row.file_path.clone(),
+		line_start: row.line_start,
+		line_end: row.line_end,
+		cwe: row.cwe.clone(),
+		patch_unified: row.patch_unified.clone(),
+		poc_unified: row.poc_unified.clone(),
+		fingerprint: row.fingerprint.clone(),
+	};
+	let reporter =
+		reporters::select(&repo, state.github_reporter.clone(), state.email_reporter.clone())
+			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
+	let receipt = reporter.dispatch(&repo, std::slice::from_ref(&f), &pat).await?;
+	tracing::info!(finding_id, external_id = receipt.external_id.as_deref(), "dispatched finding");
+
+	state.db.with_conn(|c| {
+		c.execute(
+			"UPDATE findings SET reported_at = ?1, state = 'reported'
+			 WHERE id = ?2 AND state = 'confirmed'",
+			(now, finding_id),
+		)?;
+		Ok(())
+	})?;
+	Ok(())
+}
+
+/// After a scan succeeds, ferry its (auto-confirmed) findings through
+/// the appropriate reporter. Marks `findings.reported_at` on success
+/// so later scans that re-emit the same fingerprint don't re-notify
+/// (UNIQUE(repo_id, fingerprint) already prevents the row insert;
+/// reported_at is the "we told someone" stamp).
 async fn dispatch_for_job(
 	state: &AppState, repo_id: i64, job_id: i64, now: i64,
 ) -> anyhow::Result<()> {
