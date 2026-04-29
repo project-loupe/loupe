@@ -74,6 +74,40 @@ pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<Find
 	rows.collect()
 }
 
+/// Reap findings whose `validating_deadline` has elapsed without
+/// enough verdicts to flip state. Each reaped finding gets a
+/// system-issued `inconclusive` verdict in `finding_verifications`
+/// (with `job_id = NULL`) and transitions to `dismissed`. Returns the
+/// number of findings reaped.
+pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> {
+	let tx = conn.transaction()?;
+	let stale: Vec<i64> = {
+		let mut stmt = tx.prepare(
+			"SELECT id FROM findings
+			 WHERE state = 'validating'
+			   AND validating_deadline IS NOT NULL
+			   AND validating_deadline < ?1",
+		)?;
+		let rows = stmt.query_map([now], |r| r.get::<_, i64>(0))?;
+		rows.collect::<rusqlite::Result<Vec<i64>>>()?
+	};
+	for fid in &stale {
+		tx.execute(
+			"INSERT INTO finding_verifications
+			   (finding_id, job_id, verdict, notes, created_at)
+			 VALUES (?1, NULL, 'inconclusive', 'validating_deadline expired', ?2)",
+			(fid, now),
+		)?;
+		tx.execute(
+			"UPDATE findings SET state = 'dismissed', dismissed_at = ?1
+			 WHERE id = ?2 AND state = 'validating'",
+			(now, fid),
+		)?;
+	}
+	tx.commit()?;
+	Ok(stale.len())
+}
+
 pub fn get_for_repo(
 	conn: &Connection, repo_id: i64, fingerprint: &str,
 ) -> rusqlite::Result<Option<FindingRow>> {
@@ -200,6 +234,82 @@ mod tests {
 		assert_eq!(listed[0].id, id);
 		assert_eq!(listed[0].severity, Severity::High);
 		assert_eq!(listed[0].fingerprint, "fp1");
+	}
+
+	#[test]
+	fn reap_stale_validating_dismisses_expired_findings() {
+		let (db, repo_id, job_id) = fixture();
+		let f = sample("fp-stale");
+		let id = db
+			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, true, 0)?))
+			.unwrap()
+			.unwrap();
+		// Push the finding into 'validating' with a deadline in the past.
+		db.with_conn(|c| {
+			c.execute(
+				"UPDATE findings
+				   SET state = 'validating', validating_deadline = 100
+				 WHERE id = ?1",
+				[id],
+			)?;
+			Ok(())
+		})
+		.unwrap();
+
+		let n = db.with_conn(|c| Ok(reap_stale_validating(c, 200)?)).unwrap();
+		assert_eq!(n, 1);
+
+		// Finding flipped to dismissed; verifications row landed with
+		// the timeout reason and a NULL job_id.
+		let (state, dismissed_at): (String, Option<i64>) = db
+			.with_conn(|c| {
+				Ok(c.query_row(
+					"SELECT state, dismissed_at FROM findings WHERE id = ?1",
+					[id],
+					|r| Ok((r.get(0)?, r.get(1)?)),
+				)?)
+			})
+			.unwrap();
+		assert_eq!(state, "dismissed");
+		assert_eq!(dismissed_at, Some(200));
+
+		let (count, with_null_job): (i64, i64) = db
+			.with_conn(|c| {
+				Ok(c.query_row(
+					"SELECT COUNT(*), SUM(CASE WHEN job_id IS NULL THEN 1 ELSE 0 END)
+					 FROM finding_verifications WHERE finding_id = ?1",
+					[id],
+					|r| Ok((r.get(0)?, r.get(1)?)),
+				)?)
+			})
+			.unwrap();
+		assert_eq!(count, 1);
+		assert_eq!(with_null_job, 1, "reaper-issued row must have job_id = NULL");
+	}
+
+	#[test]
+	fn reap_stale_validating_skips_confirmed_findings() {
+		let (db, repo_id, job_id) = fixture();
+		let f = sample("fp-confirmed");
+		let id = db
+			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, true, 0)?))
+			.unwrap()
+			.unwrap();
+		db.with_conn(|c| {
+			c.execute(
+				"UPDATE findings
+				   SET state = 'confirmed', validating_deadline = 100
+				 WHERE id = ?1",
+				[id],
+			)?;
+			Ok(())
+		})
+		.unwrap();
+		let n = db.with_conn(|c| Ok(reap_stale_validating(c, 200)?)).unwrap();
+		assert_eq!(
+			n, 0,
+			"confirmed findings must not be touched by the validating-deadline reaper"
+		);
 	}
 
 	#[test]

@@ -187,7 +187,10 @@ CREATE TABLE finding_verifications (
     id              INTEGER PRIMARY KEY,
     record_version  INTEGER NOT NULL DEFAULT 1,
     finding_id      INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
-    job_id          INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    -- Nullable so the validating-deadline reaper can record a
+    -- system-issued `inconclusive` verdict without inventing a
+    -- fake verify job.
+    job_id          INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
     verdict         TEXT    NOT NULL CHECK (verdict IN ('confirmed','dismissed','inconclusive')),
     notes           TEXT,
     created_at      INTEGER NOT NULL

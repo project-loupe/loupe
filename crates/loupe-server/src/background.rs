@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loupe_core::JobKind;
 use loupe_storage::jobs::{self, NewJob};
-use loupe_storage::{repos, Db};
+use loupe_storage::{findings, repos, Db};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -69,7 +69,15 @@ pub fn reap_once(db: &Db, now: i64) -> anyhow::Result<usize> {
 	if n > 0 {
 		tracing::info!(reclaimed = n, "reaper transitioned stale leases");
 	}
-	Ok(n)
+	// Same tick: dismiss findings whose validating_deadline has elapsed.
+	// Stale validating findings sit invisible to the dispatcher (state
+	// is 'validating', not 'confirmed') so without a reaper they'd
+	// never escape their own state.
+	let dismissed = db.with_conn(|c| Ok(findings::reap_stale_validating(c, now)?))?;
+	if dismissed > 0 {
+		tracing::info!(dismissed, "reaper dismissed stale validating findings");
+	}
+	Ok(n + dismissed)
 }
 
 /// Spawn the scheduler. Returns a JoinHandle so the caller can wait on
