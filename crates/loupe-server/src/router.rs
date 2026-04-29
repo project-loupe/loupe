@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::Router;
 use hyper::body::Incoming;
 use hyper::Request;
@@ -15,7 +15,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
 use crate::state::AppState;
-use crate::{routes, tls, Config};
+use crate::{auth, routes, tls, Config};
 
 /// Request extension carrying the peer's leaf certificate (DER bytes), if
 /// the connection presented one. The auth middleware (added in a later
@@ -27,16 +27,28 @@ pub struct PeerCert(pub CertificateDer<'static>);
 /// Build the axum `Router` for the server. Pure function — exposed so
 /// integration tests can mount it without spinning up TLS.
 pub fn router(state: AppState) -> Router {
-	Router::new().route("/v1/health", get(routes::health::get)).with_state(state).layer(
-		axum::middleware::from_fn(|req, next: axum::middleware::Next| async move {
+	let admin_only = Router::new()
+		.route("/v1/workers", post(routes::workers::create))
+		.route("/v1/workers/{id}", delete(routes::workers::revoke))
+		.route_layer(axum::middleware::from_fn(auth::require_admin));
+
+	let authed = Router::new()
+		.merge(admin_only)
+		.route("/v1/whoami", get(routes::whoami::get))
+		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
+
+	Router::new()
+		.route("/v1/health", get(routes::health::get))
+		.merge(authed)
+		.with_state(state)
+		.layer(axum::middleware::from_fn(|req, next: axum::middleware::Next| async move {
 			let mut resp = next.run(req).await;
 			resp.headers_mut().insert(
 				PROTOCOL_VERSION_HEADER,
 				PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
 			);
 			resp
-		}),
-	)
+		}))
 }
 
 /// Handle returned by [`serve`]. Drop or call `shutdown` to stop the

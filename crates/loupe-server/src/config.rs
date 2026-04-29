@@ -11,4 +11,5 @@ pub struct Config {
 	pub server_cert_pem: String,
 	pub server_key_pem: String,
 	pub ca_cert_pem: String,
+	pub ca_key_pem: String,
 }

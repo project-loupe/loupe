@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use loupe_server::init::{run_init, DataDirLayout};
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
+use loupe_tls::Ca;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe security-scanning daemon")]
@@ -48,6 +49,8 @@ struct ServeArgs {
 	server_key: PathBuf,
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	ca_cert: PathBuf,
+	#[arg(long, env = "LOUPE_CA_KEY")]
+	ca_key: PathBuf,
 }
 
 #[tokio::main]
@@ -86,6 +89,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		.with_context(|| format!("reading server key at {}", args.server_key.display()))?;
 	let ca_cert_pem = std::fs::read_to_string(&args.ca_cert)
 		.with_context(|| format!("reading CA cert at {}", args.ca_cert.display()))?;
+	let ca_key_pem = std::fs::read_to_string(&args.ca_key)
+		.with_context(|| format!("reading CA key at {}", args.ca_key.display()))?;
+
+	let ca = Ca::from_pem(&ca_cert_pem, &ca_key_pem).context("rebuilding CA from PEM")?;
 
 	let cfg = Config {
 		bind_addr: args.bind,
@@ -93,9 +100,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		server_cert_pem,
 		server_key_pem,
 		ca_cert_pem,
+		ca_key_pem,
 	};
 	let db = Db::open(&args.db).with_context(|| format!("opening db at {}", args.db.display()))?;
-	let state = AppState::new(Arc::new(db));
+	let state = AppState::new(Arc::new(db), Arc::new(ca));
 
 	let handle = serve(cfg, state).await?;
 	tracing::info!(addr = %handle.local_addr, "loupe-server listening");

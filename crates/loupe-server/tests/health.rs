@@ -28,23 +28,26 @@ async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) 
 	let ca = Ca::new("loupe-test-ca").unwrap();
 	let server_cert = ca.mint_server("loupe-server", &["loupe-server".into()]).unwrap();
 	let client_cert = ca.mint_client("admin").unwrap();
+	let ca_cert_pem = ca.cert_pem().to_owned();
+	let ca_key_pem = ca.key_pem().to_owned();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: ":memory:".into(),
 		server_cert_pem: server_cert.cert_pem,
 		server_key_pem: server_cert.key_pem,
-		ca_cert_pem: ca.cert_pem().to_owned(),
+		ca_cert_pem: ca_cert_pem.clone(),
+		ca_key_pem,
 	};
 	let db = Arc::new(Db::open_in_memory().unwrap());
-	let state = AppState::new(db);
+	let state = AppState::new(db, Arc::new(ca));
 	let handle = serve(cfg, state).await.unwrap();
 	let local = handle.local_addr;
 
 	let _ = CertificateRevocationList::from_pem; // just makes sure tls feature flags compile
 
 	let client = reqwest::Client::builder()
-		.add_root_certificate(pem_to_certificate(ca.cert_pem()))
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
 		.identity(pem_to_identity(&client_cert.cert_pem, &client_cert.key_pem))
 		.resolve("loupe-server", local)
 		.use_rustls_tls()
