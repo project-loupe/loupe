@@ -30,12 +30,24 @@ pub fn router(state: AppState) -> Router {
 	let admin_only = Router::new()
 		.route("/v1/repos", post(routes::repos::create).get(routes::repos::list))
 		.route("/v1/repos/{id}", delete(routes::repos::delete))
+		.route("/v1/repos/{id}/scan", post(routes::jobs::enqueue_scan))
 		.route("/v1/workers", post(routes::workers::create))
 		.route("/v1/workers/{id}", delete(routes::workers::revoke))
+		.route("/v1/jobs", get(routes::jobs::list))
+		.route("/v1/jobs/{id}", get(routes::jobs::get))
 		.route_layer(axum::middleware::from_fn(auth::require_admin));
+
+	let worker_only = Router::new()
+		.route("/v1/jobs/lease", post(routes::jobs::lease))
+		.route("/v1/jobs/{id}/heartbeat", post(routes::jobs::heartbeat))
+		.route("/v1/jobs/{id}/findings", post(routes::jobs::submit_findings))
+		.route("/v1/jobs/{id}/verdict", post(routes::jobs::submit_verdict))
+		.route("/v1/jobs/{id}/complete", post(routes::jobs::complete))
+		.route_layer(axum::middleware::from_fn(auth::require_worker));
 
 	let authed = Router::new()
 		.merge(admin_only)
+		.merge(worker_only)
 		.route("/v1/whoami", get(routes::whoami::get))
 		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
 

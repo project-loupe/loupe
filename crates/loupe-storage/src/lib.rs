@@ -7,6 +7,8 @@
 //! run.
 
 mod db;
+pub mod findings;
+pub mod jobs;
 pub mod migrations;
 pub mod repos;
 pub mod secrets;
