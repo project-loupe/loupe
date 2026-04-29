@@ -70,10 +70,15 @@ pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i6
 /// 'queued' … RETURNING` flips one row to `leased` and hands it back, so
 /// two concurrent workers can't race the same job.
 ///
-/// Returns `Ok(None)` if the queue is empty. Increments `attempts` and
-/// stamps `worker_id`, `lease_expires_at`, `started_at`.
+/// `accepts_verify` controls capability matching for `kind=verify`
+/// jobs: when `false`, the worker is excluded from picking up verify
+/// jobs. Scan jobs are unconstrained today — adding scan-side
+/// capability matching is its own follow-up.
+///
+/// Returns `Ok(None)` if no eligible job is queued. Increments
+/// `attempts` and stamps `worker_id`, `lease_expires_at`, `started_at`.
 pub fn lease_next(
-	conn: &Connection, worker_id: i64, now: i64, lease_seconds: i64,
+	conn: &Connection, worker_id: i64, accepts_verify: bool, now: i64, lease_seconds: i64,
 ) -> rusqlite::Result<Option<JobRow>> {
 	let lease_until = now + lease_seconds;
 	let mut stmt = conn.prepare(
@@ -86,6 +91,7 @@ pub fn lease_next(
 		 WHERE id = (
 		     SELECT id FROM jobs
 		     WHERE state = 'queued'
+		       AND (kind = 'scan' OR (kind = 'verify' AND ?4 = 1))
 		     ORDER BY enqueued_at ASC
 		     LIMIT 1
 		 )
@@ -93,7 +99,8 @@ pub fn lease_next(
 		           parent_job_id, target_finding_id, worker_id, lease_expires_at,
 		           attempts, enqueued_at, started_at, finished_at, error",
 	)?;
-	let mut iter = stmt.query_map(params![worker_id, lease_until, now], row_to_job)?;
+	let mut iter =
+		stmt.query_map(params![worker_id, lease_until, now, accepts_verify as i64], row_to_job)?;
 	match iter.next() {
 		Some(row) => Ok(Some(row?)),
 		None => Ok(None),
@@ -294,7 +301,7 @@ mod tests {
 			.unwrap();
 
 		let leased = db
-			.with_conn(|c| Ok(lease_next(c, worker_id, 200, DEFAULT_LEASE_SECONDS)?))
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, DEFAULT_LEASE_SECONDS)?))
 			.unwrap()
 			.expect("lease should produce a job");
 		assert_eq!(leased.id, job_id);
@@ -323,19 +330,69 @@ mod tests {
 		})
 		.unwrap();
 
-		let first =
-			db.with_conn(|c| Ok(lease_next(c, worker_id, 200, DEFAULT_LEASE_SECONDS)?)).unwrap();
-		let second =
-			db.with_conn(|c| Ok(lease_next(c, worker_id, 201, DEFAULT_LEASE_SECONDS)?)).unwrap();
+		let first = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, DEFAULT_LEASE_SECONDS)?))
+			.unwrap();
+		let second = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 201, DEFAULT_LEASE_SECONDS)?))
+			.unwrap();
 		assert!(first.is_some(), "first lease must succeed");
 		assert!(second.is_none(), "second lease must see an empty queue");
 	}
 
 	#[test]
+	fn verify_jobs_skip_workers_that_do_not_accept_verify() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		// One scan job and one verify job, scan first.
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				100,
+			)?)
+		})
+		.unwrap();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Verify,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: Some(42),
+				},
+				101,
+			)?)
+		})
+		.unwrap();
+
+		// Worker that does NOT accept verify: leases scan, then sees
+		// the queue as empty (verify is gated).
+		let first = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?)).unwrap();
+		assert!(matches!(first.as_ref().map(|r| r.kind), Some(JobKind::Scan)));
+		let second = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 201, 60)?)).unwrap();
+		assert!(second.is_none(), "verify job must be invisible to non-verify workers");
+
+		// A verify-capable worker DOES pick it up.
+		let third = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 202, 60)?)).unwrap();
+		assert!(matches!(third.as_ref().map(|r| r.kind), Some(JobKind::Verify)));
+	}
+
+	#[test]
 	fn empty_queue_returns_none() {
 		let (db, _, worker_id) = db_with_repo_and_worker();
-		let r =
-			db.with_conn(|c| Ok(lease_next(c, worker_id, 100, DEFAULT_LEASE_SECONDS)?)).unwrap();
+		let r = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, DEFAULT_LEASE_SECONDS)?))
+			.unwrap();
 		assert!(r.is_none());
 	}
 
@@ -357,7 +414,8 @@ mod tests {
 			)?)
 		})
 		.unwrap();
-		let leased = db.with_conn(|c| Ok(lease_next(c, worker_id, 100, 60)?)).unwrap().unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
 		let new_until = db.with_conn(|c| Ok(heartbeat(c, leased.id, worker_id, 200, 60)?)).unwrap();
 		assert_eq!(new_until, Some(260));
 	}
@@ -380,7 +438,8 @@ mod tests {
 			)?)
 		})
 		.unwrap();
-		let leased = db.with_conn(|c| Ok(lease_next(c, worker_id, 100, 60)?)).unwrap().unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
 		let other_worker_id = db
 			.with_conn(|c| Ok(workers::insert(c, "w2", WorkerKind::Worker, &[2u8; 32], 0)?))
 			.unwrap();
@@ -406,7 +465,8 @@ mod tests {
 			)?)
 		})
 		.unwrap();
-		let leased = db.with_conn(|c| Ok(lease_next(c, worker_id, 100, 60)?)).unwrap().unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
 		let ok = db
 			.with_conn(|c| {
 				Ok(complete(c, leased.id, worker_id, JobState::Succeeded, Some("abc"), None, 200)?)
@@ -438,7 +498,7 @@ mod tests {
 		})
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ should requeue.
-		db.with_conn(|c| Ok(lease_next(c, worker_id, 100, 10)?)).unwrap();
+		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 10)?)).unwrap();
 		let n = db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
 		assert_eq!(n, 1);
 		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
@@ -468,12 +528,12 @@ mod tests {
 		// in a loop, then one more lease should be the last one and the
 		// next reap should send it to `failed`.
 		for t in 0..MAX_ATTEMPTS as i64 {
-			db.with_conn(|c| Ok(lease_next(c, worker_id, t * 100, 10)?)).unwrap();
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, t * 100, 10)?)).unwrap();
 			db.with_conn(|c| Ok(reap_stale_leases(c, t * 100 + 50)?)).unwrap();
 		}
 		// Now attempts == MAX_ATTEMPTS. One more lease and reap drops it
 		// to failed.
-		db.with_conn(|c| Ok(lease_next(c, worker_id, 999, 10)?)).unwrap();
+		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 999, 10)?)).unwrap();
 		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
 		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);

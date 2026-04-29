@@ -142,9 +142,13 @@ pub async fn lease(
 	Json(req): Json<LeaseRequest>,
 ) -> Result<Json<LeaseResponse>, (StatusCode, String)> {
 	check_version(req.protocol_version)?;
-	let _ = req.capabilities; // capability matching lands with the verifier dispatcher in M2.
+	// A worker is eligible for verify jobs iff it advertised at least
+	// one `verify:*` capability. Fine-grained tag matching (e.g.
+	// `verify:secrets` only matches secret-flavoured verify jobs) is a
+	// follow-up; today we only have one tag in flight.
+	let accepts_verify = req.capabilities.iter().any(|c| c.starts_with("verify:"));
 
-	if let Some(env) = try_lease(&state, worker.id())? {
+	if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
 		return Ok(Json(LeaseResponse::Lease(Box::new(env))));
 	}
 	if req.wait_seconds == 0 {
@@ -159,7 +163,7 @@ pub async fn lease(
 		let notified = state.job_arrived.notified();
 		tokio::pin!(notified);
 
-		if let Some(env) = try_lease(&state, worker.id())? {
+		if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
 			return Ok(Json(LeaseResponse::Lease(Box::new(env))));
 		}
 
@@ -178,14 +182,17 @@ pub async fn lease(
 	}
 }
 
-/// One non-blocking lease attempt. `None` means the queue is empty.
+/// One non-blocking lease attempt. `None` means no eligible job is
+/// queued. `accepts_verify` gates verify-kind jobs.
 fn try_lease(
-	state: &AppState, worker_id: i64,
+	state: &AppState, worker_id: i64, accepts_verify: bool,
 ) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
 	let now = now_secs();
 	let row = state
 		.db
-		.with_conn(|c| Ok(jobs::lease_next(c, worker_id, now, DEFAULT_LEASE_SECONDS)?))
+		.with_conn(|c| {
+			Ok(jobs::lease_next(c, worker_id, accepts_verify, now, DEFAULT_LEASE_SECONDS)?)
+		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
 	let Some(row) = row else { return Ok(None) };
 	let env = build_lease_envelope(state, &row)

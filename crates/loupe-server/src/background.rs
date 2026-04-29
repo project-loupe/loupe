@@ -190,7 +190,7 @@ mod tests {
 		})
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ requeue.
-		db.with_conn(|c| Ok(jobs::lease_next(c, worker_id, 100, 10)?)).unwrap();
+		db.with_conn(|c| Ok(jobs::lease_next(c, worker_id, false, 100, 10)?)).unwrap();
 		let n = reap_once(&db, 200).unwrap();
 		assert_eq!(n, 1);
 	}
