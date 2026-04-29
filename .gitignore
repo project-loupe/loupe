@@ -1,6 +1,9 @@
 /target
 Cargo.lock.bak
 
+# Local planning doc, kept out of git.
+/LOUPE.md
+
 # Local config & state
 .env
 .env.*
