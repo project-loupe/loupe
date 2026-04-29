@@ -22,6 +22,7 @@ loupe-proto = { path = "../loupe-proto" }
 loupe-storage = { path = "../loupe-storage" }
 loupe-tls = { path = "../loupe-tls" }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -1,0 +1,165 @@
+//! `loupe-server init` — bootstrap a fresh data dir.
+//!
+//! Mints the internal CA, the server cert, and the admin client cert,
+//! writes the PEM bundle under the data dir with restrictive perms, and
+//! registers the admin in the workers table. The admin bundle is
+//! returned to the caller (the binary then prints it once and only once
+//! — re-running init against an existing data dir errors).
+
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Context, Result};
+use loupe_storage::workers::{self, WorkerKind};
+use loupe_storage::Db;
+use loupe_tls::{cert_fingerprint, Ca, CertBundle};
+
+/// Layout of files written under the data dir.
+pub struct DataDirLayout {
+	pub root: PathBuf,
+	pub db_path: PathBuf,
+	pub ca_cert: PathBuf,
+	pub ca_key: PathBuf,
+	pub server_cert: PathBuf,
+	pub server_key: PathBuf,
+	pub admin_cert: PathBuf,
+	pub admin_key: PathBuf,
+}
+
+impl DataDirLayout {
+	pub fn at(root: impl Into<PathBuf>) -> Self {
+		let root = root.into();
+		Self {
+			db_path: root.join("loupe.sqlite"),
+			ca_cert: root.join("ca.pem"),
+			ca_key: root.join("ca.key"),
+			server_cert: root.join("server.pem"),
+			server_key: root.join("server.key"),
+			admin_cert: root.join("admin.pem"),
+			admin_key: root.join("admin.key"),
+			root,
+		}
+	}
+
+	/// True if any of the bundle files already exist — used to refuse to
+	/// overwrite an initialised data dir.
+	pub fn any_exists(&self) -> bool {
+		[&self.ca_cert, &self.ca_key, &self.server_cert, &self.server_key, &self.admin_cert]
+			.iter()
+			.any(|p| p.exists())
+	}
+}
+
+/// What `init` returns to its caller. The admin bundle is intended to be
+/// printed once and then erased from process memory.
+pub struct InitOutput {
+	pub layout: DataDirLayout,
+	pub admin_bundle: CertBundle,
+	pub ca_cert_pem: String,
+}
+
+/// Bootstrap `data_dir`. `server_hostnames` populates the SubjectAltName
+/// of the server cert (callers usually pass the public DNS name plus
+/// `localhost` for development).
+pub fn run_init(data_dir: &Path, server_hostnames: &[String]) -> Result<InitOutput> {
+	let layout = DataDirLayout::at(data_dir);
+
+	std::fs::create_dir_all(&layout.root)
+		.with_context(|| format!("creating data dir {}", layout.root.display()))?;
+	if layout.any_exists() {
+		bail!("data dir {} already initialised — refusing to overwrite", layout.root.display());
+	}
+
+	let ca = Ca::new("loupe").context("minting internal CA")?;
+	let server = ca.mint_server("loupe-server", server_hostnames).context("minting server cert")?;
+	let admin = ca.mint_client("admin").context("minting admin client cert")?;
+
+	write_secret(&layout.ca_cert, ca.cert_pem().as_bytes())?;
+	write_secret(&layout.ca_key, ca.key_pem().as_bytes())?;
+	write_secret(&layout.server_cert, server.cert_pem.as_bytes())?;
+	write_secret(&layout.server_key, server.key_pem.as_bytes())?;
+	write_secret(&layout.admin_cert, admin.cert_pem.as_bytes())?;
+	write_secret(&layout.admin_key, admin.key_pem.as_bytes())?;
+
+	let db = Db::open(&layout.db_path)
+		.with_context(|| format!("opening db at {}", layout.db_path.display()))?;
+	let admin_der = pem_first_cert_der(&admin.cert_pem)?;
+	let fingerprint = cert_fingerprint(&admin_der);
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+	db.with_conn(|c| Ok(workers::insert(c, "admin", WorkerKind::Admin, &fingerprint, now)?))
+		.context("recording admin in workers table")?;
+
+	Ok(InitOutput { layout, admin_bundle: admin, ca_cert_pem: ca.cert_pem().to_owned() })
+}
+
+fn write_secret(path: &Path, contents: &[u8]) -> Result<()> {
+	#[cfg(unix)]
+	{
+		use std::io::Write;
+		use std::os::unix::fs::OpenOptionsExt;
+		let mut f = std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(0o600)
+			.open(path)
+			.with_context(|| format!("creating {}", path.display()))?;
+		f.write_all(contents).with_context(|| format!("writing {}", path.display()))?;
+	}
+	#[cfg(not(unix))]
+	{
+		std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+	}
+	Ok(())
+}
+
+/// Strip a single CERTIFICATE PEM block back to its DER bytes.
+fn pem_first_cert_der(pem: &str) -> Result<Vec<u8>> {
+	let mut reader = pem.as_bytes();
+	let mut iter = rustls_pemfile::certs(&mut reader);
+	let der = iter
+		.next()
+		.context("PEM contained no CERTIFICATE block")?
+		.context("rustls-pemfile failed to parse certificate")?;
+	Ok(der.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn bootstraps_a_fresh_data_dir() {
+		let tmp = tempfile::tempdir().unwrap();
+		let out = run_init(tmp.path(), &["localhost".to_owned()]).unwrap();
+		assert!(out.layout.ca_cert.exists());
+		assert!(out.layout.server_cert.exists());
+		assert!(out.layout.admin_cert.exists());
+		assert!(out.layout.db_path.exists());
+
+		// Admin bundle must be parseable as a real cert.
+		assert!(out.admin_bundle.cert_pem.contains("BEGIN CERTIFICATE"));
+		assert!(out.admin_bundle.key_pem.contains("PRIVATE KEY"));
+
+		// Admin must be in the workers table with kind=admin.
+		let db = Db::open(&out.layout.db_path).unwrap();
+		let admin_der = pem_first_cert_der(&out.admin_bundle.cert_pem).unwrap();
+		let fp = cert_fingerprint(&admin_der);
+		let row = db
+			.with_conn(|c| Ok(workers::find_active_by_fingerprint(c, &fp)?))
+			.unwrap()
+			.expect("admin must be registered after init");
+		assert_eq!(row.kind, WorkerKind::Admin);
+		assert_eq!(row.name, "admin");
+	}
+
+	#[test]
+	fn second_init_refuses_existing_data_dir() {
+		let tmp = tempfile::tempdir().unwrap();
+		run_init(tmp.path(), &["localhost".to_owned()]).unwrap();
+		let err = match run_init(tmp.path(), &["localhost".to_owned()]) {
+			Err(e) => e,
+			Ok(_) => panic!("second init must fail against an existing data dir"),
+		};
+		assert!(err.to_string().contains("already initialised"), "got: {err}");
+	}
+}

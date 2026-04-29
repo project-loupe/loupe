@@ -4,6 +4,7 @@
 //! wrapper that loads config and spins up [`serve`].
 
 pub mod config;
+pub mod init;
 pub mod router;
 pub mod routes;
 pub mod state;

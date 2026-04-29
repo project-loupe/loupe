@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use loupe_server::init::{run_init, DataDirLayout};
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
 
@@ -16,9 +17,23 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-	/// Run the loupe daemon. Bootstrap the CA + admin cert separately
-	/// (the bootstrap subcommand lands in a follow-up commit).
+	/// Bootstrap a fresh data dir: mint the internal CA, server cert,
+	/// and admin client cert; persist them under the data dir;
+	/// register the admin in the workers table; print the admin bundle
+	/// once. Refuses to run against an already-initialised data dir.
+	Init(InitArgs),
+	/// Run the loupe daemon against an already-initialised data dir.
 	Serve(ServeArgs),
+}
+
+#[derive(Debug, Parser)]
+struct InitArgs {
+	#[arg(long, env = "LOUPE_DATA_DIR")]
+	data_dir: PathBuf,
+	/// SubjectAltName entries for the server cert. Pass at least one;
+	/// `localhost` is a sensible default for local development.
+	#[arg(long = "hostname", value_name = "HOSTNAME", default_values_t = vec!["localhost".to_owned()])]
+	hostnames: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -40,8 +55,28 @@ async fn main() -> Result<()> {
 	tracing_subscriber::fmt::init();
 	let cli = Cli::parse();
 	match cli.cmd {
+		Cmd::Init(args) => run_init_cmd(args),
 		Cmd::Serve(args) => run_serve(args).await,
 	}
+}
+
+fn run_init_cmd(args: InitArgs) -> Result<()> {
+	let out = run_init(&args.data_dir, &args.hostnames)
+		.with_context(|| format!("initialising data dir {}", args.data_dir.display()))?;
+	let layout = DataDirLayout::at(&args.data_dir);
+	println!("loupe data dir initialised at {}", out.layout.root.display());
+	println!();
+	println!("server cert: {}", layout.server_cert.display());
+	println!("server key:  {}", layout.server_key.display());
+	println!("ca cert:     {}", layout.ca_cert.display());
+	println!();
+	println!("admin client cert (saved to {}):", layout.admin_cert.display());
+	println!("{}", out.admin_bundle.cert_pem.trim_end());
+	println!();
+	println!("admin client key (saved to {}):", layout.admin_key.display());
+	println!("KEEP THIS SECRET — written once, never re-derivable.");
+	println!("{}", out.admin_bundle.key_pem.trim_end());
+	Ok(())
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {

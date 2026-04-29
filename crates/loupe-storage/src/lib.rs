@@ -8,5 +8,6 @@
 
 mod db;
 pub mod migrations;
+pub mod workers;
 
 pub use db::{Db, Error, Result};

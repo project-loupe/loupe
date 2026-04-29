@@ -15,7 +15,8 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: V1_INITIAL }];
+const MIGRATIONS: &[Migration] =
+	&[Migration { version: 1, sql: V1_INITIAL }, Migration { version: 2, sql: V2_WORKER_KIND }];
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {
@@ -197,6 +198,15 @@ CREATE TABLE scan_history (
     finished_at     INTEGER NOT NULL
 );
 CREATE INDEX idx_history_repo ON scan_history(repo_id, finished_at DESC);
+"#;
+
+/// v2 — add a `kind` column to `workers` so we can distinguish admin
+/// operators from scan workers. Both authenticate by client cert against
+/// the same CA; the kind column is what gates admin-only routes from
+/// scan workers and vice versa.
+const V2_WORKER_KIND: &str = r#"
+ALTER TABLE workers ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'
+    CHECK (kind IN ('worker', 'admin'));
 "#;
 
 #[cfg(test)]

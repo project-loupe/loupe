@@ -1000,6 +1000,7 @@ dependencies = [
  "loupe-tls",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
