@@ -1,0 +1,29 @@
+/target
+Cargo.lock.bak
+
+# Local config & state
+.env
+.env.*
+!.env.example
+
+# Cert / key material — never check in
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# SQLite databases used during development / smoke tests
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
