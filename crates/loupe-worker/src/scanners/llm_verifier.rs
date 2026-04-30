@@ -74,6 +74,7 @@ impl Scanner for LlmVerifierScanner {
 			workdir: ctx.workdir.clone(),
 			timeout: crate::llm::DEFAULT_REQUEST_TIMEOUT,
 			cancel: ctx.cancel.clone(),
+			repo_id: Some(ctx.repo_id),
 		};
 		let resp = self.backend.run(req).await?;
 
@@ -108,6 +109,7 @@ mod tests {
 	fn ctx() -> VerifyContext {
 		VerifyContext {
 			workdir: PathBuf::from("/tmp"),
+			repo_id: 1,
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),

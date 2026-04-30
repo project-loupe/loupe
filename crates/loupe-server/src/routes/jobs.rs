@@ -241,6 +241,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 	Ok(LeaseEnvelope {
 		protocol_version: PROTOCOL_VERSION,
 		job_id: row.id,
+		repo_id: repo.id,
 		repo: loupe_core::RepoSpec {
 			host: repo.host.clone(),
 			owner: repo.owner.clone(),

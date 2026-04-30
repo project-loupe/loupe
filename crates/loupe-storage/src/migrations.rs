@@ -294,12 +294,19 @@ mod tests {
 	#[test]
 	fn every_substantive_table_carries_record_version() {
 		// `schema_meta` is exempt — it tracks migrations itself.
+		// FTS5 virtual tables and their shadow tables (`*_data`,
+		// `*_idx`, `*_content`, `*_docsize`, `*_config`) are SQLite
+		// internals indexing user data, not first-class entities
+		// themselves. The user-data row in `findings` is the
+		// authoritative one and *does* carry record_version.
 		let c = fresh();
 		let mut stmt = c
 			.prepare(
 				"SELECT name FROM sqlite_master \
 				 WHERE type='table' \
 				   AND name NOT LIKE 'sqlite_%' \
+				   AND name NOT LIKE '%_fts' \
+				   AND name NOT LIKE '%_fts_%' \
 				   AND name <> 'schema_meta'",
 			)
 			.unwrap();

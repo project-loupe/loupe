@@ -9,7 +9,16 @@
 //!
 //! Network is allowed through the sandbox so the CLI can reach
 //! api.anthropic.com.
+//!
+//! When constructed with [`McpContext`], each invocation writes a
+//! per-call MCP config and passes `--mcp-config` to claude. The
+//! agent then has the loupe tool surface (`query_prior_findings`,
+//! etc., served by `loupe-worker mcp-serve`) for the duration of
+//! the call. Sandbox-side: the worker binary and the worker's mTLS
+//! cert are bind-mounted in at fixed paths the MCP child can refer
+//! to.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +31,84 @@ use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
+
+/// Fixed paths the sandbox uses for the MCP server bundle. The
+/// loupe-worker binary and the worker's mTLS cert + key + CA cert
+/// get bind-mounted under `/loupe/`; the per-call MCP config lives
+/// next to them. Inside the sandbox the agent only ever sees these
+/// paths, regardless of where the host install actually lives.
+const SANDBOX_LOUPE_BIN: &str = "/loupe/loupe-worker";
+const SANDBOX_CA_CERT: &str = "/loupe/ca.pem";
+const SANDBOX_CLIENT_CERT: &str = "/loupe/worker.pem";
+const SANDBOX_CLIENT_KEY: &str = "/loupe/worker.key";
+const SANDBOX_MCP_CONFIG: &str = "/loupe/mcp-config.json";
+
+/// Everything the MCP child needs to talk back to loupe-server.
+/// Built once at worker startup from the `loupe-worker run` CLI
+/// flags and stashed on the backend; per-call data (the repo id)
+/// arrives through [`LlmRequest::repo_id`].
+#[derive(Debug, Clone)]
+pub struct McpContext {
+	/// Path to the loupe-worker binary on the host. Usually
+	/// `std::env::current_exe()` for the worker itself, so the same
+	/// binary serves both `run` and `mcp-serve` modes.
+	pub worker_binary: PathBuf,
+	/// loupe-server URL the MCP child will call back to.
+	pub server_url: String,
+	pub ca_cert_path: PathBuf,
+	pub client_cert_path: PathBuf,
+	pub client_key_path: PathBuf,
+}
+
+/// Per-call MCP scratch: a host-side tempdir holding the JSON
+/// config that `claude --mcp-config` reads. The `TempDir` is
+/// returned so the caller keeps it alive until after claude exits;
+/// dropping the `TempDir` unlinks the config file.
+struct McpScratch {
+	#[allow(dead_code)] // RAII — drop at end of caller's scope cleans up.
+	dir: tempfile::TempDir,
+	config_path: PathBuf,
+}
+
+fn prepare_mcp_scratch(ctx: &McpContext, repo_id: i64) -> Result<McpScratch> {
+	let dir = tempfile::Builder::new()
+		.prefix("loupe-mcp-")
+		.tempdir()
+		.context("creating MCP scratch tempdir")?;
+	let config_path = dir.path().join("mcp-config.json");
+	let config = serde_json::json!({
+		"mcpServers": {
+			"loupe": {
+				"type": "stdio",
+				// Inside the sandbox the worker binary is mounted at
+				// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
+				// — see the bind_ro calls above.
+				"command": SANDBOX_LOUPE_BIN,
+				"args": [
+					"mcp-serve",
+					"--server-url", ctx.server_url,
+					"--ca-cert", SANDBOX_CA_CERT,
+					"--cert", SANDBOX_CLIENT_CERT,
+					"--key", SANDBOX_CLIENT_KEY,
+					"--repo-id", repo_id.to_string(),
+				],
+				// The MCP child inherits the bwrap'd env, which has
+				// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
+				// (irrelevant for the MCP child but harmless). No
+				// extra env needed at this layer.
+				"env": {}
+			}
+		}
+	});
+	std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+		.with_context(|| format!("writing MCP config at {}", config_path.display()))?;
+	tracing::debug!(
+		config_path = %config_path.display(),
+		repo_id,
+		"loupe-mcp: prepared per-call scratch config",
+	);
+	Ok(McpScratch { dir, config_path })
+}
 
 /// Cap a borrow at `n` chars; appends an ellipsis if the original was
 /// longer. Used to keep error messages from blowing up when the CLI
@@ -36,15 +123,25 @@ fn truncate(s: &str, n: usize) -> String {
 
 pub struct ClaudeCliBackend {
 	bin: String,
+	mcp: Option<McpContext>,
 }
 
 impl ClaudeCliBackend {
 	pub fn new() -> Self {
-		Self { bin: CLAUDE_BIN.to_owned() }
+		Self { bin: CLAUDE_BIN.to_owned(), mcp: None }
 	}
 
 	pub fn with_bin(bin: impl Into<String>) -> Self {
-		Self { bin: bin.into() }
+		Self { bin: bin.into(), mcp: None }
+	}
+
+	/// Attach an MCP server to every invocation. When set, each call
+	/// writes a temp `mcp-config.json` and passes `--mcp-config` to
+	/// claude; the agent then sees the `loupe-worker mcp-serve`
+	/// tool surface (currently `query_prior_findings`).
+	pub fn with_mcp_context(mut self, mcp: McpContext) -> Self {
+		self.mcp = Some(mcp);
+		self
 	}
 }
 
@@ -94,8 +191,37 @@ impl LlmBackend for ClaudeCliBackend {
 				.bind_ro(claude_dir, "/home/scanner/.claude")
 				.bind_ro(claude_json, "/home/scanner/.claude.json");
 		}
+
+		// Optional MCP attachment. Held in a local so its `TempDir`
+		// lives until after the subprocess returns — dropping it
+		// early would unlink the config file out from under claude.
+		let _mcp_scratch = match (&self.mcp, req.repo_id) {
+			(Some(ctx), Some(repo_id)) => {
+				let scratch =
+					prepare_mcp_scratch(ctx, repo_id).context("preparing MCP scratch directory")?;
+				sandbox = sandbox
+					.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN)
+					.bind_ro(ctx.ca_cert_path.clone(), SANDBOX_CA_CERT)
+					.bind_ro(ctx.client_cert_path.clone(), SANDBOX_CLIENT_CERT)
+					.bind_ro(ctx.client_key_path.clone(), SANDBOX_CLIENT_KEY)
+					.bind_ro(scratch.config_path.clone(), SANDBOX_MCP_CONFIG);
+				Some(scratch)
+			},
+			(Some(_), None) => {
+				tracing::debug!(
+					backend = BACKEND_ID,
+					"MCP context configured but request has no repo_id; skipping --mcp-config",
+				);
+				None
+			},
+			_ => None,
+		};
+
 		let mut cmd = sandbox.build(&self.bin);
 		cmd.arg("--dangerously-skip-permissions").arg("-p").arg(&req.prompt);
+		if _mcp_scratch.is_some() {
+			cmd.arg("--mcp-config").arg(SANDBOX_MCP_CONFIG);
+		}
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
 		let mut child = cmd
@@ -225,6 +351,7 @@ mod tests {
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(60),
 			cancel: CancellationToken::new(),
+			repo_id: None,
 		};
 		let resp = backend.run(req).await.expect("claude responded");
 		assert_eq!(resp.backend_id, BACKEND_ID);
@@ -241,6 +368,7 @@ mod tests {
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
+			repo_id: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();

@@ -200,7 +200,7 @@ impl Scanner for LlmCodeReviewScanner {
 		);
 
 		let (discovered, discovery_errors) =
-			self.discover_all(&cfg, &ctx.workdir, &files, &ctx.cancel).await;
+			self.discover_all(&cfg, &ctx.workdir, &files, ctx.repo_id, &ctx.cancel).await;
 		// Hard-fail when every discovery call errored. Without this, an
 		// LLM scanner that's completely broken (sandbox can't reach the
 		// CLI, auth missing, network blocked) silently completes as
@@ -230,7 +230,7 @@ impl Scanner for LlmCodeReviewScanner {
 
 		let n_candidates = after_dedup.len();
 		let (validated, validation_errors) =
-			self.validate_all(&cfg, &ctx.workdir, after_dedup, &ctx.cancel).await;
+			self.validate_all(&cfg, &ctx.workdir, after_dedup, ctx.repo_id, &ctx.cancel).await;
 		// Same fail-loud logic for validation, gated on the candidate
 		// count so a zero-candidate run (clean repo) doesn't trip it.
 		if validation_errors > 0 && validation_errors == n_candidates {
@@ -279,7 +279,8 @@ impl LlmCodeReviewScanner {
 	/// counts as a success). The caller fails the scan loud if every
 	/// attempt errored.
 	async fn discover_all(
-		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], cancel: &CancellationToken,
+		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64,
+		cancel: &CancellationToken,
 	) -> (Vec<Discovered>, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
@@ -295,7 +296,7 @@ impl LlmCodeReviewScanner {
 			let cancel = cancel.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				discover_one(backend, &workdir, &path, &cfg_owned, cancel).await
+				discover_one(backend, &workdir, &path, &cfg_owned, repo_id, cancel).await
 			}));
 		}
 
@@ -318,7 +319,7 @@ impl LlmCodeReviewScanner {
 	/// Returns `(validated, error_count)`. Same semantics as
 	/// `discover_all` for the error count.
 	async fn validate_all(
-		&self, cfg: &ScannerConfig, workdir: &Path, discovered: Vec<Discovered>,
+		&self, cfg: &ScannerConfig, workdir: &Path, discovered: Vec<Discovered>, repo_id: i64,
 		cancel: &CancellationToken,
 	) -> (Vec<Validated>, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
@@ -334,7 +335,7 @@ impl LlmCodeReviewScanner {
 			let cancel = cancel.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				validate_one(backend, &workdir, d, &cfg_owned, cancel).await
+				validate_one(backend, &workdir, d, &cfg_owned, repo_id, cancel).await
 			}));
 		}
 		let mut out = Vec::new();
@@ -367,7 +368,7 @@ const RESPONSE_PREVIEW_CHARS: usize = 240;
 /// the backend / sandbox / network call itself failed; the caller
 /// counts these and fails the scan if every attempt errors.
 async fn discover_one(
-	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig,
+	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
 	cancel: CancellationToken,
 ) -> Result<Option<Discovered>, ()> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
@@ -379,6 +380,7 @@ async fn discover_one(
 		workdir: workdir.to_path_buf(),
 		timeout: cfg.per_request_timeout,
 		cancel,
+		repo_id: Some(repo_id),
 	};
 	let resp = match backend.run(req).await {
 		Ok(r) => r,
@@ -398,7 +400,7 @@ async fn discover_one(
 }
 
 async fn validate_one(
-	backend: Arc<dyn LlmBackend>, workdir: &Path, d: Discovered, cfg: &ScannerConfig,
+	backend: Arc<dyn LlmBackend>, workdir: &Path, d: Discovered, cfg: &ScannerConfig, repo_id: i64,
 	cancel: CancellationToken,
 ) -> Result<Option<Validated>, ()> {
 	let finding_json = serde_json::json!({
@@ -421,6 +423,7 @@ async fn validate_one(
 		workdir: workdir.to_path_buf(),
 		timeout: cfg.per_request_timeout,
 		cancel,
+		repo_id: Some(repo_id),
 	};
 	let resp = match backend.run(req).await {
 		Ok(r) => r,
@@ -774,6 +777,7 @@ mod tests {
 	fn make_ctx(workdir: &Path) -> ScanContext {
 		ScanContext {
 			workdir: workdir.to_path_buf(),
+			repo_id: 1,
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),

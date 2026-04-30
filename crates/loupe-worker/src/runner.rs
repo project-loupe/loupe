@@ -155,6 +155,7 @@ impl Runner {
 				let vctx = VerifyContext {
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
+					repo_id: env.repo_id,
 					finding,
 					config: env.scanner_config,
 					cancel: cancel.clone(),
@@ -206,6 +207,7 @@ impl Runner {
 				let ctx = ScanContext {
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
+					repo_id: env.repo_id,
 					head_sha: head_sha.clone(),
 					base_sha: since_sha,
 					config: env.scanner_config,

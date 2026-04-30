@@ -37,6 +37,12 @@ pub enum LeaseResponse {
 pub struct LeaseEnvelope {
 	pub protocol_version: u16,
 	pub job_id: i64,
+	/// Server-side numeric id for the registered repo. Workers
+	/// forward this through `ScanContext`/`VerifyContext` so LLM
+	/// backends can scope MCP tool calls
+	/// (e.g. `query_prior_findings`) to the repo currently under
+	/// scan without piecing it together from `(host, owner, repo)`.
+	pub repo_id: i64,
 	pub repo: RepoSpec,
 	pub head_branch: Option<String>,
 	/// Lease expiry as epoch seconds. Worker must heartbeat or complete
@@ -93,6 +99,7 @@ mod tests {
 		let env = LeaseEnvelope {
 			protocol_version: PROTOCOL_VERSION,
 			job_id: 1,
+			repo_id: 9,
 			repo: sample_repo(),
 			head_branch: Some("main".into()),
 			lease_expires_at: 1_700_000_600,
@@ -124,6 +131,7 @@ mod tests {
 		let env = LeaseEnvelope {
 			protocol_version: PROTOCOL_VERSION,
 			job_id: 7,
+			repo_id: 11,
 			repo: sample_repo(),
 			head_branch: None,
 			lease_expires_at: 1_700_000_800,

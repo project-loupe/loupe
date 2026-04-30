@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use loupe_worker::llm::claude_cli::McpContext;
 use loupe_worker::llm::ClaudeCliBackend;
 use loupe_worker::scanners::{LlmCodeReviewScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -115,7 +116,8 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 	let key_pem = std::fs::read_to_string(&key)
 		.with_context(|| format!("reading worker key at {}", key.display()))?;
 
-	let client = Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, server_url)?);
+	let client =
+		Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, server_url.clone())?);
 	let cache = Arc::new(RepoCache::new(cache_dir, args.max_cache_gb * 1_073_741_824)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
@@ -131,8 +133,24 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 				return Err(e.context("LLM scanner enabled but bubblewrap is unavailable"));
 			},
 		}
-		scanners.push(Arc::new(LlmCodeReviewScanner::new(Arc::new(ClaudeCliBackend::new()))));
-		tracing::info!("LLM code-review scanner enabled");
+
+		// Resolve the worker binary's host path so the sandbox can
+		// bind-mount it for the MCP child to exec. `current_exe()`
+		// returns the executable currently running; the agent's MCP
+		// child will be `loupe-worker mcp-serve`, served by the same
+		// binary.
+		let worker_binary = std::env::current_exe()
+			.context("resolving the loupe-worker binary path for MCP bind-mount")?;
+		let mcp_ctx = McpContext {
+			worker_binary,
+			server_url: server_url.to_string(),
+			ca_cert_path: ca_cert.clone(),
+			client_cert_path: cert.clone(),
+			client_key_path: key.clone(),
+		};
+		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx));
+		scanners.push(Arc::new(LlmCodeReviewScanner::new(backend)));
+		tracing::info!("LLM code-review scanner enabled (MCP server attached per call)");
 	}
 	let runner = Runner::new(client, cache, scanners);
 

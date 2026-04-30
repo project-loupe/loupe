@@ -32,6 +32,12 @@ pub struct LlmRequest {
 	pub workdir: PathBuf,
 	pub timeout: Duration,
 	pub cancel: CancellationToken,
+	/// Repo id for the scan currently in progress. When `Some`, the
+	/// backend may attach the loupe MCP server to its agent
+	/// invocation so the model can call tools like
+	/// `query_prior_findings` scoped to this repo. `None` falls back
+	/// to the no-MCP behaviour (just prompt + stdout).
+	pub repo_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

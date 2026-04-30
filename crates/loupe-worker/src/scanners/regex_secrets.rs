@@ -148,6 +148,7 @@ mod tests {
 	fn make_ctx(workdir: &Path) -> ScanContext {
 		ScanContext {
 			workdir: workdir.to_path_buf(),
+			repo_id: 1,
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),
