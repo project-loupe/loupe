@@ -39,6 +39,18 @@ markdown fences, no follow-up. The object must have these fields:
 ```
 
 If you found nothing serious, return `{"found": false}`.
+
+Before deciding `found: true`, you may use the `query_prior_findings`
+MCP tool (when available) to check whether the same vulnerability has
+already been reported on this repo in a previous scan. Search with
+keywords from the bug — function name, vulnerability class, CWE if
+known. If a prior finding clearly describes the same issue, the most
+useful thing is usually to NOT re-emit it: return `{"found": false}`
+so the run doesn't re-confirm a known bug. Only re-emit if you see
+something materially different about the current state of the code
+(e.g. the original was dismissed and the bug returned, or the
+location moved). The tool is optional — if it's not available or
+returns nothing, proceed with your usual judgment.
 "##;
 
 /// Validation prompt — runs once per discovered finding.

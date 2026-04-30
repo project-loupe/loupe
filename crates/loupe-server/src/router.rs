@@ -60,6 +60,10 @@ pub fn router(state: AppState) -> Router {
 		// FTS surface adds nothing beyond what they could
 		// reconstruct on their own.
 		.route("/v1/repos/{id}/findings/search", get(routes::findings_admin::search))
+		.route(
+			"/v1/repos/{id}/findings/known-fingerprints",
+			post(routes::findings_admin::known_fingerprints),
+		)
 		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
 
 	Router::new()

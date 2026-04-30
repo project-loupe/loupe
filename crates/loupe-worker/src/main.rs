@@ -149,8 +149,11 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 			client_key_path: key.clone(),
 		};
 		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx));
-		scanners.push(Arc::new(LlmCodeReviewScanner::new(backend)));
-		tracing::info!("LLM code-review scanner enabled (MCP server attached per call)");
+		scanners
+			.push(Arc::new(LlmCodeReviewScanner::new(backend).with_server_client(client.clone())));
+		tracing::info!(
+			"LLM code-review scanner enabled (MCP server attached per call, dedup pass on)"
+		);
 	}
 	let runner = Runner::new(client, cache, scanners);
 

@@ -15,6 +15,7 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::client::ServerClient;
 use crate::llm::prompts::{self, DISCOVERY, VALIDATE};
 use crate::llm::{LlmBackend, LlmRequest, LlmResponse, DEFAULT_REQUEST_TIMEOUT};
 use crate::scanner::{ScanContext, Scanner};
@@ -153,15 +154,30 @@ fn default_excludes() -> Vec<String> {
 pub struct LlmCodeReviewScanner {
 	backend: Arc<dyn LlmBackend>,
 	config: ScannerConfig,
+	/// Optional handle to the server's findings DAO over HTTP. When
+	/// set, the scanner runs a hash-based dedup pass between
+	/// discovery and validation, dropping candidates whose
+	/// fingerprint already matches a prior finding on the same repo.
+	/// Skips paying validation LLM cost on duplicates. `None` (the
+	/// test path) makes the dedup pass a no-op.
+	client: Option<Arc<ServerClient>>,
 }
 
 impl LlmCodeReviewScanner {
 	pub fn new(backend: Arc<dyn LlmBackend>) -> Self {
-		Self { backend, config: ScannerConfig::default() }
+		Self { backend, config: ScannerConfig::default(), client: None }
 	}
 
 	pub fn with_config(mut self, config: ScannerConfig) -> Self {
 		self.config = config;
+		self
+	}
+
+	/// Plug in the server client used for the post-discovery dedup
+	/// pass. The runner does this when constructing the scanner;
+	/// stub-backend tests leave it unset.
+	pub fn with_server_client(mut self, client: Arc<ServerClient>) -> Self {
+		self.client = Some(client);
 		self
 	}
 }
@@ -223,9 +239,17 @@ impl Scanner for LlmCodeReviewScanner {
 				"llm-code-review: some discovery calls errored",
 			);
 		}
-		// Dedup slot: no-op for now. When server-side prior-findings
-		// arrive (see LOUPE.md), this is where we'd drop matches.
-		let after_dedup = discovered;
+		// Hash-dedup pass. For each surviving discovery, compute the
+		// candidate fingerprint (same shape `build_finding` will use
+		// post-validation) and ask the server which fingerprints it
+		// already has on this repo. Drop matches before paying
+		// validation LLM cost. No-op when `client` is None — that's
+		// the test path with the stub backend.
+		let after_dedup = if let Some(client) = self.client.as_ref() {
+			dedup_against_server(client, ctx.repo_id, &ctx.workdir, discovered).await
+		} else {
+			discovered
+		};
 		tracing::info!(candidates = after_dedup.len(), "llm-code-review entering validation");
 
 		let n_candidates = after_dedup.len();
@@ -582,6 +606,55 @@ fn build_finding(
 		poc_unified: Some(v.poc_unified),
 		fingerprint,
 	}
+}
+
+/// Hash-dedup pass: compute fingerprints for each candidate, ask
+/// the server which ones already exist on the repo, drop matches.
+///
+/// On a server error we *don't* bail — we just skip dedup and let
+/// validation run as if every candidate were novel. The
+/// `INSERT OR IGNORE` on `(repo_id, fingerprint)` at the eventual
+/// submit_findings call still prevents duplicate rows; the only
+/// thing we lose by skipping dedup is the validation-cost saving.
+/// Fail-open is the right behaviour for an optimisation pass.
+async fn dedup_against_server(
+	client: &Arc<ServerClient>, repo_id: i64, workdir: &Path, candidates: Vec<Discovered>,
+) -> Vec<Discovered> {
+	if candidates.is_empty() {
+		return candidates;
+	}
+	// Compute the candidate fingerprint AND remember which
+	// `Discovered` it came from in one pass — `Vec<(Discovered, fp)>`.
+	let with_fps: Vec<(Discovered, String)> = candidates
+		.into_iter()
+		.map(|d| {
+			let fp = fingerprint_for(workdir, &d.file, d.line_start, d.line_end);
+			(d, fp)
+		})
+		.collect();
+	let fps: Vec<String> = with_fps.iter().map(|(_, f)| f.clone()).collect();
+
+	let known = match client.known_fingerprints(repo_id, fps).await {
+		Ok(resp) => resp.known.into_iter().collect::<std::collections::HashSet<_>>(),
+		Err(e) => {
+			tracing::warn!(error = %e, "dedup lookup failed; skipping (validation will run on all)");
+			return with_fps.into_iter().map(|(d, _)| d).collect();
+		},
+	};
+	let total = with_fps.len();
+	let kept: Vec<Discovered> =
+		with_fps.into_iter().filter(|(_, fp)| !known.contains(fp)).map(|(d, _)| d).collect();
+	let dropped = total - kept.len();
+	if dropped > 0 {
+		tracing::info!(
+			dropped,
+			total,
+			"llm-code-review: dedup skipped {dropped}/{total} candidates that hash-match prior findings",
+		);
+	} else {
+		tracing::debug!(total, "llm-code-review: dedup found no prior matches");
+	}
+	kept
 }
 
 /// Read the source window for `(file, line_start..=line_end)` from

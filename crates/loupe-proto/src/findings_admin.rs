@@ -16,6 +16,24 @@ pub struct ListFindingsResponse {
 	pub findings: Vec<FindingSummary>,
 }
 
+/// Worker-side dedup query: "of these candidate fingerprints, which
+/// already exist on this repo?" Used between discovery and
+/// validation so the worker doesn't pay validation LLM cost on
+/// candidates that hash-match a prior finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownFingerprintsRequest {
+	pub protocol_version: u16,
+	pub fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownFingerprintsResponse {
+	pub protocol_version: u16,
+	/// Subset of the requested fingerprints that the server has
+	/// already recorded for this repo. Order is unspecified.
+	pub known: Vec<String>,
+}
+
 /// Compact view used in listings — drops `description`, `patch_unified`,
 /// and `poc_unified` to keep responses small. `loupectl finding get
 /// <id>` returns the full detail view.

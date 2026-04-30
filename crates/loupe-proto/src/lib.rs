@@ -13,7 +13,10 @@ mod registry;
 mod scan;
 mod version;
 
-pub use findings_admin::{FindingDetail, FindingSummary, ListFindingsResponse};
+pub use findings_admin::{
+	FindingDetail, FindingSummary, KnownFingerprintsRequest, KnownFingerprintsResponse,
+	ListFindingsResponse,
+};
 pub use job_io::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatResponse, VerdictSubmission,
 };
