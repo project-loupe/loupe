@@ -102,7 +102,15 @@ fn walk(
 		for m in re.find_iter(text) {
 			let line_start = 1 + text[..m.start()].matches('\n').count() as u32;
 			let rel = entry.path().strip_prefix(workdir).unwrap_or(entry.path()).to_string_lossy();
-			let fingerprint = format!("{SCANNER_ID}|{rel}|{line_start}|{}|{head_sha}", m.as_str());
+			// Fingerprint shape: `(scanner_id, file, matched_secret)`.
+			// Deliberately excludes line_start (line shifts when an
+			// unrelated line is added above the match) and head_sha
+			// (every scan would otherwise produce a fresh fingerprint
+			// for the same secret, defeating the dedup index). The
+			// matched bytes themselves are stable across cosmetic
+			// edits and uniquely identify the secret.
+			let _ = head_sha;
+			let fingerprint = crate::fingerprint::compute(SCANNER_ID, &rel, m.as_str());
 			out.push(Finding {
 				scanner_id: SCANNER_ID.into(),
 				severity: Severity::High,

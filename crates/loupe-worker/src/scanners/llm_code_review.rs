@@ -245,7 +245,10 @@ impl Scanner for LlmCodeReviewScanner {
 		}
 		tracing::info!(emitted = validated.len(), "llm-code-review finished");
 
-		Ok(validated.into_iter().map(|v| build_finding(&self.backend, v, &ctx.head_sha)).collect())
+		Ok(validated
+			.into_iter()
+			.map(|v| build_finding(&self.backend, v, &ctx.workdir, &ctx.head_sha))
+			.collect())
 	}
 }
 
@@ -546,23 +549,23 @@ pub(crate) fn extract_json_object(text: &str) -> Option<String> {
 	None
 }
 
-fn build_finding(backend: &Arc<dyn LlmBackend>, v: Validated, head_sha: &str) -> Finding {
-	let mut hasher = blake3::Hasher::new();
-	hasher.update(SCANNER_ID.as_bytes());
-	hasher.update(b"|");
-	hasher.update(v.d.file.as_bytes());
-	hasher.update(b"|");
-	hasher.update(v.d.line_start.to_string().as_bytes());
-	hasher.update(b"|");
-	hasher.update(v.d.title.as_bytes());
-	let fingerprint = hasher.finalize().to_hex().to_string();
+/// How many lines of context to take on each side of the bug-line
+/// range when computing the fingerprint window. Two lines is enough
+/// to keep the hash stable across `cargo fmt`-style reflows while
+/// staying narrow enough that touching the bug body shifts it.
+const FINGERPRINT_CONTEXT_LINES: u32 = 2;
+
+fn build_finding(
+	backend: &Arc<dyn LlmBackend>, v: Validated, workdir: &Path, head_sha: &str,
+) -> Finding {
+	let fingerprint = fingerprint_for(workdir, &v.d.file, v.d.line_start, v.d.line_end);
 
 	let description = if let Some(notes) = v.notes {
 		format!("{}\n\n_validation notes ({}): {}_", v.d.description, backend.id(), notes)
 	} else {
 		v.d.description
 	};
-	let _ = head_sha; // not currently part of the fingerprint; M2-deferred dedup may reference it
+	let _ = head_sha; // not currently part of the fingerprint; semantic dedup (stage 2) may reference it
 	Finding {
 		scanner_id: SCANNER_ID.into(),
 		severity: v.d.severity,
@@ -576,6 +579,42 @@ fn build_finding(backend: &Arc<dyn LlmBackend>, v: Validated, head_sha: &str) ->
 		poc_unified: Some(v.poc_unified),
 		fingerprint,
 	}
+}
+
+/// Read the source window for `(file, line_start..=line_end)` from
+/// the worktree and produce the fingerprint via
+/// [`crate::fingerprint::compute`]. Falls back to a degenerate but
+/// safe input when the file can't be read (model hallucinated a
+/// path, file is non-UTF-8, etc.) so `build_finding` still produces
+/// *some* fingerprint rather than panicking — the line-range alone
+/// is the worst-case input.
+fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -> String {
+	// Strip a leading "/workdir/" if the model echoed back the
+	// in-sandbox absolute path; we want the path relative to the
+	// host worktree.
+	let rel = file.strip_prefix("/workdir/").unwrap_or(file).trim_start_matches('/');
+	let abs = workdir.join(rel);
+	let source = match std::fs::read_to_string(&abs) {
+		Ok(s) => s,
+		Err(e) => {
+			tracing::warn!(
+				file = %rel, error = %e,
+				"fingerprint: could not read worktree file; falling back to line-range-only window",
+			);
+			return crate::fingerprint::compute(
+				SCANNER_ID,
+				rel,
+				&format!("L{line_start}-L{line_end}"),
+			);
+		},
+	};
+	let window = crate::fingerprint::extract_window(
+		&source,
+		line_start,
+		line_end,
+		FINGERPRINT_CONTEXT_LINES,
+	);
+	crate::fingerprint::compute(SCANNER_ID, rel, &window)
 }
 
 /// Walk the worktree for source files following the strategy from
@@ -914,6 +953,108 @@ mod tests {
 		assert_eq!(f.line_start, Some(1));
 		assert!(f.poc_unified.as_deref().unwrap().contains("#[test]"), "got: {:?}", f.poc_unified);
 		assert!(f.description.contains("validation notes"));
+	}
+
+	#[tokio::test]
+	async fn fingerprint_is_stable_across_cosmetic_edits_to_the_file() {
+		// Same bug body in both runs. Variant B inserts an unrelated
+		// helper *above* the bug, so the bug shifts down by 4 lines.
+		// The model picks up the new line numbers, but the content of
+		// the bug + its 2-line context window stays identical because
+		// the inserted code is far enough above to leave the context
+		// lines unchanged. Plus the model paraphrases the title
+		// between runs to mimic real LLM drift. Fingerprint must stay
+		// the same.
+		let backend = |line: u32, title: &'static str| {
+			Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+				if req.prompt.contains("validating a vulnerability report") {
+					Ok(r#"{"verdict":"confirmed","notes":"r","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+x\n"}"#.to_owned())
+				} else {
+					Ok(format!(
+						r#"{{"found":true,"severity":"high","title":"{title}","file":"src/lib.rs","line_start":{line},"line_end":{line},"description":"d"}}"#,
+					))
+				}
+			}))
+		};
+
+		// Source: a small module with several functions; the bug is
+		// inside `idx`, surrounded on both sides by other code that
+		// stays identical between variants A and B.
+		let prelude = "//! lib\n\npub fn add(a: u8, b: u8) -> u8 { a + b }\n\n\
+		               pub fn sub(a: u8, b: u8) -> u8 { a - b }\n\n";
+		let bug_block = "pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }\n";
+		let tail = "\npub fn double(a: u8) -> u8 { a + a }\n";
+
+		let src_a = format!("{prelude}{bug_block}{tail}");
+		// Variant B: insert an unrelated helper at the very top, far
+		// enough above the bug that 2-line context lines don't drift.
+		let src_b = format!("// extra license header\n\n{prelude}{bug_block}{tail}",);
+
+		// Compute where `idx` actually lands so we hand realistic line
+		// numbers to the stub backend.
+		let line_a = src_a.lines().position(|l| l.starts_with("pub fn idx")).unwrap() + 1;
+		let line_b = src_b.lines().position(|l| l.starts_with("pub fn idx")).unwrap() + 1;
+		assert_ne!(line_a, line_b, "fixture must shift the line number to be a meaningful test");
+
+		let tmp_a = tempfile::tempdir().unwrap();
+		write_crate(tmp_a.path(), &[("src/lib.rs", &src_a)]);
+		let findings_a = LlmCodeReviewScanner::new(backend(line_a as u32, "oob index"))
+			.scan(&make_ctx(tmp_a.path()))
+			.await
+			.unwrap();
+		assert_eq!(findings_a.len(), 1);
+
+		let tmp_b = tempfile::tempdir().unwrap();
+		write_crate(tmp_b.path(), &[("src/lib.rs", &src_b)]);
+		let findings_b =
+			LlmCodeReviewScanner::new(backend(line_b as u32, "unchecked array indexing"))
+				.scan(&make_ctx(tmp_b.path()))
+				.await
+				.unwrap();
+		assert_eq!(findings_b.len(), 1);
+
+		assert_eq!(
+			findings_a[0].fingerprint, findings_b[0].fingerprint,
+			"fingerprint must be stable when a header is added far above the bug \
+			 (line_start drifts but the 2-line context stays identical); \
+			 got a={} b={}",
+			findings_a[0].fingerprint, findings_b[0].fingerprint,
+		);
+	}
+
+	#[tokio::test]
+	async fn fingerprint_changes_when_the_bug_body_is_edited() {
+		// Same file, same line, same title — but different code at the
+		// bug location. The fingerprint must shift so a fix doesn't
+		// inherit the prior approval state.
+		let stub = |body_response: &'static str| {
+			Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+				if req.prompt.contains("validating a vulnerability report") {
+					Ok(r#"{"verdict":"confirmed","notes":"r","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+x\n"}"#.to_owned())
+				} else {
+					Ok(body_response.to_owned())
+				}
+			}))
+		};
+
+		let discovery = r#"{"found":true,"severity":"high","title":"x","file":"src/lib.rs","line_start":1,"line_end":1,"description":"d"}"#;
+
+		let tmp_a = tempfile::tempdir().unwrap();
+		write_crate(tmp_a.path(), &[("src/lib.rs", "let v = unsafe { *raw };\n")]);
+		let a =
+			LlmCodeReviewScanner::new(stub(discovery)).scan(&make_ctx(tmp_a.path())).await.unwrap();
+
+		let tmp_b = tempfile::tempdir().unwrap();
+		write_crate(tmp_b.path(), &[("src/lib.rs", "let v = unsafe { *raw }.unwrap_or(0);\n")]);
+		let b =
+			LlmCodeReviewScanner::new(stub(discovery)).scan(&make_ctx(tmp_b.path())).await.unwrap();
+
+		assert_eq!(a.len(), 1);
+		assert_eq!(b.len(), 1);
+		assert_ne!(
+			a[0].fingerprint, b[0].fingerprint,
+			"fingerprint must shift when the bug body is touched",
+		);
 	}
 
 	#[tokio::test]
