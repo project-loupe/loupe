@@ -200,6 +200,40 @@ CREATE TABLE findings (
 CREATE INDEX idx_findings_job   ON findings(job_id);
 CREATE INDEX idx_findings_state ON findings(state);
 
+-- Full-text-search index on the human-readable finding columns. The
+-- worker-side MCP `query_prior_findings` tool reads this when an
+-- agent is mid-scan and wants to know "have we seen something like
+-- this before?". Backed by SQLite FTS5 with a porter-stem tokeniser
+-- so search ignores plurals / verb forms; unicode61 + diacritics
+-- removal keeps non-ASCII titles findable.
+--
+-- `content='findings'` makes this an external-content table — the
+-- tokenized index lives here, but the actual column values live in
+-- the source `findings` row, no duplication. The triggers below
+-- keep the index in sync with INSERT / UPDATE / DELETE on findings.
+CREATE VIRTUAL TABLE findings_fts USING fts5(
+    title,
+    description,
+    file_path,
+    content='findings',
+    content_rowid='id',
+    tokenize='porter unicode61 remove_diacritics 1'
+);
+CREATE TRIGGER findings_fts_ai AFTER INSERT ON findings BEGIN
+    INSERT INTO findings_fts(rowid, title, description, file_path)
+    VALUES (new.id, new.title, new.description, new.file_path);
+END;
+CREATE TRIGGER findings_fts_ad AFTER DELETE ON findings BEGIN
+    INSERT INTO findings_fts(findings_fts, rowid, title, description, file_path)
+    VALUES('delete', old.id, old.title, old.description, old.file_path);
+END;
+CREATE TRIGGER findings_fts_au AFTER UPDATE ON findings BEGIN
+    INSERT INTO findings_fts(findings_fts, rowid, title, description, file_path)
+    VALUES('delete', old.id, old.title, old.description, old.file_path);
+    INSERT INTO findings_fts(rowid, title, description, file_path)
+    VALUES (new.id, new.title, new.description, new.file_path);
+END;
+
 CREATE TABLE finding_verifications (
     id              INTEGER PRIMARY KEY,
     record_version  INTEGER NOT NULL DEFAULT 1,
