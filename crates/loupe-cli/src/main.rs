@@ -177,6 +177,18 @@ enum JobCmd {
 enum FindingCmd {
 	/// List recent findings for a repo (newest first, capped server-side).
 	List { repo_id: i64 },
+	/// FTS5 keyword search over a repo's findings (title, description,
+	/// file path). Free-form keywords are sanitized server-side; the
+	/// match is "every term must appear" with BM25 ranking. Useful for
+	/// "have we seen something like this before?" lookups.
+	Search {
+		repo_id: i64,
+		/// One or more space-separated keywords. Quote the whole
+		/// thing if your shell would split on spaces.
+		query: String,
+		#[arg(long, default_value_t = 20)]
+		limit: i64,
+	},
 	/// Pretty-print a single finding for human review: title + severity,
 	/// location, description, PoC diff, and audit trail. Pass `--json`
 	/// to dump the raw FindingDetail DTO instead (for scripting).
@@ -222,6 +234,9 @@ async fn main() -> Result<()> {
 		Cmd::Finding(c) => match c {
 			FindingCmd::List { repo_id } => {
 				finding_list(&client, &cli.conn.server_url, repo_id).await
+			},
+			FindingCmd::Search { repo_id, query, limit } => {
+				finding_search(&client, &cli.conn.server_url, repo_id, &query, limit).await
 			},
 			FindingCmd::Show { id, json } => {
 				finding_show(&client, &cli.conn.server_url, id, json).await
@@ -441,6 +456,30 @@ async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i6
 			f.verification_required,
 			loc,
 			f.title,
+		);
+	}
+	Ok(())
+}
+
+async fn finding_search(
+	client: &reqwest::Client, base: &reqwest::Url, repo_id: i64, query: &str, limit: i64,
+) -> Result<()> {
+	let url = url(base, &format!("/v1/repos/{repo_id}/findings/search"));
+	let resp = client.get(url).query(&[("q", query), ("limit", &limit.to_string())]).send().await?;
+	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
+	if body.findings.is_empty() {
+		println!("(no matches)");
+		return Ok(());
+	}
+	for f in body.findings {
+		let loc = match (f.file_path.as_deref(), f.line_start) {
+			(Some(p), Some(l)) => format!("{p}:{l}"),
+			(Some(p), None) => p.to_string(),
+			_ => "-".into(),
+		};
+		println!(
+			"{:>5}\t{:?}\t{}\tstate={}\t{}\t{}",
+			f.id, f.severity, f.scanner_id, f.state, loc, f.title,
 		);
 	}
 	Ok(())

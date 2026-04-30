@@ -1,17 +1,28 @@
-//! Admin-only findings inspection + approval routes:
+//! Findings inspection + approval routes:
 //!
-//! - `GET  /v1/repos/:id/findings` → recent findings for a repo
-//! - `GET  /v1/findings/:id`       → full detail for one finding
-//! - `POST /v1/findings/:id/approve` → release a held finding
-//! - `POST /v1/findings/:id/reject`  → terminally dismiss a held finding
+//! - `GET  /v1/repos/:id/findings`           → recent findings for a repo
+//! - `GET  /v1/repos/:id/findings/search?q=` → FTS5 keyword search
+//! - `GET  /v1/findings/:id`                 → full detail for one finding
+//! - `POST /v1/findings/:id/approve`         → release a held finding
+//! - `POST /v1/findings/:id/reject`          → terminally dismiss a held finding
+//!
+//! The list / get / approve / reject routes are admin-only — they
+//! sit behind `require_admin`. The `search` route is callable by any
+//! authenticated client (admin OR worker) because the worker-side
+//! MCP server (running as a child of `loupe-worker`) uses it as the
+//! backing for the `query_prior_findings` agent tool. Workers
+//! already see finding bodies via the lease envelope on verify jobs,
+//! so allowing them to FTS-search the same bodies is not a privilege
+//! escalation.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use loupe_proto::{FindingDetail, FindingSummary, ListFindingsResponse, PROTOCOL_VERSION};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
+use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
 use crate::state::AppState;
@@ -21,6 +32,14 @@ use crate::state::AppState;
 /// `loupectl finding get <id>` for individual rows.
 const LIST_LIMIT: i64 = 100;
 
+/// Default cap on `search` results. The agent typically only needs
+/// the top handful of "is this a duplicate of any prior finding?"
+/// candidates, not a full repo dump.
+const SEARCH_DEFAULT_LIMIT: i64 = 20;
+/// Hard ceiling on `search` to keep a single tool call from
+/// downloading every finding on a repo.
+const SEARCH_MAX_LIMIT: i64 = 100;
+
 pub async fn list_for_repo(
 	State(state): State<AppState>, Path(repo_id): Path<i64>,
 ) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
@@ -28,6 +47,43 @@ pub async fn list_for_repo(
 		.db
 		.with_conn(|c| Ok(findings::list_for_repo(c, repo_id, LIST_LIMIT)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listing findings: {e}")))?;
+	Ok(Json(ListFindingsResponse {
+		protocol_version: PROTOCOL_VERSION,
+		findings: rows.into_iter().map(row_to_summary).collect(),
+	}))
+}
+
+/// Query string for `GET /v1/repos/:id/findings/search`.
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+	pub q: String,
+	#[serde(default)]
+	pub limit: Option<i64>,
+}
+
+/// `GET /v1/repos/:id/findings/search?q=<keywords>&limit=<n>`. FTS5
+/// keyword search over title, description, file_path. Open to any
+/// authenticated client; the MCP server's `query_prior_findings`
+/// tool calls this from inside the worker. Free-form `q` is run
+/// through `findings::sanitize_fts_query` server-side, so the
+/// caller doesn't need to know FTS5 syntax.
+pub async fn search(
+	State(state): State<AppState>, Path(repo_id): Path<i64>, Query(qp): Query<SearchQuery>,
+) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
+	let limit = qp.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
+	let sanitized = findings::sanitize_fts_query(&qp.q);
+	if sanitized.is_empty() {
+		// No usable terms — return empty rather than running an
+		// invalid FTS5 query that errors out.
+		return Ok(Json(ListFindingsResponse {
+			protocol_version: PROTOCOL_VERSION,
+			findings: vec![],
+		}));
+	}
+	let rows = state
+		.db
+		.with_conn(|c| Ok(findings::search(c, repo_id, &sanitized, limit)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("searching findings: {e}")))?;
 	Ok(Json(ListFindingsResponse {
 		protocol_version: PROTOCOL_VERSION,
 		findings: rows.into_iter().map(row_to_summary).collect(),

@@ -53,6 +53,13 @@ pub fn router(state: AppState) -> Router {
 		.merge(admin_only)
 		.merge(worker_only)
 		.route("/v1/whoami", get(routes::whoami::get))
+		// Open to any authenticated client (admin or worker) — the
+		// MCP server inside `loupe-worker` calls this for the
+		// `query_prior_findings` agent tool. Workers already see
+		// finding bodies via the verify-job lease envelope, so the
+		// FTS surface adds nothing beyond what they could
+		// reconstruct on their own.
+		.route("/v1/repos/{id}/findings/search", get(routes::findings_admin::search))
 		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
 
 	Router::new()
