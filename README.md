@@ -245,6 +245,30 @@ SQLCipher when the row is fetched) and posts to
 `https://api.github.com/repos/acme/widget-security/issues`, stamping
 `reported_at` on the finding row.
 
+#### Or: scan-only mode (no tracker)
+
+If you want to use loupe purely as a "find issues, queue them for me"
+system — no tracker repo, no automatic GitHub issue creation, just
+a queue you triage with `loupectl finding ...` and act on
+out-of-band — pass `--no-reporting`:
+
+```
+loupectl repo add \
+  --clone-url https://github.com/acme/widget.git \
+  --no-reporting
+```
+
+`--no-reporting` implies `--require-approval = true` unless you
+override it (else findings would silently flip to `reported` before
+a human ever sees them — defeating the point). The full pipeline
+(scan → optional verify → approval gate) runs as usual, but on
+approve the dispatcher simply stamps `reported_at` and state
+`reported` without calling any external system. Reject still moves
+the finding to terminal `dismissed`. Operators take whatever
+follow-up action they want — open a ticket elsewhere, fix the bug
+directly, ignore it — and `loupectl finding list` shows what's been
+triaged versus still pending.
+
 ### 7. Inspect what happened
 
 ```

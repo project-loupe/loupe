@@ -25,6 +25,12 @@ pub enum ReportingSetup {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		subject_prefix: Option<String>,
 	},
+	/// No automatic reporter. The server runs the scan, verification,
+	/// and approval pipeline as usual, but on dispatch the finding
+	/// goes straight to `reported` without poking an external system.
+	/// Operators triage via `loupectl finding show`/`approve`/`reject`
+	/// and take whatever follow-up action they want out-of-band.
+	Manual,
 }
 
 /// Body of `POST /v1/repos`.

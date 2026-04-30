@@ -73,6 +73,7 @@ pub async fn create(
 					from: from.clone(),
 					subject_prefix: subject_prefix.clone(),
 				},
+				ReportingSetup::Manual => ReportingDestination::Manual,
 			};
 			let id = repos::insert(
 				&tx,

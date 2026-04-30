@@ -241,7 +241,7 @@ mod tests {
 			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 				assert_eq!(pat_secret_id, secret_id)
 			},
-			ReportingDestination::Email { .. } => {
+			ReportingDestination::Email { .. } | ReportingDestination::Manual => {
 				panic!("fixture builds a github_issue destination")
 			},
 		}

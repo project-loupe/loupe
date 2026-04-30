@@ -33,14 +33,17 @@ pub trait Reporter: Send + Sync {
 	) -> Result<DispatchReceipt>;
 }
 
-/// Pick the right reporter for `repo.reporting`. Returns `None` if the
-/// destination is one this build doesn't understand (forward
-/// compatibility — older builds shouldn't crash on a future variant).
+/// Pick the right reporter for `repo.reporting`. Returns `None` for
+/// `Manual` (the dispatcher short-circuits before reaching this — the
+/// `None` here just keeps the API total) or for a destination this
+/// build doesn't understand (forward compatibility — older builds
+/// shouldn't crash on a future variant).
 pub fn select(
 	repo: &RepoRow, github: Arc<GithubReporter>, email: Arc<EmailReporter>,
 ) -> Option<Arc<dyn Reporter>> {
 	match &repo.reporting {
 		ReportingDestination::GithubIssue { .. } => Some(github),
 		ReportingDestination::Email { .. } => Some(email),
+		ReportingDestination::Manual => None,
 	}
 }

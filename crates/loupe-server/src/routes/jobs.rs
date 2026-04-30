@@ -629,6 +629,21 @@ pub(super) async fn dispatch_finding(
 	let repo = state.db.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?.ok_or_else(|| {
 		anyhow::anyhow!("repo {} for finding {} missing", row.repo_id, finding_id)
 	})?;
+	// Manual mode short-circuits: terminate the finding's lifecycle but
+	// don't poke any external system. Operator handled it (or will
+	// handle it) out-of-band.
+	if matches!(repo.reporting, ReportingDestination::Manual) {
+		state.db.with_conn(|c| {
+			c.execute(
+				"UPDATE findings SET reported_at = ?1, state = 'reported'
+				 WHERE id = ?2 AND state = 'confirmed'",
+				(now, finding_id),
+			)?;
+			Ok(())
+		})?;
+		tracing::info!(finding_id, "manual mode: finding terminated without external dispatch");
+		return Ok(());
+	}
 	let pat = match &repo.reporting {
 		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 			let bytes = state
@@ -638,6 +653,7 @@ pub(super) async fn dispatch_finding(
 			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
 		},
 		ReportingDestination::Email { .. } => String::new(),
+		ReportingDestination::Manual => unreachable!("Manual handled above"),
 	};
 
 	let f = Finding {
@@ -684,6 +700,25 @@ async fn dispatch_for_job(
 		.db
 		.with_conn(|c| Ok(repos::get(c, repo_id)?))?
 		.ok_or_else(|| anyhow::anyhow!("repo {repo_id} disappeared before dispatch"))?;
+	// Manual mode short-circuits: terminate every confirmed finding
+	// from this scan job without poking any external system.
+	if matches!(repo.reporting, ReportingDestination::Manual) {
+		let n = state.db.with_conn(|c| {
+			Ok(c.execute(
+				"UPDATE findings SET reported_at = ?1, state = 'reported'
+				 WHERE job_id = ?2 AND state = 'confirmed'",
+				(now, job_id),
+			)?)
+		})?;
+		if n > 0 {
+			tracing::info!(
+				job_id,
+				count = n,
+				"manual mode: findings terminated without external dispatch"
+			);
+		}
+		return Ok(());
+	}
 	let pat = match &repo.reporting {
 		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 			let bytes = state
@@ -693,6 +728,7 @@ async fn dispatch_for_job(
 			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
 		},
 		ReportingDestination::Email { .. } => String::new(),
+		ReportingDestination::Manual => unreachable!("Manual handled above"),
 	};
 
 	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;

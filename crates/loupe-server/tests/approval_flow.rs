@@ -157,6 +157,30 @@ async fn boot_server_with_default(require_approval_default: bool) -> Harness {
 async fn register_repo(
 	h: &Harness, clone_url: &str, require_approval: Option<bool>, target_repo: &str,
 ) -> i64 {
+	register_with(
+		h,
+		clone_url,
+		require_approval,
+		target_repo,
+		ReportingSetup::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: target_repo.into(),
+			github_pat: "ghp_test_pat".into(),
+		},
+	)
+	.await
+}
+
+async fn register_manual_repo(
+	h: &Harness, clone_url: &str, require_approval: Option<bool>, label: &str,
+) -> i64 {
+	register_with(h, clone_url, require_approval, label, ReportingSetup::Manual).await
+}
+
+async fn register_with(
+	h: &Harness, clone_url: &str, require_approval: Option<bool>, target_repo: &str,
+	reporting: ReportingSetup,
+) -> i64 {
 	let resp = h
 		.admin
 		.post("https://loupe-server/v1/repos")
@@ -167,11 +191,7 @@ async fn register_repo(
 			clone_url: format!("https://github.com/loupe/{target_repo}.git"),
 			branch: None,
 			scan_interval_seconds: None,
-			reporting: ReportingSetup::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: target_repo.into(),
-				github_pat: "ghp_test_pat".into(),
-			},
+			reporting,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: false,
 			require_approval,
@@ -363,6 +383,64 @@ async fn per_repo_opt_out_beats_global_default() {
 		})
 		.unwrap();
 	assert_eq!(state, "reported");
+
+	h.server.shutdown().await;
+	drop(h.server_dir);
+}
+
+#[tokio::test]
+async fn manual_mode_terminates_findings_without_calling_the_reporter() {
+	let (_repo_tmp, clone_url) = make_planted_repo("manual");
+	// Server default off, but we register the repo with `Manual` and
+	// pin require_approval = true so the operator gets to triage
+	// before the dispatcher stamps `reported`.
+	let h = boot_server_with_default(false).await;
+	let repo_id = register_manual_repo(&h, &clone_url, Some(true), "manual-mode").await;
+
+	trigger_scan_and_run(&h, repo_id).await;
+
+	// Approval gate held the finding, so the GitHub stub must still be
+	// untouched at this point.
+	assert!(
+		h.stub.captured.lock().unwrap().is_empty(),
+		"manual mode + require_approval must hold the finding before approve"
+	);
+	let id: i64 =
+		h.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT id FROM findings WHERE repo_id = ?1 AND state = 'awaiting_approval'",
+				[repo_id],
+				|r| r.get(0),
+			)?)
+		})
+		.unwrap();
+
+	// Approve. The dispatcher should short-circuit on Manual: stamp
+	// `reported_at` + state without ever touching the GitHub stub.
+	let resp = h
+		.admin
+		.post(format!("https://loupe-server/v1/findings/{id}/approve"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	assert!(
+		h.stub.captured.lock().unwrap().is_empty(),
+		"manual mode must not call the reporter even after approve"
+	);
+	let (state, reported_at, approved_by): (String, Option<i64>, Option<String>) =
+		h.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT state, reported_at, approved_by_cn FROM findings WHERE id = ?1",
+				[id],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+			)?)
+		})
+		.unwrap();
+	assert_eq!(state, "reported");
+	assert!(reported_at.is_some(), "reported_at must be stamped on terminate");
+	assert_eq!(approved_by.as_deref(), Some("admin"));
 
 	h.server.shutdown().await;
 	drop(h.server_dir);

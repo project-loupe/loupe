@@ -110,15 +110,34 @@ struct RepoAddArgs {
 	branch: Option<String>,
 	#[arg(long)]
 	scan_interval_seconds: Option<u64>,
-	#[arg(long)]
-	target_owner: String,
-	#[arg(long)]
-	target_repo: String,
+	/// Owner of the tracker repo where findings get filed. Required
+	/// unless `--no-reporting` is set.
+	#[arg(long, required_unless_present = "no_reporting")]
+	target_owner: Option<String>,
+	/// Tracker repo name where findings get filed. Required unless
+	/// `--no-reporting` is set.
+	#[arg(long, required_unless_present = "no_reporting")]
+	target_repo: Option<String>,
 	/// PAT with `repo` scope on the target tracker. Read from the env
 	/// var `LOUPE_TRACKER_PAT` if not supplied — never echo it on the
-	/// command line in shared shells.
-	#[arg(long, env = "LOUPE_TRACKER_PAT")]
-	pat: String,
+	/// command line in shared shells. Required unless `--no-reporting`
+	/// is set.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", required_unless_present = "no_reporting")]
+	pat: Option<String>,
+	/// Skip configuring an automatic reporter. Findings still go
+	/// through the full scan + verification + approval pipeline; on
+	/// dispatch they go straight to `reported` without poking any
+	/// external system. Operators triage via `loupectl finding show /
+	/// approve / reject` and act on findings out-of-band. Implies
+	/// `--require-approval` unless explicitly overridden — pairing
+	/// manual mode with auto-dispatch would silently mark every
+	/// finding `reported` before a human ever sees it.
+	#[arg(
+		long,
+		default_value_t = false,
+		conflicts_with_all = ["target_owner", "target_repo", "pat"],
+	)]
+	no_reporting: bool,
 	/// Route findings through the verify flow before dispatching. Off
 	/// by default; turn on for repos where you want a second-opinion
 	/// verifier worker to confirm each finding.
@@ -129,7 +148,8 @@ struct RepoAddArgs {
 	require_approval: bool,
 	/// Pin per-repo require_approval = false at registration time.
 	/// If neither flag is set, the repo inherits the server-level
-	/// `require_approval_default`.
+	/// `require_approval_default` (or implicit `true` when paired with
+	/// `--no-reporting`).
 	#[arg(long, conflicts_with = "require_approval")]
 	no_require_approval: bool,
 }
@@ -242,21 +262,34 @@ fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
 }
 
 async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
+	// Manual mode implies require_approval = true unless the operator
+	// explicitly opts out. Pairing manual mode with auto-dispatch
+	// would flip every finding to `reported` before a human ever sees
+	// it — almost certainly not what someone passing --no-reporting
+	// wants.
 	let require_approval = match (a.require_approval, a.no_require_approval) {
 		(true, false) => Some(true),
 		(false, true) => Some(false),
+		_ if a.no_reporting => Some(true),
 		_ => None,
+	};
+	let reporting = if a.no_reporting {
+		ReportingSetup::Manual
+	} else {
+		ReportingSetup::GithubIssue {
+			// `clap` enforces these are present unless --no-reporting is set,
+			// so the unwrap is structurally safe.
+			target_owner: a.target_owner.expect("clap enforces target_owner"),
+			target_repo: a.target_repo.expect("clap enforces target_repo"),
+			github_pat: a.pat.expect("clap enforces pat"),
+		}
 	};
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: a.clone_url,
 		branch: a.branch,
 		scan_interval_seconds: a.scan_interval_seconds,
-		reporting: ReportingSetup::GithubIssue {
-			target_owner: a.target_owner,
-			target_repo: a.target_repo,
-			github_pat: a.pat,
-		},
+		reporting,
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: a.verification_enabled,
 		require_approval,
