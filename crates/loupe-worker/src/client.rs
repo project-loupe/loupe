@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
-	CompleteRequest, FindingsBatch, HeartbeatResponse, KnownFingerprintsRequest,
+	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatResponse, KnownFingerprintsRequest,
 	KnownFingerprintsResponse, LeaseRequest, LeaseResponse, ListFindingsResponse,
 	VerdictSubmission, PROTOCOL_VERSION,
 };
@@ -89,6 +89,17 @@ impl ServerClient {
 			.context("search request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding search response")
+	}
+
+	/// Fetch the full detail view for one finding by id. Used by the
+	/// MCP `get_finding_by_id` tool when the agent wants the
+	/// description / PoC body of a search hit beyond what
+	/// `query_prior_findings` (a summary-only listing) returned.
+	pub async fn get_finding(&self, id: i64) -> Result<FindingDetail> {
+		let url = self.url(&format!("/v1/findings/{id}"));
+		let resp = self.http.get(url).send().await.context("get_finding request")?;
+		ensure_ok(&resp)?;
+		resp.json().await.context("decoding finding detail")
 	}
 
 	/// Worker-side dedup pass: of these candidate fingerprints, which

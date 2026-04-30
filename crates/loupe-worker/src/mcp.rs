@@ -15,9 +15,10 @@
 //!   spawned per `claude` invocation by the worker, with the
 //!   `repo_id` baked in as a CLI arg, so the tool doesn't need to
 //!   take it as a parameter.
-//!
-//! Future tools (queued for follow-up commits): `get_finding_by_id`,
-//! `submit_finding`, `validate_poc`.
+//! - `get_finding_by_id(id)` — full detail view for one finding.
+//!   Used after `query_prior_findings` returns a summary and the
+//!   model wants to see the description / PoC of a hit before
+//!   deciding whether the new finding is a duplicate.
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -185,6 +186,26 @@ fn tool_definitions() -> Value {
 				},
 			},
 		},
+		{
+			"name": "get_finding_by_id",
+			"description":
+				"Fetch the full detail view for one prior finding — description, PoC unified diff, \
+				 patch (if any), CWE, file location, severity, state, audit trail. Use this after \
+				 `query_prior_findings` returns a summary and you want to compare bodies before \
+				 deciding whether the new finding you're about to report duplicates an existing one. \
+				 The id is from a prior `query_prior_findings` hit.",
+			"inputSchema": {
+				"type": "object",
+				"required": ["id"],
+				"properties": {
+					"id": {
+						"type": "integer",
+						"description": "The finding id, as returned in `query_prior_findings` hits.",
+						"minimum": 1,
+					},
+				},
+			},
+		},
 	])
 }
 
@@ -200,6 +221,7 @@ async fn handle_tool_call(
 
 	let result: Result<String> = match tool_name {
 		"query_prior_findings" => tool_query_prior_findings(client, repo_id, &arguments).await,
+		"get_finding_by_id" => tool_get_finding_by_id(client, &arguments).await,
 		other => Err(anyhow::anyhow!("unknown tool: {other}")),
 	};
 
@@ -226,6 +248,43 @@ async fn handle_tool_call(
 			}
 		},
 	}
+}
+
+async fn tool_get_finding_by_id(client: &Arc<ServerClient>, args: &Value) -> Result<String> {
+	let id = args
+		.get("id")
+		.and_then(|v| v.as_i64())
+		.context("`id` argument is required and must be an integer")?;
+	let detail =
+		client.get_finding(id).await.with_context(|| format!("calling /v1/findings/{id}"))?;
+	let loc = match (detail.file_path.as_deref(), detail.line_start, detail.line_end) {
+		(Some(p), Some(s), Some(e)) if e > s => format!("{p}:{s}-{e}"),
+		(Some(p), Some(s), _) => format!("{p}:{s}"),
+		(Some(p), None, _) => p.to_owned(),
+		_ => "(no location)".into(),
+	};
+	let mut out = String::with_capacity(detail.description.len() + 256);
+	let _ = std::fmt::Write::write_fmt(
+		&mut out,
+		format_args!(
+			"Finding #{} [{:?}] state={} {}\n{}\n",
+			detail.id, detail.severity, detail.state, loc, detail.title,
+		),
+	);
+	if let Some(cwe) = &detail.cwe {
+		let _ = std::fmt::Write::write_fmt(&mut out, format_args!("CWE: {cwe}\n"));
+	}
+	out.push_str("\nDescription:\n");
+	out.push_str(&detail.description);
+	if let Some(poc) = &detail.poc_unified {
+		out.push_str("\n\nProof of concept (unified diff):\n");
+		out.push_str(poc);
+	}
+	if let Some(patch) = &detail.patch_unified {
+		out.push_str("\n\nSuggested fix (unified diff):\n");
+		out.push_str(patch);
+	}
+	Ok(out)
 }
 
 async fn tool_query_prior_findings(

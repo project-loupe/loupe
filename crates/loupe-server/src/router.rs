@@ -32,7 +32,6 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/repos/{id}", delete(routes::repos::delete).patch(routes::repos::update))
 		.route("/v1/repos/{id}/scan", post(routes::jobs::enqueue_scan))
 		.route("/v1/repos/{id}/findings", get(routes::findings_admin::list_for_repo))
-		.route("/v1/findings/{id}", get(routes::findings_admin::get))
 		.route("/v1/findings/{id}/approve", post(routes::findings_admin::approve))
 		.route("/v1/findings/{id}/reject", post(routes::findings_admin::reject))
 		.route("/v1/workers", post(routes::workers::create))
@@ -54,16 +53,17 @@ pub fn router(state: AppState) -> Router {
 		.merge(worker_only)
 		.route("/v1/whoami", get(routes::whoami::get))
 		// Open to any authenticated client (admin or worker) — the
-		// MCP server inside `loupe-worker` calls this for the
-		// `query_prior_findings` agent tool. Workers already see
-		// finding bodies via the verify-job lease envelope, so the
-		// FTS surface adds nothing beyond what they could
-		// reconstruct on their own.
+		// MCP server inside `loupe-worker` calls these for agent
+		// tools like `query_prior_findings` and `get_finding_by_id`.
+		// Workers already see finding bodies via the verify-job
+		// lease envelope, so the FTS / detail surface adds nothing
+		// beyond what they could reconstruct on their own.
 		.route("/v1/repos/{id}/findings/search", get(routes::findings_admin::search))
 		.route(
 			"/v1/repos/{id}/findings/known-fingerprints",
 			post(routes::findings_admin::known_fingerprints),
 		)
+		.route("/v1/findings/{id}", get(routes::findings_admin::get))
 		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
 
 	Router::new()
