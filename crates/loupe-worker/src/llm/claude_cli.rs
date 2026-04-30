@@ -50,6 +50,14 @@ impl LlmBackend for ClaudeCliBackend {
 	}
 
 	async fn run(&self, req: LlmRequest) -> Result<LlmResponse> {
+		tracing::debug!(
+			backend = BACKEND_ID,
+			workdir = %req.workdir.display(),
+			prompt_chars = req.prompt.chars().count(),
+			timeout_ms = req.timeout.as_millis() as u64,
+			"claude-cli: invoking",
+		);
+		let started = std::time::Instant::now();
 		let mut cmd = SandboxBuilder::new(&req.workdir).allow_network().build(&self.bin);
 		cmd.arg("--dangerously-skip-permissions").arg("-p").arg(&req.prompt);
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -93,11 +101,25 @@ impl LlmBackend for ClaudeCliBackend {
 
 		if !status.success() {
 			let stderr_text = String::from_utf8_lossy(&stderr);
+			tracing::debug!(
+				backend = BACKEND_ID,
+				exit = ?status.code(),
+				stderr_chars = stderr.len(),
+				elapsed_ms = started.elapsed().as_millis() as u64,
+				"claude-cli: subprocess failed",
+			);
 			return Err(anyhow!("claude CLI exited with {}: {}", status, stderr_text.trim()));
 		}
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
+		tracing::debug!(
+			backend = BACKEND_ID,
+			elapsed_ms = started.elapsed().as_millis() as u64,
+			stdout_chars = text.chars().count(),
+			stderr_chars = stderr.len(),
+			"claude-cli: subprocess succeeded",
+		);
 		Ok(LlmResponse { text, backend_id: BACKEND_ID })
 	}
 }

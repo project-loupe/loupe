@@ -297,12 +297,20 @@ impl LlmCodeReviewScanner {
 	}
 }
 
+/// How many leading characters of an LLM response to log at debug
+/// level. Long enough that a JSON parse failure usually prints the
+/// offending shape; short enough that GBs of model output don't
+/// drown the terminal.
+const RESPONSE_PREVIEW_CHARS: usize = 240;
+
 async fn discover_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig,
 	cancel: CancellationToken,
 ) -> Option<Discovered> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
 	let prompt = prompts::render(DISCOVERY, &[("file", &rel)]);
+	tracing::info!(file = %rel, "llm-code-review: running discovery");
+	let started = std::time::Instant::now();
 	let req = LlmRequest {
 		prompt,
 		workdir: workdir.to_path_buf(),
@@ -316,6 +324,13 @@ async fn discover_one(
 			return None;
 		},
 	};
+	tracing::debug!(
+		file = %rel,
+		elapsed_ms = started.elapsed().as_millis() as u64,
+		response_chars = resp.text.chars().count(),
+		preview = %resp.text.chars().take(RESPONSE_PREVIEW_CHARS).collect::<String>(),
+		"discovery response",
+	);
 	parse_discovery(&resp, &rel)
 }
 
@@ -336,6 +351,8 @@ async fn validate_one(
 		VALIDATE,
 		&[("file", &d.file), ("finding_json", &finding_json.to_string())],
 	);
+	tracing::info!(file = %d.file, title = %d.title, "llm-code-review: running validation");
+	let started = std::time::Instant::now();
 	let req = LlmRequest {
 		prompt,
 		workdir: workdir.to_path_buf(),
@@ -349,6 +366,13 @@ async fn validate_one(
 			return None;
 		},
 	};
+	tracing::debug!(
+		file = %d.file,
+		elapsed_ms = started.elapsed().as_millis() as u64,
+		response_chars = resp.text.chars().count(),
+		preview = %resp.text.chars().take(RESPONSE_PREVIEW_CHARS).collect::<String>(),
+		"validation response",
+	);
 	parse_validation(&resp, d)
 }
 

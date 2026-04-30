@@ -31,9 +31,9 @@ struct ConnArgs {
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	ca_cert: PathBuf,
 	#[arg(long, env = "LOUPE_ADMIN_CERT")]
-	cert: PathBuf,
+	admin_cert: PathBuf,
 	#[arg(long, env = "LOUPE_ADMIN_KEY")]
-	key: PathBuf,
+	admin_key: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -235,10 +235,10 @@ async fn main() -> Result<()> {
 fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
 	let ca = std::fs::read_to_string(&c.ca_cert)
 		.with_context(|| format!("reading CA cert at {}", c.ca_cert.display()))?;
-	let cert = std::fs::read_to_string(&c.cert)
-		.with_context(|| format!("reading admin cert at {}", c.cert.display()))?;
-	let key = std::fs::read_to_string(&c.key)
-		.with_context(|| format!("reading admin key at {}", c.key.display()))?;
+	let cert = std::fs::read_to_string(&c.admin_cert)
+		.with_context(|| format!("reading admin cert at {}", c.admin_cert.display()))?;
+	let key = std::fs::read_to_string(&c.admin_key)
+		.with_context(|| format!("reading admin key at {}", c.admin_key.display()))?;
 	let mut combined = String::with_capacity(cert.len() + key.len() + 1);
 	combined.push_str(&cert);
 	if !cert.ends_with('\n') {
