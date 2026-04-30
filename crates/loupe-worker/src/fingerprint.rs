@@ -41,9 +41,10 @@
 //!
 //! For paraphrase / refactor tolerance (function moved to a different
 //! file, model phrased the description differently), the hash is the
-//! deterministic floor; semantic dedup runs above it as a separate
-//! pass — see `dedup_against_server` in `scanners::llm_code_review`
-//! and the `query_prior_findings` MCP tool in `crate::mcp`.
+//! deterministic floor; the agent's `query_prior_findings` MCP tool
+//! handles the semantic layer above it. The hash gets the final word
+//! at insert time via the `UNIQUE(repo_id, fingerprint)` constraint
+//! on the `findings` table.
 
 /// Compute the fingerprint for a finding.
 ///

@@ -20,10 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use loupe_proto::{
-	FindingDetail, FindingSummary, KnownFingerprintsRequest, KnownFingerprintsResponse,
-	ListFindingsResponse, PROTOCOL_VERSION,
-};
+use loupe_proto::{FindingDetail, FindingSummary, ListFindingsResponse, PROTOCOL_VERSION};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
 use serde::Deserialize;
 
@@ -90,31 +87,6 @@ pub async fn search(
 	Ok(Json(ListFindingsResponse {
 		protocol_version: PROTOCOL_VERSION,
 		findings: rows.into_iter().map(row_to_summary).collect(),
-	}))
-}
-
-/// `POST /v1/repos/:id/findings/known-fingerprints`. Worker-side
-/// dedup pass: takes a list of candidate fingerprints, returns the
-/// subset already recorded on this repo. Open to any authenticated
-/// client (workers call this between discovery and validation; the
-/// admin CLI doesn't have a use for it today but isn't excluded).
-pub async fn known_fingerprints(
-	State(state): State<AppState>, Path(repo_id): Path<i64>,
-	Json(req): Json<KnownFingerprintsRequest>,
-) -> Result<Json<KnownFingerprintsResponse>, (StatusCode, String)> {
-	if req.protocol_version != PROTOCOL_VERSION {
-		return Err((
-			StatusCode::BAD_REQUEST,
-			format!("unsupported protocol_version {}", req.protocol_version),
-		));
-	}
-	let known = state
-		.db
-		.with_conn(|c| Ok(findings::known_fingerprints(c, repo_id, &req.fingerprints)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dedup lookup: {e}")))?;
-	Ok(Json(KnownFingerprintsResponse {
-		protocol_version: PROTOCOL_VERSION,
-		known: known.into_iter().collect(),
 	}))
 }
 

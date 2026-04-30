@@ -169,41 +169,6 @@ pub fn search(
 	rows.collect()
 }
 
-/// Filter a candidate-fingerprint list to those already present on
-/// `repo_id`. Used by the worker-side dedup stage: between
-/// discovery and validation, the scanner asks "which of these
-/// fingerprints have we already recorded?", drops the matches, and
-/// only pays validation LLM cost on genuinely-new candidates.
-///
-/// Empty input returns an empty set; this is the natural answer
-/// when discovery produced zero candidates (or every one was below
-/// the dedup threshold). The query packs the list into a single
-/// `IN (?, ?, …)` clause — for the few-tens-of-fingerprints scale
-/// per scan, that's well under SQLite's max-bind-parameter limit
-/// (999 by default).
-pub fn known_fingerprints(
-	conn: &Connection, repo_id: i64, candidates: &[String],
-) -> rusqlite::Result<std::collections::HashSet<String>> {
-	if candidates.is_empty() {
-		return Ok(std::collections::HashSet::new());
-	}
-	// `repeat_n` is stable since 1.82; we target 1.75. `repeat(...).take(n)` is the equivalent.
-	let placeholders = std::iter::repeat("?").take(candidates.len()).collect::<Vec<_>>().join(",");
-	let sql = format!(
-		"SELECT fingerprint FROM findings \
-		 WHERE repo_id = ? AND fingerprint IN ({placeholders})",
-	);
-	let mut stmt = conn.prepare(&sql)?;
-	let mut binds: Vec<rusqlite::types::Value> = Vec::with_capacity(candidates.len() + 1);
-	binds.push(repo_id.into());
-	for fp in candidates {
-		binds.push(fp.clone().into());
-	}
-	let rows =
-		stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?;
-	rows.collect::<rusqlite::Result<std::collections::HashSet<String>>>()
-}
-
 /// Turn a free-form keyword string into a safe FTS5 MATCH query.
 ///
 /// Splits on whitespace; drops tokens of length < 2; strips
@@ -647,75 +612,6 @@ mod tests {
 		.unwrap();
 		// Search now empty — the trigger reaped the FTS row.
 		assert!(db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap().is_empty());
-	}
-
-	#[test]
-	fn known_fingerprints_filters_to_present_only() {
-		let (db, repo_id, job_id) = fixture();
-		// Plant two findings under repo_id with distinct fingerprints.
-		let mut a = sample("fp-aaa");
-		a.title = "alpha".into();
-		let mut b = sample("fp-bbb");
-		b.title = "beta".into();
-		for f in &[&a, &b] {
-			db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, f, false, 0)?)).unwrap();
-		}
-
-		// Mix planted + novel candidates.
-		let candidates: Vec<String> =
-			["fp-aaa", "fp-novel", "fp-bbb", "also-novel"].iter().map(|s| s.to_string()).collect();
-		let known = db.with_conn(|c| Ok(known_fingerprints(c, repo_id, &candidates)?)).unwrap();
-		assert_eq!(known.len(), 2);
-		assert!(known.contains("fp-aaa"));
-		assert!(known.contains("fp-bbb"));
-		assert!(!known.contains("fp-novel"));
-
-		// Empty input → empty set, no query at all.
-		let empty: Vec<String> = vec![];
-		let known = db.with_conn(|c| Ok(known_fingerprints(c, repo_id, &empty)?)).unwrap();
-		assert!(known.is_empty());
-	}
-
-	#[test]
-	fn known_fingerprints_is_repo_scoped() {
-		// A fingerprint planted on repo A should not be reported as
-		// "known" for repo B.
-		let (db, repo_id_a, job_id_a) = fixture();
-		let secret_id = db
-			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p2", b"x", 0)?))
-			.unwrap();
-		let repo_id_b = db
-			.with_conn(|c| {
-				Ok(repos::insert(
-					c,
-					&repos::NewRepo {
-						clone_url: "https://github.com/x/y.git".into(),
-						host: "github.com".into(),
-						owner: "x".into(),
-						repo: "y".into(),
-						default_branch: None,
-						scan_interval_seconds: None,
-						scanner_config: serde_json::Value::Null,
-						reporting: ReportingDestination::GithubIssue {
-							target_owner: "x".into(),
-							target_repo: "t".into(),
-							pat_secret_id: secret_id,
-						},
-						verification_enabled: false,
-						require_approval: None,
-					},
-					0,
-				)?)
-			})
-			.unwrap();
-		// Seed only repo A.
-		let mut f = sample("shared-fp");
-		f.title = "x".into();
-		db.with_conn(|c| Ok(insert_or_ignore(c, repo_id_a, job_id_a, &f, false, 0)?)).unwrap();
-
-		let candidates = vec!["shared-fp".to_string()];
-		let known_b = db.with_conn(|c| Ok(known_fingerprints(c, repo_id_b, &candidates)?)).unwrap();
-		assert!(known_b.is_empty(), "fingerprint on repo A must not match repo B");
 	}
 
 	#[test]

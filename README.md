@@ -2,8 +2,10 @@
 
 A security-scanning harness for source repositories. `loupe` runs LLM
 agents (and, in future milestones, fuzzers and other tooling) over a
-codebase, validates the resulting reports, and files them as GitHub
-issues so they show up where the rest of the team's bugs live.
+codebase, lets each agent self-validate its findings (write a
+regression-test PoC, check it applies), and files confirmed findings
+as GitHub issues so they show up where the rest of the team's bugs
+live.
 
 The system is split into three components that talk to each other over
 mTLS:
@@ -287,29 +289,29 @@ agent can ask "have we seen anything like this before?" mid-scan.
 #### Continuous scans
 
 When you set `--scan-interval-seconds`, loupe runs the scan periodically
-without operator intervention. Two automatic dedup layers keep
-re-scans cheap:
+without operator intervention. Two complementary dedup mechanisms
+keep re-scans cheap:
 
-- **Hash dedup (free):** between discovery and validation, the worker
-  computes the candidate fingerprint
-  `(scanner_id, file, normalized_content_window)` and asks the
-  server "do you already have this?". Matches skip the validation
-  LLM call entirely. So if yesterday's scan validated a finding and
-  today's scan re-discovers it on unchanged code, today pays one
-  discovery call (cheap) and zero validation calls (the expensive
-  ones). Survives `cargo fmt`-style cosmetic edits because the hash
-  normalises whitespace and case.
-- **Semantic dedup (LLM-driven):** the discovery prompt tells the
-  agent it has the `query_prior_findings` MCP tool and asks it to
-  return `{"found": false}` when a clear prior match exists. Catches
+- **Semantic dedup (agent-driven):** every discovery session has the
+  `query_prior_findings` and `get_finding_by_id` MCP tools. The
+  prompt asks the agent to search for prior reports of the bug it's
+  about to flag and skip submission on a clear match. Catches
   paraphrases, refactor-shifted bugs (function moved to a different
-  file), and re-named functions that the hash inevitably misses.
-  Conservative — only suppresses on a clear match.
+  file), and renamed functions. Conservative — only suppresses on
+  a clear match.
+- **Hash dedup (free, server-side):** every finding carries a
+  `blake3(scanner_id | file | normalized_content_window)`
+  fingerprint. The `findings` table has `UNIQUE(repo_id,
+  fingerprint)`, so any submission that hash-matches an existing
+  row is silently dropped at insert (`INSERT OR IGNORE`). Survives
+  `cargo fmt`-style cosmetic edits because the hash normalises
+  whitespace and case. This is the deterministic floor under the
+  agent's semantic decisions.
 
-If you want to verify dedup is working: run `loupectl repo scan <id>`
-twice in a row, look at the second job's worker logs for
-`llm-code-review: dedup skipped N/M candidates that hash-match prior
-findings`.
+To verify dedup is working: run `loupectl repo scan <id>` twice in
+a row and compare the new-finding counts in `loupectl finding list
+<repo-id>` between the two jobs — the second run shouldn't add rows
+the first one already covered.
 
 ### 8. Adjust an existing repo
 

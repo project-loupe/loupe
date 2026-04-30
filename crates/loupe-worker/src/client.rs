@@ -4,9 +4,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
-	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatResponse, KnownFingerprintsRequest,
-	KnownFingerprintsResponse, LeaseRequest, LeaseResponse, ListFindingsResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatResponse, LeaseRequest, LeaseResponse,
+	ListFindingsResponse, VerdictSubmission, PROTOCOL_VERSION,
 };
 use reqwest::Url;
 
@@ -100,21 +99,6 @@ impl ServerClient {
 		let resp = self.http.get(url).send().await.context("get_finding request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding finding detail")
-	}
-
-	/// Worker-side dedup pass: of these candidate fingerprints, which
-	/// already exist on the repo? Used between discovery and
-	/// validation so the worker doesn't pay validation LLM cost on
-	/// candidates that already hash-match a prior finding.
-	pub async fn known_fingerprints(
-		&self, repo_id: i64, fingerprints: Vec<String>,
-	) -> Result<KnownFingerprintsResponse> {
-		let url = self.url(&format!("/v1/repos/{repo_id}/findings/known-fingerprints"));
-		let req = KnownFingerprintsRequest { protocol_version: PROTOCOL_VERSION, fingerprints };
-		let resp =
-			self.http.post(url).json(&req).send().await.context("known-fingerprints request")?;
-		ensure_ok(&resp)?;
-		resp.json().await.context("decoding known-fingerprints response")
 	}
 
 	fn url(&self, path: &str) -> Url {

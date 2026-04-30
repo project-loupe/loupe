@@ -90,9 +90,15 @@ inside the sandbox.
                        │           ▼
                        │  ┌──────────────────┐  │   mTLS (worker cert)
                        │  │ loupe-worker     │ ─┼──────────► loupe-server
-                       │  │   mcp-serve      │  │   GET /v1/repos/:id/
-                       │  │ • query_prior_   │  │       findings/search
-                       │  │   findings       │  │   (and future tools)
+                       │  │   mcp-serve      │  │   GET    /v1/repos/:id/
+                       │  │                  │  │            findings/search
+                       │  │ tools:           │  │   GET    /v1/findings/:id
+                       │  │ • query_prior_   │  │   POST   /v1/jobs/:id/
+                       │  │   findings       │  │            findings
+                       │  │ • get_finding_   │  │
+                       │  │   by_id          │  │
+                       │  │ • submit_finding │  │
+                       │  │ • validate_poc   │  │
                        │  └──────────────────┘  │
                        └────────────────────────┘
 ```
@@ -109,45 +115,31 @@ A finding's journey from "agent saw something" to "human looked at it":
    │ for each file in parallel:      │   │
    │   spawn `claude` inside bwrap   │   │
    │   prompt: DISCOVERY             │   │
-   │   parse JSON from stdout        │   │   discovery pass
-   │   → Discovered{file,line,…}     │   │
+   │   ┌── one agent session ──────┐ │   │   agent fan-out
+   │   │ • read /workdir/{file}    │ │   │
+   │   │ • query_prior_findings    │ │   │     (semantic dedup)
+   │   │ • get_finding_by_id       │ │   │     (compare bodies)
+   │   │ • generate PoC diff       │ │   │
+   │   │ • validate_poc            │ │   │     (`git apply --check`)
+   │   │ • submit_finding ─────────┼─┼───┼──── mTLS to loupe-server
+   │   └───────────────────────────┘ │   │     POST /v1/jobs/{id}/findings
+   │   wait for session exit         │   │     (one finding per call)
+   │ scanner returns Vec::new()      │   │
+   │   (submission already happened) │   │
    └─────────────────────────────────┘   │
-                  │                      │
-                  ▼                      │
-   ┌─────────────────────────────────┐   │
-   │ dedup pass (both layers active):│   │
-   │   stage 1: compute fingerprint, │   │
-   │     POST known-fingerprints,    │   │   dedup
-   │     drop matches (deterministic)│   │
-   │   stage 2: model self-suppress  │   │
-   │     via query_prior_findings    │   │
-   │     during DISCOVERY (semantic) │   │
-   └─────────────────────────────────┘   │
-                  │                      │
-                  ▼                      │
-   ┌─────────────────────────────────┐   │
-   │ for each surviving discovery:   │   │
-   │   spawn `claude` inside bwrap   │   │
-   │   prompt: VALIDATE              │   │   validation pass
-   │   accept verdict=confirmed only │   │
-   │   → Validated{discovered,poc}   │   │
-   └─────────────────────────────────┘   │
-                  │                      │
-                  ▼                      │
-   ┌─────────────────────────────────┐   │
-   │ build_finding(workdir, v):      │   │
-   │   read source window from disk  │   │   emit
-   │   compute fingerprint =         │   │
-   │     blake3(scanner_id|file|     │   │
-   │            normalized_window)   │   │
-   └─────────────────────────────────┘   │
-                  │                      │
-                  ▼ POST /v1/jobs/{id}/findings (one batch, end-of-scan)
+                  │
+                  ▼ POST /v1/jobs/{id}/complete  (no findings batch — agent
+                                                  already submitted them)
                                          ┴───────────── network hop ─────────
    ┌─────────────────────────────────┐
-   │ INSERT OR IGNORE into findings  │
-   │ on UNIQUE(repo_id, fingerprint) │  loupe-server
-   │ → state = pending               │
+   │ submit_finding handler:         │
+   │   build Finding{fingerprint}    │
+   │     from MCP args + workdir     │
+   │     (read source window, hash)  │
+   │   INSERT OR IGNORE on findings  │  loupe-server
+   │   on UNIQUE(repo_id,            │
+   │             fingerprint)        │
+   │   → state = pending             │
    └─────────────────────────────────┘
                   │
                   ▼ POST /v1/jobs/{id}/complete
