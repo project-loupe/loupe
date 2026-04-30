@@ -179,9 +179,25 @@ pub async fn delete(
 	}
 }
 
-/// Permissive parser for GitHub-style `https://github.com/<owner>/<repo>(.git)?`.
-/// Returns (host, owner, repo). Rejects unrecognised URLs with `None`.
+/// Permissive parser for clone URLs.
+///
+/// Accepts `https://<host>/<owner>/<repo>(.git)?` (the GitHub /
+/// GitLab / GHE shape) and `file:///path/to/repo(.git)?` (for local-
+/// only testing — `loupectl repo add --clone-url file:///tmp/fixture`
+/// just works without spinning up a real git server). For `file://`
+/// URLs the host/owner triple is synthesized as
+/// `("local", "local", <last-path-component>)` so the rest of the
+/// schema (which requires non-empty values) stays happy.
 fn parse_github_clone_url(url: &str) -> Option<(String, String, String)> {
+	if let Some(path) = url.strip_prefix("file://") {
+		let trimmed = path.trim_end_matches('/');
+		let last = trimmed.rsplit('/').find(|s| !s.is_empty())?;
+		let repo = last.strip_suffix(".git").unwrap_or(last).to_owned();
+		if repo.is_empty() {
+			return None;
+		}
+		return Some(("local".into(), "local".into(), repo));
+	}
 	let without_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
 	let mut parts = without_scheme.splitn(2, '/');
 	let host = parts.next()?.to_owned();
@@ -216,7 +232,7 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_non_https_url() {
+	fn rejects_non_https_or_file_url() {
 		assert!(parse_github_clone_url("git@github.com:acme/widget.git").is_none());
 		assert!(parse_github_clone_url("ssh://github.com/acme/widget").is_none());
 	}
@@ -225,5 +241,23 @@ mod tests {
 	fn rejects_path_without_owner_or_repo() {
 		assert!(parse_github_clone_url("https://github.com/").is_none());
 		assert!(parse_github_clone_url("https://github.com/acme").is_none());
+	}
+
+	#[test]
+	fn parses_local_file_url() {
+		let (host, owner, repo) = parse_github_clone_url("file:///tmp/fixture/widget.git").unwrap();
+		assert_eq!(host, "local");
+		assert_eq!(owner, "local");
+		assert_eq!(repo, "widget");
+		// Without `.git` suffix.
+		assert_eq!(parse_github_clone_url("file:///home/me/projects/sample").unwrap().2, "sample");
+		// Trailing slash tolerated.
+		assert_eq!(parse_github_clone_url("file:///home/me/projects/sample/").unwrap().2, "sample");
+	}
+
+	#[test]
+	fn rejects_file_url_with_empty_path() {
+		assert!(parse_github_clone_url("file:///").is_none());
+		assert!(parse_github_clone_url("file://").is_none());
 	}
 }
