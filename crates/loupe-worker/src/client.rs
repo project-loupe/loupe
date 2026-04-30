@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
 	CompleteRequest, FindingsBatch, HeartbeatResponse, LeaseRequest, LeaseResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	ListFindingsResponse, VerdictSubmission, PROTOCOL_VERSION,
 };
 use reqwest::Url;
 
@@ -70,6 +70,24 @@ impl ServerClient {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
 		let resp = self.http.post(url).json(req).send().await.context("verdict request")?;
 		ensure_ok(&resp)
+	}
+
+	/// FTS keyword search over a repo's accumulated findings. The
+	/// MCP server's `query_prior_findings` tool calls this. `query`
+	/// is free-form keywords; the server sanitises them.
+	pub async fn search_findings(
+		&self, repo_id: i64, query: &str, limit: i64,
+	) -> Result<ListFindingsResponse> {
+		let url = self.url(&format!("/v1/repos/{repo_id}/findings/search"));
+		let resp = self
+			.http
+			.get(url)
+			.query(&[("q", query), ("limit", &limit.to_string())])
+			.send()
+			.await
+			.context("search request")?;
+		ensure_ok(&resp)?;
+		resp.json().await.context("decoding search response")
 	}
 
 	fn url(&self, path: &str) -> Url {

@@ -3,6 +3,7 @@
 pub mod client;
 pub mod fingerprint;
 pub mod llm;
+pub mod mcp;
 pub mod repo_cache;
 pub mod runner;
 pub mod sandbox;
