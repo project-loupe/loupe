@@ -41,8 +41,9 @@
 //!
 //! For paraphrase / refactor tolerance (function moved to a different
 //! file, model phrased the description differently), the hash is the
-//! deterministic floor; semantic dedup belongs above it as a separate
-//! pass — see the MCP build-out / stage-2 dedup work in `LOUPE.md`.
+//! deterministic floor; semantic dedup runs above it as a separate
+//! pass — see `dedup_against_server` in `scanners::llm_code_review`
+//! and the `query_prior_findings` MCP tool in `crate::mcp`.
 
 /// Compute the fingerprint for a finding.
 ///

@@ -1,8 +1,7 @@
 # Architecture
 
 This file is for "what is in the box and how does it talk to itself."
-For the milestone-by-milestone "what shipped, what's deferred,"
-see `LOUPE.md`. For "how do I run it," see `README.md`.
+For "how do I run it," see `README.md`.
 
 ## Components
 
@@ -282,8 +281,9 @@ server" sections for the master-key sourcing rules.
 ## Cross-references
 
 - Finding state machine details (verdict rollup policy, approval
-  gate audit trail): `LOUPE.md` "Shipped — verification flow" /
-  "human-in-the-loop approval gate" sections.
+  gate audit trail): `crates/loupe-server/src/routes/jobs.rs` —
+  `submit_verdict` and `complete` handlers walk through the
+  transitions inline.
 - Sandbox mount layout (which host paths get bind-mounted where):
   `crates/loupe-worker/src/sandbox.rs` module docs.
 - MCP tool catalogue: `crates/loupe-worker/src/mcp.rs` —

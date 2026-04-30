@@ -4,9 +4,7 @@
 //! Wire shape: JSON-RPC 2.0 over stdio. The agent is the JSON-RPC
 //! client; this module is the server. We hand-roll the protocol to
 //! avoid taking a third-party MCP dep — the surface we use is small
-//! (`initialize`, `tools/list`, `tools/call`) and the bkb-mcp crate
-//! at `~/workspace/bitcoin-knowledge-base/bkb-mcp` showed the same
-//! shape works fine in production.
+//! (`initialize`, `tools/list`, `tools/call`).
 //!
 //! Tools currently exposed:
 //!
@@ -18,8 +16,8 @@
 //!   `repo_id` baked in as a CLI arg, so the tool doesn't need to
 //!   take it as a parameter.
 //!
-//! Future tools (queued for follow-up commits, see LOUPE.md):
-//! `get_finding_by_id`, `submit_finding`, `validate_poc`.
+//! Future tools (queued for follow-up commits): `get_finding_by_id`,
+//! `submit_finding`, `validate_poc`.
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -72,8 +70,9 @@ struct RpcError {
 ///
 /// `repo_id` is baked into the server because the agent only ever
 /// reasons about the repo currently being scanned — there's no
-/// cross-repo lookup. Same shape bkb-mcp uses (`api_url` is fixed
-/// at server start; tool calls don't re-specify it).
+/// cross-repo lookup. The connection target (the loupe-server URL,
+/// mTLS cert) is similarly fixed at MCP-server start; tool calls
+/// don't re-specify it.
 pub async fn run_stdio_server(client: Arc<ServerClient>, repo_id: i64) -> Result<()> {
 	let stdin = std::io::stdin();
 	let mut stdout = std::io::stdout();

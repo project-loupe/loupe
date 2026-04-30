@@ -24,8 +24,7 @@ mTLS:
   scans, inspect findings.
 
 For the architecture in one page (component diagram, data lifecycle,
-mTLS topology), see `ARCH.md`. For milestone-by-milestone status —
-what's shipped, what's deferred — see `LOUPE.md`.
+mTLS topology), see `ARCH.md`.
 
 ## Prerequisites
 
@@ -385,8 +384,9 @@ a `verify:*` capability, which runs an independent LLM pass over the
 finding and submits a `confirm | dismiss | inconclusive` verdict. The
 server applies a rollup policy in-transaction (any `dismissed` →
 finding `dismissed`; else any `confirmed` → `confirmed` + dispatch;
-else stay in `validating`). The full state machine, reaper, and
-runbook for the verification flow are in `LOUPE.md`.
+else stay in `validating`). The full state machine + reaper details
+are in `ARCH.md` and the `submit_verdict` / `complete` handlers in
+`crates/loupe-server/src/routes/jobs.rs`.
 
 > **Heads-up.** The `LlmVerifierScanner` exists in the codebase
 > (`loupe-worker::scanners::llm_verifier`) but is **not yet wired

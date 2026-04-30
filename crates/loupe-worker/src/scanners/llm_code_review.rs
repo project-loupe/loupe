@@ -1,8 +1,12 @@
 //! LLM-driven code-review scanner.
 //!
-//! Pipeline: walk → discovery → dedup (no-op) → validation → emit.
-//! Each stage in its own helper so the dedup slot can be filled in
-//! without restructuring the rest. See `LOUPE.md` for the design.
+//! Pipeline: walk → discovery → dedup → validation → emit. Each
+//! stage in its own helper. The dedup pass uses
+//! `findings::known_fingerprints` (server-backed) to drop hash-
+//! matched candidates before paying validation LLM cost; the
+//! discovery prompt also tells the model about
+//! `query_prior_findings` so it can self-suppress on semantic
+//! matches the hash misses.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -693,10 +697,10 @@ fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -
 	crate::fingerprint::compute(SCANNER_ID, rel, &window)
 }
 
-/// Walk the worktree for source files following the strategy from
-/// `claude-ctf.sh`: workspace `[workspace] members` → each member's
-/// `src/`; single-crate `Cargo.toml` → `src/`; otherwise the entire
-/// tree under any `src/` directory. Honours the include extension
+/// Walk the worktree for source files. Strategy:
+/// workspace `[workspace] members` → each member's `src/`;
+/// single-crate `Cargo.toml` → `src/`; otherwise the entire tree
+/// under any `src/` directory. Honours the include extension
 /// allowlist and the path-substring exclude list, plus the per-file
 /// size cap. `.git` and any directory matching an exclude substring
 /// is skipped wholesale.
