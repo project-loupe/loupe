@@ -87,8 +87,11 @@ CREATE TABLE secrets (
     record_version  INTEGER NOT NULL DEFAULT 1,
     kind            TEXT    NOT NULL,
     label           TEXT    NOT NULL,
-    nonce           BLOB    NOT NULL,
-    ciphertext      BLOB    NOT NULL,
+    -- Value bytes (e.g. a GitHub PAT). Stored verbatim — the DB file
+    -- itself is sealed by SQLCipher under loupe-server's master key,
+    -- so per-row encryption would just double the work without
+    -- adding coverage we care about.
+    value           BLOB    NOT NULL,
     created_at      INTEGER NOT NULL,
     UNIQUE(kind, label)
 );

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
 use loupe_tls::Ca;
 use tokio::sync::Notify;
@@ -8,16 +7,16 @@ use tokio::sync::Notify;
 use crate::reporters::{EmailReporter, GithubReporter};
 
 /// Shared state passed to every axum handler. Cheap to clone — wraps
-/// `Arc`s around storage, the internal CA, the reporter that the
-/// dispatcher hands findings to, and the optional master key for
-/// secrets-at-rest encryption.
+/// `Arc`s around storage, the internal CA, and the reporter that the
+/// dispatcher hands findings to.
 ///
 /// `job_arrived` is poked whenever a new job lands in `queued`. Long-
 /// polling lease handlers wait on it so workers don't have to busy-poll.
 ///
-/// `master_key` enables `record_version = 2` secret writes/reads. When
-/// `None`, the server falls back to plaintext secrets — fine for dev,
-/// strongly discouraged in production.
+/// At-rest encryption of the database itself (including secrets,
+/// findings, and everything else) is handled by SQLCipher inside
+/// [`Db`] — the master key is consumed at `Db::open` time and is no
+/// longer in the AppState.
 #[derive(Clone)]
 pub struct AppState {
 	pub db: Arc<Db>,
@@ -25,7 +24,6 @@ pub struct AppState {
 	pub github_reporter: Arc<GithubReporter>,
 	pub email_reporter: Arc<EmailReporter>,
 	pub job_arrived: Arc<Notify>,
-	pub master_key: Option<Arc<MasterKey>>,
 	/// Server-wide default for the human-in-the-loop approval gate.
 	/// Used when a repo has `require_approval = NULL` (the wire-side
 	/// default — i.e. the operator didn't pin a per-repo override).
@@ -41,14 +39,8 @@ impl AppState {
 			github_reporter,
 			email_reporter: Arc::new(EmailReporter::new()),
 			job_arrived: Arc::new(Notify::new()),
-			master_key: None,
 			require_approval_default: false,
 		}
-	}
-
-	pub fn with_master_key(mut self, key: MasterKey) -> Self {
-		self.master_key = Some(Arc::new(key));
-		self
 	}
 
 	pub fn with_email_reporter(mut self, reporter: EmailReporter) -> Self {

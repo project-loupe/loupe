@@ -62,14 +62,15 @@ Before installing, the host needs:
     *Read and write*.
   - **Classic PAT**: the `repo` scope. (`public_repo` is enough if
     the tracker repo is public.)
-  PATs are stored in the `secrets` table. With
-  `LOUPE_MASTER_KEY` set on the server (a base64-encoded 32-byte
-  key), each row is sealed with `ChaCha20Poly1305` under a
-  per-row random 12-byte nonce, so an attacker reading the SQLite
-  file off disk cannot recover the token. Without
-  `LOUPE_MASTER_KEY` the token is stored as plaintext and the
-  server logs a startup warning — fine for local development, not
-  for shared hosts.
+  PATs are stored in the `secrets` table inside an
+  SQLCipher-encrypted SQLite file. The whole database — secrets,
+  findings (descriptions, PoCs, suggested fixes), repo metadata,
+  audit trails — is sealed with AES-256 + HMAC-SHA512 under
+  `loupe-server`'s master key, so an attacker reading
+  `loupe.sqlite` off disk gets ciphertext for every row. The master
+  key is mandatory (the server refuses to start without one);
+  `loupe-server init` mints it the first time you bootstrap a data
+  dir.
 
 ## Building
 
@@ -102,22 +103,29 @@ the server cert's SAN list (`--hostname` at init time) covers it.
 loupe-server init --data-dir /var/lib/loupe --hostname loupe.example.internal
 ```
 
-This mints the internal CA, the server cert, and the admin client
-cert; writes `ca.pem`, `ca.key`, `server.pem`, `server.key`,
-`admin.pem`, `admin.key` under the data dir with `0600` perms; and
-prints the admin client cert + key on stdout. Save the admin bundle
-somewhere you can reach with `loupectl` — `init` is the only time the
-admin key leaves the machine.
+This mints the internal CA, the server cert, the admin client cert,
+**and** the database master key (32 random bytes, hex-encoded);
+writes `ca.pem`, `ca.key`, `server.pem`, `server.key`, `admin.pem`,
+`admin.key`, and `master.key` under the data dir with `0600` perms;
+and prints the admin client cert + key on stdout. Save the admin
+bundle somewhere you can reach with `loupectl` — `init` is the only
+time the admin key leaves the machine.
+
+If `LOUPE_MASTER_KEY` is already set in the environment when you run
+`init` (e.g. you're managing the key in a secret store / systemd
+credentials / vault), `init` uses it as-is and does **not** write a
+`master.key` file. That keeps the env var the source of truth for
+operators who don't want the key on disk at all.
 
 `init` refuses to run against an already-initialised data dir.
 
 ### 2. Run the server
 
 ```
-# Optional but recommended: 32 random bytes, base64-encoded, used to
-# encrypt secrets (GitHub PATs) at rest. Keep it stable across
-# restarts.
-export LOUPE_MASTER_KEY="$(openssl rand -base64 32)"
+# Source the master key. Either point the server at the on-disk file:
+export LOUPE_MASTER_KEY="$(cat /var/lib/loupe/master.key)"
+# …or load from a secret manager and skip persisting to disk:
+# export LOUPE_MASTER_KEY="$(systemd-creds cat loupe-master)"
 
 loupe-server serve \
   --bind 127.0.0.1:8443 \
@@ -127,6 +135,13 @@ loupe-server serve \
   --ca-cert     /var/lib/loupe/ca.pem \
   --ca-key      /var/lib/loupe/ca.key
 ```
+
+If you'd rather have the server read the key from the on-disk file
+itself, drop `LOUPE_MASTER_KEY` and pass `--master-key-file
+/var/lib/loupe/master.key` (also `LOUPE_MASTER_KEY_FILE`) instead.
+The env var still takes precedence when both are set. The server
+refuses to start if neither source supplies a key — there's no
+plaintext-mode fallback because the database itself is sealed.
 
 All flags also accept the matching `LOUPE_*` env vars (`LOUPE_BIND`,
 `LOUPE_DB`, `LOUPE_SERVER_CERT`, etc.).
@@ -146,10 +161,12 @@ loupe-server serve --config /var/lib/loupe/config.toml
 
 Path-typed fields under `[paths]` are interpreted relative to the
 config file's directory, so a single file can ship next to the certs
-and database without absolute paths. CLI flags and `LOUPE_*` env vars
-override anything the file supplies, so a typical deploy keeps stable
-settings in `config.toml` and uses the env to flip per-environment
-knobs.
+and database without absolute paths. The master key path can also
+live under `[paths] master_key`; the env var still wins on conflict
+so `LOUPE_MASTER_KEY` overrides the file. CLI flags and `LOUPE_*`
+env vars override anything the file supplies, so a typical deploy
+keeps stable settings in `config.toml` and uses the env to flip
+per-environment knobs.
 
 ### 3. Point `loupectl` at the server
 
@@ -223,9 +240,10 @@ loupectl repo scan 1                 # one-shot scan of repo id 1
 ```
 
 Confirmed findings dispatch automatically — the GitHub reporter
-loads the PAT from the secrets table, decrypts it with the in-memory
-master key, and posts to `https://api.github.com/repos/acme/widget-security/issues`,
-stamping `reported_at` on the finding row.
+reads the PAT out of the secrets table (transparently decrypted by
+SQLCipher when the row is fetched) and posts to
+`https://api.github.com/repos/acme/widget-security/issues`, stamping
+`reported_at` on the finding row.
 
 ### 7. Inspect what happened
 

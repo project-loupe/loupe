@@ -53,7 +53,7 @@ struct Fixture {
 
 async fn bring_up_with_repo_and_worker() -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()]).unwrap();
+	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
 
 	let ca = Ca::from_pem(
 		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
@@ -73,7 +73,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),

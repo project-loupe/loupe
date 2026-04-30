@@ -49,7 +49,7 @@ struct Fixture {
 
 async fn bring_up() -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()]).unwrap();
+	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
 
 	let ca = Ca::from_pem(
 		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
@@ -72,7 +72,7 @@ async fn bring_up() -> Fixture {
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),
@@ -115,7 +115,7 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	let stored_secret: Vec<u8> =
 		f.db.with_conn(|c| {
 			let s = c.query_row(
-				"SELECT ciphertext FROM secrets WHERE kind='github_pat' LIMIT 1",
+				"SELECT value FROM secrets WHERE kind='github_pat' LIMIT 1",
 				[],
 				|r| r.get::<_, Vec<u8>>(0),
 			)?;

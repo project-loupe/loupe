@@ -100,7 +100,7 @@ mod tests {
 	use crate::Db;
 
 	fn open() -> Db {
-		Db::open_in_memory().unwrap()
+		Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap()
 	}
 
 	#[test]

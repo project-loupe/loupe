@@ -114,7 +114,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()]).unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
 	let ca = Ca::from_pem(
 		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
 		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
@@ -133,7 +133,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();

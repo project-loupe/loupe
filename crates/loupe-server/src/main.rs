@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use base64::Engine;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use loupe_server::init::{run_init, DataDirLayout};
 use loupe_server::{serve, AppState, Config, FileConfig};
@@ -58,6 +57,13 @@ struct ServeArgs {
 	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_KEY")]
 	ca_key: Option<PathBuf>,
+	/// Path to a file containing the database master key (64 hex
+	/// characters, optionally trailing newline — the shape
+	/// `loupe-server init` writes). Used only when `LOUPE_MASTER_KEY`
+	/// is not set; the env var still wins so operators who manage
+	/// the key in a secret store don't need to drop it on disk.
+	#[arg(long, env = "LOUPE_MASTER_KEY_FILE")]
+	master_key_file: Option<PathBuf>,
 	/// Server-level default for the human-in-the-loop approval gate.
 	/// Per-repo `require_approval` overrides this. When unset both
 	/// here and in the config file, the default is `false`
@@ -77,7 +83,12 @@ async fn main() -> Result<()> {
 }
 
 fn run_init_cmd(args: InitArgs) -> Result<()> {
-	let out = run_init(&args.data_dir, &args.hostnames)
+	// LOUPE_MASTER_KEY (64 hex chars) takes precedence: when set,
+	// init uses it as-is and does not write a master.key file.
+	// Operators who manage the key in a secret store / systemd cred /
+	// vault stay in control of where it lives.
+	let caller_key = read_master_key_from_env()?;
+	let out = run_init(&args.data_dir, &args.hostnames, caller_key)
 		.with_context(|| format!("initialising data dir {}", args.data_dir.display()))?;
 	let layout = DataDirLayout::at(&args.data_dir);
 	println!("loupe data dir initialised at {}", out.layout.root.display());
@@ -85,6 +96,19 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 	println!("server cert: {}", layout.server_cert.display());
 	println!("server key:  {}", layout.server_key.display());
 	println!("ca cert:     {}", layout.ca_cert.display());
+	println!();
+	if out.minted_master_key {
+		println!("master key:  {}", layout.master_key.display());
+		println!(
+			"  (32 random bytes, hex-encoded; database is sealed under this key.\n\
+			   Set `LOUPE_MASTER_KEY=$(cat {})` for `loupe-server serve`,\n\
+			   or pass --master-key {}.)",
+			layout.master_key.display(),
+			layout.master_key.display(),
+		);
+	} else {
+		println!("master key:  loaded from LOUPE_MASTER_KEY env (not persisted to disk)");
+	}
 	println!();
 	println!("admin client cert (saved to {}):", layout.admin_cert.display());
 	println!("{}", out.admin_bundle.cert_pem.trim_end());
@@ -126,6 +150,25 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	let require_approval_default =
 		args.require_approval_default.or(file_cfg.policy.require_approval_default).unwrap_or(false);
 
+	// Master key resolution: env > --master-key-file flag > [paths]
+	// master_key in config.toml. The env-var path is the highest
+	// priority so operators who keep the key out of the filesystem
+	// (systemd creds, secret managers, etc.) don't need to drop it
+	// on disk just to start the server.
+	let master_key = if let Some(key) = read_master_key_from_env()? {
+		tracing::info!("loupe-server: master key loaded from LOUPE_MASTER_KEY");
+		key
+	} else if let Some(path) = args.master_key_file.or(file_cfg.paths.master_key) {
+		tracing::info!(path = %path.display(), "loupe-server: master key loaded from file");
+		read_master_key_from_file(&path)?
+	} else {
+		bail!(
+			"master key missing — set LOUPE_MASTER_KEY, pass --master-key-file <path>,\n\
+			 or add `[paths] master_key = \"...\"` to config.toml.\n\
+			 (run `loupe-server init` to mint one.)"
+		);
+	};
+
 	let server_cert_pem = std::fs::read_to_string(&server_cert_path)
 		.with_context(|| format!("reading server cert at {}", server_cert_path.display()))?;
 	let server_key_pem = std::fs::read_to_string(&server_key_path)
@@ -145,18 +188,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		ca_cert_pem,
 		ca_key_pem,
 	};
-	let db = Db::open(&db_path).with_context(|| format!("opening db at {}", db_path.display()))?;
+	let db = Db::open(&db_path, &master_key)
+		.with_context(|| format!("opening db at {}", db_path.display()))?;
 	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
-	let mut state = AppState::new(Arc::new(db), Arc::new(ca), github)
+	let state = AppState::new(Arc::new(db), Arc::new(ca), github)
 		.with_require_approval_default(require_approval_default);
-	if let Some(key) = read_master_key_from_env()? {
-		state = state.with_master_key(key);
-		tracing::info!("loupe-server: master key loaded; secrets will be encrypted at rest");
-	} else {
-		tracing::warn!(
-			"loupe-server: LOUPE_MASTER_KEY not set; secrets will be stored as plaintext"
-		);
-	}
 	if require_approval_default {
 		tracing::info!(
 			"loupe-server: require_approval_default = true (per-repo overrides may opt out)"
@@ -187,15 +223,31 @@ fn init_tracing() {
 	}
 }
 
-/// Parse a 32-byte master key from base64 in `LOUPE_MASTER_KEY`. Returns
-/// `Ok(None)` when the env var is unset (server runs in plaintext mode).
+/// Parse a 32-byte master key from `LOUPE_MASTER_KEY`. The variable
+/// holds the key as 64 hex characters (the same shape `loupe-server
+/// init` writes to `master.key`). `Ok(None)` if the variable is unset.
 fn read_master_key_from_env() -> Result<Option<MasterKey>> {
-	let Ok(b64) = std::env::var("LOUPE_MASTER_KEY") else { return Ok(None) };
-	let decoded = base64::engine::general_purpose::STANDARD
-		.decode(b64.trim())
-		.context("LOUPE_MASTER_KEY must be base64-encoded 32 bytes")?;
-	let bytes: [u8; 32] = decoded
-		.try_into()
-		.map_err(|_| anyhow::anyhow!("LOUPE_MASTER_KEY must decode to exactly 32 bytes"))?;
-	Ok(Some(MasterKey::from_bytes(bytes)))
+	let Ok(raw) = std::env::var("LOUPE_MASTER_KEY") else { return Ok(None) };
+	Ok(Some(parse_master_key_hex(raw.trim()).context("LOUPE_MASTER_KEY")?))
+}
+
+fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
+	let raw = std::fs::read_to_string(path)
+		.with_context(|| format!("reading master key file at {}", path.display()))?;
+	parse_master_key_hex(raw.trim())
+		.with_context(|| format!("master key file at {}", path.display()))
+}
+
+fn parse_master_key_hex(s: &str) -> Result<MasterKey> {
+	if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+		bail!("expected 64 hex characters, got {} chars", s.len());
+	}
+	let mut bytes = [0u8; 32];
+	for (i, byte) in bytes.iter_mut().enumerate() {
+		// Indexing is safe: we just confirmed the string is 64 ASCII chars.
+		let hi = u8::from_str_radix(&s[i * 2..i * 2 + 1], 16).expect("ascii hex digit");
+		let lo = u8::from_str_radix(&s[i * 2 + 1..i * 2 + 2], 16).expect("ascii hex digit");
+		*byte = (hi << 4) | lo;
+	}
+	Ok(MasterKey::from_bytes(bytes))
 }

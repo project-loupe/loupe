@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use loupe_server::{serve, AppState, Config};
+use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
 use loupe_tls::Ca;
 use reqwest::tls::CertificateRevocationList;
@@ -39,7 +40,7 @@ async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) 
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open_in_memory().unwrap());
+	let db = Arc::new(Db::open_in_memory(&MasterKey::for_tests()).unwrap());
 	let state = AppState::new(
 		db,
 		Arc::new(ca),

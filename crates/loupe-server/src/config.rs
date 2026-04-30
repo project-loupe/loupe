@@ -58,6 +58,12 @@ pub struct PathsSection {
 	pub ca_cert: Option<PathBuf>,
 	#[serde(default)]
 	pub ca_key: Option<PathBuf>,
+	/// Path to a file holding the database master key as 64 hex
+	/// characters (the shape `loupe-server init` writes). Loaded once
+	/// at server startup and used for SQLCipher's `PRAGMA key`. Lower
+	/// priority than the `LOUPE_MASTER_KEY` env var.
+	#[serde(default)]
+	pub master_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -86,6 +92,7 @@ impl FileConfig {
 		cfg.paths.server_key = cfg.paths.server_key.map(|p| resolve(base, p));
 		cfg.paths.ca_cert = cfg.paths.ca_cert.map(|p| resolve(base, p));
 		cfg.paths.ca_key = cfg.paths.ca_key.map(|p| resolve(base, p));
+		cfg.paths.master_key = cfg.paths.master_key.map(|p| resolve(base, p));
 		Ok(cfg)
 	}
 }

@@ -23,6 +23,13 @@ server_cert = "server.pem"
 server_key  = "server.key"
 ca_cert     = "ca.pem"
 ca_key      = "ca.key"
+# Database master key (64 hex characters) used by SQLCipher to seal
+# the entire `loupe.sqlite` file. Read at startup only — never held
+# in AppState. Lower priority than `LOUPE_MASTER_KEY` (env), so an
+# operator who keeps the key in a secret store / systemd creds /
+# vault stays in control of where it lives. Comment this out if
+# you're feeding the key in via the env var.
+master_key  = "master.key"
 
 [policy]
 # Server-wide default for the human-in-the-loop approval gate. When

@@ -46,7 +46,6 @@ pub async fn create(
 		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https github URL".into()))?;
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
-	let master_key = state.master_key.clone();
 	let new_repo_id = state
 		.db
 		.with_conn(|c| {
@@ -56,23 +55,13 @@ pub async fn create(
 			let reporting = match &req.reporting {
 				ReportingSetup::GithubIssue { target_owner, target_repo, github_pat } => {
 					let secret_label = format!("pat:{}:{}/{}", parsed.0, target_owner, target_repo);
-					let secret_id = match master_key.as_deref() {
-						Some(key) => secrets::insert_encrypted(
-							&tx,
-							SecretKind::GithubPat,
-							&secret_label,
-							github_pat.as_bytes(),
-							key,
-							now,
-						)?,
-						None => secrets::insert_plaintext(
-							&tx,
-							SecretKind::GithubPat,
-							&secret_label,
-							github_pat.as_bytes(),
-							now,
-						)?,
-					};
+					let secret_id = secrets::insert(
+						&tx,
+						SecretKind::GithubPat,
+						&secret_label,
+						github_pat.as_bytes(),
+						now,
+					)?;
 					ReportingDestination::GithubIssue {
 						target_owner: target_owner.clone(),
 						target_repo: target_repo.clone(),

@@ -135,10 +135,11 @@ mod tests {
 	use super::*;
 
 	fn fixture() -> (std::sync::Arc<Db>, i64, i64) {
-		let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
-		let secret_id = db
-			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
-			.unwrap();
+		let db = std::sync::Arc::new(
+			Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests()).unwrap(),
+		);
+		let secret_id =
+			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		let repo_id = db
 			.with_conn(|c| {
 				Ok(repos::insert(

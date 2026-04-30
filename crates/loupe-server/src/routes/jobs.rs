@@ -633,7 +633,7 @@ pub(super) async fn dispatch_finding(
 		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 			let bytes = state
 				.db
-				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id, state.master_key.as_deref())?))?
+				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
 				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
 			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
 		},
@@ -688,7 +688,7 @@ async fn dispatch_for_job(
 		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 			let bytes = state
 				.db
-				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id, state.master_key.as_deref())?))?
+				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
 				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
 			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
 		},

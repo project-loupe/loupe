@@ -26,9 +26,7 @@ all = { level = "warn", priority = -1 }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.22"
 blake3 = "1"
-chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service", "server"] }
@@ -37,7 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 tokio-util = { version = "0.7", features = ["rt"] }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
@@ -49,7 +47,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "ne
 toml = "0.8"
 tokio-rustls = "0.26"
 tower = "0.5"
-rand_core = "0.6"
+rand_core = { version = "0.6", features = ["getrandom"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 walkdir = "2"

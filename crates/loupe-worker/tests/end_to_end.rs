@@ -55,7 +55,7 @@ fn make_planted_repo() -> (tempfile::TempDir, String) {
 async fn worker_runs_a_scan_and_emits_a_finding() {
 	let (_repo_tmp, clone_url) = make_planted_repo();
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()]).unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
 
 	let ca = Ca::from_pem(
 		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
@@ -75,7 +75,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),

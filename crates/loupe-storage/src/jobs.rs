@@ -247,10 +247,9 @@ mod tests {
 	use crate::Db;
 
 	fn db_with_repo_and_worker() -> (Db, i64, i64) {
-		let db = Db::open_in_memory().unwrap();
-		let secret_id = db
-			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
-			.unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let secret_id =
+			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		let repo_id = db
 			.with_conn(|c| {
 				Ok(repos::insert(

@@ -224,11 +224,9 @@ mod tests {
 
 	#[test]
 	fn insert_list_and_delete() {
-		let db = Db::open_in_memory().unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
 		let secret_id = db
-			.with_conn(|c| {
-				Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "pat", b"ghp", 0)?)
-			})
+			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "pat", b"ghp", 0)?))
 			.unwrap();
 		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(secret_id), 100)?)).unwrap();
 
@@ -254,11 +252,9 @@ mod tests {
 
 	#[test]
 	fn duplicate_clone_url_is_rejected() {
-		let db = Db::open_in_memory().unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
 		let sid = db
-			.with_conn(|c| {
-				Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "pat", b"ghp", 0)?)
-			})
+			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "pat", b"ghp", 0)?))
 			.unwrap();
 		db.with_conn(|c| Ok(insert(c, &fake_repo(sid), 1)?)).unwrap();
 		let dup = db.with_conn(|c| Ok(insert(c, &fake_repo(sid), 1).is_ok()));
@@ -267,16 +263,15 @@ mod tests {
 
 	#[test]
 	fn delete_missing_returns_false() {
-		let db = Db::open_in_memory().unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
 		assert!(!db.with_conn(|c| Ok(delete(c, 9_999)?)).unwrap());
 	}
 
 	#[test]
 	fn list_due_picks_unscanned_and_overdue_repos() {
-		let db = Db::open_in_memory().unwrap();
-		let sid = db
-			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
-			.unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let sid =
+			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		// Repo A: never scanned, interval=60. Due immediately.
 		let a = NewRepo {
 			clone_url: "https://github.com/a/a.git".into(),
@@ -334,10 +329,9 @@ mod tests {
 
 	#[test]
 	fn update_toggles_disabled_and_changes_interval() {
-		let db = Db::open_in_memory().unwrap();
-		let sid = db
-			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
-			.unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let sid =
+			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(sid), 0)?)).unwrap();
 
 		// Disable.
@@ -393,10 +387,9 @@ mod tests {
 
 	#[test]
 	fn list_due_skips_disabled_repos() {
-		let db = Db::open_in_memory().unwrap();
-		let sid = db
-			.with_conn(|c| Ok(secrets::insert_plaintext(c, SecretKind::GithubPat, "p", b"x", 0)?))
-			.unwrap();
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let sid =
+			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(sid), 0)?)).unwrap();
 		// Originally `fake_repo` has scan_interval=3600 set, so it'd
 		// otherwise be due. Disable it and confirm it drops out.

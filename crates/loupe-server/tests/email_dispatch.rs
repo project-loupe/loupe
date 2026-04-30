@@ -72,7 +72,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	let (sendmail_bin, captured_path) = write_fake_sendmail(scratch.path());
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()]).unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
 
 	let ca = Ca::from_pem(
 		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
@@ -92,7 +92,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), Arc::new(GithubReporter::new().unwrap()))
 		.with_email_reporter(EmailReporter::with_bin(&sendmail_bin));
 	let server = serve(cfg, state).await.unwrap();

@@ -104,7 +104,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 
 	// Stand up loupe-server with a GithubReporter pointed at the stub.
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()]).unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
 
 	let ca = Ca::from_pem(
 		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
@@ -124,12 +124,13 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 		ca_cert_pem: ca_cert_pem.clone(),
 		ca_key_pem,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path).unwrap());
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
-	// Master key turned on so the PAT round-trips through encrypted
-	// storage on the dispatch path.
-	let master_key = loupe_storage::secrets::MasterKey::from_bytes([7u8; 32]);
-	let state = AppState::new(db.clone(), Arc::new(ca), reporter).with_master_key(master_key);
+	// SQLCipher seals the whole DB under `init.master_key`; the dispatch
+	// path therefore reads / decrypts the PAT transparently. The
+	// "raw bytes don't appear in the file" assertion lives in
+	// `loupe-storage`'s `db.rs` test, not here.
+	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();
 	let addr = server.local_addr;
 
@@ -228,19 +229,14 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 		.unwrap();
 	assert_eq!(reported_count, 1);
 
-	// Storage check: the PAT must be at record_version=2 (encrypted),
-	// and the on-disk ciphertext column must NOT contain the plaintext.
-	let (rv, ct): (i64, Vec<u8>) = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT record_version, ciphertext FROM secrets LIMIT 1", [], |r| {
-				Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-			})?)
-		})
-		.unwrap();
-	assert_eq!(rv, 2, "secret must be encrypted at rest");
+	// On-disk encryption check: the SQLCipher-sealed file must not
+	// contain the PAT in the clear. (The DAO-level "raw .sqlite is
+	// ciphertext" guarantee is also tested in `loupe-storage::db`
+	// tests; this one proves it survives a real dispatch path.)
+	let raw = std::fs::read(&init.layout.db_path).unwrap();
 	assert!(
-		!ct.windows(b"ghp_test_pat_value".len()).any(|w| w == b"ghp_test_pat_value"),
-		"plaintext PAT must not survive in ciphertext column"
+		!raw.windows(b"ghp_test_pat_value".len()).any(|w| w == b"ghp_test_pat_value"),
+		"plaintext PAT must not survive in the encrypted db file"
 	);
 
 	server.shutdown().await;
