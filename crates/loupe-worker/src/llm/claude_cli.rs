@@ -58,7 +58,32 @@ impl LlmBackend for ClaudeCliBackend {
 			"claude-cli: invoking",
 		);
 		let started = std::time::Instant::now();
-		let mut cmd = SandboxBuilder::new(&req.workdir).allow_network().build(&self.bin);
+
+		let mut sandbox = SandboxBuilder::new(&req.workdir)
+			.allow_network()
+			// Make the `claude` install reachable — by default the
+			// sandbox only mounts /usr, /etc, /lib*, /bin, /sbin, so
+			// per-user installs at ~/.local/bin/... are invisible
+			// without this.
+			.allow_binary(&self.bin)
+			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
+			// Forward auth: ANTHROPIC_API_KEY for env-based auth, plus
+			// any user-managed login state under ~/.claude/* which
+			// `claude /login` writes to.
+			.forward_env("ANTHROPIC_API_KEY");
+		if let Some(home) = std::env::var_os("HOME") {
+			let host_home = std::path::PathBuf::from(home);
+			let claude_dir = host_home.join(".claude");
+			let claude_json = host_home.join(".claude.json");
+			// Sandbox $HOME is /home/scanner; map the operator's
+			// claude state into the equivalent paths there. `--ro-bind-try`
+			// (used inside SandboxBuilder) makes missing sources a
+			// no-op, so a host without these files just skips.
+			sandbox = sandbox
+				.bind_ro(claude_dir, "/home/scanner/.claude")
+				.bind_ro(claude_json, "/home/scanner/.claude.json");
+		}
+		let mut cmd = sandbox.build(&self.bin);
 		cmd.arg("--dangerously-skip-permissions").arg("-p").arg(&req.prompt);
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -154,11 +179,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn cli_backend_round_trip_against_real_claude() {
-		// Live test: needs both `claude` and `bwrap` on PATH. Skips
-		// otherwise. Asks Claude a tiny deterministic question and
-		// confirms we get *some* non-empty response back.
+		// Live test: needs `claude` + `bwrap` + an `ANTHROPIC_API_KEY`
+		// in env. The API-key requirement is because the sandbox
+		// mounts `~/.claude` read-only, so OAuth-based logins (which
+		// expect to write back token-refresh state) can fail. Env-
+		// based auth has no write path and works cleanly.
 		if !claude_present("claude") || !bwrap_present() {
 			eprintln!("skipping: claude or bwrap missing");
+			return;
+		}
+		if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
+			eprintln!(
+				"skipping: no ANTHROPIC_API_KEY in env (sandbox blocks OAuth refresh writes)"
+			);
 			return;
 		}
 

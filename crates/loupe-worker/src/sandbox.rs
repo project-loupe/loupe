@@ -55,6 +55,12 @@ pub struct SandboxBuilder {
 	workdir: PathBuf,
 	allow_network: bool,
 	disabled: bool,
+	/// Caller-supplied read-only bind mounts (host path, sandbox
+	/// path). Populated by [`bind_ro`] and [`allow_binary`].
+	extra_ro_binds: Vec<(PathBuf, PathBuf)>,
+	/// Env vars to forward into the sandbox by name (the value is
+	/// looked up from the worker's own env at `build()` time).
+	forward_env: Vec<&'static str>,
 }
 
 impl SandboxBuilder {
@@ -62,7 +68,13 @@ impl SandboxBuilder {
 	/// mounted read-only into the sandbox at `/workdir`.
 	pub fn new(workdir: impl Into<PathBuf>) -> Self {
 		let disabled = std::env::var_os(DISABLE_SANDBOX_ENV).is_some_and(|v| !v.is_empty());
-		Self { workdir: workdir.into(), allow_network: false, disabled }
+		Self {
+			workdir: workdir.into(),
+			allow_network: false,
+			disabled,
+			extra_ro_binds: Vec::new(),
+			forward_env: Vec::new(),
+		}
 	}
 
 	/// Permit outbound network. Used by LLM backends that need to reach
@@ -71,6 +83,58 @@ impl SandboxBuilder {
 	pub fn allow_network(mut self) -> Self {
 		self.allow_network = true;
 		self
+	}
+
+	/// Bind-mount `src` (a path on the host) read-only at `dst` (a path
+	/// inside the sandbox). The two can be equal — that's the common
+	/// case when surfacing a host install directly.
+	pub fn bind_ro(mut self, src: impl Into<PathBuf>, dst: impl Into<PathBuf>) -> Self {
+		self.extra_ro_binds.push((src.into(), dst.into()));
+		self
+	}
+
+	/// Forward an env var into the sandbox. The value is looked up
+	/// from the worker's own environment at `build()` time. Use for
+	/// things like `ANTHROPIC_API_KEY` that the agent reads to
+	/// authenticate.
+	pub fn forward_env(mut self, name: &'static str) -> Self {
+		self.forward_env.push(name);
+		self
+	}
+
+	/// Locate `name` on the host PATH and bind-mount the install tree
+	/// into the sandbox so the wrapped subprocess can `exec` it. The
+	/// default sandbox only mounts `/usr`, `/etc`, `/lib`, `/lib64`,
+	/// `/bin`, `/sbin` — anything installed in `~/.local/bin` (per-
+	/// user installs, npm-global with non-root prefix, etc.) is
+	/// invisible to the wrapped subprocess unless this method is
+	/// called.
+	///
+	/// Resolves the entry point on PATH, follows the symlink chain
+	/// to its canonical real path, and bind-mounts both the entry
+	/// point and the canonical install directory read-only. That
+	/// covers the common shape (a `~/.local/bin/foo` symlink into
+	/// `~/.local/share/foo/...`) without any binary-specific
+	/// knowledge.
+	pub fn allow_binary(self, name: &str) -> Result<Self> {
+		let original =
+			locate_on_path(name).ok_or_else(|| anyhow::anyhow!("`{name}` not found on PATH"))?;
+		let canonical = std::fs::canonicalize(&original)
+			.with_context(|| format!("canonicalizing {}", original.display()))?;
+		let mut this = self.bind_ro(original.clone(), original);
+		// If the canonical resolves to a file, mount its parent so
+		// sibling deps (node_modules, libexec/, etc.) come along. If
+		// it's a directory, mount the directory itself.
+		let install_dir = if canonical.is_dir() {
+			canonical
+		} else {
+			canonical
+				.parent()
+				.ok_or_else(|| anyhow::anyhow!("canonical path has no parent"))?
+				.to_path_buf()
+		};
+		this = this.bind_ro(install_dir.clone(), install_dir);
+		Ok(this)
 	}
 
 	/// Build a `Command` for `program`. The command runs inside the
@@ -106,6 +170,14 @@ impl SandboxBuilder {
 
 		cmd.args(["--proc", "/proc", "--dev", "/dev"]);
 
+		// Caller-supplied read-only binds (binary install dirs, agent
+		// config dirs, etc.). Use `--ro-bind-try` so a missing src
+		// path is a no-op rather than a fatal — handy when binding an
+		// optional auth dir that may or may not exist on every host.
+		for (src, dst) in &self.extra_ro_binds {
+			cmd.arg("--ro-bind-try").arg(src).arg(dst);
+		}
+
 		// Worktree: read-only.
 		cmd.arg("--ro-bind").arg(&self.workdir).arg("/workdir");
 		cmd.args(["--chdir", "/workdir"]);
@@ -114,6 +186,13 @@ impl SandboxBuilder {
 		cmd.args(["--tmpfs", "/tmp", "--tmpfs", "/home/scanner"]);
 		cmd.args(["--setenv", "HOME", "/home/scanner"]);
 		cmd.args(["--setenv", "TMPDIR", "/tmp"]);
+
+		// Forwarded env vars. Skip those that aren't set on the host.
+		for name in &self.forward_env {
+			if let Some(value) = std::env::var_os(name) {
+				cmd.arg("--setenv").arg(name).arg(value);
+			}
+		}
 
 		cmd.arg("--").arg(program);
 		cmd
@@ -130,6 +209,21 @@ impl SandboxBuilder {
 		}
 		cmd
 	}
+}
+
+/// PATH walk: return the first existing executable file matching
+/// `name`. Mirrors what `execvp` would do — used by
+/// [`SandboxBuilder::allow_binary`] to discover the host install of
+/// an agent CLI without pulling in a `which`-style dep.
+fn locate_on_path(name: &str) -> Option<PathBuf> {
+	let path = std::env::var_os("PATH")?;
+	for dir in std::env::split_paths(&path) {
+		let candidate = dir.join(name);
+		if candidate.is_file() {
+			return Some(candidate);
+		}
+	}
+	None
 }
 
 /// Validate that the host can run `bwrap` *with its full mount layout*,

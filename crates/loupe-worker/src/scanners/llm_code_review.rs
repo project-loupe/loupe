@@ -199,13 +199,50 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting discovery"
 		);
 
-		let discovered = self.discover_all(&cfg, &ctx.workdir, &files, &ctx.cancel).await;
+		let (discovered, discovery_errors) =
+			self.discover_all(&cfg, &ctx.workdir, &files, &ctx.cancel).await;
+		// Hard-fail when every discovery call errored. Without this, an
+		// LLM scanner that's completely broken (sandbox can't reach the
+		// CLI, auth missing, network blocked) silently completes as
+		// "succeeded with 0 findings", which an operator can't tell
+		// apart from "this is a clean repo." Parse failures count as
+		// successes here (the call ran, the model just said nothing
+		// usable) — only backend / sandbox errors fail the scan.
+		if discovery_errors > 0 && discovery_errors == files.len() {
+			anyhow::bail!(
+				"llm-code-review: every one of {n} discovery calls errored; \
+				 check worker logs for the underlying error (`RUST_LOG=loupe_worker=debug` \
+				 surfaces the per-call failures)",
+				n = files.len(),
+			);
+		}
+		if discovery_errors > 0 {
+			tracing::warn!(
+				errored = discovery_errors,
+				total = files.len(),
+				"llm-code-review: some discovery calls errored",
+			);
+		}
 		// Dedup slot: no-op for now. When server-side prior-findings
 		// arrive (see LOUPE.md), this is where we'd drop matches.
 		let after_dedup = discovered;
 		tracing::info!(candidates = after_dedup.len(), "llm-code-review entering validation");
 
-		let validated = self.validate_all(&cfg, &ctx.workdir, after_dedup, &ctx.cancel).await;
+		let n_candidates = after_dedup.len();
+		let (validated, validation_errors) =
+			self.validate_all(&cfg, &ctx.workdir, after_dedup, &ctx.cancel).await;
+		// Same fail-loud logic for validation, gated on the candidate
+		// count so a zero-candidate run (clean repo) doesn't trip it.
+		if validation_errors > 0 && validation_errors == n_candidates {
+			anyhow::bail!("llm-code-review: every one of {n_candidates} validation calls errored",);
+		}
+		if validation_errors > 0 {
+			tracing::warn!(
+				errored = validation_errors,
+				total = n_candidates,
+				"llm-code-review: some validation calls errored",
+			);
+		}
 		tracing::info!(emitted = validated.len(), "llm-code-review finished");
 
 		Ok(validated.into_iter().map(|v| build_finding(&self.backend, v, &ctx.head_sha)).collect())
@@ -233,9 +270,14 @@ struct Validated {
 }
 
 impl LlmCodeReviewScanner {
+	/// Returns `(discovered, error_count)`. `error_count` is the number
+	/// of per-file backend / sandbox call errors — distinct from
+	/// "call succeeded but the model returned no finding" (which
+	/// counts as a success). The caller fails the scan loud if every
+	/// attempt errored.
 	async fn discover_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], cancel: &CancellationToken,
-	) -> Vec<Discovered> {
+	) -> (Vec<Discovered>, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
@@ -255,20 +297,27 @@ impl LlmCodeReviewScanner {
 		}
 
 		let mut out = Vec::new();
+		let mut errors = 0usize;
 		for h in handles {
 			match h.await {
-				Ok(Some(d)) => out.push(d),
-				Ok(None) => {},
-				Err(e) => tracing::warn!(error = %e, "discovery task panicked"),
+				Ok(Ok(Some(d))) => out.push(d),
+				Ok(Ok(None)) => {},
+				Ok(Err(())) => errors += 1,
+				Err(e) => {
+					tracing::warn!(error = %e, "discovery task panicked");
+					errors += 1;
+				},
 			}
 		}
-		out
+		(out, errors)
 	}
 
+	/// Returns `(validated, error_count)`. Same semantics as
+	/// `discover_all` for the error count.
 	async fn validate_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, discovered: Vec<Discovered>,
 		cancel: &CancellationToken,
-	) -> Vec<Validated> {
+	) -> (Vec<Validated>, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(discovered.len());
 		for d in discovered {
@@ -286,14 +335,19 @@ impl LlmCodeReviewScanner {
 			}));
 		}
 		let mut out = Vec::new();
+		let mut errors = 0usize;
 		for h in handles {
 			match h.await {
-				Ok(Some(v)) => out.push(v),
-				Ok(None) => {},
-				Err(e) => tracing::warn!(error = %e, "validation task panicked"),
+				Ok(Ok(Some(v))) => out.push(v),
+				Ok(Ok(None)) => {},
+				Ok(Err(())) => errors += 1,
+				Err(e) => {
+					tracing::warn!(error = %e, "validation task panicked");
+					errors += 1;
+				},
 			}
 		}
-		out
+		(out, errors)
 	}
 }
 
@@ -303,10 +357,16 @@ impl LlmCodeReviewScanner {
 /// drown the terminal.
 const RESPONSE_PREVIEW_CHARS: usize = 240;
 
+/// `Ok(Some(_))` = call ran, model produced a valid finding.
+/// `Ok(None)` = call ran, model said "no finding here" (or output was
+/// unparseable — we lump unparseable in with "no finding" because the
+/// call itself worked, the model just emitted garbage). `Err(())` =
+/// the backend / sandbox / network call itself failed; the caller
+/// counts these and fails the scan if every attempt errors.
 async fn discover_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig,
 	cancel: CancellationToken,
-) -> Option<Discovered> {
+) -> Result<Option<Discovered>, ()> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
 	let prompt = prompts::render(DISCOVERY, &[("file", &rel)]);
 	tracing::info!(file = %rel, "llm-code-review: running discovery");
@@ -321,7 +381,7 @@ async fn discover_one(
 		Ok(r) => r,
 		Err(e) => {
 			tracing::warn!(file = %rel, error = %e, "discovery call failed");
-			return None;
+			return Err(());
 		},
 	};
 	tracing::debug!(
@@ -331,13 +391,13 @@ async fn discover_one(
 		preview = %resp.text.chars().take(RESPONSE_PREVIEW_CHARS).collect::<String>(),
 		"discovery response",
 	);
-	parse_discovery(&resp, &rel)
+	Ok(parse_discovery(&resp, &rel))
 }
 
 async fn validate_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, d: Discovered, cfg: &ScannerConfig,
 	cancel: CancellationToken,
-) -> Option<Validated> {
+) -> Result<Option<Validated>, ()> {
 	let finding_json = serde_json::json!({
 		"severity": d.severity.as_str(),
 		"title": d.title,
@@ -363,7 +423,7 @@ async fn validate_one(
 		Ok(r) => r,
 		Err(e) => {
 			tracing::warn!(file = %d.file, error = %e, "validation call failed");
-			return None;
+			return Err(());
 		},
 	};
 	tracing::debug!(
@@ -373,7 +433,7 @@ async fn validate_one(
 		preview = %resp.text.chars().take(RESPONSE_PREVIEW_CHARS).collect::<String>(),
 		"validation response",
 	);
-	parse_validation(&resp, d)
+	Ok(parse_validation(&resp, d))
 }
 
 #[derive(Debug, Deserialize)]
