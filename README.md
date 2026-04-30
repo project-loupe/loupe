@@ -52,11 +52,24 @@ Before installing, the host needs:
 - **`/usr/sbin/sendmail`** on the *server* host, only if you intend to
   use the email reporter. The GitHub-issue reporter has no extra
   prereq beyond outbound HTTPS to `api.github.com`.
-- **A GitHub personal access token** with `Issues: write` scope on
-  every target tracker repo, only if you intend to use the
-  GitHub-issue reporter. Tokens are stored encrypted at rest when
-  `LOUPE_MASTER_KEY` is set on the server (see below); plaintext
-  otherwise, with a startup warning.
+- **A GitHub personal access token** for each target tracker repo,
+  only if you intend to use the GitHub-issue reporter. The token is
+  used by the server to call `POST /repos/{owner}/{repo}/issues`, so
+  it needs scope to file issues on the *tracker* repo (not the source
+  repo being scanned — those can be different). Required scopes:
+  - **Fine-grained PAT** (recommended): repository access scoped to
+    the tracker repo, with the **Issues** permission set to
+    *Read and write*.
+  - **Classic PAT**: the `repo` scope. (`public_repo` is enough if
+    the tracker repo is public.)
+  PATs are stored in the `secrets` table. With
+  `LOUPE_MASTER_KEY` set on the server (a base64-encoded 32-byte
+  key), each row is sealed with `ChaCha20Poly1305` under a
+  per-row random 12-byte nonce, so an attacker reading the SQLite
+  file off disk cannot recover the token. Without
+  `LOUPE_MASTER_KEY` the token is stored as plaintext and the
+  server logs a startup warning — fine for local development, not
+  for shared hosts.
 
 ## Building
 
@@ -166,6 +179,15 @@ clones above the cap.
 
 ### 6. Register a repo and trigger a scan
 
+The `--pat` value here is the GitHub PAT you minted in the
+prerequisites: a fine-grained token with **Issues: Read and write**
+on the *tracker* repo, or a classic token with the `repo` scope.
+Pass it via the `LOUPE_TRACKER_PAT` env var rather than as a
+positional flag so it doesn't end up in shell history. The server
+encrypts it at rest with the master key (see prerequisites) before
+persisting; the plaintext PAT never travels back out of the server in
+any response.
+
 ```
 export LOUPE_TRACKER_PAT=ghp_xxx_with_issues_write_scope
 
@@ -181,8 +203,9 @@ loupectl repo scan 1                 # one-shot scan of repo id 1
 ```
 
 Confirmed findings dispatch automatically — the GitHub reporter
-posts to `https://api.github.com/repos/acme/widget-security/issues`
-and stamps `reported_at` on the row.
+loads the PAT from the secrets table, decrypts it with the in-memory
+master key, and posts to `https://api.github.com/repos/acme/widget-security/issues`,
+stamping `reported_at` on the finding row.
 
 ### 7. Inspect what happened
 
