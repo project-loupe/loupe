@@ -116,11 +116,13 @@ A finding's journey from "agent saw something" to "human looked at it":
                   │                      │
                   ▼                      │
    ┌─────────────────────────────────┐   │
-   │ dedup pass:                     │   │
-   │   stage 1 (fingerprint pre-     │   │
-   │      filter, deterministic)     │   │   dedup (stage 1 shipped;
-   │   stage 2 (LLM semantic dedup   │   │    stage 2 lands w/ MCP)
-   │      via query_prior_findings)  │   │
+   │ dedup pass (both layers active):│   │
+   │   stage 1: compute fingerprint, │   │
+   │     POST known-fingerprints,    │   │   dedup
+   │     drop matches (deterministic)│   │
+   │   stage 2: model self-suppress  │   │
+   │     via query_prior_findings    │   │
+   │     during DISCOVERY (semantic) │   │
    └─────────────────────────────────┘   │
                   │                      │
                   ▼                      │

@@ -285,6 +285,33 @@ loupectl finding search <repo-id> "<keywords>"  # FTS5 keyword search
 MCP tool `query_prior_findings` calls the same endpoint, so the
 agent can ask "have we seen anything like this before?" mid-scan.
 
+#### Continuous scans
+
+When you set `--scan-interval-seconds`, loupe runs the scan periodically
+without operator intervention. Two automatic dedup layers keep
+re-scans cheap:
+
+- **Hash dedup (free):** between discovery and validation, the worker
+  computes the candidate fingerprint
+  `(scanner_id, file, normalized_content_window)` and asks the
+  server "do you already have this?". Matches skip the validation
+  LLM call entirely. So if yesterday's scan validated a finding and
+  today's scan re-discovers it on unchanged code, today pays one
+  discovery call (cheap) and zero validation calls (the expensive
+  ones). Survives `cargo fmt`-style cosmetic edits because the hash
+  normalises whitespace and case.
+- **Semantic dedup (LLM-driven):** the discovery prompt tells the
+  agent it has the `query_prior_findings` MCP tool and asks it to
+  return `{"found": false}` when a clear prior match exists. Catches
+  paraphrases, refactor-shifted bugs (function moved to a different
+  file), and re-named functions that the hash inevitably misses.
+  Conservative — only suppresses on a clear match.
+
+If you want to verify dedup is working: run `loupectl repo scan <id>`
+twice in a row, look at the second job's worker logs for
+`llm-code-review: dedup skipped N/M candidates that hash-match prior
+findings`.
+
 ### 8. Adjust an existing repo
 
 ```
