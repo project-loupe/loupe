@@ -26,9 +26,17 @@
 //!   to `/v1/jobs/{job_id}/findings`. Only registered when the
 //!   worker passed `--job-id` at MCP-server start; without a job
 //!   id, there's nowhere to attribute submissions to.
+//! - `validate_poc(poc_unified)` — pre-flight check for the PoC
+//!   diff the agent is about to attach to a `submit_finding` call.
+//!   Runs `git apply --check` against the worktree (`--workdir`)
+//!   without writing anything; returns `{applies, error?}`. Use it
+//!   to catch path drift, fuzzy-context failures, and malformed
+//!   diff hunks before submission so we don't store a finding whose
+//!   "regression test" doesn't actually apply.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -36,6 +44,7 @@ use loupe_core::{Finding, Severity};
 use loupe_proto::{FindingsBatch, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 
 use crate::scanners::llm_code_review::SCANNER_ID;
 use crate::ServerClient;
@@ -318,6 +327,33 @@ fn tool_definitions(submissions_enabled: bool) -> Value {
 			},
 		}));
 	}
+	// Always-on, read-only against the worktree. Useful even when
+	// submission is disabled (e.g. the agent might validate a diff
+	// for diagnostics) — and harmless to advertise either way since
+	// `git apply --check` doesn't write.
+	tools.push(json!({
+		"name": "validate_poc",
+		"description":
+			"Pre-flight check for a PoC unified diff. Runs `git apply --check` against the \
+			 worktree without writing anything; returns `applies: true` when the diff would \
+			 cleanly apply, or `applies: false` with `error` carrying git's stderr (typically \
+			 'corrupt patch', 'patch does not apply', fuzz/context warnings, or missing-file \
+			 messages). Use this before calling `submit_finding` to catch path drift, fuzzy \
+			 context, and malformed hunks — a finding whose PoC doesn't apply is a finding \
+			 someone has to reproduce by hand.",
+		"inputSchema": {
+			"type": "object",
+			"required": ["poc_unified"],
+			"properties": {
+				"poc_unified": {
+					"type": "string",
+					"description":
+						"Unified diff to check, in `git diff` format with `a/`/`b/` prefixes. \
+						 Same string you'd pass as `submit_finding`'s `poc_unified`.",
+				},
+			},
+		},
+	}));
 	Value::Array(tools)
 }
 
@@ -335,6 +371,7 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 		},
 		"get_finding_by_id" => tool_get_finding_by_id(&session.client, &arguments).await,
 		"submit_finding" => tool_submit_finding(session, &arguments).await,
+		"validate_poc" => tool_validate_poc(&session.workdir, &arguments).await,
 		other => Err(anyhow::anyhow!("unknown tool: {other}")),
 	};
 
@@ -529,6 +566,77 @@ async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<Str
 	))
 }
 
+async fn tool_validate_poc(workdir: &Path, args: &Value) -> Result<String> {
+	let diff = args
+		.get("poc_unified")
+		.and_then(|v| v.as_str())
+		.context("`poc_unified` is required and must be a string")?;
+
+	let outcome = check_diff_applies(workdir, diff).await?;
+	let payload = match outcome {
+		DiffCheck::Applies => json!({
+			"applies": true,
+			"message": "git apply --check accepted the diff",
+		}),
+		DiffCheck::Rejects { stderr } => json!({
+			"applies": false,
+			"error": stderr,
+		}),
+	};
+	// Tools return a string `text` per MCP convention; serialise the
+	// JSON payload so the agent gets a structured-looking response.
+	Ok(serde_json::to_string(&payload).expect("payload serialises"))
+}
+
+#[derive(Debug)]
+enum DiffCheck {
+	Applies,
+	Rejects { stderr: String },
+}
+
+/// Run `git apply --check` against `workdir`, feeding `diff` over
+/// stdin. `--check` does not modify the worktree, only verifies that
+/// the diff would apply — safe to run against the read-only bwrap
+/// mount. Errors here are infrastructure-level (couldn't spawn git);
+/// a clean "this diff doesn't apply" is a `DiffCheck::Rejects`.
+async fn check_diff_applies(workdir: &Path, diff: &str) -> Result<DiffCheck> {
+	let mut child = tokio::process::Command::new("git")
+		.arg("apply")
+		.arg("--check")
+		// Read the diff from stdin via the conventional `-` filename.
+		.arg("-")
+		.current_dir(workdir)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.context("spawning `git apply --check`")?;
+	{
+		let mut stdin = child.stdin.take().context("git apply stdin already taken")?;
+		stdin.write_all(diff.as_bytes()).await.context("writing diff to git apply stdin")?;
+		stdin.shutdown().await.ok();
+	}
+	let output = child.wait_with_output().await.context("waiting on git apply")?;
+	if output.status.success() {
+		Ok(DiffCheck::Applies)
+	} else {
+		// Cap stderr — pathological diffs can produce many lines and we
+		// want to leave room in the agent's tool-result for surrounding
+		// reasoning. 4 KiB is plenty for a "patch doesn't apply at line
+		// N" message; longer diagnostics get truncated.
+		let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+		const MAX_STDERR: usize = 4096;
+		if stderr.len() > MAX_STDERR {
+			stderr.truncate(MAX_STDERR);
+			stderr.push_str("\n…(truncated)");
+		}
+		if stderr.trim().is_empty() {
+			stderr = format!("git apply exited {}", output.status);
+		}
+		Ok(DiffCheck::Rejects { stderr })
+	}
+}
+
 /// Read `workdir/file` and compute the fingerprint for the bug at
 /// `line_start..=line_end`. Falls back to a degenerate-but-safe input
 /// when the file can't be read (model hallucinated a path, file is
@@ -704,5 +812,96 @@ mod tests {
 		});
 		let err = build_finding_from_args(workdir.path(), &args).expect_err("must fail");
 		assert!(err.to_string().to_lowercase().contains("severity"), "got: {err}");
+	}
+
+	fn git_present() -> bool {
+		std::process::Command::new("git")
+			.arg("--version")
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status()
+			.map(|s| s.success())
+			.unwrap_or(false)
+	}
+
+	#[tokio::test]
+	async fn validate_poc_accepts_a_clean_diff() {
+		// `git apply --check` works outside a `.git` repo as long as it
+		// can find the file — set up a worktree without a `.git` so
+		// the test mirrors the runner's checkout-tree shape (we
+		// extract a tree, no .git is created).
+		if !git_present() {
+			eprintln!("skipping: git not on PATH");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		std::fs::write(workdir.path().join("hello.txt"), "hello\nworld\n").unwrap();
+		let diff = concat!(
+			"diff --git a/hello.txt b/hello.txt\n",
+			"--- a/hello.txt\n",
+			"+++ b/hello.txt\n",
+			"@@ -1,2 +1,3 @@\n",
+			" hello\n",
+			"+greetings\n",
+			" world\n",
+		);
+		let args = json!({ "poc_unified": diff });
+		let result = tool_validate_poc(workdir.path(), &args).await.expect("tool ok");
+		let parsed: Value = serde_json::from_str(&result).expect("json");
+		assert_eq!(parsed["applies"], json!(true), "expected applies=true, got: {parsed}");
+	}
+
+	#[tokio::test]
+	async fn validate_poc_rejects_a_diff_against_missing_file() {
+		if !git_present() {
+			eprintln!("skipping: git not on PATH");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		// Don't create any source file. The diff references a file
+		// that doesn't exist in workdir.
+		let diff = "\
+--- a/nonexistent.txt\n\
++++ b/nonexistent.txt\n\
+@@ -1,1 +1,2 @@\n\
+ line\n\
++added\n\
+";
+		let args = json!({ "poc_unified": diff });
+		let result = tool_validate_poc(workdir.path(), &args).await.expect("tool ok");
+		let parsed: Value = serde_json::from_str(&result).expect("json");
+		assert_eq!(parsed["applies"], json!(false), "expected applies=false");
+		let err = parsed["error"].as_str().unwrap_or("");
+		assert!(!err.is_empty(), "must include git stderr: {parsed}");
+	}
+
+	#[tokio::test]
+	async fn validate_poc_rejects_corrupt_diff() {
+		if !git_present() {
+			eprintln!("skipping: git not on PATH");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		let args = json!({ "poc_unified": "this is not a unified diff" });
+		let result = tool_validate_poc(workdir.path(), &args).await.expect("tool ok");
+		let parsed: Value = serde_json::from_str(&result).expect("json");
+		assert_eq!(parsed["applies"], json!(false));
+	}
+
+	#[test]
+	fn validate_poc_is_advertised_regardless_of_submissions_setting() {
+		// Even when --job-id is omitted we keep validate_poc on the
+		// list — it's read-only against the worktree and useful for
+		// diagnostics. Pinned because future "tighten the surface"
+		// refactors might be tempted to gate it.
+		for enabled in [true, false] {
+			let v = tool_definitions(enabled);
+			let names: Vec<&str> =
+				v.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
+			assert!(
+				names.contains(&"validate_poc"),
+				"submissions_enabled={enabled}, got: {names:?}"
+			);
+		}
 	}
 }

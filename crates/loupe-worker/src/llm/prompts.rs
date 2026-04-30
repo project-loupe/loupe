@@ -35,6 +35,11 @@ You have these MCP tools available (provided by the loupe MCP server):
   description, poc_unified, cwe?)` — the **only** way to report a
   finding. The worker does not parse your text response. If you don't
   call this tool, no finding is emitted.
+- `validate_poc(poc_unified)` — pre-flight your PoC diff: runs
+  `git apply --check` against the worktree without writing anything
+  and returns `{applies, error?}`. Call this before `submit_finding`;
+  if `applies: false`, fix the diff and re-check. A finding whose PoC
+  doesn't apply wastes everyone's time downstream.
 
 Your workflow:
 
@@ -50,7 +55,9 @@ Your workflow:
    framework (`#[test]` for Rust, `pytest` for Python, etc.). The diff
    must be applicable with `git apply` against the worktree as it
    stands.
-5. Call `submit_finding` once with the full report (severity, title,
+5. Call `validate_poc` to check that your diff applies cleanly. If it
+   doesn't, revise the diff and re-check.
+6. Call `submit_finding` once with the full report (severity, title,
    location, description, your PoC diff, CWE if known).
 
 Constraints:
