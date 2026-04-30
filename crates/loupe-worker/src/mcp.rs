@@ -61,6 +61,42 @@ const SERVER_VERSION: &str = "0.1.0";
 /// staying narrow enough that touching the bug body shifts it.
 const FINGERPRINT_CONTEXT_LINES: u32 = 2;
 
+/// Pull a required string argument out of an MCP `tools/call` payload.
+/// Compresses the `args.get(k).and_then(as_str).context(...)` triplet
+/// repeated across every tool handler.
+fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+	args.get(key)
+		.and_then(|v| v.as_str())
+		.with_context(|| format!("`{key}` argument is required and must be a string"))
+}
+
+/// Pull a required positive `u32` argument out of an MCP `tools/call`
+/// payload. Saturates at `u32::MAX` so a model that emits an absurdly
+/// large line number doesn't poison downstream arithmetic — line
+/// counts are 1-indexed and capped well below 4 billion in any real
+/// source file.
+fn arg_u32(args: &Value, key: &str) -> Result<u32> {
+	let v = args
+		.get(key)
+		.and_then(|v| v.as_u64())
+		.with_context(|| format!("`{key}` argument is required and must be a positive integer"))?;
+	Ok(v.min(u32::MAX as u64) as u32)
+}
+
+/// Format a finding's location as `path:line[-end]` for human display
+/// in MCP tool text output. Used for both `query_prior_findings`
+/// summaries (which lack `line_end`) and `get_finding_by_id` detail
+/// views — `line_end` is only rendered when it strictly exceeds
+/// `line_start` to keep "1:5-5" out of the output.
+fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option<u32>) -> String {
+	match (path, line_start, line_end) {
+		(Some(p), Some(s), Some(e)) if e > s => format!("{p}:{s}-{e}"),
+		(Some(p), Some(s), _) => format!("{p}:{s}"),
+		(Some(p), None, _) => p.to_owned(),
+		_ => "(no location)".into(),
+	}
+}
+
 /// Per-call session state that flows into every tool handler. Built
 /// once at `run_stdio_server` start from CLI args; never mutated.
 struct Session {
@@ -101,6 +137,21 @@ struct Response {
 	error: Option<RpcError>,
 }
 
+impl Response {
+	fn ok(id: Value, result: Value) -> Self {
+		Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+	}
+
+	fn err(id: Value, code: i64, message: impl Into<String>) -> Self {
+		Self {
+			jsonrpc: "2.0",
+			id,
+			result: None,
+			error: Some(RpcError { code, message: message.into(), data: None }),
+		}
+	}
+}
+
 #[derive(Debug, Serialize)]
 struct RpcError {
 	code: i64,
@@ -133,17 +184,10 @@ pub async fn run_stdio_server(
 		let request: Request = match serde_json::from_str(&line) {
 			Ok(r) => r,
 			Err(e) => {
-				let err = Response {
-					jsonrpc: "2.0",
-					id: Value::Null,
-					result: None,
-					error: Some(RpcError {
-						code: -32700,
-						message: format!("parse error: {e}"),
-						data: None,
-					}),
-				};
-				write_response(&mut stdout, &err)?;
+				write_response(
+					&mut stdout,
+					&Response::err(Value::Null, -32700, format!("parse error: {e}")),
+				)?;
 				continue;
 			},
 		};
@@ -160,37 +204,21 @@ pub async fn run_stdio_server(
 
 async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Response {
 	match req.method.as_str() {
-		"initialize" => Response {
-			jsonrpc: "2.0",
+		"initialize" => Response::ok(
 			id,
-			result: Some(json!({
+			json!({
 				"protocolVersion": "2024-11-05",
 				"capabilities": { "tools": { "listChanged": false } },
 				"serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-			})),
-			error: None,
-		},
-		"tools/list" => Response {
-			jsonrpc: "2.0",
-			id,
-			result: Some(json!({ "tools": tool_definitions(session.job_id.is_some()) })),
-			error: None,
+			}),
+		),
+		"tools/list" => {
+			Response::ok(id, json!({ "tools": tool_definitions(session.job_id.is_some()) }))
 		},
 		"tools/call" => handle_tool_call(session, req, id).await,
 		// Common no-op MCP notifications/requests we just ack.
-		"notifications/initialized" | "ping" => {
-			Response { jsonrpc: "2.0", id, result: Some(json!({})), error: None }
-		},
-		other => Response {
-			jsonrpc: "2.0",
-			id,
-			result: None,
-			error: Some(RpcError {
-				code: -32601,
-				message: format!("method not found: {other}"),
-				data: None,
-			}),
-		},
+		"notifications/initialized" | "ping" => Response::ok(id, json!({})),
+		other => Response::err(id, -32601, format!("method not found: {other}")),
 	}
 }
 
@@ -376,26 +404,19 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 	};
 
 	match result {
-		Ok(text) => Response {
-			jsonrpc: "2.0",
-			id,
-			result: Some(json!({ "content": [{ "type": "text", "text": text }] })),
-			error: None,
-		},
+		Ok(text) => Response::ok(id, json!({ "content": [{ "type": "text", "text": text }] })),
 		Err(e) => {
 			tracing::warn!(tool = tool_name, error = %e, "loupe-mcp: tool call failed");
-			Response {
-				jsonrpc: "2.0",
+			// MCP convention: tool errors flow through `result` with
+			// `isError: true`, not the JSON-RPC `error` field (which
+			// is reserved for protocol-level failures).
+			Response::ok(
 				id,
-				// MCP convention: tool errors flow through `result`
-				// with `isError: true`, not the JSON-RPC `error` field
-				// (which is reserved for protocol-level failures).
-				result: Some(json!({
+				json!({
 					"content": [{ "type": "text", "text": format!("Error: {e}") }],
 					"isError": true,
-				})),
-				error: None,
-			}
+				}),
+			)
 		},
 	}
 }
@@ -407,12 +428,7 @@ async fn tool_get_finding_by_id(client: &Arc<ServerClient>, args: &Value) -> Res
 		.context("`id` argument is required and must be an integer")?;
 	let detail =
 		client.get_finding(id).await.with_context(|| format!("calling /v1/findings/{id}"))?;
-	let loc = match (detail.file_path.as_deref(), detail.line_start, detail.line_end) {
-		(Some(p), Some(s), Some(e)) if e > s => format!("{p}:{s}-{e}"),
-		(Some(p), Some(s), _) => format!("{p}:{s}"),
-		(Some(p), None, _) => p.to_owned(),
-		_ => "(no location)".into(),
-	};
+	let loc = format_location(detail.file_path.as_deref(), detail.line_start, detail.line_end);
 	let mut out = String::with_capacity(detail.description.len() + 256);
 	let _ = std::fmt::Write::write_fmt(
 		&mut out,
@@ -440,10 +456,7 @@ async fn tool_get_finding_by_id(client: &Arc<ServerClient>, args: &Value) -> Res
 async fn tool_query_prior_findings(
 	client: &Arc<ServerClient>, repo_id: i64, args: &Value,
 ) -> Result<String> {
-	let query = args
-		.get("query")
-		.and_then(|v| v.as_str())
-		.context("`query` argument is required and must be a string")?;
+	let query = arg_str(args, "query")?;
 	let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 100);
 
 	let resp = client
@@ -462,11 +475,9 @@ async fn tool_query_prior_findings(
 		resp.findings.len()
 	));
 	for f in &resp.findings {
-		let loc = match (f.file_path.as_deref(), f.line_start) {
-			(Some(p), Some(l)) => format!("{p}:{l}"),
-			(Some(p), None) => p.to_owned(),
-			_ => "(no location)".into(),
-		};
+		// Search summaries don't include line_end; pass None so the
+		// helper renders `path:line` instead of falling through.
+		let loc = format_location(f.file_path.as_deref(), f.line_start, None);
 		out.push_str(&format!(
 			"- #{} [{:?}] state={} {} — {}\n",
 			f.id, f.severity, f.state, loc, f.title,
@@ -481,41 +492,15 @@ async fn tool_query_prior_findings(
 /// exercise the fingerprint / clamp / parse logic without standing
 /// up an MCP server or a real HTTP backend.
 pub(crate) fn build_finding_from_args(workdir: &Path, args: &Value) -> Result<Finding> {
-	let severity_str = args
-		.get("severity")
-		.and_then(|v| v.as_str())
-		.context("`severity` is required and must be a string")?;
+	let severity_str = arg_str(args, "severity")?;
 	let severity: Severity =
 		severity_str.parse().with_context(|| format!("unknown severity: `{severity_str}`"))?;
-	let title = args
-		.get("title")
-		.and_then(|v| v.as_str())
-		.context("`title` is required and must be a string")?
-		.to_owned();
-	let file = args
-		.get("file")
-		.and_then(|v| v.as_str())
-		.context("`file` is required and must be a string")?;
-	let line_start = args
-		.get("line_start")
-		.and_then(|v| v.as_u64())
-		.context("`line_start` is required and must be a positive integer")?
-		.min(u32::MAX as u64) as u32;
-	let line_end = args
-		.get("line_end")
-		.and_then(|v| v.as_u64())
-		.context("`line_end` is required and must be a positive integer")?
-		.min(u32::MAX as u64) as u32;
-	let description = args
-		.get("description")
-		.and_then(|v| v.as_str())
-		.context("`description` is required and must be a string")?
-		.to_owned();
-	let poc_unified = args
-		.get("poc_unified")
-		.and_then(|v| v.as_str())
-		.context("`poc_unified` is required and must be a string")?
-		.to_owned();
+	let title = arg_str(args, "title")?.to_owned();
+	let file = arg_str(args, "file")?;
+	let line_start = arg_u32(args, "line_start")?;
+	let line_end = arg_u32(args, "line_end")?;
+	let description = arg_str(args, "description")?.to_owned();
+	let poc_unified = arg_str(args, "poc_unified")?.to_owned();
 	let cwe = args.get("cwe").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
 
 	// Sandbox-leak guard: the agent occasionally echoes the in-bwrap
@@ -567,10 +552,7 @@ async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<Str
 }
 
 async fn tool_validate_poc(workdir: &Path, args: &Value) -> Result<String> {
-	let diff = args
-		.get("poc_unified")
-		.and_then(|v| v.as_str())
-		.context("`poc_unified` is required and must be a string")?;
+	let diff = arg_str(args, "poc_unified")?;
 
 	let outcome = check_diff_applies(workdir, diff).await?;
 	let payload = match outcome {

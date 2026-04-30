@@ -11,19 +11,8 @@ use loupe_storage::Db;
 use loupe_tls::Ca;
 use reqwest::tls::CertificateRevocationList;
 
-fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
-	reqwest::Certificate::from_pem(pem.as_bytes()).expect("parse cert PEM")
-}
-
-fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
-	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
-	combined.push_str(cert_pem);
-	if !cert_pem.ends_with('\n') {
-		combined.push('\n');
-	}
-	combined.push_str(key_pem);
-	reqwest::Identity::from_pem(combined.as_bytes()).expect("parse client identity PEM")
-}
+mod common;
+use common::{pem_to_certificate, pem_to_identity};
 
 async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) {
 	let ca = Ca::new("loupe-test-ca").unwrap();

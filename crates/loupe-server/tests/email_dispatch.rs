@@ -19,18 +19,8 @@ use loupe_worker::scanners::RegexSecretsScanner;
 use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
-fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
-	reqwest::Certificate::from_pem(pem.as_bytes()).unwrap()
-}
-fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
-	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
-	combined.push_str(cert_pem);
-	if !cert_pem.ends_with('\n') {
-		combined.push('\n');
-	}
-	combined.push_str(key_pem);
-	reqwest::Identity::from_pem(combined.as_bytes()).unwrap()
-}
+mod common;
+use common::{pem_to_certificate, pem_to_identity};
 
 /// Plant a fake sendmail script under tmp that copies its stdin to
 /// `out`. Returns the path to invoke and the path it'll write to.

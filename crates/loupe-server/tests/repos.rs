@@ -12,19 +12,8 @@ use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
 use loupe_tls::Ca;
 
-fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
-	reqwest::Certificate::from_pem(pem.as_bytes()).unwrap()
-}
-
-fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
-	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
-	combined.push_str(cert_pem);
-	if !cert_pem.ends_with('\n') {
-		combined.push('\n');
-	}
-	combined.push_str(key_pem);
-	reqwest::Identity::from_pem(combined.as_bytes()).unwrap()
-}
+mod common;
+use common::{pem_to_certificate, pem_to_identity};
 
 fn admin_client(
 	ca_cert_pem: &str, cert_pem: &str, key_pem: &str, addr: SocketAddr,
