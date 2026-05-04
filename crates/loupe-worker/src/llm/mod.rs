@@ -37,7 +37,16 @@ use tokio_util::sync::CancellationToken;
 /// Default per-call wall-clock budget. Per-file LLM invocations should
 /// fit comfortably within this; if they don't, the call is aborted and
 /// the file is treated as having produced no findings (logged warning).
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+///
+/// 30 minutes is generous; the goal is to be the *fallback* ceiling,
+/// not the operative deadline. Auditing a 1–2k-line source file
+/// end-to-end (several MCP round-trips for prior-finding dedup, a PoC
+/// regression-test diff, validation) routinely takes 1–3 minutes
+/// against real-world Rust repos, and the previous 180s default was
+/// killing roughly 4 in 5 sessions before the agent could submit.
+/// Operators can still tighten via the per-repo `scanner_config` JSON
+/// (`per_request_timeout_seconds`).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Pull the first balanced JSON object out of a possibly noisy text
 /// response. Tolerates prose before/after the object and a single

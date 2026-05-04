@@ -262,7 +262,7 @@ impl RepoCache {
 	///
 	/// libgit2's `file://` transport doesn't use the local-clone fast
 	/// path that git CLI does (hardlink pack files, copy refs verbatim).
-	/// On a 538MB ldk-node clone that's the difference between
+	/// On a ~500 MB Rust workspace that's the difference between
 	/// **~0.4s** (git CLI) and **~7m** (libgit2). HTTPS clones are also
 	/// modestly faster via git CLI (parallel delta resolution, bitmap
 	/// support) but the gap there is single-digit-x rather than 1000x.
