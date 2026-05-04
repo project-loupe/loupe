@@ -66,11 +66,14 @@ Before installing, the host needs:
   `bkb_lookup_blip`, `bkb_find_commit`, `bkb_get_document`,
   `bkb_get_references`, `bkb_timeline`) so the agent can pull spec +
   historical context the worktree alone won't carry. Install with
-  `cargo install bkb-mcp`; the binary needs to reach the BKB HTTP
-  API server (default `http://127.0.0.1:3000`, override with
-  `BKB_API_URL` — the worker forwards that env var into the
-  sandbox). Absence is silent: workers without bkb-mcp run normally
-  and the agent's prompt doesn't mention bkb at all.
+  `cargo install bkb-mcp`. The worker pins `BKB_API_URL` to
+  `https://bitcoinknowledge.dev` (the public hosted instance) for
+  every spawn so behaviour is uniform across the fleet regardless
+  of what bkb-mcp's compiled-in default happens to be — operators
+  pointing at a self-hosted BKB instance should patch the
+  `BKB_API_URL` constant in `crates/loupe-worker/src/llm/claude_cli.rs`
+  and rebuild. Absence is silent: workers without bkb-mcp run
+  normally and the agent's prompt doesn't mention bkb at all.
 - **A GitHub personal access token** for each target tracker repo,
   only if you intend to use the GitHub-issue reporter (skip this
   prereq when registering repos with `--no-reporting` for manual

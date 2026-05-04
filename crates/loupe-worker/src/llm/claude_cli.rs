@@ -44,6 +44,21 @@ const SANDBOX_CLIENT_KEY: &str = "/loupe/worker.key";
 const SANDBOX_MCP_CONFIG: &str = "/loupe/mcp-config.json";
 const SANDBOX_BKB_MCP_BIN: &str = "/loupe/bkb-mcp";
 
+/// BKB HTTP API endpoint loupe always pins for the bkb-mcp child.
+///
+/// bkb-mcp's own compiled-in default (`http://127.0.0.1:3000`) is
+/// handy for a developer running the BKB stack locally but useless
+/// on a fresh worker host that has only `cargo install`'d the
+/// client. Loupe overrides unconditionally so the bkb tools work
+/// out of the box pointing at the public hosted instance, with
+/// uniform behaviour across the worker fleet.
+///
+/// Operators with a self-hosted BKB instance: patch this constant
+/// (recompile) — there's no env-var escape hatch on purpose, so
+/// findings emitted by different workers can't disagree about
+/// where their bkb context came from.
+const BKB_API_URL: &str = "https://bitcoinknowledge.dev";
+
 /// Everything the MCP child needs to talk back to loupe-server.
 /// Built once at worker startup from the `loupe-worker run` CLI
 /// flags and stashed on the backend; per-call data (the repo id)
@@ -126,10 +141,11 @@ fn prepare_mcp_scratch(
 	);
 	// Conditionally attach bkb-mcp. The binary is bind-mounted under
 	// /loupe/bkb-mcp by the caller (see `run` below). bkb-mcp itself
-	// is a thin client to a BKB HTTP API; the agent's network
-	// namespace is shared with the worker (allow_network), so a
-	// `127.0.0.1:3000` default — or whatever `BKB_API_URL` points at
-	// — is reachable from inside the sandbox.
+	// is a thin client to the BKB HTTP API: we always override its
+	// compiled-in localhost default to the public hosted instance
+	// (see [`BKB_API_URL`]) by setting `BKB_API_URL` in the per-MCP
+	// `env` block — that's MCP-server-scoped, doesn't leak into
+	// claude or other potential sibling MCP children.
 	if ctx.bkb_mcp_path.is_some() {
 		servers.insert(
 			"bkb".to_string(),
@@ -137,10 +153,7 @@ fn prepare_mcp_scratch(
 				"type": "stdio",
 				"command": SANDBOX_BKB_MCP_BIN,
 				"args": [],
-				// BKB_API_URL is forwarded into the sandbox by the caller
-				// when the operator has it set; bkb-mcp picks it up
-				// automatically (it reads the env var directly).
-				"env": {}
+				"env": { "BKB_API_URL": BKB_API_URL }
 			}),
 		);
 	}
@@ -266,11 +279,11 @@ impl LlmBackend for ClaudeCliBackend {
 				// binary at a fixed sandbox path so the MCP config
 				// emitted by `prepare_mcp_scratch` can reference it
 				// without leaking the operator's actual install
-				// location. Forward `BKB_API_URL` so a non-default
-				// API endpoint flows through to the MCP child.
+				// location. The API endpoint is hard-pinned in the
+				// MCP config's `env` block (see `BKB_API_URL` above),
+				// so no host env forwarding is needed here.
 				if let Some(bkb_path) = &ctx.bkb_mcp_path {
 					sandbox = sandbox.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
-					sandbox = sandbox.forward_env("BKB_API_URL");
 				}
 				Some(scratch)
 			},
