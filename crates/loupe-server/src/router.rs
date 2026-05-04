@@ -164,7 +164,13 @@ async fn handle_connection(
 	let tls_stream = match acceptor.accept(sock).await {
 		Ok(s) => s,
 		Err(e) => {
-			tracing::debug!(peer = %peer_addr, error = %e, "tls handshake failed");
+			// Log loudly: in mTLS the handshake failing usually means
+			// either a stale CA on one side after a rotation, a worker
+			// connecting before its cert is registered, or a port
+			// scanner — all worth surfacing at info+. At debug level
+			// these were invisible by default and the operator had no
+			// way to know why their workers couldn't connect.
+			tracing::error!(peer = %peer_addr, error = %e, "tls handshake failed");
 			return;
 		},
 	};
