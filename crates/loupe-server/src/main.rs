@@ -32,9 +32,13 @@ enum Cmd {
 struct InitArgs {
 	#[arg(long, env = "LOUPE_DATA_DIR")]
 	data_dir: PathBuf,
-	/// SubjectAltName entries for the server cert. Pass at least one;
-	/// `localhost` is a sensible default for local development.
-	#[arg(long = "hostname", value_name = "HOSTNAME", default_values_t = vec!["localhost".to_owned()])]
+	/// SubjectAltName entries for the server cert. Pass at least one.
+	/// Defaults cover both `localhost` and `127.0.0.1` so a fresh
+	/// bootstrap works for clients that prefer either form (rcgen
+	/// auto-classifies entries that parse as IPs into IP SANs and the
+	/// rest into DNS SANs). Override with `--hostname` for production
+	/// SAN lists.
+	#[arg(long = "hostname", value_name = "HOSTNAME", default_values_t = vec!["localhost".to_owned(), "127.0.0.1".to_owned()])]
 	hostnames: Vec<String>,
 }
 
@@ -250,4 +254,36 @@ fn parse_master_key_hex(s: &str) -> Result<MasterKey> {
 		*byte = (hi << 4) | lo;
 	}
 	Ok(MasterKey::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn init_default_hostnames_cover_localhost_and_loopback_ip() {
+		// Regression guard: a fresh `loupe-server init` (no
+		// --hostname flag) must mint a cert valid for BOTH
+		// `localhost` AND `127.0.0.1`. Clients connecting via the
+		// loopback IP otherwise hit
+		//   `invalid peer certificate: certificate not valid for
+		//    name "127.0.0.1"`
+		// at handshake time, because the cert SAN list lacks the IP.
+		// Pinning the default catches anyone shrinking it back to
+		// just `localhost` for "tidiness."
+		let cli = Cli::try_parse_from(["loupe-server", "init", "--data-dir", "/tmp/x"]).unwrap();
+		let Cmd::Init(args) = cli.cmd else {
+			panic!("expected init subcommand, got {:?}", cli.cmd);
+		};
+		assert!(
+			args.hostnames.contains(&"localhost".to_owned()),
+			"default SAN list must include `localhost`: {:?}",
+			args.hostnames,
+		);
+		assert!(
+			args.hostnames.contains(&"127.0.0.1".to_owned()),
+			"default SAN list must include `127.0.0.1`: {:?}",
+			args.hostnames,
+		);
+	}
 }
