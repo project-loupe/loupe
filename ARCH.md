@@ -84,10 +84,27 @@ inside the sandbox.
                        │  ┌──────────────────┐  │ HTTPS  ┌────────────────┐
                        │  │  claude (agent)  │ ─┼───────►│ api.anthropic. │
                        │  │  --mcp-config    │  │        │      com       │
-                       │  └────────┬─────────┘  │        └────────────────┘
-                       │           │ stdio JSON-RPC
-                       │           │ (MCP protocol)
-                       │           ▼
+                       │  └─┬─────────┬──────┘  │        └────────────────┘
+                       │    │         │
+                       │    │         │ stdio JSON-RPC (MCP)
+                       │    │         ▼
+                       │    │     ┌──────────────────┐  HTTP   ┌────────────────┐
+                       │    │     │ bkb-mcp (opt.)   │ ───────►│  bkb HTTP API  │
+                       │    │     │                  │         │  (BKB_API_URL) │
+                       │    │     │ tools:           │         └────────────────┘
+                       │    │     │ • bkb_search     │
+                       │    │     │ • bkb_lookup_bip │
+                       │    │     │ • bkb_lookup_bolt│
+                       │    │     │ • bkb_lookup_lud │
+                       │    │     │ • bkb_lookup_nut │
+                       │    │     │ • bkb_lookup_blip│
+                       │    │     │ • bkb_find_commit│
+                       │    │     │ • bkb_get_doc    │
+                       │    │     │ • bkb_get_refs   │
+                       │    │     │ • bkb_timeline   │
+                       │    │     └──────────────────┘
+                       │    │ stdio JSON-RPC (MCP)
+                       │    ▼
                        │  ┌──────────────────┐  │   mTLS (worker cert)
                        │  │ loupe-worker     │ ─┼──────────► loupe-server
                        │  │   mcp-serve      │  │   GET    /v1/repos/:id/
@@ -102,6 +119,11 @@ inside the sandbox.
                        │  └──────────────────┘  │
                        └────────────────────────┘
 ```
+
+The `bkb-mcp` block is dashed because it's optional: the worker
+attaches it to `--mcp-config` only when `bkb-mcp` is on PATH at
+startup. Workers that don't have it installed run without that
+branch and the agent's prompt makes no mention of bkb tools.
 
 ## Data lifecycle
 
