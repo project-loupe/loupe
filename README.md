@@ -214,22 +214,30 @@ loupe-worker \
   --ca-cert    /etc/loupe/ca.pem \
   --cert       /etc/loupe/worker.pem \
   --key        /etc/loupe/worker.key \
-  --cache-dir  /var/lib/loupe/cache \
-  --enable-llm-scanner       # discovery; omit to run only the regex scanner
-  --enable-llm-verifier      # cross-model second opinion; advertises verify:llm
+  --cache-dir  /var/lib/loupe/cache
 ```
 
-The worker probes for `bwrap` at startup when either LLM scanner is
-on and exits 1 if it is missing (set `LOUPE_DISABLE_SANDBOX=1` to
-bypass for dev work). Cache size defaults to 40 GB and evicts LRU
-clones above the cap.
+The worker auto-detects `claude` and `codex` on PATH at startup and
+wires the LLM scanners accordingly:
 
-`--enable-llm-verifier` prefers the `codex` CLI so the second
-opinion comes from a different model family than the discovery
-scanner's `claude`; if `codex` isn't on PATH it falls back to
-`claude` (same-family fallback — still better than no verification,
-but not a true cross-model check). Verifier jobs only get queued
-when a repo is registered with `--verification-enabled`.
+- **`claude` installed** → discovery scanner advertises `scan:llm`
+  (claude owns submission via the loupe MCP server's
+  `submit_finding` tool).
+- **`claude` or `codex` installed** → verifier scanner advertises
+  `verify:llm`. Codex is preferred when both are present so the
+  second opinion comes from a different model family than discovery;
+  claude is the fallback if codex isn't on PATH (same-family check —
+  still useful, not a true cross-model verification).
+- **Neither installed** → worker refuses to start. A "regex-only"
+  loupe-worker isn't a deployment we want operators to fall into by
+  accident; install at least one agent CLI.
+
+The worker also probes for `bwrap` at startup and exits 1 if it is
+missing (set `LOUPE_DISABLE_SANDBOX=1` to bypass for dev work).
+Cache size defaults to 40 GB and evicts LRU clones above the cap.
+
+Verifier jobs only get queued when a repo is registered with
+`--verification-enabled`.
 
 ### 6. Register a repo and trigger a scan
 
@@ -407,12 +415,13 @@ else stay in `validating`). The full state machine + reaper details
 are in `ARCH.md` and the `submit_verdict` / `complete` handlers in
 `crates/loupe-server/src/routes/jobs.rs`.
 
-Run a worker with `--enable-llm-verifier` (or
-`LOUPE_ENABLE_LLM_VERIFIER=1`) to advertise `verify:llm` and lease
-those jobs; see step 5 above for the flag's CLI/codex selection
-behaviour. A deployment can run discovery and verifier on the same
-worker, on separate workers, or share a single worker with both —
-the lease loop matches by capability, not by binary.
+A worker with `codex` (or just `claude`) on PATH advertises
+`verify:llm` automatically — see step 5 for backend selection. A
+deployment can run discovery and verifier on the same worker, on
+separate workers, or share a single worker with both — the lease
+loop matches by capability, not by binary. To force role separation,
+install only `claude` on the discovery hosts and only `codex` on the
+verifier hosts; the auto-detect picks the matching capability tags.
 
 ## Continuous integration
 

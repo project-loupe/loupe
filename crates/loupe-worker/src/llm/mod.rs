@@ -117,6 +117,24 @@ pub trait LlmBackend: Send + Sync {
 	async fn run(&self, req: LlmRequest) -> Result<LlmResponse>;
 }
 
+/// Probe PATH for `claude --version`. Returns `true` only if the
+/// invocation succeeds — a missing binary, non-zero exit, or any IO
+/// error all read as "not available."
+///
+/// Cheap to call at startup. The discovery scanner needs claude
+/// specifically (its MCP `--mcp-config` surface is the contract for
+/// `submit_finding`); the verifier accepts either, see
+/// [`build_verifier_backend`].
+pub fn claude_available() -> bool {
+	std::process::Command::new("claude")
+		.arg("--version")
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false)
+}
+
 /// Probe PATH for `codex --version`. Returns `true` only if the
 /// invocation succeeds — a missing binary, non-zero exit, or any IO
 /// error all read as "not available."

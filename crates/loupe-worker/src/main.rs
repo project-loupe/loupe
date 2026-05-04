@@ -16,7 +16,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use loupe_worker::llm::claude_cli::McpContext;
-use loupe_worker::llm::{build_verifier_backend, ClaudeCliBackend};
+use loupe_worker::llm::{
+	build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
+};
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
@@ -63,22 +65,6 @@ struct RunArgs {
 	/// Maximum cache size in GB before LRU eviction kicks in.
 	#[arg(long, default_value_t = 40)]
 	max_cache_gb: u64,
-	/// Enable the LLM code-review scanner. Requires `claude` and
-	/// `bwrap` (bubblewrap) to be on PATH unless `LOUPE_DISABLE_SANDBOX=1`
-	/// is set. Disabled by default because each scan accrues real LLM
-	/// spend.
-	#[arg(long, env = "LOUPE_ENABLE_LLM_SCANNER")]
-	enable_llm_scanner: bool,
-	/// Enable the cross-model LLM verifier scanner. Advertises
-	/// `verify:llm` and leases `kind=verify` jobs from the server.
-	/// Prefers the `codex` CLI (so the verifier reads with a different
-	/// model family from the discovery scanner's `claude` — the whole
-	/// point of the second opinion); falls back to `claude` if `codex`
-	/// isn't on PATH. Same `bwrap` requirement as `--enable-llm-scanner`.
-	/// Disabled by default — verifier jobs only get queued when a repo
-	/// has `verification_enabled = true`.
-	#[arg(long, env = "LOUPE_ENABLE_LLM_VERIFIER")]
-	enable_llm_verifier: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -143,22 +129,40 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 	let cache = Arc::new(RepoCache::new(cache_dir, args.max_cache_gb * 1_073_741_824)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
-	if args.enable_llm_scanner || args.enable_llm_verifier {
-		// Hard-fatal if bubblewrap is missing — both LLM scanners run
-		// untrusted agent subprocesses and we won't fall back silently.
-		// Probe once even when both are on so the operator sees one log
-		// line, not two.
-		match sandbox::probe_at_startup() {
-			Ok(true) => tracing::info!("bubblewrap available; LLM scanners sandboxed"),
-			Ok(false) => tracing::warn!(
-				"LOUPE_DISABLE_SANDBOX is set; LLM scanners running without isolation"
-			),
-			Err(e) => {
-				return Err(e.context("LLM scanner enabled but bubblewrap is unavailable"));
-			},
-		}
+
+	// LLM scanners auto-wire based on which agent CLIs are on PATH:
+	//
+	// - `claude` present  → discovery scanner (only claude has the
+	//                       MCP `--mcp-config` plumbing today, so it
+	//                       owns submission via the loupe MCP server).
+	// - `claude` or `codex` present → verifier scanner (codex
+	//                       preferred — true cross-model second
+	//                       opinion; claude fallback if it's the only
+	//                       one installed).
+	// - neither present   → hard-fatal at startup. A loupe-worker
+	//                       with no agent CLI is "regex-only", which
+	//                       isn't a deployment we want operators to
+	//                       fall into by accident.
+	let claude = claude_available();
+	let codex = codex_available();
+	if !claude && !codex {
+		anyhow::bail!(
+			"no LLM agent CLI found on PATH (looked for `claude` and `codex`). \
+			 Install at least one before starting the worker — see the README \
+			 prerequisites section."
+		);
 	}
-	if args.enable_llm_scanner {
+	// bwrap is the security boundary for every agent subprocess; if
+	// it's missing and LOUPE_DISABLE_SANDBOX isn't set, refuse to run.
+	match sandbox::probe_at_startup() {
+		Ok(true) => tracing::info!("bubblewrap available; LLM scanners sandboxed"),
+		Ok(false) => {
+			tracing::warn!("LOUPE_DISABLE_SANDBOX is set; LLM scanners running without isolation")
+		},
+		Err(e) => return Err(e.context("LLM scanner requires bubblewrap")),
+	}
+
+	if claude {
 		// Resolve the worker binary's host path so the sandbox can
 		// bind-mount it for the MCP child to exec. `current_exe()`
 		// returns the executable currently running; the agent's MCP
@@ -175,17 +179,20 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		};
 		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx));
 		scanners.push(Arc::new(LlmCodeReviewScanner::new(backend)));
+		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
+	} else {
 		tracing::info!(
-			"LLM code-review scanner enabled (agent owns submission via MCP submit_finding)"
+			"`claude` not on PATH; LLM code-review (discovery) scanner not registered \
+			 — this worker advertises verify-only"
 		);
 	}
-	if args.enable_llm_verifier {
-		// Backend choice (codex vs claude) is logged inside the helper
-		// so the operator sees which model family is verifying.
-		let backend = build_verifier_backend();
-		scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
-		tracing::info!("LLM verifier scanner enabled (verify:llm advertised)");
-	}
+
+	// Verifier always wires up when *either* CLI is present. The
+	// helper logs which backend it picked.
+	let backend = build_verifier_backend();
+	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
+	tracing::info!("LLM verifier scanner enabled (verify:llm advertised)");
+
 	let runner = Runner::new(client, cache, scanners);
 
 	let cancel = CancellationToken::new();
