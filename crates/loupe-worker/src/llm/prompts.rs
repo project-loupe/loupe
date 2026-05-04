@@ -76,6 +76,30 @@ Constraints:
   bugs you can't write a regression test for. Quality over volume.
 - Your text response is logged but not parsed. Use it for diagnostic
   notes if useful; do not put findings there.
+
+Scope of knowledge — read carefully:
+
+- Your only filesystem access is the worktree mounted at `/workdir`.
+  You cannot read external repositories, dependency source from
+  `cargo registry`, vendored crates outside this tree, system docs,
+  the internet, or anything else off-tree. If `Cargo.toml` pins a
+  dependency, you have access to the *name and version* of that
+  pin — not its source code.
+- Do not claim to have "verified against" or "checked" any
+  out-of-tree source you cannot actually open through this
+  worktree. If a determination depends on an invariant the
+  *caller* of this code is supposed to uphold, on a downstream
+  crate's behaviour, or on a pinned dependency's internals, treat
+  that as **uncertainty**, not as a clearance to dismiss the bug.
+  Note the dependency in the `description` and submit the finding
+  anyway, flagging the assumption — a false positive a human can
+  dismiss is better than a false negative dressed as a confident
+  cross-reference check.
+- If you find yourself writing "I verified against …" or "this
+  matches upstream's convention" about code you have no path to
+  read, stop and re-frame: either the bug stands without that
+  external check, or you are uncertain, in which case submit and
+  flag the uncertainty.
 "##;
 
 /// Cross-model verification prompt — runs once per finding when the
@@ -184,5 +208,34 @@ mod tests {
 	fn verify_template_has_required_placeholders() {
 		assert!(VERIFY.contains("{file}"));
 		assert!(VERIFY.contains("{finding_json}"));
+	}
+
+	#[test]
+	fn discovery_prompt_forbids_claimed_external_verification() {
+		// Failure mode this guards against: the agent claiming it
+		// "verified against the pinned LDK rev" or similar, when the
+		// bwrap sandbox grants it no path to that source — and then
+		// using that confabulated check to dismiss real findings as
+		// safe. The prompt must explicitly tell the agent its
+		// filesystem access is /workdir-only and that absent
+		// cross-references mean *uncertainty*, not clearance.
+		//
+		// Compare against a whitespace-collapsed copy so prose reflow
+		// (which moves phrases across line breaks) doesn't break the
+		// pin.
+		let collapsed: String = DISCOVERY.split_whitespace().collect::<Vec<_>>().join(" ");
+		assert!(
+			collapsed.contains("filesystem access is the worktree"),
+			"prompt must declare /workdir-only filesystem scope",
+		);
+		assert!(
+			collapsed.contains("Do not claim to have")
+				|| collapsed.contains("do not claim to have"),
+			"prompt must forbid agent from claiming out-of-tree verification",
+		);
+		assert!(
+			collapsed.contains("uncertainty"),
+			"prompt must tell the agent that absent cross-refs map to uncertainty, not clearance",
+		);
 	}
 }
