@@ -37,6 +37,7 @@ walkdir = { workspace = true }
 loupe-server = { path = "../loupe-server" }
 loupe-storage = { path = "../loupe-storage" }
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

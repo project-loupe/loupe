@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use loupe_worker::llm::claude_cli::McpContext;
+use loupe_worker::llm::McpContext;
 use loupe_worker::llm::{
 	bkb_mcp_available, build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
 };

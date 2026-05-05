@@ -11,13 +11,13 @@
 //! sandbox is the actual security boundary, not codex's own
 //! permission machinery.
 //!
-//! MCP integration is intentionally not wired for codex yet. The
-//! current consumer (the verifier scanner) doesn't need MCP — the
-//! original finding is rendered into the prompt and the model just
-//! returns a JSON verdict — and codex's MCP-config surface (TOML
-//! under `~/.codex/config.toml` / `--config mcp_servers...`) differs
-//! from claude's `--mcp-config <file>` enough to deserve its own
-//! pass.
+//! When constructed with [`McpContext`] the backend additionally
+//! advertises the loupe MCP server (and optionally bkb-mcp) to
+//! codex via `-c mcp_servers.<name>.command="..."` /
+//! `-c mcp_servers.<name>.args=[...]` overrides — codex's MCP
+//! config surface is TOML, but the `-c` overrides take TOML literals
+//! one key at a time, so we stream the same `mcp_serve_args` list
+//! that the claude backend writes to its JSON scratch file.
 //!
 //! [`ClaudeCliBackend`]: super::ClaudeCliBackend
 
@@ -28,11 +28,48 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
+use super::mcp::{
+	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
+	SANDBOX_LOUPE_BIN,
+};
 use super::{LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "codex-cli";
 const CODEX_BIN: &str = "codex";
+
+/// Render a Rust string as a TOML basic-string literal: wraps in
+/// double quotes, escapes the few characters TOML cares about (`\`,
+/// `"`, control chars). Used to build `-c key=value` overrides where
+/// `value` is parsed as a TOML literal — sandbox paths and the BKB
+/// API URL are ASCII so this is mostly defensive against future
+/// regressions.
+fn toml_string_literal(s: &str) -> String {
+	let mut out = String::with_capacity(s.len() + 2);
+	out.push('"');
+	for c in s.chars() {
+		match c {
+			'\\' => out.push_str(r"\\"),
+			'"' => out.push_str(r#"\""#),
+			'\n' => out.push_str(r"\n"),
+			'\r' => out.push_str(r"\r"),
+			'\t' => out.push_str(r"\t"),
+			c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+			c => out.push(c),
+		}
+	}
+	out.push('"');
+	out
+}
+
+/// Render a slice of strings as a TOML inline array of basic strings.
+/// Codex parses each `-c` value as TOML, so an args list passed as
+/// `["mcp-serve", "--server-url", "...", ...]` round-trips into the
+/// MCP server config's `args` field.
+fn toml_string_array(items: &[String]) -> String {
+	let parts: Vec<String> = items.iter().map(|s| toml_string_literal(s)).collect();
+	format!("[{}]", parts.join(", "))
+}
 
 /// Cap a borrow at `n` chars; appends an ellipsis if the original was
 /// longer. Used to keep error messages from blowing up when the CLI
@@ -47,15 +84,25 @@ fn truncate(s: &str, n: usize) -> String {
 
 pub struct CodexCliBackend {
 	bin: String,
+	mcp: Option<McpContext>,
 }
 
 impl CodexCliBackend {
 	pub fn new() -> Self {
-		Self { bin: CODEX_BIN.to_owned() }
+		Self { bin: CODEX_BIN.to_owned(), mcp: None }
 	}
 
 	pub fn with_bin(bin: impl Into<String>) -> Self {
-		Self { bin: bin.into() }
+		Self { bin: bin.into(), mcp: None }
+	}
+
+	/// Attach an MCP server to every invocation. When set, each call
+	/// emits `-c mcp_servers.loupe.command/args/env=...` overrides
+	/// (and the same for `bkb` when bkb-mcp is on the host) so the
+	/// agent sees the loupe tool surface for the duration of the call.
+	pub fn with_mcp_context(mut self, mcp: McpContext) -> Self {
+		self.mcp = Some(mcp);
+		self
 	}
 }
 
@@ -111,11 +158,62 @@ impl LlmBackend for CodexCliBackend {
 				.bind_ro(codex_dir.join("config.toml"), "/home/scanner/.codex/config.toml");
 		}
 
+		// Optional MCP attachment. Codex doesn't take a "config-file"
+		// flag like claude's `--mcp-config`; instead it accepts
+		// `-c <key>=<toml-literal>` overrides on the command line.
+		// Build one override per MCP server table key (command, args,
+		// env) so the loupe MCP server (and bkb-mcp when present)
+		// shows up in the agent's tool catalog without polluting the
+		// operator's `~/.codex/config.toml`.
+		let mcp_overrides: Vec<String> = match (&self.mcp, req.repo_id) {
+			(Some(ctx), Some(repo_id)) => {
+				let sandbox_workdir = if std::env::var_os(crate::sandbox::DISABLE_SANDBOX_ENV)
+					.is_some_and(|v| !v.is_empty())
+				{
+					req.workdir.to_string_lossy().into_owned()
+				} else {
+					"/workdir".to_owned()
+				};
+				sandbox = bind_mcp_into_sandbox(sandbox, ctx);
+				let args = mcp_serve_args(ctx, repo_id, req.job_id, &sandbox_workdir);
+				let mut overrides = Vec::new();
+				overrides.push(format!(
+					"mcp_servers.loupe.command={}",
+					toml_string_literal(SANDBOX_LOUPE_BIN)
+				));
+				overrides.push(format!("mcp_servers.loupe.args={}", toml_string_array(&args)));
+				overrides.push("mcp_servers.loupe.env={}".to_owned());
+				if ctx.bkb_mcp_path.is_some() {
+					overrides.push(format!(
+						"mcp_servers.bkb.command={}",
+						toml_string_literal(SANDBOX_BKB_MCP_BIN)
+					));
+					overrides.push("mcp_servers.bkb.args=[]".to_owned());
+					overrides.push(format!(
+						"mcp_servers.bkb.env={{ BKB_API_URL = {} }}",
+						toml_string_literal(BKB_API_URL)
+					));
+				}
+				overrides
+			},
+			(Some(_), None) => {
+				tracing::debug!(
+					backend = BACKEND_ID,
+					"MCP context configured but request has no repo_id; skipping codex MCP overrides",
+				);
+				Vec::new()
+			},
+			_ => Vec::new(),
+		};
+
 		let mut cmd = sandbox.build(&self.bin);
 		cmd.arg("exec")
 			.arg("--dangerously-bypass-approvals-and-sandbox")
-			.arg("--skip-git-repo-check")
-			.arg(&req.prompt);
+			.arg("--skip-git-repo-check");
+		for ov in &mcp_overrides {
+			cmd.arg("-c").arg(ov);
+		}
+		cmd.arg(&req.prompt);
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
 		let mut child = cmd
@@ -279,5 +377,43 @@ mod tests {
 				|| msg.contains("preparing sandbox"),
 			"unexpected error: {err}"
 		);
+	}
+
+	#[test]
+	fn toml_string_literal_quotes_and_escapes() {
+		// Plain ASCII paths are the common case (sandbox paths,
+		// BKB_API_URL): quoted, no escapes needed.
+		assert_eq!(toml_string_literal("/loupe/loupe-worker"), r#""/loupe/loupe-worker""#);
+		// Backslashes and double-quotes both have to escape; otherwise
+		// codex's TOML parser splits the string mid-value and the MCP
+		// config silently drops the rest.
+		assert_eq!(toml_string_literal(r#"a"b\c"#), r#""a\"b\\c""#);
+		// A literal newline / tab in a path would fall outside TOML's
+		// basic-string set; emit the escape so the override still
+		// parses round-trip.
+		assert_eq!(toml_string_literal("a\nb"), r#""a\nb""#);
+	}
+
+	#[test]
+	fn toml_string_array_round_trips_through_a_real_toml_parser() {
+		// `mcp_serve_args` produces a Vec<String>; the array form has
+		// to parse back as TOML so codex's `-c key=value` override
+		// can read it. Pin the round-trip explicitly — string
+		// concatenation bugs in the array helper would otherwise only
+		// surface at runtime when codex rejects the override.
+		let items = vec![
+			"mcp-serve".to_owned(),
+			"--server-url".to_owned(),
+			"https://loupe-server:8443".to_owned(),
+			"--workdir".to_owned(),
+			"/workdir".to_owned(),
+		];
+		let rendered = toml_string_array(&items);
+		// Wrap in a key=value pair so we can use the standard `toml`
+		// parser to validate. Cheap and decisive.
+		let parsed: toml::Value = format!("k = {rendered}").parse().expect("must parse");
+		let arr = parsed["k"].as_array().expect("must be array");
+		let back: Vec<String> = arr.iter().map(|v| v.as_str().unwrap().to_owned()).collect();
+		assert_eq!(back, items);
 	}
 }

@@ -22,6 +22,7 @@
 
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod mcp;
 pub mod prompts;
 
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ use std::time::Duration;
 use anyhow::Result;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
+pub use mcp::McpContext;
 use tokio_util::sync::CancellationToken;
 
 /// Default per-call wall-clock budget. Per-file LLM invocations should

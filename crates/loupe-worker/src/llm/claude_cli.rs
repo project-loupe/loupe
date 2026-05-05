@@ -26,61 +26,21 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
+use super::mcp::{
+	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
+	SANDBOX_LOUPE_BIN,
+};
 use super::{LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
 
-/// Fixed paths the sandbox uses for the MCP server bundle. The
-/// loupe-worker binary and the worker's mTLS cert + key + CA cert
-/// get bind-mounted under `/loupe/`; the per-call MCP config lives
-/// next to them. Inside the sandbox the agent only ever sees these
-/// paths, regardless of where the host install actually lives.
-const SANDBOX_LOUPE_BIN: &str = "/loupe/loupe-worker";
-const SANDBOX_CA_CERT: &str = "/loupe/ca.pem";
-const SANDBOX_CLIENT_CERT: &str = "/loupe/worker.pem";
-const SANDBOX_CLIENT_KEY: &str = "/loupe/worker.key";
+/// Fixed sandbox path for the per-call MCP config file claude reads.
+/// The host-side scratch dir (a `tempfile::TempDir`) bind-mounts
+/// onto this path; dropping the scratch dir unlinks the source
+/// (sandbox view becomes EROFS, which the next call recreates).
 const SANDBOX_MCP_CONFIG: &str = "/loupe/mcp-config.json";
-const SANDBOX_BKB_MCP_BIN: &str = "/loupe/bkb-mcp";
-
-/// BKB HTTP API endpoint loupe always pins for the bkb-mcp child.
-///
-/// bkb-mcp's own compiled-in default (`http://127.0.0.1:3000`) is
-/// handy for a developer running the BKB stack locally but useless
-/// on a fresh worker host that has only `cargo install`'d the
-/// client. Loupe overrides unconditionally so the bkb tools work
-/// out of the box pointing at the public hosted instance, with
-/// uniform behaviour across the worker fleet.
-///
-/// Operators with a self-hosted BKB instance: patch this constant
-/// (recompile) — there's no env-var escape hatch on purpose, so
-/// findings emitted by different workers can't disagree about
-/// where their bkb context came from.
-const BKB_API_URL: &str = "https://bitcoinknowledge.dev";
-
-/// Everything the MCP child needs to talk back to loupe-server.
-/// Built once at worker startup from the `loupe-worker run` CLI
-/// flags and stashed on the backend; per-call data (the repo id)
-/// arrives through [`LlmRequest::repo_id`].
-#[derive(Debug, Clone)]
-pub struct McpContext {
-	/// Path to the loupe-worker binary on the host. Usually
-	/// `std::env::current_exe()` for the worker itself, so the same
-	/// binary serves both `run` and `mcp-serve` modes.
-	pub worker_binary: PathBuf,
-	/// loupe-server URL the MCP child will call back to.
-	pub server_url: String,
-	pub ca_cert_path: PathBuf,
-	pub client_cert_path: PathBuf,
-	pub client_key_path: PathBuf,
-	/// Optional `bkb-mcp` binary path. When `Some`, the per-call MCP
-	/// config gets a second server entry exposing bkb's spec /
-	/// historical-context tools (`bkb_search`, `bkb_lookup_bip`, …)
-	/// alongside loupe's `submit_finding`. None means "host doesn't
-	/// have bkb-mcp installed; advertise loupe only."
-	pub bkb_mcp_path: Option<PathBuf>,
-}
 
 /// Per-call MCP scratch: a host-side tempdir holding the JSON
 /// config that `claude --mcp-config` reads. The `TempDir` is
@@ -100,28 +60,7 @@ fn prepare_mcp_scratch(
 		.tempdir()
 		.context("creating MCP scratch tempdir")?;
 	let config_path = dir.path().join("mcp-config.json");
-	// Build the args list. `--job-id` only goes in when the caller
-	// supplied one in the request; without it, `submit_finding` is
-	// not advertised on the MCP-server side.
-	let mut args: Vec<String> = vec![
-		"mcp-serve".into(),
-		"--server-url".into(),
-		ctx.server_url.clone(),
-		"--ca-cert".into(),
-		SANDBOX_CA_CERT.into(),
-		"--cert".into(),
-		SANDBOX_CLIENT_CERT.into(),
-		"--key".into(),
-		SANDBOX_CLIENT_KEY.into(),
-		"--repo-id".into(),
-		repo_id.to_string(),
-		"--workdir".into(),
-		sandbox_workdir.to_owned(),
-	];
-	if let Some(j) = job_id {
-		args.push("--job-id".into());
-		args.push(j.to_string());
-	}
+	let args = mcp_serve_args(ctx, repo_id, job_id, sandbox_workdir);
 	let mut servers = serde_json::Map::new();
 	servers.insert(
 		"loupe".to_string(),
@@ -269,22 +208,8 @@ impl LlmBackend for ClaudeCliBackend {
 				};
 				let scratch = prepare_mcp_scratch(ctx, repo_id, req.job_id, &sandbox_workdir)
 					.context("preparing MCP scratch directory")?;
-				sandbox = sandbox
-					.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN)
-					.bind_ro(ctx.ca_cert_path.clone(), SANDBOX_CA_CERT)
-					.bind_ro(ctx.client_cert_path.clone(), SANDBOX_CLIENT_CERT)
-					.bind_ro(ctx.client_key_path.clone(), SANDBOX_CLIENT_KEY)
+				sandbox = bind_mcp_into_sandbox(sandbox, ctx)
 					.bind_ro(scratch.config_path.clone(), SANDBOX_MCP_CONFIG);
-				// Optional bkb-mcp attachment. Bind-mount the host
-				// binary at a fixed sandbox path so the MCP config
-				// emitted by `prepare_mcp_scratch` can reference it
-				// without leaking the operator's actual install
-				// location. The API endpoint is hard-pinned in the
-				// MCP config's `env` block (see `BKB_API_URL` above),
-				// so no host env forwarding is needed here.
-				if let Some(bkb_path) = &ctx.bkb_mcp_path {
-					sandbox = sandbox.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
-				}
 				Some(scratch)
 			},
 			(Some(_), None) => {
