@@ -16,4 +16,4 @@ pub use finding::Finding;
 pub use job::{JobKind, JobState};
 pub use repo::{RepoSpec, ReportingDestination};
 pub use severity::Severity;
-pub use verdict::Verdict;
+pub use verdict::{Verdict, VerdictPatch};

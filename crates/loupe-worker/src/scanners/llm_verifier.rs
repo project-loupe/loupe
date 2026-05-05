@@ -90,7 +90,7 @@ impl Scanner for LlmVerifierScanner {
 			)
 		})?;
 		Ok(match raw.verdict.as_str() {
-			"confirmed" => Verdict::Confirmed { notes: raw.notes },
+			"confirmed" => Verdict::Confirmed { notes: raw.notes, patch: None },
 			"dismissed" => Verdict::Dismissed { notes: raw.notes },
 			_ => Verdict::Inconclusive {
 				reason: raw.notes.unwrap_or_else(|| "model returned inconclusive".into()),

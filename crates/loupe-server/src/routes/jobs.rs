@@ -350,7 +350,7 @@ pub async fn submit_verdict(
 		.ok_or((StatusCode::BAD_REQUEST, "verify job missing target finding".into()))?;
 
 	let (verdict_str, notes) = match &submission.verdict {
-		loupe_core::Verdict::Confirmed { notes } => ("confirmed", notes.clone()),
+		loupe_core::Verdict::Confirmed { notes, .. } => ("confirmed", notes.clone()),
 		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone()),
 		loupe_core::Verdict::Inconclusive { reason } => ("inconclusive", Some(reason.clone())),
 	};

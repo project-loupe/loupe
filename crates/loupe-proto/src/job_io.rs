@@ -79,7 +79,7 @@ mod tests {
 	fn verdict_submission_round_trips() {
 		let v = VerdictSubmission {
 			protocol_version: PROTOCOL_VERSION,
-			verdict: Verdict::Confirmed { notes: Some("matches".into()) },
+			verdict: Verdict::Confirmed { notes: Some("matches".into()), patch: None },
 		};
 		let s = serde_json::to_string(&v).unwrap();
 		let back: VerdictSubmission = serde_json::from_str(&s).unwrap();

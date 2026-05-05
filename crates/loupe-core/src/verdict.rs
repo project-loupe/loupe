@@ -1,5 +1,25 @@
 use serde::{Deserialize, Serialize};
 
+/// Candidate fix attached to a `Verdict::Confirmed`. Carries the
+/// unified diff plus a short rationale from the verifier.
+///
+/// Patches only ride on confirmed verdicts — by construction.
+/// Dismissed and inconclusive verdicts have no place to attach a
+/// fix, and the type system pins that down by living only on the
+/// `Confirmed` variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictPatch {
+	/// Unified diff of the proposed fix. Must apply cleanly against
+	/// the worktree the verifier was reasoning over (the MCP-side
+	/// `validate_patch` tool runs `git apply --check` before this
+	/// reaches the server).
+	pub patch_unified: String,
+	/// One- or two-sentence rationale from the verifier: what the
+	/// fix does and why this is the minimal correct change. Surfaced
+	/// to human reviewers via `loupectl finding show`.
+	pub notes: String,
+}
+
 /// Outcome of a verification job — a verifier's vote on whether a finding
 /// from a prior scan is real, false-positive, or undecidable.
 ///
@@ -11,6 +31,12 @@ pub enum Verdict {
 	Confirmed {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		notes: Option<String>,
+		/// Optional candidate fix. Older workers that don't speak
+		/// the patch-attachment surface omit this field on the wire;
+		/// `skip_serializing_if = Option::is_none` keeps the JSON
+		/// shape backwards-compatible in both directions.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		patch: Option<VerdictPatch>,
 	},
 	Dismissed {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,7 +54,14 @@ mod tests {
 	#[test]
 	fn round_trips_each_variant() {
 		let cases = [
-			Verdict::Confirmed { notes: Some("matched second scanner".into()) },
+			Verdict::Confirmed { notes: Some("matched second scanner".into()), patch: None },
+			Verdict::Confirmed {
+				notes: Some("real bug".into()),
+				patch: Some(VerdictPatch {
+					patch_unified: "--- a/x\n+++ b/x\n@@\n-old\n+new\n".into(),
+					notes: "swap the comparison operator".into(),
+				}),
+			},
 			Verdict::Dismissed { notes: None },
 			Verdict::Inconclusive { reason: "scanner does not verify".into() },
 		];
@@ -44,5 +77,31 @@ mod tests {
 		let v = Verdict::Dismissed { notes: None };
 		let s = serde_json::to_string(&v).unwrap();
 		assert!(s.contains(r#""outcome":"dismissed""#), "got: {s}");
+	}
+
+	#[test]
+	fn confirmed_without_patch_omits_field_on_wire() {
+		// `skip_serializing_if = Option::is_none` is what keeps an
+		// older verifier worker (or any caller that doesn't propose a
+		// patch) from polluting the wire shape with a `"patch":null`
+		// noise field. If this regresses, every Confirmed verdict
+		// suddenly grows a null field — visible to operators
+		// inspecting raw JSON, and a needless wire-shape diff.
+		let v = Verdict::Confirmed { notes: Some("real bug".into()), patch: None };
+		let s = serde_json::to_string(&v).unwrap();
+		assert!(!s.contains("patch"), "got: {s}");
+	}
+
+	#[test]
+	fn confirmed_with_patch_round_trips_through_legacy_shape() {
+		// Backwards-compat against an older server build: a Confirmed
+		// verdict serialised without the `patch` field (the v1 wire
+		// shape) must still parse cleanly into the current type with
+		// `patch = None`. If this assertion ever fires, an older
+		// worker can't talk to the current server (or vice versa)
+		// without a coordinated upgrade.
+		let legacy = r#"{"outcome":"confirmed","notes":"bug"}"#;
+		let parsed: Verdict = serde_json::from_str(legacy).unwrap();
+		assert_eq!(parsed, Verdict::Confirmed { notes: Some("bug".into()), patch: None });
 	}
 }
