@@ -26,6 +26,8 @@ pub struct FindingRow {
 	pub approved_by_cn: Option<String>,
 	pub rejected_at: Option<i64>,
 	pub rejected_by_cn: Option<String>,
+	pub patch_proposed_at: Option<i64>,
+	pub patch_proposed_by_cn: Option<String>,
 }
 
 /// Insert a finding produced by a scan job. Idempotent on
@@ -72,7 +74,8 @@ pub fn insert_or_ignore(
 const FINDING_COLUMNS: &str = "id, repo_id, job_id, scanner_id, severity, title, description,
         file_path, line_start, line_end, cwe, patch_unified,
         poc_unified, fingerprint, state, verification_required, created_at,
-        approved_at, approved_by_cn, rejected_at, rejected_by_cn";
+        approved_at, approved_by_cn, rejected_at, rejected_by_cn,
+        patch_proposed_at, patch_proposed_by_cn";
 
 pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<FindingRow>> {
 	let mut stmt = conn.prepare(&format!(
@@ -210,6 +213,41 @@ pub fn get_for_repo(
 	.optional()
 }
 
+/// Outcome of an `attach_proposed_patch` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchAttachOutcome {
+	/// The row had no patch yet; we wrote one and stamped the audit.
+	Attached,
+	/// A patch was already on the row (a prior verifier got there
+	/// first, or a human attached one out-of-band). The new patch is
+	/// dropped — first-writer-wins keeps a single canonical proposal
+	/// per finding without forcing the route to special-case the race.
+	AlreadyPresent,
+}
+
+/// Stamp `patch_unified` plus the audit columns on a finding, only if
+/// it doesn't already have a patch attached. The atomic guard
+/// (`WHERE id = ?1 AND patch_unified IS NULL`) makes concurrent
+/// verifier verdicts race-safe: whichever verdict commits first wins
+/// the slot; later writes silently no-op (`AlreadyPresent`).
+///
+/// Caller is responsible for having already validated that the
+/// verdict was `confirmed` — this function does not check verdict
+/// state. Pairing it with the verdict-insert in the same tx (see
+/// `routes/jobs.rs::submit_verdict`) is what enforces the invariant
+/// that a patch can only ride on a confirmed verdict.
+pub fn attach_proposed_patch(
+	conn: &Connection, finding_id: i64, patch_unified: &str, by_cn: &str, now: i64,
+) -> rusqlite::Result<PatchAttachOutcome> {
+	let n = conn.execute(
+		"UPDATE findings
+		    SET patch_unified = ?1, patch_proposed_by_cn = ?2, patch_proposed_at = ?3
+		  WHERE id = ?4 AND patch_unified IS NULL",
+		params![patch_unified, by_cn, now, finding_id],
+	)?;
+	Ok(if n > 0 { PatchAttachOutcome::Attached } else { PatchAttachOutcome::AlreadyPresent })
+}
+
 /// Outcome of an `approve`/`reject` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOutcome {
@@ -309,6 +347,8 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 		approved_by_cn: row.get(18)?,
 		rejected_at: row.get(19)?,
 		rejected_by_cn: row.get(20)?,
+		patch_proposed_at: row.get(21)?,
+		patch_proposed_by_cn: row.get(22)?,
 	})
 }
 
@@ -625,6 +665,63 @@ mod tests {
 		// All-empty after sanitisation → empty string. Callers can
 		// detect this and skip the query.
 		assert_eq!(sanitize_fts_query("'\" *: ()"), "");
+	}
+
+	#[test]
+	fn attach_proposed_patch_writes_when_slot_is_empty() {
+		let (db, repo_id, job_id) = fixture();
+		let f = sample("fp-attach");
+		let id = db
+			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 100)?))
+			.unwrap()
+			.unwrap();
+
+		let outcome = db
+			.with_conn(|c| {
+				Ok(attach_proposed_patch(
+					c,
+					id,
+					"--- a/x\n+++ b/x\n@@\n-old\n+new\n",
+					"alice",
+					200,
+				)?)
+			})
+			.unwrap();
+		assert_eq!(outcome, PatchAttachOutcome::Attached);
+
+		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		assert_eq!(row.patch_unified.as_deref(), Some("--- a/x\n+++ b/x\n@@\n-old\n+new\n"));
+		assert_eq!(row.patch_proposed_by_cn.as_deref(), Some("alice"));
+		assert_eq!(row.patch_proposed_at, Some(200));
+	}
+
+	#[test]
+	fn attach_proposed_patch_is_first_writer_wins() {
+		// Race semantics: a second verifier confirming the same finding
+		// after the first one already attached a patch must NOT
+		// overwrite the existing diff. The audit columns also stay
+		// pinned to the first writer so a later reader can't be misled
+		// about provenance.
+		let (db, repo_id, job_id) = fixture();
+		let f = sample("fp-race");
+		let id = db
+			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 100)?))
+			.unwrap()
+			.unwrap();
+
+		let first = db
+			.with_conn(|c| Ok(attach_proposed_patch(c, id, "first patch", "alice", 200)?))
+			.unwrap();
+		assert_eq!(first, PatchAttachOutcome::Attached);
+		let second = db
+			.with_conn(|c| Ok(attach_proposed_patch(c, id, "second patch", "bob", 300)?))
+			.unwrap();
+		assert_eq!(second, PatchAttachOutcome::AlreadyPresent);
+
+		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		assert_eq!(row.patch_unified.as_deref(), Some("first patch"));
+		assert_eq!(row.patch_proposed_by_cn.as_deref(), Some("alice"));
+		assert_eq!(row.patch_proposed_at, Some(200));
 	}
 
 	#[test]

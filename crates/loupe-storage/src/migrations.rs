@@ -15,7 +15,8 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: V1_INITIAL }];
+const MIGRATIONS: &[Migration] =
+	&[Migration { version: 1, sql: V1_INITIAL }, Migration { version: 2, sql: V2_PATCH_AUDIT }];
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {
@@ -262,6 +263,19 @@ CREATE TABLE scan_history (
 CREATE INDEX idx_history_repo ON scan_history(repo_id, finished_at DESC);
 "#;
 
+/// v2 — verifier-proposed patch attribution.
+///
+/// `patch_unified` already exists from v1 (intended as the storage
+/// slot for a candidate fix), but no producer wrote to it. The
+/// verifier flow now optionally attaches a patch when it confirms a
+/// finding; these two columns capture *who* attached it and *when*,
+/// matching the `approved_by_cn` / `approved_at` audit pattern that
+/// already covers the human approval gate.
+const V2_PATCH_AUDIT: &str = r#"
+ALTER TABLE findings ADD COLUMN patch_proposed_by_cn TEXT;
+ALTER TABLE findings ADD COLUMN patch_proposed_at    INTEGER;
+"#;
+
 #[cfg(test)]
 mod tests {
 	use rusqlite::Connection;
@@ -278,6 +292,29 @@ mod tests {
 	fn fresh_db_reaches_latest_version() {
 		let c = fresh();
 		assert_eq!(current_schema_version(&c).unwrap(), LATEST_SCHEMA_VERSION);
+	}
+
+	#[test]
+	fn v2_adds_patch_proposed_audit_columns_to_findings() {
+		// Pin the surface that the verifier-proposed-patch flow depends
+		// on. If a later refactor drops one of these columns, the
+		// audit trail for "who attached this patch" disappears
+		// silently — readers would see `patch_unified` populated with
+		// no provenance. The migration itself, plus this assertion,
+		// keeps that contract honest.
+		let c = fresh();
+		for col in ["patch_proposed_by_cn", "patch_proposed_at"] {
+			let exists: bool = c
+				.query_row(
+					&format!(
+						"SELECT EXISTS(SELECT 1 FROM pragma_table_info('findings') WHERE name='{col}')"
+					),
+					[],
+					|r| r.get(0),
+				)
+				.unwrap();
+			assert!(exists, "findings.{col} column missing — v2 migration regressed");
+		}
 	}
 
 	#[test]
