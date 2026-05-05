@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::{Finding, Verdict};
+use loupe_core::{Finding, Verdict, VerdictPatch};
 use serde::Deserialize;
 
 use crate::llm::prompts::{self, VERIFY};
@@ -40,6 +40,21 @@ struct VerifyRaw {
 	verdict: String,
 	#[serde(default)]
 	notes: Option<String>,
+	/// Optional candidate fix on a confirmed verdict. Today the
+	/// production prompt doesn't ask for it (the next commit moves
+	/// the verifier to MCP, where `submit_patch` is the real surface);
+	/// this field is parsed eagerly so the integration tests in
+	/// `verify_flow.rs` can drive the server-side patch-attachment
+	/// path through the existing JSON-stdout shape without first
+	/// landing the MCP rewrite.
+	#[serde(default)]
+	patch: Option<VerifyRawPatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyRawPatch {
+	patch_unified: String,
+	notes: String,
 }
 
 #[async_trait]
@@ -90,7 +105,12 @@ impl Scanner for LlmVerifierScanner {
 			)
 		})?;
 		Ok(match raw.verdict.as_str() {
-			"confirmed" => Verdict::Confirmed { notes: raw.notes, patch: None },
+			"confirmed" => Verdict::Confirmed {
+				notes: raw.notes,
+				patch: raw
+					.patch
+					.map(|p| VerdictPatch { patch_unified: p.patch_unified, notes: p.notes }),
+			},
 			"dismissed" => Verdict::Dismissed { notes: raw.notes },
 			_ => Verdict::Inconclusive {
 				reason: raw.notes.unwrap_or_else(|| "model returned inconclusive".into()),

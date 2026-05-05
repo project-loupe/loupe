@@ -354,6 +354,16 @@ pub async fn submit_verdict(
 		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone()),
 		loupe_core::Verdict::Inconclusive { reason } => ("inconclusive", Some(reason.clone())),
 	};
+	// Patches only ride on Confirmed verdicts (pinned by the
+	// `Verdict` type itself); pull the diff out here so the closure
+	// below can borrow it cleanly without re-matching on the variant.
+	let patch_to_attach: Option<(&str, &str)> = match &submission.verdict {
+		loupe_core::Verdict::Confirmed { patch: Some(p), .. } => {
+			Some((p.patch_unified.as_str(), p.notes.as_str()))
+		},
+		_ => None,
+	};
+	let by_cn = worker.worker.name.clone();
 	// Resolve effective approval mode for this finding's repo before
 	// the tx so the rollup can route a `confirmed` verdict either to
 	// `confirmed` (immediate dispatch) or `awaiting_approval` (parked
@@ -379,6 +389,23 @@ pub async fn submit_verdict(
 				 VALUES (?1, ?2, ?3, ?4, ?5)",
 				(target_finding_id, row.id, verdict_str, &notes, now),
 			)?;
+			// Attach a verifier-proposed patch (when Confirmed and one
+			// was supplied) inside the same tx as the verdict insert,
+			// so by the time `dispatch_finding` runs after tx.commit
+			// the GitHub reporter sees the patch in the row. The
+			// storage layer's NULL-check guards against a second
+			// verifier overwriting an earlier patch — first writer
+			// wins, the audit columns pin provenance to that writer.
+			if let Some((patch_unified, patch_notes)) = patch_to_attach {
+				let _ = loupe_storage::findings::attach_proposed_patch(
+					&tx,
+					target_finding_id,
+					patch_unified,
+					patch_notes,
+					&by_cn,
+					now,
+				)?;
+			}
 			// Bail out early if the finding was already terminal — a
 			// concurrent reaper or earlier verdict beat us here.
 			let current: String = tx.query_row(

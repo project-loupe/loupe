@@ -15,8 +15,11 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] =
-	&[Migration { version: 1, sql: V1_INITIAL }, Migration { version: 2, sql: V2_PATCH_AUDIT }];
+const MIGRATIONS: &[Migration] = &[
+	Migration { version: 1, sql: V1_INITIAL },
+	Migration { version: 2, sql: V2_PATCH_AUDIT },
+	Migration { version: 3, sql: V3_PATCH_NOTES },
+];
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {
@@ -276,6 +279,19 @@ ALTER TABLE findings ADD COLUMN patch_proposed_by_cn TEXT;
 ALTER TABLE findings ADD COLUMN patch_proposed_at    INTEGER;
 "#;
 
+/// v3 — rationale text for verifier-proposed patches.
+///
+/// The patch unified diff alone is the *what*; this column captures
+/// the verifier's *why*: "swap the comparison operator", "add the
+/// missing bounds check", etc. Surfaced verbatim to human reviewers
+/// during the approval gate and embedded into auto-filed GitHub
+/// issues alongside the diff. Nullable because (a) early findings
+/// pre-date the column and (b) regex-style scanners that never
+/// route through the verifier won't populate it.
+const V3_PATCH_NOTES: &str = r#"
+ALTER TABLE findings ADD COLUMN patch_notes TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
 	use rusqlite::Connection;
@@ -303,7 +319,7 @@ mod tests {
 		// no provenance. The migration itself, plus this assertion,
 		// keeps that contract honest.
 		let c = fresh();
-		for col in ["patch_proposed_by_cn", "patch_proposed_at"] {
+		for col in ["patch_proposed_by_cn", "patch_proposed_at", "patch_notes"] {
 			let exists: bool = c
 				.query_row(
 					&format!(

@@ -287,6 +287,62 @@ async fn confirmed_verdict_dispatches_the_finding() {
 }
 
 #[tokio::test]
+async fn confirmed_verdict_with_patch_attaches_diff_and_audit() {
+	// End-to-end coverage of the patch-attachment path: the
+	// verifier returns a Confirmed verdict carrying a candidate
+	// fix; the server lands the diff, the rationale, and the
+	// patch_proposed_* audit columns inside the same tx as the
+	// verdict insert + state transition; the dispatcher reads the
+	// row *after* the tx commits, so the auto-filed GitHub issue
+	// includes the patch.
+	let (db, stub, server) = run_flow(
+		r#"{
+			"verdict": "confirmed",
+			"notes": "OOB confirmed on empty slice",
+			"patch": {
+				"patch_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,3 @@\n-pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }\n+pub fn idx(arr: &[u8], i: usize) -> u8 {\n+    if i < arr.len() { arr[i] } else { 0 }\n+}\n",
+				"notes": "guard the index lookup so an empty slice can't panic"
+			}
+		}"#,
+	)
+	.await;
+
+	let row: (String, Option<String>, Option<String>, Option<String>, Option<i64>) = db
+		.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT state, patch_unified, patch_notes, patch_proposed_by_cn, patch_proposed_at
+				 FROM findings LIMIT 1",
+				[],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+			)?)
+		})
+		.unwrap();
+	let (state, patch_unified, patch_notes, by_cn, at) = row;
+	assert_eq!(state, "reported");
+	let patch = patch_unified.expect("patch_unified must be set when verdict carries a patch");
+	assert!(patch.contains("if i < arr.len()"), "stored diff must match what the verdict carried");
+	assert_eq!(
+		patch_notes.as_deref(),
+		Some("guard the index lookup so an empty slice can't panic")
+	);
+	assert_eq!(by_cn.as_deref(), Some("w1"), "audit must record the verifier worker's name");
+	assert!(at.is_some(), "patch_proposed_at must be stamped");
+
+	// GitHub stub got the issue (already covered by the confirmed-
+	// without-patch test); just sanity-check the body now carries
+	// the diff so the human reviewer sees the fix on the issue.
+	let captured = stub.captured.lock().unwrap().clone();
+	assert_eq!(captured.len(), 1);
+	let body = captured[0]["body"].as_str().unwrap();
+	assert!(
+		body.contains("if i < arr.len()"),
+		"GitHub issue body must embed the proposed diff; got: {body}"
+	);
+
+	server.shutdown().await;
+}
+
+#[tokio::test]
 async fn dismissed_verdict_blocks_dispatch() {
 	let (db, stub, server) =
 		run_flow(r#"{"verdict":"dismissed","notes":"false positive — ignore"}"#).await;
