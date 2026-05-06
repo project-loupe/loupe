@@ -800,7 +800,7 @@ async fn dispatch_for_job(
 	state.db.with_conn(|c| {
 		c.execute(
 			"UPDATE findings SET reported_at = ?1, state = 'reported'
-			 WHERE job_id = ?2 AND state != 'reported'",
+			 WHERE job_id = ?2 AND state = 'confirmed'",
 			(now, job_id),
 		)?;
 		Ok(())
