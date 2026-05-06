@@ -205,8 +205,8 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 		.db
 		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?
 		.ok_or_else(|| anyhow::anyhow!("repo {} for leased job not found", row.repo_id))?;
-	// For now no clone-side PAT is stored separately; M2 wires this in.
-	// (We deliberately do not ship the reporting PAT to the worker.)
+	// No clone-side credential is stored separately. We deliberately do
+	// not ship the reporting PAT to the worker.
 	let github_pat: Option<String> = None;
 
 	let payload = match row.kind {

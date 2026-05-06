@@ -1,8 +1,8 @@
-//! Built-in scanners for M1.
+//! Built-in scan and verify implementations.
 //!
-//! `regex_secrets` is intentionally simple — its job is to prove the
-//! pipeline (lease → checkout → scan → submit → complete → report)
-//! actually produces a finding end-to-end without hand-waving.
+//! `regex_secrets` stays as a cheap deterministic scanner and test
+//! fixture; the LLM scanners handle agent-driven discovery and
+//! cross-model verification.
 
 pub mod llm_code_review;
 pub mod llm_verifier;

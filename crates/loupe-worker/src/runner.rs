@@ -1,9 +1,8 @@
 //! Worker runner loop: lease → ensure_repo → checkout → scan → submit → complete.
 //!
-//! M1 polls when the queue is empty (long-poll happens in M2 when the
-//! server adds streaming) and runs the regex scanner on every leased
-//! scan job. Verify-kind jobs are leased but not yet executed —
-//! verifier scanners arrive in M2.
+//! The runner long-polls for scan or verify jobs, checks out a fresh
+//! worktree, runs the matching scanner, submits any in-process findings
+//! or verdicts, and completes the lease.
 
 use std::path::Path;
 use std::sync::Arc;

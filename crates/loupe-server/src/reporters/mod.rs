@@ -1,9 +1,8 @@
-//! Reporter trait + the M1 GithubReporter that opens issues on a
-//! target tracker repo.
+//! Reporter trait plus the built-in automatic reporting destinations.
 //!
 //! The dispatcher hands a freshly-completed scan's findings to whatever
-//! `Reporter` matches the repo's `ReportingDestination`. For M1 that's
-//! always `GithubReporter` (issue mode); email and PR-mode are M2.
+//! `Reporter` matches the repo's `ReportingDestination`. Manual mode
+//! short-circuits before a reporter is selected.
 
 use std::sync::Arc;
 

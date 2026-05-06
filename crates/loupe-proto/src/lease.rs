@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// `wait_seconds` enables server-side long-polling: if the queue is
 /// empty, the server holds the connection up to that many seconds
-/// waiting for a job. Default `0` means the legacy poll-and-return-empty
-/// behaviour, so older workers don't have to opt in.
+/// waiting for a job. Default `0` keeps immediate empty-queue responses
+/// available for callers that prefer explicit polling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRequest {
 	pub protocol_version: u16,

@@ -7,8 +7,9 @@ use crate::severity::Severity;
 /// columns one-for-one so the worker can construct one without consulting
 /// the storage layer.
 ///
-/// `fingerprint` is the dedup key — `blake3(scanner_id|file|line|title)`
-/// in the canonical implementation, but treated as opaque bytes here.
+/// `fingerprint` is the server-side dedup key. Scanners treat it as
+/// opaque; the built-in implementations currently hash scanner id,
+/// file path, and a normalized source window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
 	pub scanner_id: String,

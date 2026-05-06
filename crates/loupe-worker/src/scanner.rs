@@ -1,8 +1,8 @@
 //! `Scanner` trait — the extension point for security checks.
 //!
-//! M1 ships one trivial implementation (`RegexScanner`) so the
-//! end-to-end pipeline can produce findings. Real LLM-agent and fuzz
-//! scanners land in M3 behind this same trait.
+//! Built-in scanners cover regex-based secret discovery, LLM discovery,
+//! and LLM verification. Future scanner families plug into this same
+//! trait.
 
 use std::path::PathBuf;
 

@@ -13,9 +13,8 @@
 //! - Concurrent leases against the same repo are serialised by a per-repo
 //!   `tokio::sync::Mutex` keyed in an in-memory map, so two scan jobs
 //!   don't race the bare clone.
-//! - Repo-size enforcement is the **server's** job (it checks via the
-//!   GitHub API at registration time); the worker no longer carries an
-//!   HTTP client just to reject oversized repos.
+//! - Worktree-size enforcement happens in the runner after checkout,
+//!   so the cache only manages clone freshness and LRU eviction.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

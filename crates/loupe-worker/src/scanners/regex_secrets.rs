@@ -2,9 +2,8 @@
 //! files for AWS-style `AKIA…` access key prefixes, and emits a finding
 //! per match.
 //!
-//! Exists primarily so M1 has at least one real scanner producing real
-//! findings on a real worktree — the pipeline test would otherwise be
-//! a no-op.
+//! Stays intentionally small and deterministic so the end-to-end
+//! pipeline can be tested without invoking an LLM backend.
 
 use std::fs;
 use std::path::Path;
