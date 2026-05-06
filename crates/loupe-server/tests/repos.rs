@@ -90,8 +90,8 @@ async fn admin_can_register_list_and_delete_a_repo() {
 			github_pat: "ghp_secret_value".into(),
 		},
 		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
-		verification_enabled: false,
-		require_approval: None,
+		verification_enabled: true,
+		require_approval: Some(false),
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
 	assert_eq!(resp.status(), 201, "create repo: {}", resp.status());
@@ -136,6 +136,9 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	assert_eq!(body.repos.len(), 1);
 	assert_eq!(body.repos[0].clone_url, "https://github.com/acme/widget.git");
 	assert_eq!(body.repos[0].host, "github.com");
+	assert_eq!(body.repos[0].disabled_at, None);
+	assert!(body.repos[0].verification_enabled);
+	assert_eq!(body.repos[0].require_approval, Some(false));
 
 	// Delete cascades.
 	let resp =

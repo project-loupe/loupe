@@ -323,9 +323,19 @@ async fn repo_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> 
 	let resp = client.get(url(base, "/v1/repos")).send().await?;
 	let body: ListReposResponse = resp.error_for_status()?.json().await?;
 	for r in body.repos {
+		let approval = r.require_approval.map_or("inherit".to_owned(), |v| v.to_string());
+		let disabled = r.disabled_at.map_or("active".to_owned(), |ts| format!("disabled@{ts}"));
 		println!(
-			"{:>4}\t{}\t{}/{}\tinterval={:?}\tlast_sha={:?}",
-			r.id, r.host, r.owner, r.repo, r.scan_interval_seconds, r.last_scanned_sha,
+			"{:>4}\t{}\t{}/{}\tinterval={:?}\tverify={}\tapproval={}\t{}\tlast_sha={:?}",
+			r.id,
+			r.host,
+			r.owner,
+			r.repo,
+			r.scan_interval_seconds,
+			r.verification_enabled,
+			approval,
+			disabled,
+			r.last_scanned_sha,
 		);
 	}
 	Ok(())

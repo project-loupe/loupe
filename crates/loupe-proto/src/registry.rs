@@ -128,6 +128,11 @@ pub struct RepoSummary {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub scan_interval_seconds: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub disabled_at: Option<i64>,
+	pub verification_enabled: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub require_approval: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_scanned_sha: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_scanned_at: Option<i64>,
