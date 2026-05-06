@@ -6,7 +6,7 @@
 //! operator can spot a finding stuck in `validating` or already
 //! `reported` without having to read the database.
 
-use loupe_core::Severity;
+use loupe_core::{FindingState, Severity};
 use serde::{Deserialize, Serialize};
 
 /// Findings listing response body.
@@ -32,7 +32,7 @@ pub struct FindingSummary {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub line_start: Option<u32>,
 	pub fingerprint: String,
-	pub state: String,
+	pub state: FindingState,
 	pub verification_required: bool,
 	pub created_at: i64,
 	/// Approval audit trail. Populated when an admin runs
@@ -76,7 +76,7 @@ pub struct FindingDetail {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub poc_unified: Option<String>,
 	pub fingerprint: String,
-	pub state: String,
+	pub state: FindingState,
 	pub verification_required: bool,
 	pub created_at: i64,
 	#[serde(default, skip_serializing_if = "Option::is_none")]

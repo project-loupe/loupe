@@ -12,6 +12,9 @@ pub enum Error {
 
 	#[error("unknown job kind: {0:?}")]
 	UnknownJobKind(String),
+
+	#[error("unknown finding state: {0:?}")]
+	UnknownFindingState(String),
 }
 
 pub type Result<T, E = Error> = StdResult<T, E>;

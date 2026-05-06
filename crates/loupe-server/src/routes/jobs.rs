@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use loupe_core::{JobKind, JobState};
+use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatResponse, JobInfo, LeaseEnvelope,
 	LeasePayload, LeaseRequest, LeaseResponse, ScanRequest, ScanResponse, VerdictSubmission,
@@ -639,7 +639,7 @@ pub(super) async fn dispatch_finding(
 		.db
 		.with_conn(|c| Ok(findings::get(c, finding_id)?))?
 		.ok_or_else(|| anyhow::anyhow!("finding {finding_id} disappeared before dispatch"))?;
-	if row.state != "confirmed" {
+	if row.state != FindingState::Confirmed {
 		anyhow::bail!("finding {finding_id} is not confirmed; current state is {}", row.state);
 	}
 	let repo = state.db.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?.ok_or_else(|| {
@@ -679,7 +679,8 @@ async fn dispatch_confirmed_rows(
 ) -> anyhow::Result<()> {
 	use loupe_core::ReportingDestination;
 
-	let confirmed_rows: Vec<_> = rows.into_iter().filter(|r| r.state == "confirmed").collect();
+	let confirmed_rows: Vec<_> =
+		rows.into_iter().filter(|r| r.state == FindingState::Confirmed).collect();
 	if confirmed_rows.is_empty() {
 		return Ok(());
 	}

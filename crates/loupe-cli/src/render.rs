@@ -16,7 +16,7 @@
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 
-use loupe_core::Severity;
+use loupe_core::{FindingState, Severity};
 use loupe_proto::FindingDetail;
 
 /// Whether to emit ANSI escape sequences. Detected once per call by
@@ -190,16 +190,15 @@ fn severity_color(sev: Severity) -> &'static str {
 	}
 }
 
-fn state_painted(state: &str, style: Style) -> String {
+fn state_painted(state: &FindingState, style: Style) -> String {
 	let code = match state {
-		"awaiting_approval" => YELLOW,
-		"confirmed" => GREEN,
-		"reported" => CYAN,
-		"dismissed" => RED,
-		"validating" | "pending" => DIM,
-		_ => DIM,
+		FindingState::AwaitingApproval => YELLOW,
+		FindingState::Confirmed => GREEN,
+		FindingState::Reported => CYAN,
+		FindingState::Dismissed => RED,
+		FindingState::Validating | FindingState::Pending => DIM,
 	};
-	style.paint(code, state)
+	style.paint(code, state.as_str())
 }
 
 /// Format a unix timestamp as `YYYY-MM-DD HH:MM:SS UTC` without
@@ -269,7 +268,7 @@ mod tests {
 					.into(),
 			),
 			fingerprint: "deadbeef".into(),
-			state: "awaiting_approval".into(),
+			state: FindingState::AwaitingApproval,
 			verification_required: false,
 			created_at: 1_756_000_000, // 2025-08-24 01:46:40 UTC
 			approved_at: None,

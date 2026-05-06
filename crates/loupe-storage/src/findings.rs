@@ -1,6 +1,6 @@
 //! DAO for the `findings` table.
 
-use loupe_core::{Finding, Severity};
+use loupe_core::{Finding, FindingState, Severity};
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +19,7 @@ pub struct FindingRow {
 	pub patch_unified: Option<String>,
 	pub poc_unified: Option<String>,
 	pub fingerprint: String,
-	pub state: String,
+	pub state: FindingState,
 	pub verification_required: bool,
 	pub created_at: i64,
 	pub approved_at: Option<i64>,
@@ -348,7 +348,16 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 		patch_unified: row.get(11)?,
 		poc_unified: row.get(12)?,
 		fingerprint: row.get(13)?,
-		state: row.get(14)?,
+		state: {
+			let state_str: String = row.get(14)?;
+			state_str.parse::<FindingState>().map_err(|e| {
+				rusqlite::Error::FromSqlConversionFailure(
+					14,
+					rusqlite::types::Type::Text,
+					e.into(),
+				)
+			})?
+		},
 		verification_required: row.get::<_, i64>(15)? != 0,
 		created_at: row.get(16)?,
 		approved_at: row.get(17)?,

@@ -6,6 +6,7 @@
 
 mod error;
 mod finding;
+mod finding_state;
 mod job;
 mod repo;
 mod severity;
@@ -13,6 +14,7 @@ mod verdict;
 
 pub use error::{Error, Result};
 pub use finding::Finding;
+pub use finding_state::FindingState;
 pub use job::{JobKind, JobState};
 pub use repo::{RepoSpec, ReportingDestination};
 pub use severity::Severity;
