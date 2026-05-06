@@ -93,12 +93,4 @@ mod tests {
 		assert_eq!(back.poc_unified.as_deref(), f.poc_unified.as_deref());
 	}
 
-	#[test]
-	fn poc_unified_defaults_to_none_when_absent() {
-		// Wire format from an older sender that doesn't know about
-		// poc_unified must still deserialise.
-		let s = r#"{"scanner_id":"x","severity":"low","title":"t","description":"d","fingerprint":"fp"}"#;
-		let f: Finding = serde_json::from_str(s).unwrap();
-		assert!(f.poc_unified.is_none());
-	}
 }

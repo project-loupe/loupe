@@ -31,10 +31,8 @@ pub enum Verdict {
 	Confirmed {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		notes: Option<String>,
-		/// Optional candidate fix. Older workers that don't speak
-		/// the patch-attachment surface omit this field on the wire;
-		/// `skip_serializing_if = Option::is_none` keeps the JSON
-		/// shape backwards-compatible in both directions.
+		/// Optional candidate fix. Omitted when the verifier confirms
+		/// the finding without proposing a patch.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		patch: Option<VerdictPatch>,
 	},
@@ -92,16 +90,4 @@ mod tests {
 		assert!(!s.contains("patch"), "got: {s}");
 	}
 
-	#[test]
-	fn confirmed_with_patch_round_trips_through_legacy_shape() {
-		// Backwards-compat against an older server build: a Confirmed
-		// verdict serialised without the `patch` field (the v1 wire
-		// shape) must still parse cleanly into the current type with
-		// `patch = None`. If this assertion ever fires, an older
-		// worker can't talk to the current server (or vice versa)
-		// without a coordinated upgrade.
-		let legacy = r#"{"outcome":"confirmed","notes":"bug"}"#;
-		let parsed: Verdict = serde_json::from_str(legacy).unwrap();
-		assert_eq!(parsed, Verdict::Confirmed { notes: Some("bug".into()), patch: None });
-	}
 }

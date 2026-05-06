@@ -72,9 +72,6 @@ fn read_current_version(conn: &Connection) -> rusqlite::Result<u32> {
 
 /// v1 — initial schema.
 ///
-/// Every substantive table carries a `record_version` column so JSON-blob
-/// shape changes don't force a global migration; readers branch on the
-/// version when interpreting.
 const V1_INITIAL: &str = r#"
 CREATE TABLE schema_meta (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
@@ -84,7 +81,6 @@ CREATE TABLE schema_meta (
 
 CREATE TABLE secrets (
     id              INTEGER PRIMARY KEY,
-    record_version  INTEGER NOT NULL DEFAULT 1,
     kind            TEXT    NOT NULL,
     label           TEXT    NOT NULL,
     -- Value bytes (e.g. a GitHub PAT). Stored verbatim — the DB file
@@ -98,7 +94,6 @@ CREATE TABLE secrets (
 
 CREATE TABLE workers (
     id                INTEGER PRIMARY KEY,
-    record_version    INTEGER NOT NULL DEFAULT 1,
     name              TEXT    NOT NULL UNIQUE,
     kind              TEXT    NOT NULL DEFAULT 'worker'
                             CHECK (kind IN ('worker', 'admin')),
@@ -110,7 +105,6 @@ CREATE TABLE workers (
 
 CREATE TABLE registered_repos (
     id                      INTEGER PRIMARY KEY,
-    record_version          INTEGER NOT NULL DEFAULT 1,
     clone_url               TEXT    NOT NULL UNIQUE,
     host                    TEXT    NOT NULL,
     owner                   TEXT    NOT NULL,
@@ -142,7 +136,6 @@ CREATE INDEX idx_repos_due
 
 CREATE TABLE jobs (
     id                  INTEGER PRIMARY KEY,
-    record_version      INTEGER NOT NULL DEFAULT 1,
     repo_id             INTEGER NOT NULL REFERENCES registered_repos(id) ON DELETE CASCADE,
     kind                TEXT    NOT NULL CHECK (kind IN ('scan', 'verify')),
     state               TEXT    NOT NULL CHECK (state IN ('queued','leased','succeeded','failed','cancelled')),
@@ -165,7 +158,6 @@ CREATE INDEX idx_jobs_repo   ON jobs(repo_id);
 
 CREATE TABLE findings (
     id                      INTEGER PRIMARY KEY,
-    record_version          INTEGER NOT NULL DEFAULT 1,
     repo_id                 INTEGER NOT NULL REFERENCES registered_repos(id) ON DELETE CASCADE,
     job_id                  INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     scanner_id              TEXT    NOT NULL,
@@ -245,7 +237,6 @@ END;
 
 CREATE TABLE finding_verifications (
     id              INTEGER PRIMARY KEY,
-    record_version  INTEGER NOT NULL DEFAULT 1,
     finding_id      INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
     -- Nullable so the validating-deadline reaper can record a
     -- system-issued `inconclusive` verdict without inventing a
@@ -259,7 +250,6 @@ CREATE INDEX idx_verifications_finding ON finding_verifications(finding_id);
 
 CREATE TABLE scan_history (
     id              INTEGER PRIMARY KEY,
-    record_version  INTEGER NOT NULL DEFAULT 1,
     repo_id         INTEGER NOT NULL REFERENCES registered_repos(id) ON DELETE CASCADE,
     job_id          INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     head_sha        TEXT    NOT NULL,
@@ -298,40 +288,6 @@ mod tests {
 		apply_pending(&mut c).unwrap();
 		let v_after = current_schema_version(&c).unwrap();
 		assert_eq!(v_before, v_after);
-	}
-
-	#[test]
-	fn every_substantive_table_carries_record_version() {
-		// `schema_meta` is exempt — it tracks migrations itself.
-		// FTS5 virtual tables and their shadow tables (`*_data`,
-		// `*_idx`, `*_content`, `*_docsize`, `*_config`) are SQLite
-		// internals indexing user data, not first-class entities
-		// themselves. The user-data row in `findings` is the
-		// authoritative one and *does* carry record_version.
-		let c = fresh();
-		let mut stmt = c
-			.prepare(
-				"SELECT name FROM sqlite_master \
-				 WHERE type='table' \
-				   AND name NOT LIKE 'sqlite_%' \
-				   AND name NOT LIKE '%_fts' \
-				   AND name NOT LIKE '%_fts_%' \
-				   AND name <> 'schema_meta'",
-			)
-			.unwrap();
-		let tables: Vec<String> =
-			stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
-		assert!(!tables.is_empty(), "no substantive tables found");
-		for table in tables {
-			let has: bool = c
-				.query_row(
-					&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='record_version')"),
-					[],
-					|r| r.get(0),
-				)
-				.unwrap();
-			assert!(has, "table {table} is missing record_version");
-		}
 	}
 
 	#[test]
