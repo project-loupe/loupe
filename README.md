@@ -255,6 +255,80 @@ Cache size defaults to 40 GB and evicts LRU clones above the cap.
 Verifier jobs only get queued when a repo is registered with
 `--verification-enabled`.
 
+#### Deploy with systemd
+
+`contrib/` ships sample units and local-to-remote deploy scripts:
+
+- `contrib/loupe-server.service` runs `/opt/loupe/bin/loupe-server serve`
+  as `loupe`, reading `/etc/loupe/loupe-server.env`.
+- `contrib/loupe-worker.service` runs `/opt/loupe/bin/loupe-worker run`
+  as `loupe-worker`, reading `/etc/loupe/loupe-worker.env`.
+- `contrib/deploy-server.sh` and `contrib/deploy-worker.sh` build the
+  relevant release binary locally, upload it over SSH, install it with
+  `sudo install`, optionally update the unit/env file, and restart the
+  matching service.
+
+First provision each host once as root, then use an unprivileged SSH
+deploy user for routine updates. The service users need to exist before
+systemd starts the units:
+
+```
+# server host
+sudo useradd --system --home /var/lib/loupe --shell /usr/sbin/nologin loupe
+sudo install -d -o loupe -g loupe -m 0700 /var/lib/loupe
+sudo install -d -m 0755 /opt/loupe/bin /etc/loupe
+
+# worker host
+sudo useradd --system --home /var/lib/loupe-worker --shell /usr/sbin/nologin loupe-worker
+sudo install -d -o loupe-worker -g loupe-worker -m 0700 /var/lib/loupe-worker
+sudo install -d -o loupe-worker -g loupe-worker -m 0700 /var/cache/loupe-worker
+sudo install -d -m 0755 /opt/loupe/bin /etc/loupe
+```
+
+Grant the SSH deploy users only the commands the scripts need. Verify
+your distro's paths with `command -v install systemctl`, then install
+sudoers fragments with `visudo -f /etc/sudoers.d/loupe-...`:
+
+```
+deploy-server ALL=(root) NOPASSWD: \
+  /usr/bin/install -D -m 0755 /tmp/loupe-server-deploy.*.bin /opt/loupe/bin/loupe-server, \
+  /usr/bin/install -D -m 0644 /tmp/loupe-server-deploy.*.service /etc/systemd/system/loupe-server.service, \
+  /usr/bin/install -D -m 0600 /tmp/loupe-server-deploy.*.env /etc/loupe/loupe-server.env, \
+  /usr/bin/systemctl daemon-reload, \
+  /usr/bin/systemctl restart loupe-server.service
+
+deploy-worker ALL=(root) NOPASSWD: \
+  /usr/bin/install -D -m 0755 /tmp/loupe-worker-deploy.*.bin /opt/loupe/bin/loupe-worker, \
+  /usr/bin/install -D -m 0644 /tmp/loupe-worker-deploy.*.service /etc/systemd/system/loupe-worker.service, \
+  /usr/bin/install -D -m 0600 /tmp/loupe-worker-deploy.*.env /etc/loupe/loupe-worker.env, \
+  /usr/bin/systemctl daemon-reload, \
+  /usr/bin/systemctl restart loupe-worker.service
+```
+
+Examples from your local checkout:
+
+```
+LOUPE_SERVER_SSH=deploy-server@server-host \
+LOUPE_CONFIG=/var/lib/loupe/config.toml \
+LOUPE_MASTER_KEY="$(cat ./secrets/loupe-master.key)" \
+  contrib/deploy-server.sh
+
+LOUPE_WORKER_SSH=deploy-worker@worker-host \
+LOUPE_SERVER_URL=https://loupe.example.internal:8443 \
+LOUPE_CA_CERT=/etc/loupe/worker/ca.pem \
+LOUPE_WORKER_CERT=/etc/loupe/worker/worker.pem \
+LOUPE_WORKER_KEY=/etc/loupe/worker/worker.key \
+LOUPE_CACHE_DIR=/var/cache/loupe-worker \
+LOUPE_WORKER_PATH=/usr/local/bin:/usr/bin:/bin \
+ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  contrib/deploy-worker.sh
+```
+
+Set `LOUPE_*_ENV_FILE_LOCAL=/path/to/env` if you prefer to upload an
+exact env file instead of generating one from the current shell. Set
+`LOUPE_*_INSTALL_SERVICE=0` and `LOUPE_*_WRITE_ENV=0` for binary-only
+restarts after the unit and env file are already in place.
+
 ### 6. Register a repo and trigger a scan
 
 The `--pat` value here is the GitHub PAT you minted in the

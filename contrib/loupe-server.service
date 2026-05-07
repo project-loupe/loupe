@@ -1,0 +1,32 @@
+[Unit]
+Description=loupe security scanning server
+Documentation=https://github.com/tnull/loupe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loupe
+Group=loupe
+EnvironmentFile=-/etc/loupe/loupe-server.env
+WorkingDirectory=/var/lib/loupe
+ExecStart=/opt/loupe/bin/loupe-server serve
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+# systemd creates /var/lib/loupe when the service starts. Keep secrets
+# unreadable by other local users; root reads EnvironmentFile before
+# dropping to User=.
+StateDirectory=loupe
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/loupe
+
+[Install]
+WantedBy=multi-user.target
