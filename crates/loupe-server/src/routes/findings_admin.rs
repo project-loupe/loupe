@@ -6,14 +6,13 @@
 //! - `POST /v1/findings/:id/approve`         → release a held finding
 //! - `POST /v1/findings/:id/reject`          → terminally dismiss a held finding
 //!
-//! The list / get / approve / reject routes are admin-only — they
-//! sit behind `require_admin`. The `search` route is callable by any
-//! authenticated client (admin OR worker) because the worker-side
-//! MCP server (running as a child of `loupe-worker`) uses it as the
-//! backing for the `query_prior_findings` agent tool. Workers
-//! already see finding bodies via the lease envelope on verify jobs,
-//! so allowing them to FTS-search the same bodies is not a privilege
-//! escalation.
+//! The list / approve / reject routes are admin-only — they sit
+//! behind `require_admin`. `search` and `get` are callable by admins,
+//! and by workers only while the worker holds an active lease for the
+//! finding's repo. The worker-side MCP server (running as a child of
+//! `loupe-worker`) uses those routes for `query_prior_findings` and
+//! `get_finding_by_id`, so the lease check prevents a compromised
+//! agent from exploring finding history outside its current repo.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +21,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use loupe_proto::{FindingDetail, FindingSummary, ListFindingsResponse, PROTOCOL_VERSION};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
+use loupe_storage::jobs;
 use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
@@ -39,6 +39,33 @@ const SEARCH_DEFAULT_LIMIT: i64 = 20;
 /// Hard ceiling on `search` to keep a single tool call from
 /// downloading every finding on a repo.
 const SEARCH_MAX_LIMIT: i64 = 100;
+
+fn now_secs() -> i64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
+fn authorize_prior_finding_repo(
+	state: &AppState, authed: &AuthedWorker, repo_id: i64,
+) -> Result<(), (StatusCode, String)> {
+	if authed.is_admin() {
+		return Ok(());
+	}
+	let now = now_secs();
+	let allowed = state
+		.db
+		.with_conn(|c| Ok(jobs::worker_has_active_lease_for_repo(c, authed.id(), repo_id, now)?))
+		.map_err(|e| {
+			(StatusCode::INTERNAL_SERVER_ERROR, format!("checking worker repo lease: {e}"))
+		})?;
+	if allowed {
+		Ok(())
+	} else {
+		Err((
+			StatusCode::FORBIDDEN,
+			format!("worker does not hold an active lease for repo {repo_id}"),
+		))
+	}
+}
 
 pub async fn list_for_repo(
 	State(state): State<AppState>, Path(repo_id): Path<i64>,
@@ -62,14 +89,16 @@ pub struct SearchQuery {
 }
 
 /// `GET /v1/repos/:id/findings/search?q=<keywords>&limit=<n>`. FTS5
-/// keyword search over title, description, file_path. Open to any
-/// authenticated client; the MCP server's `query_prior_findings`
-/// tool calls this from inside the worker. Free-form `q` is run
-/// through `findings::sanitize_fts_query` server-side, so the
-/// caller doesn't need to know FTS5 syntax.
+/// keyword search over title, description, file_path. Open to admins
+/// and to workers with an active lease for `:id`; the MCP server's
+/// `query_prior_findings` tool calls this from inside the worker.
+/// Free-form `q` is run through `findings::sanitize_fts_query`
+/// server-side, so the caller doesn't need to know FTS5 syntax.
 pub async fn search(
-	State(state): State<AppState>, Path(repo_id): Path<i64>, Query(qp): Query<SearchQuery>,
+	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>,
+	Path(repo_id): Path<i64>, Query(qp): Query<SearchQuery>,
 ) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
+	authorize_prior_finding_repo(&state, &authed, repo_id)?;
 	let limit = qp.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
 	let sanitized = findings::sanitize_fts_query(&qp.q);
 	if sanitized.is_empty() {
@@ -91,13 +120,14 @@ pub async fn search(
 }
 
 pub async fn get(
-	State(state): State<AppState>, Path(id): Path<i64>,
+	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
 ) -> Result<Json<FindingDetail>, (StatusCode, String)> {
 	let row = state
 		.db
 		.with_conn(|c| Ok(findings::get(c, id)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
 		.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
+	authorize_prior_finding_repo(&state, &authed, row.repo_id)?;
 	Ok(Json(row_to_detail(row)))
 }
 

@@ -6,11 +6,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_core::Severity;
+use loupe_core::{Finding, Severity};
 use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseRequest, LeaseResponse,
-	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, ScanResponse, PROTOCOL_VERSION,
+	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, LeaseEnvelope, LeaseRequest,
+	LeaseResponse, ListFindingsResponse, RegisterRepoRequest, RegisterWorkerRequest,
+	RegisterWorkerResponse, ReportingSetup, ScanRequest, ScanResponse, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
@@ -38,6 +38,7 @@ struct Fixture {
 	admin: reqwest::Client,
 	worker: reqwest::Client,
 	repo_id: i64,
+	ca_cert_pem: String,
 }
 
 async fn bring_up_with_repo_and_worker() -> Fixture {
@@ -105,7 +106,97 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let worker = client(&ca_cert_pem, &bundle.client_cert_pem, &bundle.client_key_pem, addr);
 
-	Fixture { handle, addr, db, admin, worker, repo_id }
+	Fixture { handle, addr, db, admin, worker, repo_id, ca_cert_pem }
+}
+
+async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
+	let req = RegisterRepoRequest {
+		protocol_version: PROTOCOL_VERSION,
+		clone_url: clone_url.into(),
+		branch: Some("main".into()),
+		scan_interval_seconds: None,
+		reporting: ReportingSetup::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: target_repo.into(),
+			github_pat: "ghp".into(),
+		},
+		scanner_config: serde_json::Value::Null,
+		verification_enabled: false,
+		require_approval: None,
+	};
+	let resp = f.admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
+	assert_eq!(resp.status(), 201);
+	let body: serde_json::Value = resp.json().await.unwrap();
+	body["repo_id"].as_i64().unwrap()
+}
+
+async fn register_worker(f: &Fixture, name: &str) -> reqwest::Client {
+	let resp = f
+		.admin
+		.post("https://loupe-server/v1/workers")
+		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: name.into() })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
+	client(&f.ca_cert_pem, &bundle.client_cert_pem, &bundle.client_key_pem, f.addr)
+}
+
+async fn enqueue_scan(f: &Fixture, repo_id: i64) -> ScanResponse {
+	let resp = f
+		.admin
+		.post(format!("https://loupe-server/v1/repos/{repo_id}/scan"))
+		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	resp.json().await.unwrap()
+}
+
+async fn lease_job(worker: &reqwest::Client) -> LeaseEnvelope {
+	let resp = worker
+		.post("https://loupe-server/v1/jobs/lease")
+		.json(&LeaseRequest {
+			protocol_version: PROTOCOL_VERSION,
+			capabilities: vec!["scan:secrets".into()],
+			wait_seconds: 0,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert!(resp.status().is_success());
+	match resp.json::<LeaseResponse>().await.unwrap() {
+		LeaseResponse::Lease(env) => *env,
+		LeaseResponse::Empty { .. } => panic!("queue should not be empty"),
+	}
+}
+
+async fn submit_finding(worker: &reqwest::Client, job_id: i64, finding: Finding) {
+	let resp = worker
+		.post(format!("https://loupe-server/v1/jobs/{job_id}/findings"))
+		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+}
+
+fn finding(title: &str, fingerprint: &str) -> Finding {
+	Finding {
+		scanner_id: "regex".into(),
+		severity: Severity::High,
+		title: title.into(),
+		description: format!("{title} description"),
+		file_path: Some("src/x.rs".into()),
+		line_start: Some(1),
+		line_end: Some(1),
+		cwe: None,
+		patch_unified: None,
+		poc_unified: None,
+		fingerprint: fingerprint.into(),
+	}
 }
 
 #[tokio::test]
@@ -217,6 +308,116 @@ async fn end_to_end_scan_lifecycle() {
 		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM scan_history", [], |r| r.get(0))?))
 			.unwrap();
 	assert_eq!(history_count, 1);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn prior_finding_routes_require_active_lease_for_that_repo() {
+	let f = bring_up_with_repo_and_worker().await;
+	let repo_b = register_repo(&f, "https://github.com/acme/other.git", "other-tracker").await;
+	let worker2 = register_worker(&f, "w2").await;
+
+	let scan_a = enqueue_scan(&f, f.repo_id).await;
+	let env_a = lease_job(&f.worker).await;
+	assert_eq!(env_a.job_id, scan_a.job_id);
+	assert_eq!(env_a.repo_id, f.repo_id);
+	submit_finding(&f.worker, env_a.job_id, finding("Alpha overflow", "fp-alpha")).await;
+
+	let scan_b = enqueue_scan(&f, repo_b).await;
+	let env_b = lease_job(&worker2).await;
+	assert_eq!(env_b.job_id, scan_b.job_id);
+	assert_eq!(env_b.repo_id, repo_b);
+	submit_finding(&worker2, env_b.job_id, finding("Beta overflow", "fp-beta")).await;
+
+	let resp = f
+		.worker
+		.get(format!(
+			"https://loupe-server/v1/repos/{}/findings/search?q=Alpha&limit=10",
+			f.repo_id
+		))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 200);
+	let hits: ListFindingsResponse = resp.json().await.unwrap();
+	assert_eq!(hits.findings.len(), 1);
+	let finding_a_id = hits.findings[0].id;
+
+	let resp = f
+		.worker
+		.get(format!("https://loupe-server/v1/findings/{finding_a_id}"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 200);
+	let detail: FindingDetail = resp.json().await.unwrap();
+	assert_eq!(detail.title, "Alpha overflow");
+
+	let resp = f
+		.worker
+		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=Beta&limit=10"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 403, "worker must not search another repo's findings");
+
+	let resp = worker2
+		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=Beta&limit=10"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 200);
+	let hits_b: ListFindingsResponse = resp.json().await.unwrap();
+	assert_eq!(hits_b.findings.len(), 1);
+	let finding_b_id = hits_b.findings[0].id;
+
+	let resp = f
+		.worker
+		.get(format!("https://loupe-server/v1/findings/{finding_b_id}"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 403, "worker must not fetch another repo's finding body");
+
+	let resp = f
+		.admin
+		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=Beta&limit=10"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 200, "admin search access should not require a worker lease");
+
+	let resp = f
+		.admin
+		.get(format!("https://loupe-server/v1/findings/{finding_b_id}"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 200, "admin review access should not require a worker lease");
+
+	f.db.with_conn(|c| {
+		Ok(c.execute("UPDATE jobs SET lease_expires_at = 0 WHERE id = ?1", [env_a.job_id])?)
+	})
+	.unwrap();
+	let resp = f
+		.worker
+		.get(format!(
+			"https://loupe-server/v1/repos/{}/findings/search?q=Alpha&limit=10",
+			f.repo_id
+		))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 403, "expired leases must not authorize prior-finding search");
+
+	let resp = f
+		.worker
+		.get(format!("https://loupe-server/v1/findings/{finding_a_id}"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 403, "expired leases must not authorize finding detail reads");
 
 	f.handle.shutdown().await;
 }

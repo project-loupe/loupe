@@ -178,6 +178,28 @@ pub fn count_active_scans_for_repo(conn: &Connection, repo_id: i64) -> rusqlite:
 	)
 }
 
+/// Whether `worker_id` currently holds a non-expired lease for any job
+/// on `repo_id`. Used by server-side prior-finding routes so a worker
+/// can only search/read finding history for the repo it is actively
+/// scanning or verifying.
+pub fn worker_has_active_lease_for_repo(
+	conn: &Connection, worker_id: i64, repo_id: i64, now: i64,
+) -> rusqlite::Result<bool> {
+	let found: i64 = conn.query_row(
+		"SELECT EXISTS(
+		     SELECT 1 FROM jobs
+		     WHERE repo_id = ?1
+		       AND worker_id = ?2
+		       AND state = 'leased'
+		       AND lease_expires_at IS NOT NULL
+		       AND lease_expires_at >= ?3
+		 )",
+		params![repo_id, worker_id, now],
+		|r| r.get(0),
+	)?;
+	Ok(found != 0)
+}
+
 /// Reap leases that have expired. For each, transitions back to
 /// `queued` if `attempts < MAX_ATTEMPTS`, else `failed` with an error
 /// message. Returns the number of rows affected.
@@ -445,6 +467,45 @@ mod tests {
 			.unwrap();
 		let res = db.with_conn(|c| Ok(heartbeat(c, leased.id, other_worker_id, 200, 60)?)).unwrap();
 		assert_eq!(res, None, "stranger heartbeat must not extend the lease");
+	}
+
+	#[test]
+	fn active_lease_lookup_is_worker_repo_and_expiry_scoped() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let job_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					100,
+				)?)
+			})
+			.unwrap();
+		let leased = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?)).unwrap();
+		assert_eq!(leased.as_ref().map(|j| j.id), Some(job_id));
+
+		let other_worker_id = db
+			.with_conn(|c| Ok(workers::insert(c, "w3", WorkerKind::Worker, &[9u8; 32], 100)?))
+			.unwrap();
+		assert!(db
+			.with_conn(|c| Ok(worker_has_active_lease_for_repo(c, worker_id, repo_id, 250)?))
+			.unwrap());
+		assert!(!db
+			.with_conn(|c| Ok(worker_has_active_lease_for_repo(c, other_worker_id, repo_id, 250)?))
+			.unwrap());
+		assert!(!db
+			.with_conn(|c| Ok(worker_has_active_lease_for_repo(c, worker_id, repo_id + 1, 250)?))
+			.unwrap());
+		assert!(!db
+			.with_conn(|c| Ok(worker_has_active_lease_for_repo(c, worker_id, repo_id, 261)?))
+			.unwrap());
 	}
 
 	#[test]
