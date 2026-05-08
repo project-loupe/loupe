@@ -1,9 +1,13 @@
 use loupe_core::{Finding, Verdict};
 use serde::{Deserialize, Serialize};
 
-/// Body of `POST /v1/jobs/:id/heartbeat` (worker, lease holder). The
-/// request itself is empty — the path conveys the job and the cert
-/// conveys the worker — so we only need a typed response.
+/// Body of `POST /v1/jobs/:id/heartbeat` (worker, lease holder).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+	pub protocol_version: u16,
+}
+
+/// Response body of `POST /v1/jobs/:id/heartbeat`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
 	pub protocol_version: u16,
@@ -84,6 +88,14 @@ mod tests {
 		let s = serde_json::to_string(&v).unwrap();
 		let back: VerdictSubmission = serde_json::from_str(&s).unwrap();
 		assert_eq!(v, back);
+	}
+
+	#[test]
+	fn heartbeat_request_round_trips() {
+		let req = HeartbeatRequest { protocol_version: PROTOCOL_VERSION };
+		let s = serde_json::to_string(&req).unwrap();
+		let back: HeartbeatRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(req, back);
 	}
 
 	#[test]

@@ -5,6 +5,10 @@
 //! client; this module is the server. We hand-roll the protocol to
 //! avoid taking a third-party MCP dep — the surface we use is small
 //! (`initialize`, `tools/list`, `tools/call`).
+//! `initialize` returns both the MCP protocol version and Loupe's own
+//! MCP tool protocol version, and every tool schema accepts an optional
+//! `protocol_version` argument so future workers can reject tool-call
+//! shapes they do not understand without mis-parsing them.
 //!
 //! Tools currently exposed:
 //!
@@ -54,6 +58,8 @@ use crate::ServerClient;
 /// signal to the agent that the tool surface changed.
 const SERVER_NAME: &str = "loupe-mcp";
 const SERVER_VERSION: &str = "0.1.0";
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
 
 /// How many lines of context to take on each side of the bug-line
 /// range when computing the fingerprint window. Two lines is enough
@@ -314,15 +320,17 @@ async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Res
 		"initialize" => Response::ok(
 			id,
 			json!({
-				"protocolVersion": "2024-11-05",
+				"protocolVersion": MCP_PROTOCOL_VERSION,
 				"capabilities": { "tools": { "listChanged": false } },
 				"serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+				"_meta": loupe_mcp_meta(),
 			}),
 		),
 		"tools/list" => Response::ok(
 			id,
 			json!({
-				"tools": tool_definitions(session.job_id.is_some(), session.verify.is_some())
+				"tools": tool_definitions(session.job_id.is_some(), session.verify.is_some()),
+				"_meta": loupe_mcp_meta(),
 			}),
 		),
 		"tools/call" => handle_tool_call(session, req, id).await,
@@ -330,6 +338,10 @@ async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Res
 		"notifications/initialized" | "ping" => Response::ok(id, json!({})),
 		other => Response::err(id, -32601, format!("method not found: {other}")),
 	}
+}
+
+fn loupe_mcp_meta() -> Value {
+	json!({ "loupeProtocolVersion": LOUPE_MCP_PROTOCOL_VERSION })
 }
 
 /// MCP tool catalogue. Each entry is the JSON Schema the agent uses
@@ -493,6 +505,7 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 				},
 			},
 		}));
+		add_tool_protocol_version(&mut tools);
 		return Value::Array(tools);
 	}
 	if submissions_enabled {
@@ -597,7 +610,31 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 			},
 		},
 	}));
+	add_tool_protocol_version(&mut tools);
 	Value::Array(tools)
+}
+
+fn add_tool_protocol_version(tools: &mut [Value]) {
+	for tool in tools {
+		let Some(properties) = tool
+			.get_mut("inputSchema")
+			.and_then(|schema| schema.get_mut("properties"))
+			.and_then(Value::as_object_mut)
+		else {
+			continue;
+		};
+		properties.insert(
+			"protocol_version".to_owned(),
+			json!({
+				"type": "integer",
+				"const": LOUPE_MCP_PROTOCOL_VERSION,
+				"description": format!(
+					"Optional Loupe MCP tool protocol version. Current version is {}.",
+					LOUPE_MCP_PROTOCOL_VERSION
+				),
+			}),
+		);
+	}
 }
 
 async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> Response {
@@ -608,21 +645,32 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 		.cloned()
 		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-	let result: Result<String> = match tool_name {
-		"query_prior_findings" => {
-			tool_query_prior_findings(&session.client, session.repo_id, &arguments).await
+	let result: Result<String> = match check_tool_protocol_version(&arguments) {
+		Err(e) => Err(e),
+		Ok(()) => match tool_name {
+			"query_prior_findings" => {
+				tool_query_prior_findings(&session.client, session.repo_id, &arguments).await
+			},
+			"get_finding_by_id" => tool_get_finding_by_id(&session.client, &arguments).await,
+			"submit_finding" => tool_submit_finding(session, &arguments).await,
+			"validate_poc" => tool_validate_diff(&session.workdir, &arguments, "poc_unified").await,
+			"submit_verdict" => tool_submit_verdict(session, &arguments).await,
+			"submit_patch" => tool_submit_patch(session, &arguments).await,
+			"validate_patch" => {
+				tool_validate_diff(&session.workdir, &arguments, "patch_unified").await
+			},
+			other => Err(anyhow::anyhow!("unknown tool: {other}")),
 		},
-		"get_finding_by_id" => tool_get_finding_by_id(&session.client, &arguments).await,
-		"submit_finding" => tool_submit_finding(session, &arguments).await,
-		"validate_poc" => tool_validate_diff(&session.workdir, &arguments, "poc_unified").await,
-		"submit_verdict" => tool_submit_verdict(session, &arguments).await,
-		"submit_patch" => tool_submit_patch(session, &arguments).await,
-		"validate_patch" => tool_validate_diff(&session.workdir, &arguments, "patch_unified").await,
-		other => Err(anyhow::anyhow!("unknown tool: {other}")),
 	};
 
 	match result {
-		Ok(text) => Response::ok(id, json!({ "content": [{ "type": "text", "text": text }] })),
+		Ok(text) => Response::ok(
+			id,
+			json!({
+				"content": [{ "type": "text", "text": text }],
+				"_meta": loupe_mcp_meta(),
+			}),
+		),
 		Err(e) => {
 			tracing::warn!(tool = tool_name, error = %e, "loupe-mcp: tool call failed");
 			// MCP convention: tool errors flow through `result` with
@@ -633,10 +681,27 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 				json!({
 					"content": [{ "type": "text", "text": format!("Error: {e}") }],
 					"isError": true,
+					"_meta": loupe_mcp_meta(),
 				}),
 			)
 		},
 	}
+}
+
+fn check_tool_protocol_version(args: &Value) -> Result<()> {
+	let Some(value) = args.get("protocol_version") else {
+		return Ok(());
+	};
+	let Some(version) = value.as_u64() else {
+		anyhow::bail!("protocol_version must be an integer");
+	};
+	if version != u64::from(LOUPE_MCP_PROTOCOL_VERSION) {
+		anyhow::bail!(
+			"unsupported Loupe MCP protocol_version {version}; worker supports {}",
+			LOUPE_MCP_PROTOCOL_VERSION
+		);
+	}
+	Ok(())
 }
 
 async fn tool_get_finding_by_id(client: &Arc<ServerClient>, args: &Value) -> Result<String> {
@@ -1078,6 +1143,35 @@ mod tests {
 			let schema = t.get("inputSchema").expect("tool needs `inputSchema`");
 			assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
 		}
+	}
+
+	#[test]
+	fn tool_catalogue_exposes_loupe_protocol_version() {
+		for v in [tool_definitions(true, false), tool_definitions(true, true)] {
+			for t in v.as_array().expect("tools must serialise as an array") {
+				let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("<unnamed>");
+				let version = t
+					.pointer("/inputSchema/properties/protocol_version/const")
+					.and_then(Value::as_u64);
+				assert_eq!(
+					version,
+					Some(u64::from(LOUPE_MCP_PROTOCOL_VERSION)),
+					"{name} must expose the Loupe MCP tool protocol version",
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn tool_protocol_version_check_is_backward_compatible_but_rejects_mismatch() {
+		check_tool_protocol_version(&json!({})).expect("missing version remains accepted");
+		check_tool_protocol_version(&json!({ "protocol_version": LOUPE_MCP_PROTOCOL_VERSION }))
+			.expect("current version accepted");
+		let err = check_tool_protocol_version(
+			&json!({ "protocol_version": LOUPE_MCP_PROTOCOL_VERSION + 1 }),
+		)
+		.expect_err("future version must be rejected by this worker");
+		assert!(err.to_string().contains("unsupported"), "got: {err}");
 	}
 
 	#[test]

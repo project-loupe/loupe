@@ -2,8 +2,9 @@
 //!
 //! Each entry in [`MIGRATIONS`] is `(version, sql)`. On startup we read
 //! `schema_meta.version`, apply any newer migrations in a single
-//! transaction, then bump the row. Migrations must be append-only —
-//! never edit the SQL of a published version, only add a new one.
+//! transaction, then bump the row and mirror it into SQLite's native
+//! `PRAGMA user_version`. Migrations must be append-only — never edit
+//! the SQL of a published version, only add a new one.
 
 use rusqlite::{params, Connection};
 
@@ -35,6 +36,10 @@ pub const LATEST_SCHEMA_VERSION: u32 = {
 /// The bootstrap migration (`v0 → v1`) creates `schema_meta` itself.
 pub fn apply_pending(conn: &mut Connection) -> rusqlite::Result<()> {
 	let current = read_current_version(conn)?;
+	if current > LATEST_SCHEMA_VERSION {
+		return Err(rusqlite::Error::InvalidQuery);
+	}
+	let mut applied = current;
 	let tx = conn.transaction()?;
 	for m in MIGRATIONS {
 		if m.version <= current {
@@ -46,8 +51,10 @@ pub fn apply_pending(conn: &mut Connection) -> rusqlite::Result<()> {
 			 ON CONFLICT(id) DO UPDATE SET version = excluded.version, applied_at = excluded.applied_at",
 			params![m.version],
 		)?;
+		applied = m.version;
 	}
 	tx.commit()?;
+	conn.pragma_update(None, "user_version", applied)?;
 	Ok(())
 }
 
@@ -277,6 +284,30 @@ mod tests {
 	fn fresh_db_reaches_latest_version() {
 		let c = fresh();
 		assert_eq!(current_schema_version(&c).unwrap(), LATEST_SCHEMA_VERSION);
+	}
+
+	#[test]
+	fn sqlite_user_version_tracks_schema_meta() {
+		let c = fresh();
+		let user_version: u32 = c.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+		assert_eq!(user_version, LATEST_SCHEMA_VERSION);
+	}
+
+	#[test]
+	fn newer_schema_version_is_rejected() {
+		let mut c = Connection::open_in_memory().unwrap();
+		c.execute_batch(
+			"CREATE TABLE schema_meta (
+			    id INTEGER PRIMARY KEY CHECK (id = 1),
+			    version INTEGER NOT NULL,
+			    applied_at INTEGER NOT NULL
+			 );
+			 INSERT INTO schema_meta (id, version, applied_at)
+			 VALUES (1, 9999, 0);",
+		)
+		.unwrap();
+		let err = apply_pending(&mut c).expect_err("newer DB must not be opened silently");
+		assert!(matches!(err, rusqlite::Error::InvalidQuery), "got: {err:?}");
 	}
 
 	#[test]

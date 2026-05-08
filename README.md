@@ -530,10 +530,11 @@ crates/
   loupe-core      shared types: Finding, Verdict, ReportingDestination
   loupe-proto     wire-format DTOs (versioned protocol, X-Loupe-Protocol)
   loupe-tls       internal CA + cert minting + fingerprint helpers
-  loupe-storage   SQLCipher DAO surface, FTS5 index, migrations
+  loupe-storage   SQLCipher DAO surface, FTS5 index, schema-versioned migrations
   loupe-server    daemon binary + mTLS routes + reporters + scheduler/reaper
   loupe-worker    worker binary (`run` + `mcp-serve` subcommands) +
-                  scanner trait + LLM backend + bwrap sandbox
+                  scanner trait + LLM backend + versioned MCP tool surface +
+                  bwrap sandbox
   loupe-cli       loupectl admin CLI
 ```
 

@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use hyper::body::Incoming;
@@ -64,14 +66,39 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/health", get(routes::health::get))
 		.merge(authed)
 		.with_state(state)
-		.layer(axum::middleware::from_fn(|req, next: axum::middleware::Next| async move {
-			let mut resp = next.run(req).await;
-			resp.headers_mut().insert(
-				PROTOCOL_VERSION_HEADER,
-				PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
-			);
-			resp
-		}))
+		.layer(axum::middleware::from_fn(
+			|req: axum::extract::Request, next: axum::middleware::Next| async move {
+				if let Some(msg) =
+					request_protocol_error(req.headers().get(PROTOCOL_VERSION_HEADER))
+				{
+					let mut resp = (StatusCode::BAD_REQUEST, msg).into_response();
+					resp.headers_mut().insert(
+						PROTOCOL_VERSION_HEADER,
+						PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
+					);
+					return resp;
+				}
+				let mut resp = next.run(req).await;
+				resp.headers_mut().insert(
+					PROTOCOL_VERSION_HEADER,
+					PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
+				);
+				resp
+			},
+		))
+}
+
+fn request_protocol_error(value: Option<&HeaderValue>) -> Option<String> {
+	let Some(value) = value else { return None };
+	let raw = match value.to_str() {
+		Ok(v) => v,
+		Err(_) => return Some(format!("{PROTOCOL_VERSION_HEADER} must be valid ASCII")),
+	};
+	match raw.parse::<u16>() {
+		Ok(PROTOCOL_VERSION) => None,
+		Ok(other) => Some(format!("unsupported {PROTOCOL_VERSION_HEADER} {other}")),
+		Err(_) => Some(format!("{PROTOCOL_VERSION_HEADER} must be an integer")),
+	}
 }
 
 /// Handle returned by [`serve`]. Drop or call `shutdown` to stop the

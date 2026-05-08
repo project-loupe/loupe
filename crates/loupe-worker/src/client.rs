@@ -4,8 +4,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
-	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatResponse, LeaseRequest, LeaseResponse,
-	ListFindingsResponse, VerdictSubmission, PROTOCOL_VERSION,
+	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
+	LeaseRequest, LeaseResponse, ListFindingsResponse, VerdictSubmission, PROTOCOL_VERSION,
+	PROTOCOL_VERSION_HEADER,
 };
 use reqwest::Url;
 
@@ -42,33 +43,59 @@ impl ServerClient {
 	) -> Result<LeaseResponse> {
 		let url = self.url("/v1/jobs/lease");
 		let req = LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
-		let resp = self.http.post(url).json(&req).send().await.context("lease request")?;
+		let resp = self
+			.with_protocol(self.http.post(url))
+			.json(&req)
+			.send()
+			.await
+			.context("lease request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding lease response")
 	}
 
 	pub async fn heartbeat(&self, job_id: i64) -> Result<HeartbeatResponse> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/heartbeat"));
-		let resp = self.http.post(url).send().await.context("heartbeat request")?;
+		let req = HeartbeatRequest { protocol_version: PROTOCOL_VERSION };
+		let resp = self
+			.with_protocol(self.http.post(url))
+			.json(&req)
+			.send()
+			.await
+			.context("heartbeat request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding heartbeat")
 	}
 
 	pub async fn submit_findings(&self, job_id: i64, batch: &FindingsBatch) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/findings"));
-		let resp = self.http.post(url).json(batch).send().await.context("findings request")?;
+		let resp = self
+			.with_protocol(self.http.post(url))
+			.json(batch)
+			.send()
+			.await
+			.context("findings request")?;
 		ensure_ok(&resp)
 	}
 
 	pub async fn complete(&self, job_id: i64, req: &CompleteRequest) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
-		let resp = self.http.post(url).json(req).send().await.context("complete request")?;
+		let resp = self
+			.with_protocol(self.http.post(url))
+			.json(req)
+			.send()
+			.await
+			.context("complete request")?;
 		ensure_ok(&resp)
 	}
 
 	pub async fn submit_verdict(&self, job_id: i64, req: &VerdictSubmission) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
-		let resp = self.http.post(url).json(req).send().await.context("verdict request")?;
+		let resp = self
+			.with_protocol(self.http.post(url))
+			.json(req)
+			.send()
+			.await
+			.context("verdict request")?;
 		ensure_ok(&resp)
 	}
 
@@ -80,9 +107,7 @@ impl ServerClient {
 	) -> Result<ListFindingsResponse> {
 		let url = self.url(&format!("/v1/repos/{repo_id}/findings/search"));
 		let resp = self
-			.http
-			.get(url)
-			.query(&[("q", query), ("limit", &limit.to_string())])
+			.with_protocol(self.http.get(url).query(&[("q", query), ("limit", &limit.to_string())]))
 			.send()
 			.await
 			.context("search request")?;
@@ -96,13 +121,18 @@ impl ServerClient {
 	/// `query_prior_findings` (a summary-only listing) returned.
 	pub async fn get_finding(&self, id: i64) -> Result<FindingDetail> {
 		let url = self.url(&format!("/v1/findings/{id}"));
-		let resp = self.http.get(url).send().await.context("get_finding request")?;
+		let resp =
+			self.with_protocol(self.http.get(url)).send().await.context("get_finding request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding finding detail")
 	}
 
 	fn url(&self, path: &str) -> Url {
 		self.base.join(path).expect("path is always valid")
+	}
+
+	fn with_protocol(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+		req.header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
 	}
 }
 
@@ -118,9 +148,22 @@ fn build_identity(cert_pem: &str, key_pem: &str) -> Result<reqwest::Identity> {
 }
 
 fn ensure_ok(resp: &reqwest::Response) -> Result<()> {
-	if resp.status().is_success() {
-		Ok(())
-	} else {
-		Err(anyhow!("server returned {}", resp.status()))
+	if !resp.status().is_success() {
+		return Err(anyhow!("server returned {}", resp.status()));
 	}
+	let header = resp
+		.headers()
+		.get(PROTOCOL_VERSION_HEADER)
+		.ok_or_else(|| anyhow!("server response missing {PROTOCOL_VERSION_HEADER}"))?;
+	let server_version = header
+		.to_str()
+		.context("server protocol header is not valid ASCII")?
+		.parse::<u16>()
+		.context("server protocol header is not a u16")?;
+	if server_version != PROTOCOL_VERSION {
+		return Err(anyhow!(
+			"server protocol mismatch: worker speaks {PROTOCOL_VERSION}, server sent {server_version}"
+		));
+	}
+	Ok(())
 }

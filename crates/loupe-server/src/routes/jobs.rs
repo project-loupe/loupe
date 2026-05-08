@@ -17,14 +17,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatResponse, JobInfo, LeaseEnvelope,
-	LeasePayload, LeaseRequest, LeaseResponse, ScanRequest, ScanResponse, VerdictSubmission,
-	PROTOCOL_VERSION,
+	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatRequest, HeartbeatResponse, JobInfo,
+	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ScanRequest, ScanResponse,
+	VerdictSubmission, PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, secrets};
@@ -260,8 +261,13 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 /// `POST /v1/jobs/:id/heartbeat` — worker extends its lease.
 pub async fn heartbeat(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>,
+	Path(job_id): Path<i64>, body: Bytes,
 ) -> Result<Json<HeartbeatResponse>, (StatusCode, String)> {
+	if !body.is_empty() {
+		let req: HeartbeatRequest = serde_json::from_slice(&body)
+			.map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid heartbeat body: {e}")))?;
+		check_version(req.protocol_version)?;
+	}
 	let now = now_secs();
 	let lease_until = state
 		.db

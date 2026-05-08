@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
@@ -61,6 +62,26 @@ async fn health_endpoint_returns_protocol_version() {
 	let body: serde_json::Value = resp.json().await.unwrap();
 	assert_eq!(body["status"], "ok");
 	assert_eq!(body["protocol_version"], 1);
+
+	handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_rejects_unsupported_protocol_header() {
+	let (handle, client, _addr) = bring_up().await;
+	let resp = client
+		.get("https://loupe-server/v1/health")
+		.header(PROTOCOL_VERSION_HEADER, (PROTOCOL_VERSION + 1).to_string())
+		.send()
+		.await
+		.expect("request to /v1/health");
+	assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+	assert_eq!(
+		resp.headers().get(PROTOCOL_VERSION_HEADER).and_then(|v| v.to_str().ok()),
+		Some("1")
+	);
+	let body = resp.text().await.unwrap();
+	assert!(body.contains("unsupported"), "got: {body}");
 
 	handle.shutdown().await;
 }

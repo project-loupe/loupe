@@ -305,6 +305,10 @@ server" sections for the master-key sourcing rules.
 - Sandbox mount layout (which host paths get bind-mounted where):
   `crates/loupe-worker/src/sandbox.rs` module docs.
 - MCP tool catalogue: `crates/loupe-worker/src/mcp.rs` —
-  `tool_definitions()` is the canonical list.
+  `tool_definitions()` is the canonical list; `LOUPE_MCP_PROTOCOL_VERSION`
+  versions the worker-agent tool-call surface.
 - Wire-format DTOs + protocol-version handling:
   `crates/loupe-proto/src/lib.rs`.
+- Storage schema versioning: `crates/loupe-storage/src/migrations.rs`
+  records `schema_meta.version` and mirrors it to SQLite
+  `PRAGMA user_version`.
