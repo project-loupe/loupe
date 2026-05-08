@@ -9,6 +9,10 @@ Type=simple
 User=loupe-worker
 Group=loupe-worker
 EnvironmentFile=-/etc/loupe/loupe-worker.env
+# Agent API keys and worker TLS PEMs are injected by deploy-worker.sh
+# through systemd's runtime manager environment for each explicit
+# restart, rather than persisted in /etc/loupe/loupe-worker.env.
+PassEnvironment=ANTHROPIC_API_KEY OPENAI_API_KEY CODEX_HOME LOUPE_WORKER_CA_CERT_PEM LOUPE_WORKER_CA_CERT_PEM_B64 LOUPE_WORKER_CERT_PEM LOUPE_WORKER_CERT_PEM_B64 LOUPE_WORKER_KEY_PEM LOUPE_WORKER_KEY_PEM_B64
 WorkingDirectory=/var/lib/loupe-worker
 ExecStart=/opt/loupe/bin/loupe-worker run
 Restart=always

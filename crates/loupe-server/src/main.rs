@@ -61,6 +61,38 @@ struct ServeArgs {
 	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_KEY")]
 	ca_key: Option<PathBuf>,
+	/// Server certificate PEM content. When set, this takes precedence
+	/// over --server-cert / LOUPE_SERVER_CERT.
+	#[arg(long, env = "LOUPE_SERVER_CERT_PEM", hide_env_values = true)]
+	server_cert_pem: Option<String>,
+	/// Base64-encoded server certificate PEM content. Used when
+	/// LOUPE_SERVER_CERT_PEM is unset.
+	#[arg(long, env = "LOUPE_SERVER_CERT_PEM_B64", hide_env_values = true)]
+	server_cert_pem_b64: Option<String>,
+	/// Server private-key PEM content. When set, this takes precedence
+	/// over --server-key / LOUPE_SERVER_KEY.
+	#[arg(long, env = "LOUPE_SERVER_KEY_PEM", hide_env_values = true)]
+	server_key_pem: Option<String>,
+	/// Base64-encoded server private-key PEM content. Used when
+	/// LOUPE_SERVER_KEY_PEM is unset.
+	#[arg(long, env = "LOUPE_SERVER_KEY_PEM_B64", hide_env_values = true)]
+	server_key_pem_b64: Option<String>,
+	/// Internal CA certificate PEM content. When set, this takes
+	/// precedence over --ca-cert / LOUPE_CA_CERT.
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	ca_cert_pem: Option<String>,
+	/// Base64-encoded internal CA certificate PEM content. Used when
+	/// LOUPE_CA_CERT_PEM is unset.
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	ca_cert_pem_b64: Option<String>,
+	/// Internal CA private-key PEM content. When set, this takes
+	/// precedence over --ca-key / LOUPE_CA_KEY.
+	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
+	ca_key_pem: Option<String>,
+	/// Base64-encoded internal CA private-key PEM content. Used when
+	/// LOUPE_CA_KEY_PEM is unset.
+	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
+	ca_key_pem_b64: Option<String>,
 	/// Path to a file containing the database master key (64 hex
 	/// characters, optionally trailing newline — the shape
 	/// `loupe-server init` writes). Used only when `LOUPE_MASTER_KEY`
@@ -137,20 +169,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		.db
 		.or(file_cfg.paths.db)
 		.context("db path missing — pass --db, set LOUPE_DB, or [paths].db in config.toml")?;
-	let server_cert_path = args.server_cert.or(file_cfg.paths.server_cert).context(
-		"server cert path missing — pass --server-cert, set LOUPE_SERVER_CERT, or [paths].server_cert",
-	)?;
-	let server_key_path = args.server_key.or(file_cfg.paths.server_key).context(
-		"server key path missing — pass --server-key, set LOUPE_SERVER_KEY, or [paths].server_key",
-	)?;
-	let ca_cert_path = args
-		.ca_cert
-		.or(file_cfg.paths.ca_cert)
-		.context("CA cert path missing — pass --ca-cert, set LOUPE_CA_CERT, or [paths].ca_cert")?;
-	let ca_key_path = args
-		.ca_key
-		.or(file_cfg.paths.ca_key)
-		.context("CA key path missing — pass --ca-key, set LOUPE_CA_KEY, or [paths].ca_key")?;
 	let require_approval_default =
 		args.require_approval_default.or(file_cfg.policy.require_approval_default).unwrap_or(false);
 
@@ -173,14 +191,34 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		);
 	};
 
-	let server_cert_pem = std::fs::read_to_string(&server_cert_path)
-		.with_context(|| format!("reading server cert at {}", server_cert_path.display()))?;
-	let server_key_pem = std::fs::read_to_string(&server_key_path)
-		.with_context(|| format!("reading server key at {}", server_key_path.display()))?;
-	let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)
-		.with_context(|| format!("reading CA cert at {}", ca_cert_path.display()))?;
-	let ca_key_pem = std::fs::read_to_string(&ca_key_path)
-		.with_context(|| format!("reading CA key at {}", ca_key_path.display()))?;
+	let server_cert_pem = pem_from_env_or_file(
+		"server cert",
+		args.server_cert_pem,
+		args.server_cert_pem_b64,
+		args.server_cert.or(file_cfg.paths.server_cert),
+		"server cert missing — set LOUPE_SERVER_CERT_PEM, LOUPE_SERVER_CERT_PEM_B64, pass --server-cert, set LOUPE_SERVER_CERT, or [paths].server_cert",
+	)?;
+	let server_key_pem = pem_from_env_or_file(
+		"server key",
+		args.server_key_pem,
+		args.server_key_pem_b64,
+		args.server_key.or(file_cfg.paths.server_key),
+		"server key missing — set LOUPE_SERVER_KEY_PEM, LOUPE_SERVER_KEY_PEM_B64, pass --server-key, set LOUPE_SERVER_KEY, or [paths].server_key",
+	)?;
+	let ca_cert_pem = pem_from_env_or_file(
+		"CA cert",
+		args.ca_cert_pem,
+		args.ca_cert_pem_b64,
+		args.ca_cert.or(file_cfg.paths.ca_cert),
+		"CA cert missing — set LOUPE_CA_CERT_PEM, LOUPE_CA_CERT_PEM_B64, pass --ca-cert, set LOUPE_CA_CERT, or [paths].ca_cert",
+	)?;
+	let ca_key_pem = pem_from_env_or_file(
+		"CA key",
+		args.ca_key_pem,
+		args.ca_key_pem_b64,
+		args.ca_key.or(file_cfg.paths.ca_key),
+		"CA key missing — set LOUPE_CA_KEY_PEM, LOUPE_CA_KEY_PEM_B64, pass --ca-key, set LOUPE_CA_KEY, or [paths].ca_key",
+	)?;
 
 	let ca = Ca::from_pem(&ca_cert_pem, &ca_key_pem).context("rebuilding CA from PEM")?;
 
@@ -240,6 +278,30 @@ fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
 		.with_context(|| format!("reading master key file at {}", path.display()))?;
 	parse_master_key_hex(raw.trim())
 		.with_context(|| format!("master key file at {}", path.display()))
+}
+
+fn pem_from_env_or_file(
+	label: &str, pem: Option<String>, pem_b64: Option<String>, path: Option<PathBuf>,
+	missing: &'static str,
+) -> Result<String> {
+	if let Some(pem) = pem.filter(|s| !s.is_empty()) {
+		tracing::info!(%label, "loupe-server: TLS PEM loaded from environment");
+		return Ok(pem);
+	}
+	if let Some(pem_b64) = pem_b64.filter(|s| !s.is_empty()) {
+		tracing::info!(%label, "loupe-server: TLS PEM loaded from base64 environment");
+		return decode_pem_b64(label, &pem_b64);
+	}
+	let path = path.context(missing)?;
+	std::fs::read_to_string(&path).with_context(|| format!("reading {label} at {}", path.display()))
+}
+
+fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
+	use base64::Engine as _;
+	let bytes = base64::engine::general_purpose::STANDARD
+		.decode(pem_b64.trim())
+		.with_context(|| format!("decoding base64 {label} PEM"))?;
+	String::from_utf8(bytes).with_context(|| format!("{label} PEM is not valid UTF-8"))
 }
 
 fn parse_master_key_hex(s: &str) -> Result<MasterKey> {

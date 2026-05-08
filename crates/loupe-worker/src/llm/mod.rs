@@ -33,7 +33,7 @@ use std::time::Duration;
 use anyhow::Result;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
-pub use mcp::McpContext;
+pub use mcp::{McpContext, McpTlsSource};
 use tokio_util::sync::CancellationToken;
 
 /// Default per-call wall-clock budget. Per-file LLM invocations should

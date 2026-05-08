@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use loupe_worker::llm::McpContext;
+use loupe_worker::llm::{McpContext, McpTlsSource};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
 };
@@ -59,6 +59,24 @@ struct RunArgs {
 	/// Path to this worker's client private-key PEM.
 	#[arg(long, env = "LOUPE_WORKER_KEY")]
 	key: Option<PathBuf>,
+	/// CA cert PEM content. When set, this takes precedence over
+	/// --ca-cert / LOUPE_CA_CERT.
+	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM", hide_env_values = true)]
+	ca_cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM_B64", hide_env_values = true)]
+	ca_cert_pem_b64: Option<String>,
+	/// Worker client cert PEM content. When set, this takes precedence
+	/// over --cert / LOUPE_WORKER_CERT.
+	#[arg(long, env = "LOUPE_WORKER_CERT_PEM", hide_env_values = true)]
+	cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_CERT_PEM_B64", hide_env_values = true)]
+	cert_pem_b64: Option<String>,
+	/// Worker client private-key PEM content. When set, this takes
+	/// precedence over --key / LOUPE_WORKER_KEY.
+	#[arg(long, env = "LOUPE_WORKER_KEY_PEM", hide_env_values = true)]
+	key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_KEY_PEM_B64", hide_env_values = true)]
+	key_pem_b64: Option<String>,
 	/// Where to keep cached bare clones.
 	#[arg(long, env = "LOUPE_CACHE_DIR")]
 	cache_dir: Option<PathBuf>,
@@ -73,11 +91,23 @@ struct McpServeArgs {
 	#[arg(long, env = "LOUPE_SERVER_URL")]
 	server_url: reqwest::Url,
 	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: PathBuf,
+	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_WORKER_CERT")]
-	cert: PathBuf,
+	cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_WORKER_KEY")]
-	key: PathBuf,
+	key: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM", hide_env_values = true)]
+	ca_cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM_B64", hide_env_values = true)]
+	ca_cert_pem_b64: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_CERT_PEM", hide_env_values = true)]
+	cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_CERT_PEM_B64", hide_env_values = true)]
+	cert_pem_b64: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_KEY_PEM", hide_env_values = true)]
+	key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_WORKER_KEY_PEM_B64", hide_env_values = true)]
+	key_pem_b64: Option<String>,
 	/// Repo id the agent is currently scanning. Tool calls scope to
 	/// this repo automatically — there's no cross-repo lookup at the
 	/// agent surface.
@@ -121,20 +151,21 @@ async fn main() -> Result<()> {
 
 async fn run_worker(args: RunArgs) -> Result<()> {
 	let server_url = args.server_url.context("--server-url / LOUPE_SERVER_URL is required")?;
-	let ca_cert = args.ca_cert.context("--ca-cert / LOUPE_CA_CERT is required")?;
-	let cert = args.cert.context("--cert / LOUPE_WORKER_CERT is required")?;
-	let key = args.key.context("--key / LOUPE_WORKER_KEY is required")?;
 	let cache_dir = args.cache_dir.context("--cache-dir / LOUPE_CACHE_DIR is required")?;
-
-	let ca_cert_pem = std::fs::read_to_string(&ca_cert)
-		.with_context(|| format!("reading CA cert at {}", ca_cert.display()))?;
-	let cert_pem = std::fs::read_to_string(&cert)
-		.with_context(|| format!("reading worker cert at {}", cert.display()))?;
-	let key_pem = std::fs::read_to_string(&key)
-		.with_context(|| format!("reading worker key at {}", key.display()))?;
+	let tls = read_worker_tls(
+		args.ca_cert_pem,
+		args.ca_cert_pem_b64,
+		args.cert_pem,
+		args.cert_pem_b64,
+		args.key_pem,
+		args.key_pem_b64,
+		args.ca_cert,
+		args.cert,
+		args.key,
+	)?;
 
 	let client =
-		Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, server_url.clone())?);
+		Arc::new(ServerClient::new(&tls.ca_cert_pem, &tls.cert_pem, &tls.key_pem, server_url.clone())?);
 	let cache = Arc::new(RepoCache::new(cache_dir, args.max_cache_gb * 1_073_741_824)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
@@ -201,9 +232,7 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 	let mcp_ctx = McpContext {
 		worker_binary,
 		server_url: server_url.to_string(),
-		ca_cert_path: ca_cert.clone(),
-		client_cert_path: cert.clone(),
-		client_key_path: key.clone(),
+		tls: tls.source,
 		bkb_mcp_path: bkb_mcp_path.clone(),
 	};
 
@@ -244,14 +273,23 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 }
 
 async fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
-	let ca_cert_pem = std::fs::read_to_string(&args.ca_cert)
-		.with_context(|| format!("reading CA cert at {}", args.ca_cert.display()))?;
-	let cert_pem = std::fs::read_to_string(&args.cert)
-		.with_context(|| format!("reading worker cert at {}", args.cert.display()))?;
-	let key_pem = std::fs::read_to_string(&args.key)
-		.with_context(|| format!("reading worker key at {}", args.key.display()))?;
-
-	let client = Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, args.server_url)?);
+	let tls = read_worker_tls(
+		args.ca_cert_pem,
+		args.ca_cert_pem_b64,
+		args.cert_pem,
+		args.cert_pem_b64,
+		args.key_pem,
+		args.key_pem_b64,
+		args.ca_cert,
+		args.cert,
+		args.key,
+	)?;
+	let client = Arc::new(ServerClient::new(
+		&tls.ca_cert_pem,
+		&tls.cert_pem,
+		&tls.key_pem,
+		args.server_url,
+	)?);
 	if args.finding_id.is_some() && args.job_id.is_none() {
 		anyhow::bail!(
 			"--finding-id requires --job-id (verdict POSTs need a job to attribute \
@@ -267,6 +305,99 @@ async fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
 		"loupe-mcp: starting stdio server",
 	);
 	mcp::run_stdio_server(client, args.repo_id, args.job_id, args.finding_id, args.workdir).await
+}
+
+struct WorkerTls {
+	ca_cert_pem: String,
+	cert_pem: String,
+	key_pem: String,
+	source: McpTlsSource,
+}
+
+fn read_worker_tls(
+	ca_cert_pem: Option<String>, ca_cert_pem_b64: Option<String>, cert_pem: Option<String>,
+	cert_pem_b64: Option<String>, key_pem: Option<String>, key_pem_b64: Option<String>,
+	ca_cert: Option<PathBuf>, cert: Option<PathBuf>, key: Option<PathBuf>,
+) -> Result<WorkerTls> {
+	let env_pem_present = has_value(&ca_cert_pem)
+		|| has_value(&ca_cert_pem_b64)
+		|| has_value(&cert_pem)
+		|| has_value(&cert_pem_b64)
+		|| has_value(&key_pem)
+		|| has_value(&key_pem_b64);
+	if env_pem_present {
+		return Ok(WorkerTls {
+			ca_cert_pem: required_pem_env(
+				ca_cert_pem,
+				ca_cert_pem_b64,
+				"LOUPE_WORKER_CA_CERT_PEM",
+				"LOUPE_WORKER_CA_CERT_PEM_B64",
+			)?,
+			cert_pem: required_pem_env(
+				cert_pem,
+				cert_pem_b64,
+				"LOUPE_WORKER_CERT_PEM",
+				"LOUPE_WORKER_CERT_PEM_B64",
+			)?,
+			key_pem: required_pem_env(
+				key_pem,
+				key_pem_b64,
+				"LOUPE_WORKER_KEY_PEM",
+				"LOUPE_WORKER_KEY_PEM_B64",
+			)?,
+			source: McpTlsSource::Env,
+		});
+	}
+
+	let ca_cert = ca_cert.context(
+		"--ca-cert / LOUPE_CA_CERT is required unless LOUPE_WORKER_CA_CERT_PEM is set",
+	)?;
+	let cert = cert
+		.context("--cert / LOUPE_WORKER_CERT is required unless LOUPE_WORKER_CERT_PEM is set")?;
+	let key =
+		key.context("--key / LOUPE_WORKER_KEY is required unless LOUPE_WORKER_KEY_PEM is set")?;
+	let ca_cert_pem = std::fs::read_to_string(&ca_cert)
+		.with_context(|| format!("reading CA cert at {}", ca_cert.display()))?;
+	let cert_pem = std::fs::read_to_string(&cert)
+		.with_context(|| format!("reading worker cert at {}", cert.display()))?;
+	let key_pem = std::fs::read_to_string(&key)
+		.with_context(|| format!("reading worker key at {}", key.display()))?;
+	Ok(WorkerTls {
+		ca_cert_pem,
+		cert_pem,
+		key_pem,
+		source: McpTlsSource::Paths {
+			ca_cert_path: ca_cert,
+			client_cert_path: cert,
+			client_key_path: key,
+		},
+	})
+}
+
+fn has_value(value: &Option<String>) -> bool {
+	value.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+fn required_pem_env(
+	value: Option<String>, value_b64: Option<String>, name: &'static str, b64_name: &'static str,
+) -> Result<String> {
+	if let Some(value) = value.filter(|s| !s.is_empty()) {
+		return Ok(value);
+	}
+	if let Some(value_b64) = value_b64.filter(|s| !s.is_empty()) {
+		return decode_pem_b64(b64_name, &value_b64);
+	}
+	anyhow::bail!(
+		"{name} or {b64_name} is required when any worker TLS PEM env var is set"
+	)
+}
+
+fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
+	use base64::Engine as _;
+	let bytes = base64::engine::general_purpose::STANDARD
+		.decode(pem_b64.trim())
+		.with_context(|| format!("decoding {label}"))?;
+	String::from_utf8(bytes).with_context(|| format!("{label} did not decode to valid UTF-8"))
 }
 
 /// Initialise tracing. Defaults to the human-readable formatter; set

@@ -260,13 +260,16 @@ Verifier jobs only get queued when a repo is registered with
 `contrib/` ships sample units and local-to-remote deploy scripts:
 
 - `contrib/loupe-server.service` runs `/opt/loupe/bin/loupe-server serve`
-  as `loupe`, reading `/etc/loupe/loupe-server.env`.
+  as `loupe`, reading non-secret settings from
+  `/etc/loupe/loupe-server.env`.
 - `contrib/loupe-worker.service` runs `/opt/loupe/bin/loupe-worker run`
-  as `loupe-worker`, reading `/etc/loupe/loupe-worker.env`.
+  as `loupe-worker`, reading non-secret settings from
+  `/etc/loupe/loupe-worker.env`.
 - `contrib/deploy-server.sh` and `contrib/deploy-worker.sh` build the
   relevant release binary locally, upload it over SSH, install it with
-  `sudo install`, optionally update the unit/env file, and restart the
-  matching service.
+  `sudo install`, optionally update the unit/env file, stream runtime
+  secrets from local environment variables over SSH stdin, and restart
+  the matching service.
 
 First provision each host once as root, then use an unprivileged SSH
 deploy user for routine updates. The service users need to exist before
@@ -277,12 +280,14 @@ systemd starts the units:
 sudo useradd --system --home /var/lib/loupe --shell /usr/sbin/nologin loupe
 sudo install -d -o loupe -g loupe -m 0700 /var/lib/loupe
 sudo install -d -m 0755 /opt/loupe/bin /etc/loupe
+sudo install -d -m 0755 /usr/local/sbin
 
 # worker host
 sudo useradd --system --home /var/lib/loupe-worker --shell /usr/sbin/nologin loupe-worker
 sudo install -d -o loupe-worker -g loupe-worker -m 0700 /var/lib/loupe-worker
 sudo install -d -o loupe-worker -g loupe-worker -m 0700 /var/cache/loupe-worker
 sudo install -d -m 0755 /opt/loupe/bin /etc/loupe
+sudo install -d -m 0755 /usr/local/sbin
 ```
 
 Grant the SSH deploy users only the commands the scripts need. Verify
@@ -294,16 +299,33 @@ deploy-server ALL=(root) NOPASSWD: \
   /usr/bin/install -D -m 0755 /tmp/loupe-server-deploy.*.bin /opt/loupe/bin/loupe-server, \
   /usr/bin/install -D -m 0644 /tmp/loupe-server-deploy.*.service /etc/systemd/system/loupe-server.service, \
   /usr/bin/install -D -m 0600 /tmp/loupe-server-deploy.*.env /etc/loupe/loupe-server.env, \
+  /usr/bin/install -D -m 0755 /tmp/loupe-server-deploy.*.runtime-helper /usr/local/sbin/loupe-server-runtime-secrets, \
   /usr/bin/systemctl daemon-reload, \
-  /usr/bin/systemctl restart loupe-server.service
+  /usr/bin/systemctl restart loupe-server.service, \
+  /usr/local/sbin/loupe-server-runtime-secrets *
 
 deploy-worker ALL=(root) NOPASSWD: \
   /usr/bin/install -D -m 0755 /tmp/loupe-worker-deploy.*.bin /opt/loupe/bin/loupe-worker, \
   /usr/bin/install -D -m 0644 /tmp/loupe-worker-deploy.*.service /etc/systemd/system/loupe-worker.service, \
   /usr/bin/install -D -m 0600 /tmp/loupe-worker-deploy.*.env /etc/loupe/loupe-worker.env, \
+  /usr/bin/install -D -m 0755 /tmp/loupe-worker-deploy.*.runtime-helper /usr/local/sbin/loupe-worker-runtime-secrets, \
   /usr/bin/systemctl daemon-reload, \
-  /usr/bin/systemctl restart loupe-worker.service
+  /usr/bin/systemctl restart loupe-worker.service, \
+  /usr/local/sbin/loupe-worker-runtime-secrets *
 ```
+
+The generated env files deliberately exclude secret values. Server
+TLS material is streamed from `LOUPE_SERVER_CERT_PEM`,
+`LOUPE_SERVER_KEY_PEM`, `LOUPE_CA_CERT_PEM`, and `LOUPE_CA_KEY_PEM`
+into systemd's runtime manager environment for the explicit restart;
+the helper stores those PEMs as single-line `*_PEM_B64` runtime env
+vars and the daemon decodes them at startup. The database master key
+is passed the same way as `LOUPE_MASTER_KEY`. Worker mTLS material
+follows the same shape with `LOUPE_WORKER_*_PEM`, and agent API keys
+are also passed as runtime env. By default the deploy helpers unset
+those systemd manager env vars immediately after the restart; rerun
+the deploy script after a reboot or for a manual restart that needs
+secrets rehydrated.
 
 Examples from your local checkout:
 
@@ -311,13 +333,17 @@ Examples from your local checkout:
 LOUPE_SERVER_SSH=deploy-server@server-host \
 LOUPE_CONFIG=/var/lib/loupe/config.toml \
 LOUPE_MASTER_KEY="$(cat ./secrets/loupe-master.key)" \
+LOUPE_SERVER_CERT_PEM="$(cat .deploy/server-data/server.pem)" \
+LOUPE_SERVER_KEY_PEM="$(cat .deploy/server-data/server.key)" \
+LOUPE_CA_CERT_PEM="$(cat .deploy/server-data/ca.pem)" \
+LOUPE_CA_KEY_PEM="$(cat .deploy/server-data/ca.key)" \
   contrib/deploy-server.sh
 
 LOUPE_WORKER_SSH=deploy-worker@worker-host \
 LOUPE_SERVER_URL=https://loupe.example.internal:8443 \
-LOUPE_CA_CERT=/etc/loupe/worker/ca.pem \
-LOUPE_WORKER_CERT=/etc/loupe/worker/worker.pem \
-LOUPE_WORKER_KEY=/etc/loupe/worker/worker.key \
+LOUPE_WORKER_CA_CERT_PEM="$(jq -r .ca_cert_pem .deploy/workers/worker-01.json)" \
+LOUPE_WORKER_CERT_PEM="$(jq -r .client_cert_pem .deploy/workers/worker-01.json)" \
+LOUPE_WORKER_KEY_PEM="$(jq -r .client_key_pem .deploy/workers/worker-01.json)" \
 LOUPE_CACHE_DIR=/var/cache/loupe-worker \
 LOUPE_WORKER_PATH=/usr/local/bin:/usr/bin:/bin \
 ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
@@ -325,9 +351,9 @@ ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
 ```
 
 Set `LOUPE_*_ENV_FILE_LOCAL=/path/to/env` if you prefer to upload an
-exact env file instead of generating one from the current shell. Set
-`LOUPE_*_INSTALL_SERVICE=0` and `LOUPE_*_WRITE_ENV=0` for binary-only
-restarts after the unit and env file are already in place.
+exact non-secret env file instead of generating one from the current
+shell. Set `LOUPE_*_INSTALL_SERVICE=0` and `LOUPE_*_WRITE_ENV=0` for
+binary-only restarts after the unit and env file are already in place.
 
 ### 6. Register a repo and trigger a scan
 

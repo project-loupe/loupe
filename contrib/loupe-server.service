@@ -9,6 +9,10 @@ Type=simple
 User=loupe
 Group=loupe
 EnvironmentFile=-/etc/loupe/loupe-server.env
+# Secrets such as LOUPE_MASTER_KEY and TLS PEMs are injected by deploy-server.sh
+# through systemd's runtime manager environment for each explicit
+# restart, rather than persisted in /etc/loupe/loupe-server.env.
+PassEnvironment=LOUPE_MASTER_KEY LOUPE_SERVER_CERT_PEM LOUPE_SERVER_CERT_PEM_B64 LOUPE_SERVER_KEY_PEM LOUPE_SERVER_KEY_PEM_B64 LOUPE_CA_CERT_PEM LOUPE_CA_CERT_PEM_B64 LOUPE_CA_KEY_PEM LOUPE_CA_KEY_PEM_B64
 WorkingDirectory=/var/lib/loupe
 ExecStart=/opt/loupe/bin/loupe-server serve
 Restart=on-failure

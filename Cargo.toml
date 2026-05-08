@@ -32,6 +32,7 @@ all = { level = "warn", priority = -1 }
 anyhow = { version = "1", default-features = false, features = ["std"] }
 async-trait = { version = "0.1", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio", "tracing"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }

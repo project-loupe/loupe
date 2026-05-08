@@ -903,6 +903,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "clap",
  "git2",
  "hyper",
@@ -961,6 +962,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "blake3",
  "clap",
  "git2",

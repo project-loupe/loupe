@@ -56,15 +56,23 @@ pub struct McpContext {
 	pub worker_binary: PathBuf,
 	/// loupe-server URL the MCP child will call back to.
 	pub server_url: String,
-	pub ca_cert_path: PathBuf,
-	pub client_cert_path: PathBuf,
-	pub client_key_path: PathBuf,
+	pub tls: McpTlsSource,
 	/// Optional `bkb-mcp` binary path. When `Some`, the per-call MCP
 	/// config gets a second server entry exposing bkb's spec /
 	/// historical-context tools (`bkb_search`, `bkb_lookup_bip`, …)
 	/// alongside loupe's `submit_finding`. None means "host doesn't
 	/// have bkb-mcp installed; advertise loupe only."
 	pub bkb_mcp_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum McpTlsSource {
+	Paths {
+		ca_cert_path: PathBuf,
+		client_cert_path: PathBuf,
+		client_key_path: PathBuf,
+	},
+	Env,
 }
 
 /// Build the args list that gets appended to `loupe-worker
@@ -88,17 +96,24 @@ pub fn mcp_serve_args(
 		"mcp-serve".into(),
 		"--server-url".into(),
 		ctx.server_url.clone(),
-		"--ca-cert".into(),
-		SANDBOX_CA_CERT.into(),
-		"--cert".into(),
-		SANDBOX_CLIENT_CERT.into(),
-		"--key".into(),
-		SANDBOX_CLIENT_KEY.into(),
 		"--repo-id".into(),
 		repo_id.to_string(),
 		"--workdir".into(),
 		sandbox_workdir.to_owned(),
 	];
+	if matches!(ctx.tls, McpTlsSource::Paths { .. }) {
+		args.splice(
+			3..3,
+			[
+				"--ca-cert".into(),
+				SANDBOX_CA_CERT.into(),
+				"--cert".into(),
+				SANDBOX_CLIENT_CERT.into(),
+				"--key".into(),
+				SANDBOX_CLIENT_KEY.into(),
+			],
+		);
+	}
 	if let Some(j) = job_id {
 		args.push("--job-id".into());
 		args.push(j.to_string());
@@ -114,11 +129,28 @@ pub fn mcp_serve_args(
 /// bkb-mcp binary into the sandbox at the fixed paths above. Idempotent
 /// across both backends — same mounts, same paths.
 pub fn bind_mcp_into_sandbox(sandbox: SandboxBuilder, ctx: &McpContext) -> SandboxBuilder {
-	let mut sb = sandbox
-		.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN)
-		.bind_ro(ctx.ca_cert_path.clone(), SANDBOX_CA_CERT)
-		.bind_ro(ctx.client_cert_path.clone(), SANDBOX_CLIENT_CERT)
-		.bind_ro(ctx.client_key_path.clone(), SANDBOX_CLIENT_KEY);
+	let mut sb = sandbox.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN);
+	match &ctx.tls {
+		McpTlsSource::Paths {
+			ca_cert_path,
+			client_cert_path,
+			client_key_path,
+		} => {
+			sb = sb
+				.bind_ro(ca_cert_path.clone(), SANDBOX_CA_CERT)
+				.bind_ro(client_cert_path.clone(), SANDBOX_CLIENT_CERT)
+				.bind_ro(client_key_path.clone(), SANDBOX_CLIENT_KEY);
+		},
+		McpTlsSource::Env => {
+			sb = sb
+				.forward_env("LOUPE_WORKER_CA_CERT_PEM")
+				.forward_env("LOUPE_WORKER_CA_CERT_PEM_B64")
+				.forward_env("LOUPE_WORKER_CERT_PEM")
+				.forward_env("LOUPE_WORKER_CERT_PEM_B64")
+				.forward_env("LOUPE_WORKER_KEY_PEM");
+			sb = sb.forward_env("LOUPE_WORKER_KEY_PEM_B64");
+		},
+	}
 	if let Some(bkb_path) = &ctx.bkb_mcp_path {
 		sb = sb.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
 	}
