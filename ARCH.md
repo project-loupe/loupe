@@ -125,6 +125,17 @@ attaches it to `--mcp-config` only when `bkb-mcp` is on PATH at
 startup. Workers that don't have it installed run without that
 branch and the agent's prompt makes no mention of bkb tools.
 
+The `loupe-worker mcp-serve` tool list shown above is the
+**discovery-mode** catalogue. A verify-mode session (spawned for a
+`kind=verify` job) exposes a different surface: `query_prior_findings`
+and `get_finding_by_id` carry over, while `submit_finding` /
+`validate_poc` are replaced with `submit_verdict`, `submit_patch`,
+and `validate_patch` — the verifier records a
+`confirm | dismiss | inconclusive` verdict and may optionally attach
+a minimally-invasive candidate fix. See
+`crates/loupe-worker/src/mcp.rs` `tool_definitions()` for the
+canonical mode-split.
+
 ## Data lifecycle
 
 A finding's journey from "agent saw something" to "human looked at it":

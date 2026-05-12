@@ -461,6 +461,7 @@ loupectl repo update <id> --disable                  # pause scheduler
 loupectl repo update <id> --enable
 loupectl repo update <id> --interval 3600            # hourly
 loupectl repo update <id> --verification-enabled     # route via verify flow
+loupectl repo update <id> --no-verification          # skip verify; dispatch on insert
 loupectl repo update <id> --require-approval         # hold for human sign-off
 loupectl repo update <id> --no-require-approval      # opt out of the approval gate
 loupectl repo update <id> --inherit-approval         # fall back to the server default
