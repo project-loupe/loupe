@@ -112,32 +112,35 @@ impl SandboxBuilder {
 	///
 	/// Resolves the entry point on PATH, follows the symlink chain
 	/// to its canonical real path, and bind-mounts both the entry
-	/// point and the canonical install directory read-only. That
-	/// covers the common shape (a `~/.local/bin/foo` symlink into
-	/// `~/.local/share/foo/...`) without any binary-specific
-	/// knowledge.
+	/// point and the canonical install directory read-only. Symlinked
+	/// entry points are preserved by mounting their parent directory:
+	/// binding the symlink path itself turns it into a regular file in
+	/// the sandbox, which can break runtimes that resolve modules from
+	/// the real package path.
 	///
 	/// Special-cases npm package layouts: when canonical lives inside
-	/// a `node_modules/<scope>?/<pkg>/` tree, the *package root* is
-	/// mounted instead of just the entry point's parent dir. This is
-	/// load-bearing for wrappers that load platform-specific deps via
-	/// `require.resolve('@scope/pkg-platform')` — the resolved path
-	/// is typically nested under `<package>/node_modules/...`, which
-	/// the parent-only mount would strand outside the sandbox. Codex
-	/// is the canonical example.
+	/// a `node_modules/<scope>?/<pkg>/` tree, the outer `node_modules`
+	/// root is mounted instead of just the entry point's parent dir.
+	/// This is load-bearing for wrappers that load platform-specific
+	/// optional deps via `require.resolve('@scope/pkg-platform')`.
+	/// Depending on the package manager, those deps can be nested under
+	/// the wrapper package or installed as siblings under the global
+	/// `node_modules` root. Codex is the canonical example.
 	pub fn allow_binary(self, name: &str) -> Result<Self> {
 		let original =
 			locate_on_path(name).ok_or_else(|| anyhow::anyhow!("`{name}` not found on PATH"))?;
 		let canonical = std::fs::canonicalize(&original)
 			.with_context(|| format!("canonicalizing {}", original.display()))?;
-		let mut this = self.bind_ro(original.clone(), original);
+
+		let entrypoint_bind = entrypoint_bind_source(&original)?;
+		let mut this = self.bind_ro(entrypoint_bind.clone(), entrypoint_bind);
 		// Decide what to mount alongside the entry point.
 		// Priority: directory canonical → that dir; npm package
-		// detected → the package root; else canonical's parent.
+		// detected → the node_modules root; else canonical's parent.
 		let install_dir = if canonical.is_dir() {
 			canonical
-		} else if let Some(pkg_root) = npm_package_root(&canonical) {
-			pkg_root
+		} else if let Some(node_modules_root) = npm_node_modules_root(&canonical) {
+			node_modules_root
 		} else {
 			canonical
 				.parent()
@@ -227,22 +230,22 @@ impl SandboxBuilder {
 	}
 }
 
-/// If `path` lives inside a `node_modules/` tree, return the package
-/// directory (the dir containing the package's `package.json`).
+/// If `path` lives inside a `node_modules/` tree, return the outer
+/// `node_modules` directory.
 /// Handles both unscoped (`node_modules/<pkg>/`) and scoped
 /// (`node_modules/@scope/<pkg>/`) layouts. Returns `None` if `path`
 /// isn't inside a `node_modules/`, or if the components after it
 /// don't match an npm package shape.
 ///
-/// Used by [`SandboxBuilder::allow_binary`] to mount the whole
-/// package tree — including any nested `node_modules/` (where npm
-/// stashes optional native-binary deps that didn't hoist) — rather
-/// than just the entry point's parent.
-fn npm_package_root(path: &Path) -> Option<PathBuf> {
+/// Used by [`SandboxBuilder::allow_binary`] to make a global npm CLI
+/// see both its own package and platform-specific optional deps. Some
+/// npm installs keep those deps nested under the package; others hoist
+/// them as siblings under the global `node_modules` root.
+fn npm_node_modules_root(path: &Path) -> Option<PathBuf> {
 	let components: Vec<_> = path.components().collect();
 	// First (outermost) `node_modules` in the path. Outermost is
-	// what we want: the corresponding package dir is the wrapper
-	// itself, and any deps it pulls in nest underneath it.
+	// what we want: it covers both the wrapper package and any sibling
+	// optional packages the wrapper resolves at runtime.
 	let nm_idx = components.iter().position(|c| c.as_os_str() == "node_modules")?;
 	let pkg_start = components.get(nm_idx + 1)?;
 	let is_scoped = pkg_start.as_os_str().to_str().is_some_and(|s| s.starts_with('@'));
@@ -251,10 +254,21 @@ fn npm_package_root(path: &Path) -> Option<PathBuf> {
 		return None;
 	}
 	let mut p = PathBuf::new();
-	for c in &components[..take] {
+	for c in &components[..=nm_idx] {
 		p.push(c);
 	}
 	Some(p)
+}
+
+fn entrypoint_bind_source(original: &Path) -> Result<PathBuf> {
+	if std::fs::symlink_metadata(original).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+		original
+			.parent()
+			.ok_or_else(|| anyhow::anyhow!("PATH entry has no parent"))
+			.map(Path::to_path_buf)
+	} else {
+		Ok(original.to_path_buf())
+	}
 }
 
 /// PATH walk: return the first existing executable file matching
@@ -310,42 +324,58 @@ mod tests {
 	}
 
 	#[test]
-	fn npm_package_root_picks_unscoped_package_dir() {
+	fn npm_node_modules_root_picks_unscoped_package_dir() {
 		let p = Path::new("/home/u/.local/lib/node_modules/foo/bin/foo.js");
-		let root = npm_package_root(p).unwrap();
-		assert_eq!(root, Path::new("/home/u/.local/lib/node_modules/foo"));
+		let root = npm_node_modules_root(p).unwrap();
+		assert_eq!(root, Path::new("/home/u/.local/lib/node_modules"));
 	}
 
 	#[test]
-	fn npm_package_root_picks_scoped_package_dir() {
+	fn npm_node_modules_root_picks_scoped_package_dir() {
 		// Scoped packages (`@openai/codex`) have one extra path
-		// component vs. unscoped — the mount must include the scope
-		// dir AND the package dir, otherwise nested node_modules with
-		// optional native-binary deps fall outside the sandbox.
+		// component vs. unscoped. Mount the outer node_modules dir so
+		// optional native-binary deps work whether npm nests or hoists
+		// them.
 		let p = Path::new("/h/u/.local/lib/node_modules/@openai/codex/bin/codex.js");
-		let root = npm_package_root(p).unwrap();
-		assert_eq!(root, Path::new("/h/u/.local/lib/node_modules/@openai/codex"));
+		let root = npm_node_modules_root(p).unwrap();
+		assert_eq!(root, Path::new("/h/u/.local/lib/node_modules"));
 	}
 
 	#[test]
-	fn npm_package_root_returns_none_outside_node_modules() {
-		assert!(npm_package_root(Path::new("/usr/local/bin/foo")).is_none());
-		assert!(
-			npm_package_root(Path::new("/home/u/.local/share/claude/versions/1/claude")).is_none()
-		);
+	fn npm_node_modules_root_returns_none_outside_node_modules() {
+		assert!(npm_node_modules_root(Path::new("/usr/local/bin/foo")).is_none());
+		assert!(npm_node_modules_root(Path::new("/home/u/.local/share/claude/versions/1/claude"))
+			.is_none());
 	}
 
 	#[test]
-	fn npm_package_root_handles_outermost_when_nested() {
+	fn npm_node_modules_root_handles_outermost_when_nested() {
 		// A nested install (the wrapper itself nests its native-bin
 		// dep under its own node_modules) — the *outermost*
-		// node_modules is what we want, so the package root mount
-		// covers the nested tree.
+		// node_modules is what we want, so the mount covers the
+		// wrapper package and the nested tree.
 		let p = Path::new(
 			"/h/u/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/.../bin",
 		);
-		let root = npm_package_root(p).unwrap();
-		assert_eq!(root, Path::new("/h/u/.local/lib/node_modules/@openai/codex"));
+		let root = npm_node_modules_root(p).unwrap();
+		assert_eq!(root, Path::new("/h/u/.local/lib/node_modules"));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn entrypoint_bind_source_preserves_symlinked_entrypoint_parent() {
+		use std::os::unix::fs::symlink;
+
+		let tmp = tempfile::tempdir().unwrap();
+		let bin_dir = tmp.path().join("bin");
+		let pkg_dir = tmp.path().join("lib/node_modules/@openai/codex/bin");
+		std::fs::create_dir_all(&bin_dir).unwrap();
+		std::fs::create_dir_all(&pkg_dir).unwrap();
+		let target = pkg_dir.join("codex.js");
+		std::fs::write(&target, "#!/usr/bin/env node\n").unwrap();
+		symlink("../lib/node_modules/@openai/codex/bin/codex.js", bin_dir.join("codex")).unwrap();
+
+		assert_eq!(entrypoint_bind_source(&bin_dir.join("codex")).unwrap(), bin_dir);
 	}
 
 	#[tokio::test]

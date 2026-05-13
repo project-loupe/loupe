@@ -37,6 +37,7 @@ inside the sandbox.
                        ┌────────────────────────┐         ┌──────────────────┐
                        │      loupe-server      │ ──HTTPS─► api.github.com   │
                        │                        │  (PAT)  │  (GitHub Issues) │
+                       │                        │ ─sendmail→ local MTA       │
                        │  ┌──────────────────┐  │         └──────────────────┘
                        │  │   SQLCipher DB   │  │
                        │  │ • repos          │  │
@@ -206,6 +207,8 @@ A finding's journey from "agent saw something" to "human looked at it":
    │ dispatch:                       │
    │   GithubIssue → POST issue +    │
    │     stamp reported_at           │     dispatch
+   │   Email → sendmail +            │
+   │     stamp reported_at           │
    │   Manual → no external call;    │
    │     stamp reported_at anyway    │
    └─────────────────────────────────┘

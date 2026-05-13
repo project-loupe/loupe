@@ -3,9 +3,9 @@
 A security-scanning harness for source repositories. `loupe` runs LLM
 agents (and, in future milestones, fuzzers and other tooling) over a
 codebase, lets each agent self-validate its findings (write a
-regression-test PoC, check it applies), and files confirmed findings
-as GitHub issues so they show up where the rest of the team's bugs
-live.
+regression-test PoC, check it applies), and dispatches confirmed
+findings to the configured reporter so they show up where the rest of
+the team's bugs live.
 
 The system is split into three components that talk to each other over
 mTLS:
@@ -13,8 +13,8 @@ mTLS:
 - **`loupe-server`** — long-running daemon. Holds the SQLite database
   (registered repos, jobs, findings, secrets), runs the scheduler, hands
   out leases, accepts findings + verdicts, and dispatches confirmed
-  findings to the configured reporter — today: GitHub issues, or no
-  reporter at all (manual triage via `loupectl`).
+  findings to the configured reporter — today: GitHub issues, email
+  via sendmail, or no reporter at all (manual triage via `loupectl`).
 - **`loupe-worker`** — fleet of stateless workers. Authenticate with the
   server using a client cert minted at registration time, lease a job,
   clone the repo into a local cache, run the configured scanners, and
@@ -96,6 +96,11 @@ Before installing, the host needs:
   key is mandatory (the server refuses to start without one);
   `loupe-server init` mints it the first time you bootstrap a data
   dir.
+- **A sendmail-compatible local mailer** on the server host, only if
+  you intend to use the email reporter. The built-in reporter shells
+  out to `/usr/sbin/sendmail -t -i` and writes an RFC 5322 message on
+  stdin; a local MTA or wrapper such as postfix, msmtp, or nullmailer
+  needs to own delivery.
 
 ## Building
 
@@ -385,6 +390,19 @@ reads the PAT out of the secrets table (transparently decrypted by
 SQLCipher when the row is fetched) and posts to
 `https://api.github.com/repos/acme/widget-security/issues`, stamping
 `reported_at` on the finding row.
+
+#### Or: email reporting
+
+The server also has an email reporting destination on the wire:
+`ReportingSetup::Email { to, from, subject_prefix }`. It sends
+confirmed findings through the server host's sendmail-compatible
+binary and does not require a PAT or other reporter secret.
+
+`loupectl repo add` does not expose email flags yet, so registering an
+email-backed repo currently means calling `POST /v1/repos` with an
+admin mTLS client or using a small client built on `loupe-proto`.
+Once registered, the scan, verification, approval, and dispatch flow
+is the same as the GitHub reporter.
 
 #### Or: scan-only mode (no tracker)
 
