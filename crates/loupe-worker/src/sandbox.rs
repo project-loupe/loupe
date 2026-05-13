@@ -182,6 +182,24 @@ impl SandboxBuilder {
 			}
 		}
 
+		// On systemd-resolved hosts (Ubuntu / most modern distros)
+		// /etc/resolv.conf is a symlink into /run/systemd/resolve/, so
+		// binding /etc alone leaves the symlink dangling and DNS dies
+		// inside the sandbox even with `--share-net`. Binding the
+		// symlink target onto /etc/resolv.conf doesn't work either:
+		// bwrap follows the existing dangling symlink during destination
+		// creation and fails with ENOENT. Instead, bind the symlink
+		// target's parent dir at its real path so the symlink resolves
+		// without us having to overlay /etc/resolv.conf itself.
+		if self.allow_network {
+			if let Ok(real) = std::fs::canonicalize("/etc/resolv.conf") {
+				if let Some(parent) = real.parent() {
+					let parent = parent.to_string_lossy().into_owned();
+					cmd.args(["--ro-bind-try", &parent, &parent]);
+				}
+			}
+		}
+
 		cmd.args(["--proc", "/proc", "--dev", "/dev"]);
 
 		// Fresh tmpfs for /tmp and a new $HOME. *Must* come before
