@@ -18,6 +18,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
 	/// Bootstrap a fresh data dir: mint the internal CA, server cert,
 	/// and admin client cert; persist them under the data dir;

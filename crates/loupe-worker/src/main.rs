@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use loupe_worker::llm::{McpContext, McpTlsSource};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
+	McpContext, McpTlsSource,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -164,8 +164,12 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		args.key,
 	)?;
 
-	let client =
-		Arc::new(ServerClient::new(&tls.ca_cert_pem, &tls.cert_pem, &tls.key_pem, server_url.clone())?);
+	let client = Arc::new(ServerClient::new(
+		&tls.ca_cert_pem,
+		&tls.cert_pem,
+		&tls.key_pem,
+		server_url.clone(),
+	)?);
 	let cache = Arc::new(RepoCache::new(cache_dir, args.max_cache_gb * 1_073_741_824)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
@@ -314,6 +318,7 @@ struct WorkerTls {
 	source: McpTlsSource,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_worker_tls(
 	ca_cert_pem: Option<String>, ca_cert_pem_b64: Option<String>, cert_pem: Option<String>,
 	cert_pem_b64: Option<String>, key_pem: Option<String>, key_pem_b64: Option<String>,
@@ -349,11 +354,10 @@ fn read_worker_tls(
 		});
 	}
 
-	let ca_cert = ca_cert.context(
-		"--ca-cert / LOUPE_CA_CERT is required unless LOUPE_WORKER_CA_CERT_PEM is set",
-	)?;
-	let cert = cert
-		.context("--cert / LOUPE_WORKER_CERT is required unless LOUPE_WORKER_CERT_PEM is set")?;
+	let ca_cert = ca_cert
+		.context("--ca-cert / LOUPE_CA_CERT is required unless LOUPE_WORKER_CA_CERT_PEM is set")?;
+	let cert =
+		cert.context("--cert / LOUPE_WORKER_CERT is required unless LOUPE_WORKER_CERT_PEM is set")?;
 	let key =
 		key.context("--key / LOUPE_WORKER_KEY is required unless LOUPE_WORKER_KEY_PEM is set")?;
 	let ca_cert_pem = std::fs::read_to_string(&ca_cert)
@@ -387,9 +391,7 @@ fn required_pem_env(
 	if let Some(value_b64) = value_b64.filter(|s| !s.is_empty()) {
 		return decode_pem_b64(b64_name, &value_b64);
 	}
-	anyhow::bail!(
-		"{name} or {b64_name} is required when any worker TLS PEM env var is set"
-	)
+	anyhow::bail!("{name} or {b64_name} is required when any worker TLS PEM env var is set")
 }
 
 fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {

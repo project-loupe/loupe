@@ -78,7 +78,6 @@ fn read_current_version(conn: &Connection) -> rusqlite::Result<u32> {
 }
 
 /// v1 — initial schema.
-///
 const V1_INITIAL: &str = r#"
 CREATE TABLE schema_meta (
     id          INTEGER PRIMARY KEY CHECK (id = 1),

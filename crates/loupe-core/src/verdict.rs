@@ -89,5 +89,4 @@ mod tests {
 		let s = serde_json::to_string(&v).unwrap();
 		assert!(!s.contains("patch"), "got: {s}");
 	}
-
 }

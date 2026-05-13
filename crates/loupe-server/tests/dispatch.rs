@@ -352,10 +352,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	};
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
-		.json(&FindingsBatch {
-			protocol_version: PROTOCOL_VERSION,
-			findings: vec![confirmed],
-		})
+		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![confirmed] })
 		.send()
 		.await
 		.unwrap();
@@ -382,10 +379,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	};
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
-		.json(&FindingsBatch {
-			protocol_version: PROTOCOL_VERSION,
-			findings: vec![validating],
-		})
+		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![validating] })
 		.send()
 		.await
 		.unwrap();
@@ -408,10 +402,10 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 		.with_conn(|c| {
 			let mut stmt =
 				c.prepare("SELECT fingerprint, state FROM findings ORDER BY fingerprint")?;
-			let mut rows =
+			let rows =
 				stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
 			let mut out = Vec::new();
-			while let Some(row) = rows.next() {
+			for row in rows {
 				out.push(row?);
 			}
 			Ok(out)

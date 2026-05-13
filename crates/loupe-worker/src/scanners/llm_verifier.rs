@@ -162,6 +162,7 @@ mod tests {
 		// sees and assert both are populated. If a future refactor
 		// drops one, the agent silently falls into discovery mode and
 		// the verifier surface disappears.
+		#[allow(clippy::type_complexity)]
 		let captured: Arc<Mutex<Option<(Option<i64>, Option<i64>, Option<i64>)>>> =
 			Arc::new(Mutex::new(None));
 		let captured_for_stub = captured.clone();
@@ -170,7 +171,7 @@ mod tests {
 			Ok(String::new())
 		}));
 		LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
-		let seen = captured.lock().unwrap().clone().expect("backend invoked");
+		let seen = (*captured.lock().unwrap()).expect("backend invoked");
 		assert_eq!(seen, (Some(1), Some(42), Some(7)));
 	}
 }

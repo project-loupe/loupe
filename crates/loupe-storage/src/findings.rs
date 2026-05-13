@@ -351,11 +351,7 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 		state: {
 			let state_str: String = row.get(14)?;
 			state_str.parse::<FindingState>().map_err(|e| {
-				rusqlite::Error::FromSqlConversionFailure(
-					14,
-					rusqlite::types::Type::Text,
-					e.into(),
-				)
+				rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Text, e.into())
 			})?
 		},
 		verification_required: row.get::<_, i64>(15)? != 0,
