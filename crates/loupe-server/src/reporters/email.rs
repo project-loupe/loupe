@@ -149,7 +149,9 @@ fn max_severity(findings: &[Finding]) -> Severity {
 mod tests {
 	use super::*;
 
-	fn repo_with_email(from: Option<String>, to: Vec<String>, subject_prefix: Option<String>) -> RepoRow {
+	fn repo_with_email(
+		from: Option<String>, to: Vec<String>, subject_prefix: Option<String>,
+	) -> RepoRow {
 		RepoRow {
 			id: 1,
 			clone_url: "https://github.com/acme/widget.git".into(),

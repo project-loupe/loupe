@@ -285,6 +285,7 @@ impl LlmCodeReviewScanner {
 	/// Fan out one agent session per file with bounded concurrency.
 	/// Returns the count of session-level errors; per-session "no
 	/// finding" is a success (not an error).
+	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
 		bkb_hint: &'static str, cancel: &CancellationToken,
@@ -328,6 +329,7 @@ impl LlmCodeReviewScanner {
 /// counts these and fails the scan when every attempt errors. A
 /// healthy session that produced no submission still returns `Ok(())`
 /// — the agent decided there was nothing to report.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
 	job_id: i64, bkb_hint: &'static str, cancel: CancellationToken,

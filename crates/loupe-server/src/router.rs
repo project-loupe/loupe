@@ -89,7 +89,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 fn request_protocol_error(value: Option<&HeaderValue>) -> Option<String> {
-	let Some(value) = value else { return None };
+	let value = value?;
 	let raw = match value.to_str() {
 		Ok(v) => v,
 		Err(_) => return Some(format!("{PROTOCOL_VERSION_HEADER} must be valid ASCII")),

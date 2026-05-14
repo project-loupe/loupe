@@ -67,11 +67,7 @@ pub struct McpContext {
 
 #[derive(Debug, Clone)]
 pub enum McpTlsSource {
-	Paths {
-		ca_cert_path: PathBuf,
-		client_cert_path: PathBuf,
-		client_key_path: PathBuf,
-	},
+	Paths { ca_cert_path: PathBuf, client_cert_path: PathBuf, client_key_path: PathBuf },
 	Env,
 }
 
@@ -131,11 +127,7 @@ pub fn mcp_serve_args(
 pub fn bind_mcp_into_sandbox(sandbox: SandboxBuilder, ctx: &McpContext) -> SandboxBuilder {
 	let mut sb = sandbox.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN);
 	match &ctx.tls {
-		McpTlsSource::Paths {
-			ca_cert_path,
-			client_cert_path,
-			client_key_path,
-		} => {
+		McpTlsSource::Paths { ca_cert_path, client_cert_path, client_key_path } => {
 			sb = sb
 				.bind_ro(ca_cert_path.clone(), SANDBOX_CA_CERT)
 				.bind_ro(client_cert_path.clone(), SANDBOX_CLIENT_CERT)

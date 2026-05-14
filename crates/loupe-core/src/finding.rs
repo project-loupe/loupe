@@ -93,5 +93,4 @@ mod tests {
 		let back: Finding = serde_json::from_str(&s).unwrap();
 		assert_eq!(back.poc_unified.as_deref(), f.poc_unified.as_deref());
 	}
-
 }
