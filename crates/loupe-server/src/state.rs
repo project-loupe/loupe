@@ -29,6 +29,11 @@ pub struct AppState {
 	/// default — i.e. the operator didn't pin a per-repo override).
 	/// `false` keeps the existing immediate-dispatch behaviour.
 	pub require_approval_default: bool,
+	/// Server-wide default for the verify flow. Used when a repo
+	/// registration omits `verification_enabled`; the resolved value is
+	/// stored on the repo row so later server config changes do not
+	/// silently change existing repos.
+	pub verification_default: bool,
 }
 
 impl AppState {
@@ -40,6 +45,7 @@ impl AppState {
 			email_reporter: Arc::new(EmailReporter::new()),
 			job_arrived: Arc::new(Notify::new()),
 			require_approval_default: false,
+			verification_default: false,
 		}
 	}
 
@@ -50,6 +56,11 @@ impl AppState {
 
 	pub fn with_require_approval_default(mut self, on: bool) -> Self {
 		self.require_approval_default = on;
+		self
+	}
+
+	pub fn with_verification_default(mut self, on: bool) -> Self {
+		self.verification_default = on;
 		self
 	}
 }

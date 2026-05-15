@@ -108,7 +108,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 				github_pat: "ghp".into(),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval: None,
 		})
 		.send()

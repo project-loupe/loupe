@@ -41,6 +41,10 @@ struct Fixture {
 }
 
 async fn bring_up() -> Fixture {
+	bring_up_with_verification_default(false).await
+}
+
+async fn bring_up_with_verification_default(verification_default: bool) -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
 	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
 
@@ -70,7 +74,8 @@ async fn bring_up() -> Fixture {
 		db.clone(),
 		Arc::new(ca),
 		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
-	);
+	)
+	.with_verification_default(verification_default);
 	let handle = serve(cfg, state).await.unwrap();
 	let addr = handle.local_addr;
 	std::mem::forget(tmp);
@@ -86,7 +91,7 @@ async fn create_repo(admin: &reqwest::Client, reporting: ReportingSetup) -> i64 
 		scan_interval_seconds: Some(3600),
 		reporting,
 		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
-		verification_enabled: true,
+		verification_enabled: Some(true),
 		require_approval: Some(false),
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
@@ -131,7 +136,7 @@ async fn admin_can_register_list_and_delete_a_repo() {
 			github_pat: "ghp_secret_value".into(),
 		},
 		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
-		verification_enabled: true,
+		verification_enabled: Some(true),
 		require_approval: Some(false),
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
@@ -189,6 +194,49 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	let resp = admin.get("https://loupe-server/v1/repos").send().await.unwrap();
 	let body: ListReposResponse = resp.json().await.unwrap();
 	assert!(body.repos.is_empty());
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn repo_registration_inherits_verification_default_unless_pinned() {
+	let f = bring_up_with_verification_default(true).await;
+	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
+
+	let inherited = RegisterRepoRequest {
+		protocol_version: PROTOCOL_VERSION,
+		clone_url: "https://github.com/acme/inherit.git".into(),
+		branch: None,
+		scan_interval_seconds: None,
+		reporting: ReportingSetup::Manual,
+		scanner_config: serde_json::Value::Null,
+		verification_enabled: None,
+		require_approval: None,
+	};
+	let resp = admin.post("https://loupe-server/v1/repos").json(&inherited).send().await.unwrap();
+	assert_eq!(resp.status(), 201, "create inherited repo: {}", resp.status());
+
+	let pinned = RegisterRepoRequest {
+		protocol_version: PROTOCOL_VERSION,
+		clone_url: "https://github.com/acme/pinned.git".into(),
+		branch: None,
+		scan_interval_seconds: None,
+		reporting: ReportingSetup::Manual,
+		scanner_config: serde_json::Value::Null,
+		verification_enabled: Some(false),
+		require_approval: None,
+	};
+	let resp = admin.post("https://loupe-server/v1/repos").json(&pinned).send().await.unwrap();
+	assert_eq!(resp.status(), 201, "create pinned repo: {}", resp.status());
+
+	let resp = admin.get("https://loupe-server/v1/repos").send().await.unwrap();
+	assert!(resp.status().is_success());
+	let body: ListReposResponse = resp.json().await.unwrap();
+	let inherited =
+		body.repos.iter().find(|repo| repo.repo == "inherit").expect("inherited repo listed");
+	let pinned = body.repos.iter().find(|repo| repo.repo == "pinned").expect("pinned repo listed");
+	assert!(inherited.verification_enabled);
+	assert!(!pinned.verification_enabled);
 
 	f.handle.shutdown().await;
 }
@@ -343,7 +391,7 @@ async fn registering_with_non_https_clone_url_400s() {
 				github_pat: "ghp".into(),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval: None,
 		};
 		let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();

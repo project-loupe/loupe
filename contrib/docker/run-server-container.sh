@@ -22,7 +22,14 @@ fi
 install -d -o 10001 -g 10001 -m 0700 "$DATA_DIR"
 
 env_args=()
-for name in RUST_LOG LOUPE_LOG_JSON LOUPE_BIND LOUPE_DB LOUPE_REQUIRE_APPROVAL_DEFAULT; do
+for name in \
+	RUST_LOG \
+	LOUPE_LOG_JSON \
+	LOUPE_BIND \
+	LOUPE_DB \
+	LOUPE_REQUIRE_APPROVAL_DEFAULT \
+	LOUPE_VERIFICATION_DEFAULT
+do
 	if [ -n "${!name+x}" ]; then
 		env_args+=(--env "$name=${!name}")
 	fi

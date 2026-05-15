@@ -84,7 +84,14 @@ build_conf_file() {
 		write_conf_var LOUPE_SECRET_FILE "$REMOTE_SECRET"
 		write_conf_var LOUPE_SERVER_DATA_DIR "${LOUPE_SERVER_DATA_DIR:-/var/lib/loupe-container/server}"
 		write_conf_var LOUPE_SERVER_PUBLISH "${LOUPE_SERVER_PUBLISH:-8443:8443}"
-		for name in RUST_LOG LOUPE_LOG_JSON LOUPE_BIND LOUPE_DB LOUPE_REQUIRE_APPROVAL_DEFAULT; do
+		for name in \
+			RUST_LOG \
+			LOUPE_LOG_JSON \
+			LOUPE_BIND \
+			LOUPE_DB \
+			LOUPE_REQUIRE_APPROVAL_DEFAULT \
+			LOUPE_VERIFICATION_DEFAULT
+		do
 			if [ -n "${!name+x}" ]; then
 				write_conf_var "$name" "${!name}"
 			fi

@@ -257,8 +257,10 @@ The worker also probes for `bwrap` at startup and exits 1 if it is
 missing (set `LOUPE_DISABLE_SANDBOX=1` to bypass for dev work).
 Cache size defaults to 40 GB and evicts LRU clones above the cap.
 
-Verifier jobs only get queued when a repo is registered with
-`--verification-enabled`.
+Verifier jobs only get queued when a repo resolves to
+`verification_enabled = true`, either because it was registered with
+`--verification-enabled` or because the server's verification default
+is on.
 
 #### Deploy with containers
 
@@ -296,6 +298,11 @@ loupectl repo add \
 loupectl repo list
 loupectl repo scan 1                 # one-shot scan of repo id 1
 ```
+
+Add `--verification-enabled` if this repo should route scan findings
+through verifier jobs before reporting. If the server-wide verification
+default is on, omit it to inherit the default, or pass
+`--no-verification` to opt this repo out.
 
 Confirmed findings dispatch automatically — the GitHub reporter
 reads the PAT out of the secrets table (transparently decrypted by
@@ -460,13 +467,25 @@ verifier-issued `dismiss` and a human `reject` both land on
 
 Setting `verification_enabled = true` on a repo causes scan-time
 findings to land in `validating` state with one `kind=verify` job
-enqueued per finding. The verify job is leased by a worker advertising
-a `verify:*` capability, which runs an independent LLM pass over the
-finding and submits a `confirm | dismiss | inconclusive` verdict. The
-server applies a rollup policy in-transaction (any `dismissed` →
-finding `dismissed`; else any `confirmed` → `confirmed` + dispatch;
-else stay in `validating`). The full state machine + reaper details
-are in `ARCH.md` and the `submit_verdict` / `complete` handlers in
+enqueued per finding. You can set it per repo with
+`loupectl repo add --verification-enabled` or
+`loupectl repo update <id> --verification-enabled`.
+
+For verifier-first deployments, set the server-wide
+`verification_default` in `config.toml`'s `[policy]` section,
+or pass `--verification-default` / set
+`LOUPE_VERIFICATION_DEFAULT=true`. New repo registrations that
+do not pass either `--verification-enabled` or `--no-verification`
+inherit that default. Existing repos keep their stored value; update
+them explicitly if you change the server default later.
+
+The verify job is leased by a worker advertising a `verify:*`
+capability, which runs an independent LLM pass over the finding and
+submits a `confirm | dismiss | inconclusive` verdict. The server
+applies a rollup policy in-transaction (any `dismissed` → finding
+`dismissed`; else any `confirmed` → `confirmed` + dispatch; else stay
+in `validating`). The full state machine + reaper details are in
+`ARCH.md` and the `submit_verdict` / `complete` handlers in
 `crates/loupe-server/src/routes/jobs.rs`.
 
 A worker with `codex` (or just `claude`) on PATH advertises

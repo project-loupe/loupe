@@ -182,7 +182,7 @@ async fn register_with(
 			scan_interval_seconds: None,
 			reporting,
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval,
 		})
 		.send()

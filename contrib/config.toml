@@ -41,3 +41,15 @@ master_key  = "master.key"
 #
 # Default when unset: false (immediate dispatch).
 require_approval_default = false
+
+# Server-wide default for routing new repo registrations through the
+# verifier flow. When `true`, repos added without `--verification-enabled`
+# or `--no-verification` inherit verifier-first reporting. Existing repos
+# keep the value resolved when they were registered; use
+# `loupectl repo update <id> --verification-enabled/--no-verification`
+# to change them later.
+#
+# Default when unset: false (skip verify; dispatch confirmed findings).
+# This sample enables it because production deployments should usually
+# report only after the verifier confirms a finding.
+verification_default = true

@@ -181,11 +181,14 @@ struct RepoAddArgs {
 		conflicts_with_all = ["target_owner", "target_repo", "pat"],
 	)]
 	no_reporting: bool,
-	/// Route findings through the verify flow before dispatching. Off
-	/// by default; turn on for repos where you want a second-opinion
-	/// verifier worker to confirm each finding.
-	#[arg(long, default_value_t = false)]
+	/// Route findings through the verify flow before dispatching.
+	#[arg(long, conflicts_with = "no_verification")]
 	verification_enabled: bool,
+	/// Pin verification off for this repo, even if the server default
+	/// is on. If neither flag is set, repo registration inherits the
+	/// server-level verification default.
+	#[arg(long, conflicts_with = "verification_enabled")]
+	no_verification: bool,
 	/// Pin per-repo require_approval = true at registration time.
 	#[arg(long, conflicts_with = "no_require_approval")]
 	require_approval: bool,
@@ -451,6 +454,11 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		(false, true) => Some(false),
 		_ => None,
 	};
+	let verification_enabled = match (a.verification_enabled, a.no_verification) {
+		(true, false) => Some(true),
+		(false, true) => Some(false),
+		_ => None,
+	};
 	let reporting = if a.no_reporting {
 		ReportingSetup::Manual
 	} else {
@@ -469,7 +477,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		scan_interval_seconds: a.scan_interval_seconds,
 		reporting,
 		scanner_config: serde_json::Value::Null,
-		verification_enabled: a.verification_enabled,
+		verification_enabled,
 		require_approval,
 	};
 	let resp = client.post(url(base, "/v1/repos")).json(&req).send().await?;
@@ -859,6 +867,45 @@ mod tests {
 		};
 		assert_eq!(args.id, 7);
 		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn repo_add_inherits_verification_default_unless_pinned() {
+		let base = [
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"add",
+			"--clone-url",
+			"https://github.com/acme/widget.git",
+			"--no-reporting",
+		];
+
+		let cli = Cli::try_parse_from(base).unwrap();
+		let Cmd::Repo(RepoCmd::Add(args)) = cli.cmd else {
+			panic!("expected repo add command");
+		};
+		assert!(!args.verification_enabled);
+		assert!(!args.no_verification);
+
+		let mut with_verify = base.to_vec();
+		with_verify.push("--verification-enabled");
+		let cli = Cli::try_parse_from(with_verify).unwrap();
+		let Cmd::Repo(RepoCmd::Add(args)) = cli.cmd else {
+			panic!("expected repo add command");
+		};
+		assert!(args.verification_enabled);
+		assert!(!args.no_verification);
+
+		let mut without_verify = base.to_vec();
+		without_verify.push("--no-verification");
+		let cli = Cli::try_parse_from(without_verify).unwrap();
+		let Cmd::Repo(RepoCmd::Add(args)) = cli.cmd else {
+			panic!("expected repo add command");
+		};
+		assert!(!args.verification_enabled);
+		assert!(args.no_verification);
 	}
 
 	#[test]

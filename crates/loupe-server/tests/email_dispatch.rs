@@ -110,7 +110,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 				subject_prefix: Some("[scan]".into()),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval: None,
 		})
 		.send()

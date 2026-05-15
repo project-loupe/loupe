@@ -150,7 +150,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 				github_pat: "ghp_pat".into(),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval: None,
 		})
 		.send()
