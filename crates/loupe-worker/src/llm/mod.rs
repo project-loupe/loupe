@@ -151,6 +151,12 @@ pub fn claude_available() -> bool {
 		.unwrap_or(false)
 }
 
+/// Return true when the worker has auth material the claude CLI can
+/// use without running an interactive login during a scan.
+pub fn claude_auth_available() -> bool {
+	env_present("ANTHROPIC_API_KEY") || home_path(".claude.json").is_some_and(|p| p.exists())
+}
+
 /// Probe PATH for `bkb-mcp` (Bitcoin Knowledge Base MCP server).
 /// Returns the resolved binary path (via `which`-style lookup) when
 /// available, `None` otherwise.
@@ -202,6 +208,30 @@ pub fn codex_available() -> bool {
 		.unwrap_or(false)
 }
 
+/// Directory codex should read for login-state files when env-based
+/// auth is not used. `CODEX_HOME` mirrors codex's own config-home
+/// override; otherwise we use `~/.codex`.
+pub fn codex_home_dir() -> Option<PathBuf> {
+	if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+		return Some(PathBuf::from(home));
+	}
+	home_path(".codex")
+}
+
+/// Return true when the worker has auth material the codex CLI can use
+/// without running an interactive login during a scan.
+pub fn codex_auth_available() -> bool {
+	env_present("OPENAI_API_KEY") || codex_home_dir().is_some_and(|p| p.join("auth.json").exists())
+}
+
+fn env_present(name: &str) -> bool {
+	std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
+fn home_path(child: &str) -> Option<PathBuf> {
+	std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(child))
+}
+
 /// Build the verifier's [`LlmBackend`]. Prefers codex (cross-model
 /// second opinion is the whole point of the verifier flow); falls
 /// back to claude when codex isn't installed so single-CLI hosts
@@ -217,21 +247,101 @@ pub fn codex_available() -> bool {
 ///
 /// Logs the choice at info level so operators can see which backend
 /// is actually verifying without having to inspect process listings.
-pub fn build_verifier_backend(mcp: Option<McpContext>) -> Arc<dyn LlmBackend> {
-	if codex_available() {
+pub fn build_verifier_backend(
+	mcp: Option<McpContext>, codex_ready: bool, claude_ready: bool,
+) -> Result<Arc<dyn LlmBackend>> {
+	if codex_ready {
 		tracing::info!("verifier backend: codex (cross-model second opinion)");
 		let mut backend = CodexCliBackend::new();
 		if let Some(ctx) = mcp {
 			backend = backend.with_mcp_context(ctx);
 		}
-		Arc::new(backend)
-	} else {
-		tracing::info!("verifier backend: claude (codex CLI not on PATH; same-family fallback)");
+		Ok(Arc::new(backend))
+	} else if claude_ready {
+		tracing::info!("verifier backend: claude (codex unavailable; same-family fallback)");
 		let mut backend = ClaudeCliBackend::new();
 		if let Some(ctx) = mcp {
 			backend = backend.with_mcp_context(ctx);
 		}
-		Arc::new(backend)
+		Ok(Arc::new(backend))
+	} else {
+		anyhow::bail!("no authenticated verifier backend available")
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::ffi::OsString;
+	use std::sync::Mutex;
+
+	use super::*;
+
+	static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+	struct EnvGuard {
+		name: &'static str,
+		old: Option<OsString>,
+	}
+
+	impl EnvGuard {
+		fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+			let old = std::env::var_os(name);
+			std::env::set_var(name, value);
+			Self { name, old }
+		}
+
+		fn unset(name: &'static str) -> Self {
+			let old = std::env::var_os(name);
+			std::env::remove_var(name);
+			Self { name, old }
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			if let Some(old) = &self.old {
+				std::env::set_var(self.name, old);
+			} else {
+				std::env::remove_var(self.name);
+			}
+		}
+	}
+
+	#[test]
+	fn provider_auth_checks_accept_api_keys() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", "anthropic-key");
+		let _openai = EnvGuard::set("OPENAI_API_KEY", "openai-key");
+
+		assert!(claude_auth_available());
+		assert!(codex_auth_available());
+	}
+
+	#[test]
+	fn codex_auth_checks_codex_home_auth_json() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		let _openai = EnvGuard::unset("OPENAI_API_KEY");
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
+		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());
+
+		assert_eq!(codex_home_dir().as_deref(), Some(dir.path()));
+		assert!(codex_auth_available());
+	}
+
+	#[test]
+	fn verifier_backend_prefers_codex_then_claude() {
+		let backend = build_verifier_backend(None, true, true).unwrap();
+		assert_eq!(backend.id(), "codex-cli");
+
+		let backend = build_verifier_backend(None, false, true).unwrap();
+		assert_eq!(backend.id(), "claude-cli");
+
+		let err = match build_verifier_backend(None, false, false) {
+			Ok(_) => panic!("missing verifier backend should be rejected"),
+			Err(e) => e,
+		};
+		assert!(err.to_string().contains("no authenticated verifier backend"));
 	}
 }
 

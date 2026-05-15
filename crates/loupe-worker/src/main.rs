@@ -16,8 +16,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use loupe_worker::llm::{
-	bkb_mcp_available, build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
-	McpContext, McpTlsSource,
+	bkb_mcp_available, build_verifier_backend, claude_auth_available, claude_available,
+	codex_auth_available, codex_available, ClaudeCliBackend, McpContext, McpTlsSource,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -170,36 +170,54 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		&tls.key_pem,
 		server_url.clone(),
 	)?);
-	let cache = Arc::new(RepoCache::new(cache_dir, args.max_cache_gb * 1_073_741_824)?);
+	let cache = Arc::new(RepoCache::new(cache_dir.clone(), args.max_cache_gb * 1_073_741_824)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 
-	// LLM scanners auto-wire based on which agent CLIs are on PATH:
+	// LLM scanners auto-wire based on which authenticated agent CLIs
+	// are available:
 	//
-	// - `claude` present  → discovery scanner (only claude has the
-	//                       MCP `--mcp-config` plumbing today, so it
-	//                       owns submission via the loupe MCP server).
-	// - `claude` or `codex` present → verifier scanner (codex
-	//                       preferred — true cross-model second
-	//                       opinion; claude fallback if it's the only
-	//                       one installed).
-	// - neither present   → hard-fatal at startup. A loupe-worker
-	//                       with no agent CLI is "regex-only", which
-	//                       isn't a deployment we want operators to
-	//                       fall into by accident.
-	let claude = claude_available();
-	let codex = codex_available();
+	// - authenticated `claude` → discovery scanner (only claude has
+	//   the MCP `--mcp-config` plumbing today, so it owns submission
+	//   via the loupe MCP server).
+	// - authenticated `claude` or `codex` → verifier scanner (codex
+	//   preferred for a true cross-model second opinion; claude
+	//   fallback when codex is not ready).
+	// - no authenticated CLI → hard-fatal at startup. Docker images
+	//   can install both CLIs, but missing API keys should fail before
+	//   a worker leases jobs.
+	let claude_installed = claude_available();
+	let codex_installed = codex_available();
+	let claude_auth = claude_auth_available();
+	let codex_auth = codex_auth_available();
+	let claude = claude_installed && claude_auth;
+	let codex = codex_installed && codex_auth;
 	if !claude && !codex {
 		anyhow::bail!(
-			"no LLM agent CLI found on PATH (looked for `claude` and `codex`). \
-			 Install at least one before starting the worker — see the README \
-			 prerequisites section."
+			"no authenticated LLM agent CLI available \
+			 (claude: installed={}, auth={}; codex: installed={}, auth={}). \
+			 Install at least one CLI and provide its API key before starting the worker.",
+			claude_installed,
+			claude_auth,
+			codex_installed,
+			codex_auth,
 		);
+	}
+	if claude_installed && !claude_auth {
+		tracing::warn!(
+			"`claude` is installed but no ANTHROPIC_API_KEY or ~/.claude.json auth was found"
+		);
+	}
+	if codex_installed && !codex_auth {
+		tracing::warn!("`codex` is installed but no OPENAI_API_KEY or codex auth.json was found");
 	}
 	// bwrap is the security boundary for every agent subprocess; if
 	// it's missing and LOUPE_DISABLE_SANDBOX isn't set, refuse to run.
 	match sandbox::probe_at_startup() {
-		Ok(true) => tracing::info!("bubblewrap available; LLM scanners sandboxed"),
+		Ok(true) => {
+			sandbox::smoketest(&cache_dir).context("bubblewrap sandbox smoketest failed")?;
+			tracing::info!("bubblewrap available; LLM scanners sandboxed");
+		},
 		Ok(false) => {
 			tracing::warn!("LOUPE_DISABLE_SANDBOX is set; LLM scanners running without isolation")
 		},
@@ -247,7 +265,7 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
 	} else {
 		tracing::info!(
-			"`claude` not on PATH; LLM code-review (discovery) scanner not registered \
+			"`claude` not ready; LLM code-review (discovery) scanner not registered \
 			 — this worker advertises verify-only"
 		);
 	}
@@ -257,7 +275,7 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 	// for the new verify-mode tool surface (`submit_verdict` /
 	// `submit_patch` / `validate_patch`); without it, the agent
 	// has no way to commit a verdict.
-	let backend = build_verifier_backend(Some(mcp_ctx));
+	let backend = build_verifier_backend(Some(mcp_ctx), codex, claude)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
@@ -424,5 +442,53 @@ fn init_tracing() {
 			.init();
 	} else {
 		tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(env_filter).init();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn b64(value: &str) -> String {
+		use base64::Engine as _;
+		base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+	}
+
+	#[test]
+	fn read_worker_tls_accepts_base64_env_values() {
+		let ca = "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n";
+		let cert = "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n";
+		let key = "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n";
+
+		let tls = read_worker_tls(
+			None,
+			Some(b64(ca)),
+			None,
+			Some(b64(cert)),
+			None,
+			Some(b64(key)),
+			None,
+			None,
+			None,
+		)
+		.unwrap();
+
+		assert_eq!(tls.ca_cert_pem, ca);
+		assert_eq!(tls.cert_pem, cert);
+		assert_eq!(tls.key_pem, key);
+		assert!(matches!(tls.source, McpTlsSource::Env));
+	}
+
+	#[test]
+	fn read_worker_tls_requires_complete_env_tuple() {
+		let ca = "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n";
+
+		let err =
+			match read_worker_tls(None, Some(b64(ca)), None, None, None, None, None, None, None) {
+				Ok(_) => panic!("partial env TLS should be rejected"),
+				Err(e) => e,
+			};
+
+		assert!(err.to_string().contains("LOUPE_WORKER_CERT_PEM"));
 	}
 }

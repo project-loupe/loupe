@@ -1,0 +1,15 @@
+[Unit]
+Description=Loupe server container
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/loupe-container/run-server
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

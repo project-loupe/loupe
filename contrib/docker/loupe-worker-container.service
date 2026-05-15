@@ -1,0 +1,15 @@
+[Unit]
+Description=Loupe worker container
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/loupe-container/run-worker
+Restart=always
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target
