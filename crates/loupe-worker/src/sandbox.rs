@@ -10,7 +10,7 @@
 //! hosts without `bwrap`; the worker logs a loud warning if it's set,
 //! and the helper produces a plain `Command` instead of a wrapped one.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -182,6 +182,13 @@ impl SandboxBuilder {
 			}
 		}
 
+		// On systemd-resolved hosts, /etc/resolv.conf often points
+		// outside /etc. Keep the /etc symlink usable without exposing
+		// the whole resolver runtime directory.
+		if self.allow_network {
+			add_resolver_binds(&mut cmd);
+		}
+
 		cmd.args(["--proc", "/proc", "--dev", "/dev"]);
 
 		// Fresh tmpfs for /tmp and a new $HOME. *Must* come before
@@ -228,6 +235,50 @@ impl SandboxBuilder {
 		}
 		cmd
 	}
+}
+
+fn add_resolver_binds(cmd: &mut Command) {
+	let resolv_conf = Path::new("/etc/resolv.conf");
+	let Ok(link_target) = std::fs::read_link(resolv_conf) else {
+		return;
+	};
+	let Ok(real) = std::fs::canonicalize(resolv_conf) else {
+		return;
+	};
+
+	for dst in resolver_bind_destinations(resolv_conf, &link_target, &real) {
+		cmd.arg("--ro-bind-try").arg(&real).arg(dst);
+	}
+}
+
+fn resolver_bind_destinations(symlink: &Path, link_target: &Path, real: &Path) -> Vec<PathBuf> {
+	let visible = normalize_path(&if link_target.is_absolute() {
+		link_target.to_path_buf()
+	} else {
+		symlink.parent().unwrap_or_else(|| Path::new("/")).join(link_target)
+	});
+
+	let mut destinations = vec![visible.clone()];
+	if visible != real {
+		destinations.push(real.to_path_buf());
+	}
+	destinations
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+	let mut out = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+			Component::RootDir => out.push(Path::new("/")),
+			Component::CurDir => {},
+			Component::ParentDir => {
+				out.pop();
+			},
+			Component::Normal(part) => out.push(part),
+		}
+	}
+	out
 }
 
 /// If `path` lives inside a `node_modules/` tree, return the outer
@@ -321,6 +372,34 @@ mod tests {
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
+	}
+
+	#[test]
+	fn resolver_bind_destinations_preserve_symlink_visible_alias() {
+		let destinations = resolver_bind_destinations(
+			Path::new("/etc/resolv.conf"),
+			Path::new("/var/run/systemd/resolve/stub-resolv.conf"),
+			Path::new("/run/systemd/resolve/stub-resolv.conf"),
+		);
+
+		assert_eq!(
+			destinations,
+			vec![
+				PathBuf::from("/var/run/systemd/resolve/stub-resolv.conf"),
+				PathBuf::from("/run/systemd/resolve/stub-resolv.conf"),
+			],
+		);
+	}
+
+	#[test]
+	fn resolver_bind_destinations_resolve_relative_symlink_target() {
+		let destinations = resolver_bind_destinations(
+			Path::new("/etc/resolv.conf"),
+			Path::new("../run/systemd/resolve/stub-resolv.conf"),
+			Path::new("/run/systemd/resolve/stub-resolv.conf"),
+		);
+
+		assert_eq!(destinations, vec![PathBuf::from("/run/systemd/resolve/stub-resolv.conf")],);
 	}
 
 	#[test]
