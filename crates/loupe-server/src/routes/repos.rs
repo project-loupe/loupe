@@ -89,7 +89,9 @@ pub async fn create(
 					scan_interval_seconds: req.scan_interval_seconds.map(|v| v as i64),
 					scanner_config: req.scanner_config.clone(),
 					reporting,
-					verification_enabled: req.verification_enabled,
+					verification_enabled: req
+						.verification_enabled
+						.unwrap_or(state.verification_default),
 					require_approval: req.require_approval,
 				},
 				now,

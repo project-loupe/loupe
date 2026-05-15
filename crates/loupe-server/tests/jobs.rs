@@ -87,7 +87,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 			github_pat: "ghp".into(),
 		},
 		scanner_config: serde_json::Value::Null,
-		verification_enabled: false,
+		verification_enabled: Some(false),
 		require_approval: None,
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
@@ -121,7 +121,7 @@ async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
 			github_pat: "ghp".into(),
 		},
 		scanner_config: serde_json::Value::Null,
-		verification_enabled: false,
+		verification_enabled: Some(false),
 		require_approval: None,
 	};
 	let resp = f.admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();

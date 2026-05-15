@@ -115,6 +115,11 @@ struct ServeArgs {
 	/// (immediate dispatch).
 	#[arg(long, env = "LOUPE_REQUIRE_APPROVAL_DEFAULT")]
 	require_approval_default: Option<bool>,
+	/// Server-level default for the verify flow. Repo registration can
+	/// explicitly opt in or out. When unset here and in the config file,
+	/// the default is `false` (dispatch without verifier jobs).
+	#[arg(long, env = "LOUPE_VERIFICATION_DEFAULT")]
+	verification_default: Option<bool>,
 }
 
 #[tokio::main]
@@ -212,6 +217,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		.context("db path missing — pass --db, set LOUPE_DB, or [paths].db in config.toml")?;
 	let require_approval_default =
 		args.require_approval_default.or(file_cfg.policy.require_approval_default).unwrap_or(false);
+	let verification_default =
+		args.verification_default.or(file_cfg.policy.verification_default).unwrap_or(false);
 
 	// Master key resolution: env > --master-key-file flag > [paths]
 	// master_key in config.toml. The env-var path is the highest
@@ -275,10 +282,16 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		.with_context(|| format!("opening db at {}", db_path.display()))?;
 	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
 	let state = AppState::new(Arc::new(db), Arc::new(ca), github)
-		.with_require_approval_default(require_approval_default);
+		.with_require_approval_default(require_approval_default)
+		.with_verification_default(verification_default);
 	if require_approval_default {
 		tracing::info!(
 			"loupe-server: require_approval_default = true (per-repo overrides may opt out)"
+		);
+	}
+	if verification_default {
+		tracing::info!(
+			"loupe-server: verification_default = true (repo registrations may opt out)"
 		);
 	}
 

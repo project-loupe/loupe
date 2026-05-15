@@ -185,7 +185,7 @@ async fn run_flow(
 				github_pat: "ghp_pat".into(),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: true,
+			verification_enabled: Some(true),
 			require_approval: None,
 		})
 		.send()

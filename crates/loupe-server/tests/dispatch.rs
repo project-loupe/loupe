@@ -148,7 +148,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 				github_pat: "ghp_test_pat_value".into(),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval: None,
 		})
 		.send()
@@ -287,7 +287,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 				github_pat: "ghp_test_pat_value".into(),
 			},
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: Some(false),
 			require_approval: None,
 		})
 		.send()

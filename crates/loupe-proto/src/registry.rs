@@ -44,12 +44,12 @@ pub struct RegisterRepoRequest {
 	pub reporting: ReportingSetup,
 	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
 	pub scanner_config: serde_json::Value,
-	/// When `true`, scan findings for this repo go through the verify
-	/// flow before being dispatched. Defaults to `false` so simple
-	/// scanners that don't have a verifier worker pool to back them
-	/// dispatch immediately.
-	#[serde(default)]
-	pub verification_enabled: bool,
+	/// Per-repo override of the verify flow. `None` (the default on
+	/// the wire) means "inherit the server's
+	/// `verification_default`". `Some(true)` / `Some(false)`
+	/// pin the value for this repo regardless of the server default.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub verification_enabled: Option<bool>,
 	/// Per-repo override of the human-in-the-loop approval gate. `None`
 	/// (the default on the wire) means "inherit the server's
 	/// `require_approval_default`". `Some(true)` / `Some(false)` pin
@@ -67,7 +67,7 @@ impl RegisterRepoRequest {
 			scan_interval_seconds: None,
 			reporting,
 			scanner_config: serde_json::Value::Null,
-			verification_enabled: false,
+			verification_enabled: None,
 			require_approval: None,
 		}
 	}
@@ -191,7 +191,7 @@ mod tests {
 				github_pat: "ghp_xxx".into(),
 			},
 			scanner_config: json!({"regex": {"enabled": true}}),
-			verification_enabled: true,
+			verification_enabled: Some(true),
 			require_approval: Some(false),
 		};
 		let s = serde_json::to_string(&req).unwrap();
@@ -199,6 +199,19 @@ mod tests {
 		assert_eq!(req, back);
 		// Sanity check: the wire form does not leak `pat_secret_id`.
 		assert!(!s.contains("pat_secret_id"));
+	}
+
+	#[test]
+	fn register_repo_request_omits_inherited_verification_default() {
+		let req =
+			RegisterRepoRequest::new("https://github.com/acme/widget.git", ReportingSetup::Manual);
+		let s = serde_json::to_string(&req).unwrap();
+		assert!(
+			!s.contains("verification_enabled"),
+			"verification default should be inherited unless pinned: {s}"
+		);
+		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(back.verification_enabled, None);
 	}
 
 	#[test]

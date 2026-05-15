@@ -75,6 +75,13 @@ pub struct PolicySection {
 	/// here AND unset on the repo.
 	#[serde(default)]
 	pub require_approval_default: Option<bool>,
+	/// Server-level default for routing scan findings through verifier
+	/// jobs before dispatch. Repo registrations can override this
+	/// explicitly; existing repos keep the value resolved at
+	/// registration time.
+	#[serde(default)]
+	#[serde(alias = "verification_enabled_default")]
+	pub verification_default: Option<bool>,
 }
 
 impl FileConfig {
@@ -119,6 +126,7 @@ mod tests {
 		let cfg = FileConfig::load(&path).unwrap();
 		assert!(cfg.server.bind.is_none());
 		assert!(cfg.policy.require_approval_default.is_none());
+		assert!(cfg.policy.verification_default.is_none());
 	}
 
 	#[test]
@@ -152,8 +160,13 @@ mod tests {
 	fn policy_section_round_trips() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("config.toml");
-		std::fs::write(&path, b"[policy]\nrequire_approval_default = true\n").unwrap();
+		std::fs::write(
+			&path,
+			b"[policy]\nrequire_approval_default = true\nverification_default = true\n",
+		)
+		.unwrap();
 		let cfg = FileConfig::load(&path).unwrap();
 		assert_eq!(cfg.policy.require_approval_default, Some(true));
+		assert_eq!(cfg.policy.verification_default, Some(true));
 	}
 }
