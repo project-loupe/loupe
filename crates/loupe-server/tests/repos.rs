@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use loupe_core::ReportingDestination;
 use loupe_proto::{
-	ListReposResponse, RegisterRepoRequest, ReportingSetup, RotateRepoPatRequest, PROTOCOL_VERSION,
+	ListReposResponse, RegisterRepoRequest, ReportingSetup, RotateRepoPatRequest,
+	SetRepoGithubReportingRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
@@ -264,6 +265,63 @@ async fn rotating_pat_requires_github_issue_reporting() {
 		.await
 		.unwrap();
 	assert_eq!(resp.status(), 404);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_can_set_github_reporting_on_a_manual_repo() {
+	let f = bring_up().await;
+	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
+	let repo_id = create_repo(&admin, ReportingSetup::Manual).await;
+
+	let req = SetRepoGithubReportingRequest {
+		protocol_version: PROTOCOL_VERSION,
+		target_owner: "acme".into(),
+		target_repo: "tracker".into(),
+		github_pat: "ghp_first".into(),
+	};
+	let resp = admin
+		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
+		.json(&req)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204, "set GitHub reporting: {}", resp.status());
+	let first_secret_id = match repo_reporting(&f.db, repo_id) {
+		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
+			assert_eq!(target_owner, "acme");
+			assert_eq!(target_repo, "tracker");
+			pat_secret_id
+		},
+		other => panic!("expected GitHub reporting, got {other:?}"),
+	};
+	assert_eq!(secret_value(&f.db, first_secret_id).unwrap(), b"ghp_first");
+
+	let req = SetRepoGithubReportingRequest {
+		protocol_version: PROTOCOL_VERSION,
+		target_owner: "acme".into(),
+		target_repo: "new-tracker".into(),
+		github_pat: "ghp_second".into(),
+	};
+	let resp = admin
+		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
+		.json(&req)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204, "replace GitHub reporting: {}", resp.status());
+	let second_secret_id = match repo_reporting(&f.db, repo_id) {
+		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
+			assert_eq!(target_owner, "acme");
+			assert_eq!(target_repo, "new-tracker");
+			pat_secret_id
+		},
+		other => panic!("expected GitHub reporting, got {other:?}"),
+	};
+	assert_ne!(second_secret_id, first_secret_id);
+	assert_eq!(secret_value(&f.db, second_secret_id).unwrap(), b"ghp_second");
+	assert_eq!(secret_value(&f.db, first_secret_id), None);
 
 	f.handle.shutdown().await;
 }

@@ -8,7 +8,7 @@ use axum::Json;
 use loupe_core::ReportingDestination;
 use loupe_proto::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RepoSummary, ReportingSetup,
-	RotateRepoPatRequest, UpdateRepoRequest, PROTOCOL_VERSION,
+	RotateRepoPatRequest, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
@@ -228,6 +228,83 @@ pub async fn rotate_github_pat(
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("rotate repo PAT: {e}")))?;
 	if !rotated {
+		return Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")));
+	}
+
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /v1/repos/:id/reporting/github` — admin only. Configures or
+/// replaces the GitHub issue reporting destination for a repo.
+pub async fn set_github_reporting(
+	State(state): State<AppState>, Path(id): Path<i64>,
+	Json(req): Json<SetRepoGithubReportingRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	if req.protocol_version != PROTOCOL_VERSION {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			format!("unsupported protocol_version {}", req.protocol_version),
+		));
+	}
+	let target_owner = req.target_owner.trim().to_owned();
+	let target_repo = req.target_repo.trim().to_owned();
+	if target_owner.is_empty() {
+		return Err((StatusCode::BAD_REQUEST, "target_owner must not be empty".into()));
+	}
+	if target_repo.is_empty() {
+		return Err((StatusCode::BAD_REQUEST, "target_repo must not be empty".into()));
+	}
+	if req.github_pat.trim().is_empty() {
+		return Err((StatusCode::BAD_REQUEST, "github PAT must not be empty".into()));
+	}
+
+	let row = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repo with id {id}")))?;
+	let host = row.host;
+	let old_secret_id = match row.reporting {
+		ReportingDestination::GithubIssue { pat_secret_id, .. } => Some(pat_secret_id),
+		ReportingDestination::Email { .. } | ReportingDestination::Manual => None,
+	};
+
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+	let now_secs = now.as_secs() as i64;
+	let old_label_id = old_secret_id.unwrap_or(0);
+	let secret_label = format!(
+		"pat:{host}:{target_owner}/{target_repo}:repo:{id}:replaces:{old_label_id}:at:{}",
+		now.as_nanos(),
+	);
+	let updated = state
+		.db
+		.with_conn(|c| {
+			let tx = c.transaction()?;
+			let new_secret_id = secrets::insert(
+				&tx,
+				SecretKind::GithubPat,
+				&secret_label,
+				req.github_pat.as_bytes(),
+				now_secs,
+			)?;
+			let new_reporting = ReportingDestination::GithubIssue {
+				target_owner,
+				target_repo,
+				pat_secret_id: new_secret_id,
+			};
+			if !repos::update_reporting(&tx, id, &new_reporting)? {
+				return Ok(false);
+			}
+			if let Some(old_secret_id) = old_secret_id {
+				if repos::count_github_pat_references(&tx, old_secret_id)? == 0 {
+					secrets::delete(&tx, old_secret_id)?;
+				}
+			}
+			tx.commit()?;
+			Ok(true)
+		})
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set GitHub reporting: {e}")))?;
+	if !updated {
 		return Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")));
 	}
 

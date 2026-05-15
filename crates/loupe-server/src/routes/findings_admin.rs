@@ -4,6 +4,7 @@
 //! - `GET  /v1/repos/:id/findings/search?q=` → FTS5 keyword search
 //! - `GET  /v1/findings/:id`                 → full detail for one finding
 //! - `POST /v1/findings/:id/approve`         → release a held finding
+//! - `POST /v1/findings/:id/retry-report`    → retry a confirmed finding
 //! - `POST /v1/findings/:id/reject`          → terminally dismiss a held finding
 //!
 //! The list / approve / reject routes are admin-only — they sit
@@ -19,9 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use loupe_core::{FindingState, ReportingDestination};
 use loupe_proto::{FindingDetail, FindingSummary, ListFindingsResponse, PROTOCOL_VERSION};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
-use loupe_storage::jobs;
+use loupe_storage::{jobs, repos};
 use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
@@ -150,7 +152,11 @@ pub async fn approve(
 	match outcome {
 		ApprovalOutcome::Applied => {
 			if let Err(e) = super::jobs::dispatch_finding(&state, id, now).await {
-				tracing::warn!(finding_id = id, error = %e, "dispatch on approve failed");
+				tracing::warn!(
+					finding_id = id,
+					error = %super::jobs::format_error_chain(&e),
+					"dispatch on approve failed"
+				);
 			}
 			Ok(StatusCode::NO_CONTENT)
 		},
@@ -159,6 +165,47 @@ pub async fn approve(
 		},
 		ApprovalOutcome::NotFound => {
 			Err((StatusCode::NOT_FOUND, format!("no finding with id {id}")))
+		},
+	}
+}
+
+/// `POST /v1/findings/:id/retry-report` — admin only. Retries external
+/// reporting for a finding that is already `confirmed`. Already
+/// `reported` findings are idempotent no-ops.
+pub async fn retry_report(
+	State(state): State<AppState>, Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	let now = now_secs();
+	let row = state
+		.db
+		.with_conn(|c| Ok(findings::get(c, id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
+		.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
+
+	match row.state {
+		FindingState::Reported => return Ok(StatusCode::NO_CONTENT),
+		FindingState::Confirmed => {},
+		_ => return Err((StatusCode::CONFLICT, format!("finding {id} is not confirmed"))),
+	}
+
+	let repo = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "finding repo is missing".to_owned()))?;
+	if matches!(repo.reporting, ReportingDestination::Manual) {
+		return Err((
+			StatusCode::CONFLICT,
+			format!("repo {} does not have reporting configured", repo.id),
+		));
+	}
+
+	match super::jobs::dispatch_finding(&state, id, now).await {
+		Ok(()) => Ok(StatusCode::NO_CONTENT),
+		Err(e) => {
+			let error = super::jobs::format_error_chain(&e);
+			tracing::warn!(finding_id = id, error = %error, "retry report failed");
+			Err((StatusCode::INTERNAL_SERVER_ERROR, format!("retry report: {error}")))
 		},
 	}
 }

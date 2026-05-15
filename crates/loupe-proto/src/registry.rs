@@ -26,10 +26,9 @@ pub enum ReportingSetup {
 		subject_prefix: Option<String>,
 	},
 	/// No automatic reporter. The server runs the scan, verification,
-	/// and approval pipeline as usual, but on dispatch the finding
-	/// goes straight to `reported` without poking an external system.
-	/// Operators triage via `loupectl finding show`/`approve`/`reject`
-	/// and take whatever follow-up action they want out-of-band.
+	/// and approval pipeline as usual, but confirmed findings remain
+	/// `confirmed` until an operator configures reporting and retries
+	/// delivery or handles them out-of-band.
 	Manual,
 }
 
@@ -84,6 +83,15 @@ pub struct RegisterRepoResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RotateRepoPatRequest {
 	pub protocol_version: u16,
+	pub github_pat: String,
+}
+
+/// Body of `PUT /v1/repos/:id/reporting/github`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRepoGithubReportingRequest {
+	pub protocol_version: u16,
+	pub target_owner: String,
+	pub target_repo: String,
 	pub github_pat: String,
 }
 
@@ -217,6 +225,21 @@ mod tests {
 		assert!(s.contains("github_pat"));
 		assert!(!s.contains("pat_secret_id"));
 		let back: RotateRepoPatRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(req, back);
+	}
+
+	#[test]
+	fn set_repo_github_reporting_request_does_not_use_storage_ids() {
+		let req = SetRepoGithubReportingRequest {
+			protocol_version: PROTOCOL_VERSION,
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+			github_pat: "ghp_new".into(),
+		};
+		let s = serde_json::to_string(&req).unwrap();
+		assert!(s.contains("github_pat"));
+		assert!(!s.contains("pat_secret_id"));
+		let back: SetRepoGithubReportingRequest = serde_json::from_str(&s).unwrap();
 		assert_eq!(req, back);
 	}
 }

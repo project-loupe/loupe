@@ -329,16 +329,20 @@ loupectl repo add \
   --no-reporting
 ```
 
-`--no-reporting` implies `--require-approval = true` unless you
-override it (else findings would silently flip to `reported` before
-a human ever sees them — defeating the point). The full pipeline
-(scan → optional verify → approval gate) runs as usual, but on
-approve the dispatcher simply stamps `reported_at` and state
-`reported` without calling any external system. Reject still moves
-the finding to terminal `dismissed`. Operators take whatever
-follow-up action they want — open a ticket elsewhere, fix the bug
-directly, ignore it — and `loupectl finding list` shows what's been
-triaged versus still pending.
+The full pipeline (scan → optional verify → approval gate) runs as
+usual, but with no reporter configured the dispatcher leaves confirmed
+findings in state `confirmed`. You can either handle them out-of-band,
+or configure reporting later and retry delivery:
+
+```
+loupectl repo set-github-reporting <repo-id> \
+  --target-owner acme \
+  --target-repo widget-security
+
+loupectl finding retry-report <finding-id>
+```
+
+Reject still moves a held finding to terminal `dismissed`.
 
 ### 7. Inspect what happened
 
@@ -429,6 +433,7 @@ loupectl finding show <finding-id>              # pretty: title, severity,
                                                 #   that fails on HEAD)
 loupectl finding show <finding-id> --json       # raw DTO for scripting
 loupectl finding approve <finding-id>           # → confirmed → dispatched
+loupectl finding retry-report <finding-id>      # retry a confirmed finding
 loupectl finding reject  <finding-id>           # → terminal dismissed
 ```
 
@@ -442,8 +447,10 @@ against a fresh worktree and running the test should fail on HEAD.
 machine-readable output. `NO_COLOR=1` (or piping into a non-TTY)
 suppresses ANSI escapes.
 
-`approve` runs the dispatcher synchronously, so the issue is filed
-the moment the call returns. `reject` is terminal; the audit columns
+`approve` runs the dispatcher synchronously when a reporter is
+configured. Without a reporter, the finding stays `confirmed`; add
+reporting with `repo set-github-reporting`, then run
+`finding retry-report`. `reject` is terminal; the audit columns
 `approved_by_cn` / `rejected_by_cn` record the admin client cert's
 `workers.name` so dashboards can later answer "who clicked what". A
 verifier-issued `dismiss` and a human `reject` both land on

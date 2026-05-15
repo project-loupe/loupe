@@ -477,7 +477,7 @@ pub async fn submit_verdict(
 		if let Err(e) = dispatch_finding(&state, target_finding_id, now).await {
 			tracing::warn!(
 				finding_id = target_finding_id,
-				error = %e,
+				error = %format_error_chain(&e),
 				"dispatch on verdict-confirm failed"
 			);
 		}
@@ -625,12 +625,25 @@ pub async fn complete(
 		// harmless).
 		state.job_arrived.notify_waiters();
 		if let Err(e) = dispatch_for_job(&state, job.repo_id, job.id, now).await {
-			// Dispatch failures don't roll back the job — operators can
-			// retry by re-running the scan, and we'll notice via metrics.
-			tracing::warn!(job_id = job.id, error = %e, "dispatch failed");
+			// Dispatch failures don't roll back the job. Confirmed
+			// findings remain retryable via the admin retry-report route.
+			tracing::warn!(job_id = job.id, error = %format_error_chain(&e), "dispatch failed");
 		}
 	}
 	Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) fn format_error_chain(error: &anyhow::Error) -> String {
+	let mut causes = error.chain();
+	let Some(first) = causes.next() else {
+		return error.to_string();
+	};
+	let mut rendered = first.to_string();
+	for cause in causes {
+		rendered.push_str(": ");
+		rendered.push_str(&cause.to_string());
+	}
+	rendered
 }
 
 /// Dispatch a single finding that has just transitioned to `confirmed`
@@ -694,19 +707,16 @@ async fn dispatch_confirmed_rows(
 	let findings_for_report: Vec<_> = confirmed_rows.into_iter().map(finding_from_row).collect();
 
 	if matches!(repo.reporting, ReportingDestination::Manual) {
-		let n = mark_reported(state, &ids, now)?;
-		if n > 0 {
-			match scope {
-				DispatchScope::Finding(finding_id) => tracing::info!(
-					finding_id,
-					"manual mode: finding terminated without external dispatch"
-				),
-				DispatchScope::Job(job_id) => tracing::info!(
-					job_id,
-					count = n,
-					"manual mode: findings terminated without external dispatch"
-				),
-			}
+		match scope {
+			DispatchScope::Finding(finding_id) => tracing::info!(
+				finding_id,
+				"manual mode: finding left confirmed without external dispatch"
+			),
+			DispatchScope::Job(job_id) => tracing::info!(
+				job_id,
+				count = ids.len(),
+				"manual mode: findings left confirmed without external dispatch"
+			),
 		}
 		return Ok(());
 	}

@@ -12,7 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RotateRepoPatRequest, ScanRequest, ScanResponse, UpdateRepoRequest, PROTOCOL_VERSION,
+	RotateRepoPatRequest, ScanRequest, ScanResponse, SetRepoGithubReportingRequest,
+	UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -75,6 +76,8 @@ enum RepoCmd {
 	Update(RepoUpdateArgs),
 	/// Replace the GitHub PAT used by this repo's issue reporter.
 	RotatePat(RepoRotatePatArgs),
+	/// Configure or replace this repo's GitHub issue reporter.
+	SetGithubReporting(RepoSetGithubReportingArgs),
 	/// Trigger a scan now.
 	Scan {
 		id: i64,
@@ -88,6 +91,19 @@ struct RepoRotatePatArgs {
 	id: i64,
 	/// Replacement PAT for this repo's GitHub issue reporter. Read
 	/// from LOUPE_TRACKER_PAT if omitted.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
+	pat: String,
+}
+
+#[derive(Debug, Args)]
+struct RepoSetGithubReportingArgs {
+	id: i64,
+	#[arg(long)]
+	target_owner: String,
+	#[arg(long)]
+	target_repo: String,
+	/// PAT for the target tracker repo. Read from LOUPE_TRACKER_PAT if
+	/// omitted.
 	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
 	pat: String,
 }
@@ -147,16 +163,18 @@ struct RepoAddArgs {
 	/// var `LOUPE_TRACKER_PAT` if not supplied — never echo it on the
 	/// command line in shared shells. Required unless `--no-reporting`
 	/// is set.
-	#[arg(long, env = "LOUPE_TRACKER_PAT", required_unless_present = "no_reporting")]
+	#[arg(
+		long,
+		env = "LOUPE_TRACKER_PAT",
+		hide_env_values = true,
+		required_unless_present = "no_reporting"
+	)]
 	pat: Option<String>,
 	/// Skip configuring an automatic reporter. Findings still go
-	/// through the full scan + verification + approval pipeline; on
-	/// dispatch they go straight to `reported` without poking any
-	/// external system. Operators triage via `loupectl finding show /
-	/// approve / reject` and act on findings out-of-band. Implies
-	/// `--require-approval` unless explicitly overridden — pairing
-	/// manual mode with auto-dispatch would silently mark every
-	/// finding `reported` before a human ever sees it.
+	/// through the full scan + verification + approval pipeline.
+	/// Confirmed findings remain `confirmed` so operators can configure
+	/// reporting later and run `loupectl finding retry-report`, or
+	/// triage manually with `loupectl finding show / approve / reject`.
 	#[arg(
 		long,
 		default_value_t = false,
@@ -173,8 +191,7 @@ struct RepoAddArgs {
 	require_approval: bool,
 	/// Pin per-repo require_approval = false at registration time.
 	/// If neither flag is set, the repo inherits the server-level
-	/// `require_approval_default` (or implicit `true` when paired with
-	/// `--no-reporting`).
+	/// `require_approval_default`.
 	#[arg(long, conflicts_with = "require_approval")]
 	no_require_approval: bool,
 }
@@ -232,6 +249,8 @@ enum FindingCmd {
 	/// Approve a finding parked in `awaiting_approval`. Transitions
 	/// it to `confirmed` and immediately runs the dispatcher.
 	Approve { id: i64 },
+	/// Retry external reporting for a confirmed finding.
+	RetryReport { id: i64 },
 	/// Reject a finding parked in `awaiting_approval`. Transitions
 	/// it to terminal `dismissed` with the rejection audit trail
 	/// stamped (distinct from a verifier-issued dismiss).
@@ -293,6 +312,10 @@ async fn main() -> Result<()> {
 				let (client, base) = client_and_url(&conn)?;
 				repo_rotate_pat(&client, base, a).await
 			},
+			RepoCmd::SetGithubReporting(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_set_github_reporting(&client, base, a).await
+			},
 			RepoCmd::Scan { id, incremental } => {
 				let (client, base) = client_and_url(&conn)?;
 				repo_scan(&client, base, id, incremental).await
@@ -334,6 +357,10 @@ async fn main() -> Result<()> {
 			FindingCmd::Approve { id } => {
 				let (client, base) = client_and_url(&conn)?;
 				finding_approve(&client, base, id).await
+			},
+			FindingCmd::RetryReport { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_retry_report(&client, base, id).await
 			},
 			FindingCmd::Reject { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -419,15 +446,9 @@ fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
 }
 
 async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
-	// Manual mode implies require_approval = true unless the operator
-	// explicitly opts out. Pairing manual mode with auto-dispatch
-	// would flip every finding to `reported` before a human ever sees
-	// it — almost certainly not what someone passing --no-reporting
-	// wants.
 	let require_approval = match (a.require_approval, a.no_require_approval) {
 		(true, false) => Some(true),
 		(false, true) => Some(false),
-		_ if a.no_reporting => Some(true),
 		_ => None,
 	};
 	let reporting = if a.no_reporting {
@@ -535,6 +556,31 @@ async fn repo_rotate_pat(
 	let status = resp.status();
 	if !status.is_success() {
 		anyhow::bail!("rotate repo PAT: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
+async fn repo_set_github_reporting(
+	client: &reqwest::Client, base: &reqwest::Url, a: RepoSetGithubReportingArgs,
+) -> Result<()> {
+	let req = SetRepoGithubReportingRequest {
+		protocol_version: PROTOCOL_VERSION,
+		target_owner: a.target_owner,
+		target_repo: a.target_repo,
+		github_pat: a.pat,
+	};
+	let resp = client
+		.put(url(base, &format!("/v1/repos/{}/reporting/github", a.id)))
+		.json(&req)
+		.send()
+		.await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!(
+			"set GitHub reporting: {} — {}",
+			status,
+			resp.text().await.unwrap_or_default()
+		);
 	}
 	Ok(())
 }
@@ -742,6 +788,17 @@ async fn finding_approve(client: &reqwest::Client, base: &reqwest::Url, id: i64)
 	Ok(())
 }
 
+async fn finding_retry_report(
+	client: &reqwest::Client, base: &reqwest::Url, id: i64,
+) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/retry-report"))).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("retry report: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
 async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))).send().await?;
 	let status = resp.status();
@@ -802,6 +859,49 @@ mod tests {
 		};
 		assert_eq!(args.id, 7);
 		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn repo_set_github_reporting_parses_explicit_pat() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"set-github-reporting",
+			"7",
+			"--target-owner",
+			"acme",
+			"--target-repo",
+			"tracker",
+			"--pat",
+			"ghp_replacement",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::SetGithubReporting(args)) = cli.cmd else {
+			panic!("expected repo set-github-reporting command");
+		};
+		assert_eq!(args.id, 7);
+		assert_eq!(args.target_owner, "acme");
+		assert_eq!(args.target_repo, "tracker");
+		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn finding_retry_report_parses() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"finding",
+			"retry-report",
+			"11",
+		])
+		.unwrap();
+		let Cmd::Finding(FindingCmd::RetryReport { id }) = cli.cmd else {
+			panic!("expected finding retry-report command");
+		};
+		assert_eq!(id, 11);
 	}
 
 	#[test]

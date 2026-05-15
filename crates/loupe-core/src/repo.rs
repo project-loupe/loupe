@@ -42,14 +42,9 @@ pub enum ReportingDestination {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		subject_prefix: Option<String>,
 	},
-	/// No automatic reporter. The dispatcher still terminates a
-	/// finding's lifecycle (state → `reported`, `reported_at` stamped)
-	/// but doesn't poke any external system. Useful for repos where
-	/// the operator triages findings via `loupectl` and acts on them
-	/// out-of-band — file an issue elsewhere, fix the bug directly,
-	/// etc. Pairs naturally with `require_approval = true`; otherwise
-	/// findings auto-flip to `reported` without a human ever seeing
-	/// them.
+	/// No automatic reporter is configured. Confirmed findings remain
+	/// `confirmed` until an operator either handles them out-of-band or
+	/// configures a reporter and retries delivery.
 	Manual,
 }
 

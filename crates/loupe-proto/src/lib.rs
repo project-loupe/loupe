@@ -21,7 +21,8 @@ pub use job_io::{
 pub use lease::{LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse};
 pub use registry::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest,
-	RegisterWorkerResponse, RepoSummary, ReportingSetup, RotateRepoPatRequest, UpdateRepoRequest,
+	RegisterWorkerResponse, RepoSummary, ReportingSetup, RotateRepoPatRequest,
+	SetRepoGithubReportingRequest, UpdateRepoRequest,
 };
 pub use scan::{JobInfo, ScanRequest, ScanResponse};
 pub use version::{check_protocol_version, ProtocolMismatch, PROTOCOL_VERSION};

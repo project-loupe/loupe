@@ -23,7 +23,7 @@ use axum::{Json, Router};
 use git2::{Repository, Signature};
 use loupe_proto::{
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, PROTOCOL_VERSION,
+	ScanRequest, SetRepoGithubReportingRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::reporters::GithubReporter;
@@ -378,7 +378,7 @@ async fn per_repo_opt_out_beats_global_default() {
 }
 
 #[tokio::test]
-async fn manual_mode_terminates_findings_without_calling_the_reporter() {
+async fn manual_mode_leaves_approved_findings_confirmed_without_calling_the_reporter() {
 	let (_repo_tmp, clone_url) = make_planted_repo("manual");
 	// Server default off, but we register the repo with `Manual` and
 	// pin require_approval = true so the operator gets to triage
@@ -404,8 +404,8 @@ async fn manual_mode_terminates_findings_without_calling_the_reporter() {
 		})
 		.unwrap();
 
-	// Approve. The dispatcher should short-circuit on Manual: stamp
-	// `reported_at` + state without ever touching the GitHub stub.
+	// Approve. The dispatcher should short-circuit on Manual and leave
+	// the finding confirmed without ever touching the GitHub stub.
 	let resp = h
 		.admin
 		.post(format!("https://loupe-server/v1/findings/{id}/approve"))
@@ -427,9 +427,90 @@ async fn manual_mode_terminates_findings_without_calling_the_reporter() {
 			)?)
 		})
 		.unwrap();
-	assert_eq!(state, "reported");
-	assert!(reported_at.is_some(), "reported_at must be stamped on terminate");
+	assert_eq!(state, "confirmed");
+	assert!(reported_at.is_none(), "reported_at must wait for an actual reporter");
 	assert_eq!(approved_by.as_deref(), Some("admin"));
+
+	h.server.shutdown().await;
+	drop(h.server_dir);
+}
+
+#[tokio::test]
+async fn manual_repo_can_add_reporting_and_retry_confirmed_findings() {
+	let (_repo_tmp, clone_url) = make_planted_repo("late-reporting");
+	let h = boot_server_with_default(false).await;
+	let repo_id = register_manual_repo(&h, &clone_url, Some(false), "late-reporting").await;
+
+	trigger_scan_and_run(&h, repo_id).await;
+
+	assert!(
+		h.stub.captured.lock().unwrap().is_empty(),
+		"manual repo must not dispatch before reporting is configured"
+	);
+	let id: i64 =
+		h.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT id FROM findings WHERE repo_id = ?1 AND state = 'confirmed'",
+				[repo_id],
+				|r| r.get(0),
+			)?)
+		})
+		.unwrap();
+
+	let resp = h
+		.admin
+		.post(format!("https://loupe-server/v1/findings/{id}/retry-report"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 409, "retry must require a configured reporter");
+
+	let resp = h
+		.admin
+		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
+		.json(&SetRepoGithubReportingRequest {
+			protocol_version: PROTOCOL_VERSION,
+			target_owner: "acme".into(),
+			target_repo: "late-target".into(),
+			github_pat: "ghp_late_pat".into(),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let resp = h
+		.admin
+		.post(format!("https://loupe-server/v1/findings/{id}/retry-report"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let issues = h.stub.captured.lock().unwrap().clone();
+	assert_eq!(issues.len(), 1, "retry did not dispatch exactly once");
+	assert_eq!(issues[0].owner, "acme");
+	assert_eq!(issues[0].repo, "late-target");
+
+	let state: String =
+		h.db.with_conn(|c| {
+			Ok(c.query_row("SELECT state FROM findings WHERE id = ?1", [id], |r| r.get(0))?)
+		})
+		.unwrap();
+	assert_eq!(state, "reported");
+
+	let resp = h
+		.admin
+		.post(format!("https://loupe-server/v1/findings/{id}/retry-report"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+	assert_eq!(
+		h.stub.captured.lock().unwrap().len(),
+		1,
+		"reported finding must not be dispatched again"
+	);
 
 	h.server.shutdown().await;
 	drop(h.server_dir);
