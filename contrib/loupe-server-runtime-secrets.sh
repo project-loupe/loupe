@@ -119,9 +119,11 @@ set_runtime_env() {
 	systemd_env_names="$systemd_env_names $name"
 }
 
-while IFS='=' read -r name encoded; do
-	[ -n "$name" ] || continue
-	if [ -z "$encoded" ]; then
+while IFS= read -r line; do
+	[ -n "$line" ] || continue
+	name="${line%%=*}"
+	encoded="${line#*=}"
+	if [ "$name" = "$line" ] || [ -z "$encoded" ]; then
 		echo "error: missing base64 value for $name" >&2
 		exit 2
 	fi
