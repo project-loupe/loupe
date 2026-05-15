@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
 	let admin_only = Router::new()
 		.route("/v1/repos", post(routes::repos::create).get(routes::repos::list))
 		.route("/v1/repos/{id}", delete(routes::repos::delete).patch(routes::repos::update))
+		.route("/v1/repos/{id}/reporting/github-pat", post(routes::repos::rotate_github_pat))
 		.route("/v1/repos/{id}/scan", post(routes::jobs::enqueue_scan))
 		.route("/v1/repos/{id}/findings", get(routes::findings_admin::list_for_repo))
 		.route("/v1/findings/{id}/approve", post(routes::findings_admin::approve))

@@ -89,6 +89,36 @@ pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	Ok(n > 0)
 }
 
+pub fn update_reporting(
+	conn: &Connection, id: i64, reporting: &ReportingDestination,
+) -> rusqlite::Result<bool> {
+	let n = conn.execute(
+		"UPDATE registered_repos SET reporting = ?1 WHERE id = ?2",
+		params![serde_json::to_string(reporting).expect("reporting is always serialisable"), id,],
+	)?;
+	Ok(n > 0)
+}
+
+pub fn count_github_pat_references(conn: &Connection, secret_id: i64) -> rusqlite::Result<usize> {
+	let mut stmt = conn.prepare("SELECT reporting FROM registered_repos")?;
+	let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+	let mut count = 0usize;
+	for row in rows {
+		let reporting_text = row?;
+		let reporting: ReportingDestination =
+			serde_json::from_str(&reporting_text).map_err(|e| {
+				rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+			})?;
+		if matches!(
+			reporting,
+			ReportingDestination::GithubIssue { pat_secret_id, .. } if pat_secret_id == secret_id
+		) {
+			count += 1;
+		}
+	}
+	Ok(count)
+}
+
 /// Optional patches to apply to a registered repo. `None` means "leave
 /// the existing value alone". Toggling `disabled` to `Some(true)` stamps
 /// `disabled_at = now`; `Some(false)` clears it. `require_approval`
@@ -383,6 +413,61 @@ mod tests {
 		// Empty patch on missing id returns false.
 		let touched = db.with_conn(|c| Ok(update(c, 9_999, &RepoUpdate::default(), 0)?)).unwrap();
 		assert!(!touched);
+	}
+
+	#[test]
+	fn update_reporting_repoints_a_github_pat_secret() {
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let old_sid = db
+			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "old", b"old", 0)?))
+			.unwrap();
+		let new_sid = db
+			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "new", b"new", 1)?))
+			.unwrap();
+		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(old_sid), 0)?)).unwrap();
+
+		db.with_conn(|c| {
+			Ok(update_reporting(
+				c,
+				id,
+				&ReportingDestination::GithubIssue {
+					target_owner: "acme".into(),
+					target_repo: "tracker".into(),
+					pat_secret_id: new_sid,
+				},
+			)?)
+		})
+		.unwrap();
+
+		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		match row.reporting {
+			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
+				assert_eq!(pat_secret_id, new_sid)
+			},
+			ReportingDestination::Email { .. } | ReportingDestination::Manual => {
+				panic!("fixture builds a github_issue destination")
+			},
+		}
+		assert_eq!(db.with_conn(|c| Ok(count_github_pat_references(c, old_sid)?)).unwrap(), 0);
+		assert_eq!(db.with_conn(|c| Ok(count_github_pat_references(c, new_sid)?)).unwrap(), 1);
+	}
+
+	#[test]
+	fn count_github_pat_references_tracks_shared_secrets() {
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let sid = db
+			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "shared", b"x", 0)?))
+			.unwrap();
+		let mut a = fake_repo(sid);
+		a.clone_url = "https://github.com/acme/a.git".into();
+		a.repo = "a".into();
+		let mut b = fake_repo(sid);
+		b.clone_url = "https://github.com/acme/b.git".into();
+		b.repo = "b".into();
+		db.with_conn(|c| Ok(insert(c, &a, 0)?)).unwrap();
+		db.with_conn(|c| Ok(insert(c, &b, 0)?)).unwrap();
+
+		assert_eq!(db.with_conn(|c| Ok(count_github_pat_references(c, sid)?)).unwrap(), 2);
 	}
 
 	#[test]

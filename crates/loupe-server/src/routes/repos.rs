@@ -8,7 +8,7 @@ use axum::Json;
 use loupe_core::ReportingDestination;
 use loupe_proto::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RepoSummary, ReportingSetup,
-	UpdateRepoRequest, PROTOCOL_VERSION,
+	RotateRepoPatRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
@@ -162,6 +162,76 @@ pub async fn update(
 	} else {
 		Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")))
 	}
+}
+
+/// `POST /v1/repos/:id/reporting/github-pat` — admin only. Repoints a
+/// GitHub issue reporting repo to a freshly-stored PAT, then drops the
+/// old secret if no other repo still references it.
+pub async fn rotate_github_pat(
+	State(state): State<AppState>, Path(id): Path<i64>, Json(req): Json<RotateRepoPatRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	if req.protocol_version != PROTOCOL_VERSION {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			format!("unsupported protocol_version {}", req.protocol_version),
+		));
+	}
+	if req.github_pat.trim().is_empty() {
+		return Err((StatusCode::BAD_REQUEST, "github PAT must not be empty".into()));
+	}
+
+	let row = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repo with id {id}")))?;
+	let host = row.host;
+	let (target_owner, target_repo, old_secret_id) = match row.reporting {
+		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
+			(target_owner, target_repo, pat_secret_id)
+		},
+		ReportingDestination::Email { .. } | ReportingDestination::Manual => {
+			return Err((
+				StatusCode::BAD_REQUEST,
+				format!("repo {id} does not use GitHub issue reporting"),
+			));
+		},
+	};
+
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+	let secret_label =
+		format!("pat:{host}:{target_owner}/{target_repo}:repo:{id}:replaces:{old_secret_id}");
+	let rotated = state
+		.db
+		.with_conn(|c| {
+			let tx = c.transaction()?;
+			let new_secret_id = secrets::insert(
+				&tx,
+				SecretKind::GithubPat,
+				&secret_label,
+				req.github_pat.as_bytes(),
+				now,
+			)?;
+			let new_reporting = ReportingDestination::GithubIssue {
+				target_owner,
+				target_repo,
+				pat_secret_id: new_secret_id,
+			};
+			if !repos::update_reporting(&tx, id, &new_reporting)? {
+				return Ok(false);
+			}
+			if repos::count_github_pat_references(&tx, old_secret_id)? == 0 {
+				secrets::delete(&tx, old_secret_id)?;
+			}
+			tx.commit()?;
+			Ok(true)
+		})
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("rotate repo PAT: {e}")))?;
+	if !rotated {
+		return Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")));
+	}
+
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /v1/repos/:id` — admin only. CASCADEs onto jobs, findings,

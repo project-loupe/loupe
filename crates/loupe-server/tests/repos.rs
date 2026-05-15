@@ -6,10 +6,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_proto::{ListReposResponse, RegisterRepoRequest, ReportingSetup, PROTOCOL_VERSION};
+use loupe_core::ReportingDestination;
+use loupe_proto::{
+	ListReposResponse, RegisterRepoRequest, ReportingSetup, RotateRepoPatRequest, PROTOCOL_VERSION,
+};
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
-use loupe_storage::Db;
+use loupe_storage::{secrets, Db};
 use loupe_tls::Ca;
 
 mod common;
@@ -72,6 +75,43 @@ async fn bring_up() -> Fixture {
 	std::mem::forget(tmp);
 
 	Fixture { handle, addr, ca_cert_pem, admin_cert_pem, admin_key_pem, db }
+}
+
+async fn create_repo(admin: &reqwest::Client, reporting: ReportingSetup) -> i64 {
+	let req = RegisterRepoRequest {
+		protocol_version: PROTOCOL_VERSION,
+		clone_url: "https://github.com/acme/widget.git".into(),
+		branch: Some("main".into()),
+		scan_interval_seconds: Some(3600),
+		reporting,
+		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
+		verification_enabled: true,
+		require_approval: Some(false),
+	};
+	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
+	assert_eq!(resp.status(), 201, "create repo: {}", resp.status());
+	let body: serde_json::Value = resp.json().await.unwrap();
+	let repo_id = body["repo_id"].as_i64().unwrap();
+	assert!(repo_id > 0);
+	repo_id
+}
+
+fn repo_reporting(db: &Db, repo_id: i64) -> ReportingDestination {
+	let reporting_json: String = db
+		.with_conn(|c| {
+			let s = c.query_row(
+				"SELECT reporting FROM registered_repos WHERE id = ?1",
+				[repo_id],
+				|r| r.get::<_, String>(0),
+			)?;
+			Ok(s)
+		})
+		.unwrap();
+	serde_json::from_str(&reporting_json).unwrap()
+}
+
+fn secret_value(db: &Db, id: i64) -> Option<Vec<u8>> {
+	db.with_conn(|c| Ok(secrets::read(c, id)?)).unwrap()
 }
 
 #[tokio::test]
@@ -148,6 +188,82 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	let resp = admin.get("https://loupe-server/v1/repos").send().await.unwrap();
 	let body: ListReposResponse = resp.json().await.unwrap();
 	assert!(body.repos.is_empty());
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_can_rotate_a_repo_github_pat() {
+	let f = bring_up().await;
+	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
+
+	let repo_id = create_repo(
+		&admin,
+		ReportingSetup::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+			github_pat: "ghp_old".into(),
+		},
+	)
+	.await;
+	let old_secret_id = match repo_reporting(&f.db, repo_id) {
+		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
+			assert_eq!(target_owner, "acme");
+			assert_eq!(target_repo, "tracker");
+			pat_secret_id
+		},
+		other => panic!("expected GitHub reporting, got {other:?}"),
+	};
+	assert_eq!(secret_value(&f.db, old_secret_id).unwrap(), b"ghp_old");
+
+	let req =
+		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: "ghp_new".into() };
+	let resp = admin
+		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
+		.json(&req)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204, "rotate PAT: {}", resp.status());
+
+	let new_secret_id = match repo_reporting(&f.db, repo_id) {
+		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
+			assert_eq!(target_owner, "acme");
+			assert_eq!(target_repo, "tracker");
+			pat_secret_id
+		},
+		other => panic!("expected GitHub reporting, got {other:?}"),
+	};
+	assert_ne!(new_secret_id, old_secret_id);
+	assert_eq!(secret_value(&f.db, new_secret_id).unwrap(), b"ghp_new");
+	assert_eq!(secret_value(&f.db, old_secret_id), None);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn rotating_pat_requires_github_issue_reporting() {
+	let f = bring_up().await;
+	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
+	let repo_id = create_repo(&admin, ReportingSetup::Manual).await;
+	let req =
+		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: "ghp_new".into() };
+
+	let resp = admin
+		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
+		.json(&req)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 400);
+
+	let resp = admin
+		.post("https://loupe-server/v1/repos/999/reporting/github-pat")
+		.json(&req)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 404);
 
 	f.handle.shutdown().await;
 }

@@ -80,6 +80,13 @@ pub struct RegisterRepoResponse {
 	pub repo_id: i64,
 }
 
+/// Body of `POST /v1/repos/:id/reporting/github-pat`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateRepoPatRequest {
+	pub protocol_version: u16,
+	pub github_pat: String,
+}
+
 /// Body of `PATCH /v1/repos/:id`. All fields are optional — only the
 /// ones present in the JSON are applied. `disabled = Some(true)` stamps
 /// `disabled_at = now`; `disabled = Some(false)` clears it. The repo's
@@ -198,5 +205,18 @@ mod tests {
 		let s = serde_json::to_string(&resp).unwrap();
 		let back: RegisterWorkerResponse = serde_json::from_str(&s).unwrap();
 		assert_eq!(resp, back);
+	}
+
+	#[test]
+	fn rotate_repo_pat_request_does_not_use_storage_ids() {
+		let req = RotateRepoPatRequest {
+			protocol_version: PROTOCOL_VERSION,
+			github_pat: "ghp_new".into(),
+		};
+		let s = serde_json::to_string(&req).unwrap();
+		assert!(s.contains("github_pat"));
+		assert!(!s.contains("pat_secret_id"));
+		let back: RotateRepoPatRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(req, back);
 	}
 }

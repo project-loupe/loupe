@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, ScanResponse, UpdateRepoRequest, PROTOCOL_VERSION,
+	RotateRepoPatRequest, ScanRequest, ScanResponse, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -71,12 +71,23 @@ enum RepoCmd {
 	/// Patch a repo's scheduling / verification settings. Each flag is
 	/// optional and only present fields are applied.
 	Update(RepoUpdateArgs),
+	/// Replace the GitHub PAT used by this repo's issue reporter.
+	RotatePat(RepoRotatePatArgs),
 	/// Trigger a scan now.
 	Scan {
 		id: i64,
 		#[arg(long, default_value_t = false)]
 		incremental: bool,
 	},
+}
+
+#[derive(Debug, Args)]
+struct RepoRotatePatArgs {
+	id: i64,
+	/// Replacement PAT for this repo's GitHub issue reporter. Read
+	/// from LOUPE_TRACKER_PAT if omitted.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
+	pat: String,
 }
 
 #[derive(Debug, Args)]
@@ -235,6 +246,7 @@ async fn main() -> Result<()> {
 			RepoCmd::List => repo_list(&client, &cli.conn.server_url).await,
 			RepoCmd::Rm { id } => repo_rm(&client, &cli.conn.server_url, id).await,
 			RepoCmd::Update(a) => repo_update(&client, &cli.conn.server_url, a).await,
+			RepoCmd::RotatePat(a) => repo_rotate_pat(&client, &cli.conn.server_url, a).await,
 			RepoCmd::Scan { id, incremental } => {
 				repo_scan(&client, &cli.conn.server_url, id, incremental).await
 			},
@@ -426,6 +438,22 @@ async fn repo_update(
 	let status = resp.status();
 	if !status.is_success() {
 		anyhow::bail!("update repo: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
+async fn repo_rotate_pat(
+	client: &reqwest::Client, base: &reqwest::Url, a: RepoRotatePatArgs,
+) -> Result<()> {
+	let req = RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: a.pat };
+	let resp = client
+		.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id)))
+		.json(&req)
+		.send()
+		.await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("rotate repo PAT: {} — {}", status, resp.text().await.unwrap_or_default());
 	}
 	Ok(())
 }
@@ -628,6 +656,26 @@ mod tests {
 		])
 		.expect_err("clap should reject --out with --emit-env");
 		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn repo_rotate_pat_parses_explicit_pat() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"rotate-pat",
+			"7",
+			"--pat",
+			"ghp_replacement",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::RotatePat(args)) = cli.cmd else {
+			panic!("expected repo rotate-pat command");
+		};
+		assert_eq!(args.id, 7);
+		assert_eq!(args.pat, "ghp_replacement");
 	}
 
 	#[test]
