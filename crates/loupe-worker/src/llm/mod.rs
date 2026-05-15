@@ -157,11 +157,10 @@ pub fn claude_available() -> bool {
 ///
 /// Optional auto-attached MCP server: when present, the discovery
 /// scanner advertises bkb's `bkb_search` / `bkb_lookup_bip` /
-/// `bkb_lookup_bolt` / etc. tools to the agent so it can pull spec
-/// + historical context for bitcoin/lightning code that the worktree
-///   alone won't surface. See [`crate::llm::claude_cli::McpContext`]
-///   for the attachment plumbing and [`crate::llm::prompts::DISCOVERY`]
-///   for the conditional prompt section.
+/// `bkb_lookup_bolt` / etc. tools to the agent so it can pull spec +
+/// historical context for bitcoin/lightning code that the worktree alone won't surface. See
+/// [`crate::llm::claude_cli::McpContext`] for the attachment plumbing and
+/// [`crate::llm::prompts::DISCOVERY`] for the conditional prompt section.
 ///
 /// Install via `cargo install bkb-mcp`; the binary needs to reach
 /// the BKB HTTP API server (default `http://127.0.0.1:3000`,
