@@ -32,7 +32,7 @@ use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
 	SANDBOX_LOUPE_BIN,
 };
-use super::{LlmBackend, LlmRequest, LlmResponse};
+use super::{codex_home_dir, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "codex-cli";
@@ -137,9 +137,7 @@ impl LlmBackend for CodexCliBackend {
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
 			.forward_env("OPENAI_API_KEY");
-		if let Some(home) = std::env::var_os("HOME") {
-			let host_home = std::path::PathBuf::from(home);
-			let codex_dir = host_home.join(".codex");
+		if let Some(codex_dir) = codex_home_dir() {
 			// Bind only the credential + config files read-only,
 			// rather than the whole `~/.codex/` tree. Codex writes a
 			// models cache and (sometimes) an installation_id to its

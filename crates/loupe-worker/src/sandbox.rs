@@ -165,6 +165,7 @@ impl SandboxBuilder {
 
 		let mut cmd = Command::new(BWRAP_BIN);
 		cmd.arg("--die-with-parent");
+		cmd.arg("--clearenv");
 
 		if self.allow_network {
 			cmd.arg("--share-net");
@@ -200,6 +201,7 @@ impl SandboxBuilder {
 		cmd.args(["--tmpfs", "/tmp", "--tmpfs", "/home/scanner"]);
 		cmd.args(["--setenv", "HOME", "/home/scanner"]);
 		cmd.args(["--setenv", "TMPDIR", "/tmp"]);
+		cmd.args(["--setenv", "PATH"]).arg(sandbox_path());
 
 		// Caller-supplied read-only binds (binary install dirs, agent
 		// config dirs, etc.). Use `--ro-bind-try` so a missing src
@@ -235,6 +237,11 @@ impl SandboxBuilder {
 		}
 		cmd
 	}
+}
+
+fn sandbox_path() -> String {
+	std::env::var("PATH")
+		.unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into())
 }
 
 fn add_resolver_binds(cmd: &mut Command) {
@@ -361,8 +368,11 @@ pub fn smoketest(workdir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use std::io::Write;
+	use std::sync::Mutex;
 
 	use super::*;
+
+	static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 	fn bwrap_present() -> bool {
 		std::process::Command::new(BWRAP_BIN)
@@ -607,5 +617,44 @@ mod tests {
 			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
 		assert!(args.iter().any(|a| a == "--share-net"), "args: {args:?}");
 		assert!(!args.iter().any(|a| a == "--unshare-net"), "args: {args:?}");
+	}
+
+	#[test]
+	fn wrapped_command_starts_from_clear_environment() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		std::env::set_var("LOUPE_SANDBOX_TEST_SECRET", "do-not-leak");
+
+		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+
+		assert!(args.iter().any(|a| a == "--clearenv"), "args: {args:?}");
+		assert!(args.windows(2).any(|w| w[0] == "--setenv" && w[1] == "PATH"), "args: {args:?}");
+		assert!(!args.iter().any(|a| a == "LOUPE_SANDBOX_TEST_SECRET"), "args: {args:?}");
+		assert!(!args.iter().any(|a| a == "do-not-leak"), "args: {args:?}");
+
+		std::env::remove_var("LOUPE_SANDBOX_TEST_SECRET");
+	}
+
+	#[test]
+	fn forward_env_explicitly_passes_allowlisted_values() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		std::env::set_var("LOUPE_SANDBOX_TEST_SECRET", "forwarded-value");
+
+		let cmd =
+			SandboxBuilder::new("/tmp").forward_env("LOUPE_SANDBOX_TEST_SECRET").build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+
+		assert!(
+			args.windows(3).any(|w| {
+				w[0] == "--setenv"
+					&& w[1] == "LOUPE_SANDBOX_TEST_SECRET"
+					&& w[2] == "forwarded-value"
+			}),
+			"args: {args:?}"
+		);
+
+		std::env::remove_var("LOUPE_SANDBOX_TEST_SECRET");
 	}
 }
