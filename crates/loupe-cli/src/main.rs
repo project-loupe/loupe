@@ -29,11 +29,23 @@ struct ConnArgs {
 	#[arg(long, env = "LOUPE_SERVER_URL")]
 	server_url: reqwest::Url,
 	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: PathBuf,
+	ca_cert: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	ca_cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	ca_cert_pem_b64: Option<String>,
 	#[arg(long, env = "LOUPE_ADMIN_CERT")]
-	admin_cert: PathBuf,
+	admin_cert: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true)]
+	admin_cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true)]
+	admin_cert_pem_b64: Option<String>,
 	#[arg(long, env = "LOUPE_ADMIN_KEY")]
-	admin_key: PathBuf,
+	admin_key: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true)]
+	admin_key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true)]
+	admin_key_pem_b64: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,14 +169,20 @@ struct RepoAddArgs {
 #[derive(Debug, Subcommand)]
 enum WorkerCmd {
 	/// Mint a new worker cert. Saves the bundle to `--out` (or stdout).
-	Register {
-		#[arg(long)]
-		name: String,
-		#[arg(long)]
-		out: Option<PathBuf>,
-	},
+	Register(WorkerRegisterArgs),
 	/// Revoke a worker (next mTLS handshake from that cert will 401).
 	Rm { id: i64 },
+}
+
+#[derive(Debug, Args)]
+struct WorkerRegisterArgs {
+	#[arg(long)]
+	name: String,
+	#[arg(long, conflicts_with = "emit_env")]
+	out: Option<PathBuf>,
+	/// Print sourceable LOUPE_WORKER_* env assignments instead of JSON.
+	#[arg(long, default_value_t = false)]
+	emit_env: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,9 +240,7 @@ async fn main() -> Result<()> {
 			},
 		},
 		Cmd::Worker(c) => match c {
-			WorkerCmd::Register { name, out } => {
-				worker_register(&client, &cli.conn.server_url, name, out).await
-			},
+			WorkerCmd::Register(a) => worker_register(&client, &cli.conn.server_url, a).await,
 			WorkerCmd::Rm { id } => worker_rm(&client, &cli.conn.server_url, id).await,
 		},
 		Cmd::Job(c) => match c {
@@ -248,12 +264,27 @@ async fn main() -> Result<()> {
 }
 
 fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
-	let ca = std::fs::read_to_string(&c.ca_cert)
-		.with_context(|| format!("reading CA cert at {}", c.ca_cert.display()))?;
-	let cert = std::fs::read_to_string(&c.admin_cert)
-		.with_context(|| format!("reading admin cert at {}", c.admin_cert.display()))?;
-	let key = std::fs::read_to_string(&c.admin_key)
-		.with_context(|| format!("reading admin key at {}", c.admin_key.display()))?;
+	let ca = pem_from_env_or_file(
+		"CA cert",
+		&c.ca_cert_pem,
+		&c.ca_cert_pem_b64,
+		c.ca_cert.as_ref(),
+		"CA cert missing — set LOUPE_CA_CERT_PEM, LOUPE_CA_CERT_PEM_B64, or LOUPE_CA_CERT",
+	)?;
+	let cert = pem_from_env_or_file(
+		"admin cert",
+		&c.admin_cert_pem,
+		&c.admin_cert_pem_b64,
+		c.admin_cert.as_ref(),
+		"admin cert missing — set LOUPE_ADMIN_CERT_PEM, LOUPE_ADMIN_CERT_PEM_B64, or LOUPE_ADMIN_CERT",
+	)?;
+	let key = pem_from_env_or_file(
+		"admin key",
+		&c.admin_key_pem,
+		&c.admin_key_pem_b64,
+		c.admin_key.as_ref(),
+		"admin key missing — set LOUPE_ADMIN_KEY_PEM, LOUPE_ADMIN_KEY_PEM_B64, or LOUPE_ADMIN_KEY",
+	)?;
 	let mut combined = String::with_capacity(cert.len() + key.len() + 1);
 	combined.push_str(&cert);
 	if !cert.ends_with('\n') {
@@ -270,6 +301,24 @@ fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
 		.use_rustls_tls()
 		.build()
 		.context("building reqwest client")
+}
+
+fn pem_from_env_or_file(
+	label: &str, pem: &Option<String>, pem_b64: &Option<String>, path: Option<&PathBuf>,
+	missing: &'static str,
+) -> Result<String> {
+	if let Some(pem) = pem.as_deref().filter(|s| !s.is_empty()) {
+		return Ok(pem.to_owned());
+	}
+	if let Some(pem_b64) = pem_b64.as_deref().filter(|s| !s.is_empty()) {
+		use base64::Engine as _;
+		let bytes = base64::engine::general_purpose::STANDARD
+			.decode(pem_b64.trim())
+			.with_context(|| format!("decoding base64 {label} PEM"))?;
+		return String::from_utf8(bytes).with_context(|| format!("{label} PEM is not valid UTF-8"));
+	}
+	let path = path.context(missing)?;
+	std::fs::read_to_string(path).with_context(|| format!("reading {label} at {}", path.display()))
 }
 
 fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
@@ -399,11 +448,11 @@ async fn repo_scan(
 }
 
 async fn worker_register(
-	client: &reqwest::Client, base: &reqwest::Url, name: String, out: Option<PathBuf>,
+	client: &reqwest::Client, base: &reqwest::Url, a: WorkerRegisterArgs,
 ) -> Result<()> {
 	let resp = client
 		.post(url(base, "/v1/workers"))
-		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name })
+		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: a.name })
 		.send()
 		.await?;
 	let status = resp.status();
@@ -411,8 +460,14 @@ async fn worker_register(
 		anyhow::bail!("register worker: {} — {}", status, resp.text().await.unwrap_or_default());
 	}
 	let bundle: RegisterWorkerResponse = resp.json().await?;
+	if a.emit_env {
+		for (name, value) in worker_env_assignments(base, &bundle) {
+			println!("{name}={value}");
+		}
+		return Ok(());
+	}
 	let serialised = serde_json::to_string_pretty(&bundle)?;
-	if let Some(path) = out {
+	if let Some(path) = a.out {
 		std::fs::write(&path, &serialised)
 			.with_context(|| format!("writing bundle to {}", path.display()))?;
 		println!("worker_id={} bundle written to {}", bundle.worker_id, path.display());
@@ -420,6 +475,22 @@ async fn worker_register(
 		println!("{serialised}");
 	}
 	Ok(())
+}
+
+fn worker_env_assignments(
+	base: &reqwest::Url, bundle: &RegisterWorkerResponse,
+) -> Vec<(&'static str, String)> {
+	vec![
+		("LOUPE_SERVER_URL", base.as_str().to_owned()),
+		("LOUPE_WORKER_CA_CERT_PEM_B64", b64(&bundle.ca_cert_pem)),
+		("LOUPE_WORKER_CERT_PEM_B64", b64(&bundle.client_cert_pem)),
+		("LOUPE_WORKER_KEY_PEM_B64", b64(&bundle.client_key_pem)),
+	]
+}
+
+fn b64(value: &str) -> String {
+	use base64::Engine as _;
+	base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
@@ -524,4 +595,71 @@ async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) 
 		anyhow::bail!("reject finding: {} — {}", status, resp.text().await.unwrap_or_default());
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn pem_b64_env_wins_over_file_path() {
+		let file = std::env::temp_dir().join("loupectl-test-path-that-should-not-be-read.pem");
+		let pem = "-----BEGIN CERTIFICATE-----\nfrom-env\n-----END CERTIFICATE-----\n";
+		let pem_b64 = b64(pem);
+
+		let got =
+			pem_from_env_or_file("CA cert", &None, &Some(pem_b64), Some(&file), "missing").unwrap();
+		assert_eq!(got, pem);
+	}
+
+	#[test]
+	fn worker_register_out_conflicts_with_emit_env() {
+		let err = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"worker",
+			"register",
+			"--name",
+			"worker-1",
+			"--out",
+			"worker.json",
+			"--emit-env",
+		])
+		.expect_err("clap should reject --out with --emit-env");
+		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn worker_env_assignments_are_single_line_and_decode_to_bundle() {
+		let base = reqwest::Url::parse("https://loupe.example:8443/").unwrap();
+		let bundle = RegisterWorkerResponse {
+			protocol_version: PROTOCOL_VERSION,
+			worker_id: 42,
+			ca_cert_pem: "ca\ncert\n".into(),
+			client_cert_pem: "worker\ncert\n".into(),
+			client_key_pem: "worker\nkey\n".into(),
+		};
+
+		let assignments = worker_env_assignments(&base, &bundle);
+		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
+		assert_eq!(
+			names,
+			vec![
+				"LOUPE_SERVER_URL",
+				"LOUPE_WORKER_CA_CERT_PEM_B64",
+				"LOUPE_WORKER_CERT_PEM_B64",
+				"LOUPE_WORKER_KEY_PEM_B64",
+			]
+		);
+		for (name, value) in &assignments {
+			assert!(!value.is_empty(), "{name} value must be present");
+			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+		}
+
+		use base64::Engine as _;
+		let decoded_ca =
+			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
+		assert_eq!(String::from_utf8(decoded_ca).unwrap(), bundle.ca_cert_pem);
+	}
 }

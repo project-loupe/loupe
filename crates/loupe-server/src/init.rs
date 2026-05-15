@@ -24,6 +24,20 @@ use loupe_storage::workers::{self, WorkerKind};
 use loupe_storage::Db;
 use loupe_tls::{cert_fingerprint, Ca, CertBundle};
 
+#[derive(Debug, Clone, Copy)]
+pub struct InitOptions {
+	/// Persist generated PEM/key files under the data dir. Production
+	/// non-container installs want this; env-only Docker bootstrap does
+	/// not.
+	pub persist_secrets: bool,
+}
+
+impl Default for InitOptions {
+	fn default() -> Self {
+		Self { persist_secrets: true }
+	}
+}
+
 /// Layout of files written under the data dir.
 pub struct DataDirLayout {
 	pub root: PathBuf,
@@ -74,18 +88,22 @@ impl DataDirLayout {
 /// printed once and then erased from process memory.
 pub struct InitOutput {
 	pub layout: DataDirLayout,
+	pub server_bundle: CertBundle,
 	pub admin_bundle: CertBundle,
 	pub ca_cert_pem: String,
+	pub ca_key_pem: String,
 	/// The master key the SQLCipher database is sealed under.
 	/// Either the caller-supplied one (from `LOUPE_MASTER_KEY`) or
 	/// the one init just minted. Useful for integration tests that
 	/// want to reopen the freshly-bootstrapped DB without round-
 	/// tripping through the on-disk hex file.
 	pub master_key: MasterKey,
-	/// `true` when init minted a fresh key and wrote it to
-	/// `layout.master_key`. `false` when init used a caller-supplied key
-	/// (typically from `LOUPE_MASTER_KEY`) and persisted nothing.
+	/// `true` when init minted a fresh key. `false` when init used a
+	/// caller-supplied key (typically from `LOUPE_MASTER_KEY`).
 	pub minted_master_key: bool,
+	/// `true` when generated PEM/key files were written under the data
+	/// dir. `false` for env-only bootstrap.
+	pub persisted_secrets: bool,
 }
 
 /// Bootstrap `data_dir`.
@@ -102,6 +120,13 @@ pub struct InitOutput {
 pub fn run_init(
 	data_dir: &Path, server_hostnames: &[String], caller_key: Option<MasterKey>,
 ) -> Result<InitOutput> {
+	run_init_with_options(data_dir, server_hostnames, caller_key, InitOptions::default())
+}
+
+pub fn run_init_with_options(
+	data_dir: &Path, server_hostnames: &[String], caller_key: Option<MasterKey>,
+	options: InitOptions,
+) -> Result<InitOutput> {
 	let layout = DataDirLayout::at(data_dir);
 
 	std::fs::create_dir_all(&layout.root)
@@ -114,12 +139,14 @@ pub fn run_init(
 	let server = ca.mint_server("loupe-server", server_hostnames).context("minting server cert")?;
 	let admin = ca.mint_client("admin").context("minting admin client cert")?;
 
-	write_secret(&layout.ca_cert, ca.cert_pem().as_bytes())?;
-	write_secret(&layout.ca_key, ca.key_pem().as_bytes())?;
-	write_secret(&layout.server_cert, server.cert_pem.as_bytes())?;
-	write_secret(&layout.server_key, server.key_pem.as_bytes())?;
-	write_secret(&layout.admin_cert, admin.cert_pem.as_bytes())?;
-	write_secret(&layout.admin_key, admin.key_pem.as_bytes())?;
+	if options.persist_secrets {
+		write_secret(&layout.ca_cert, ca.cert_pem().as_bytes())?;
+		write_secret(&layout.ca_key, ca.key_pem().as_bytes())?;
+		write_secret(&layout.server_cert, server.cert_pem.as_bytes())?;
+		write_secret(&layout.server_key, server.key_pem.as_bytes())?;
+		write_secret(&layout.admin_cert, admin.cert_pem.as_bytes())?;
+		write_secret(&layout.admin_key, admin.key_pem.as_bytes())?;
+	}
 
 	let (master_key, minted_master_key) = match caller_key {
 		Some(k) => (k, false),
@@ -127,9 +154,11 @@ pub fn run_init(
 			let k = MasterKey::generate();
 			// Persist as 64-char lowercase hex — same shape `serve` expects
 			// on disk and what an operator would paste into `PRAGMA key`.
-			let mut bytes = k.to_hex().into_bytes();
-			bytes.push(b'\n');
-			write_secret(&layout.master_key, &bytes)?;
+			if options.persist_secrets {
+				let mut bytes = k.to_hex().into_bytes();
+				bytes.push(b'\n');
+				write_secret(&layout.master_key, &bytes)?;
+			}
 			(k, true)
 		},
 	};
@@ -144,10 +173,13 @@ pub fn run_init(
 
 	Ok(InitOutput {
 		layout,
+		server_bundle: server,
 		admin_bundle: admin,
 		ca_cert_pem: ca.cert_pem().to_owned(),
+		ca_key_pem: ca.key_pem().to_owned(),
 		master_key,
 		minted_master_key,
+		persisted_secrets: options.persist_secrets,
 	})
 }
 
@@ -235,6 +267,38 @@ mod tests {
 		// DB only opens with the same key — proves init actually used it.
 		let same = MasterKey::from_bytes([0x42u8; 32]);
 		assert!(Db::open(&out.layout.db_path, &same).is_ok());
+	}
+
+	#[test]
+	fn can_bootstrap_without_persisting_secret_files() {
+		let tmp = tempfile::tempdir().unwrap();
+		let out = run_init_with_options(
+			tmp.path(),
+			&["localhost".to_owned()],
+			None,
+			InitOptions { persist_secrets: false },
+		)
+		.unwrap();
+		assert!(!out.layout.ca_cert.exists());
+		assert!(!out.layout.ca_key.exists());
+		assert!(!out.layout.server_cert.exists());
+		assert!(!out.layout.server_key.exists());
+		assert!(!out.layout.admin_cert.exists());
+		assert!(!out.layout.admin_key.exists());
+		assert!(!out.layout.master_key.exists());
+		assert!(out.layout.db_path.exists());
+		assert!(out.minted_master_key);
+		assert!(!out.persisted_secrets);
+
+		let db = Db::open(&out.layout.db_path, &out.master_key).unwrap();
+		let admin_der = pem_first_cert_der(&out.admin_bundle.cert_pem).unwrap();
+		let fp = cert_fingerprint(&admin_der);
+		let row = db
+			.with_conn(|c| Ok(workers::find_active_by_fingerprint(c, &fp)?))
+			.unwrap()
+			.expect("admin must be registered after env-only init");
+		assert_eq!(row.kind, WorkerKind::Admin);
+		assert_eq!(row.name, "admin");
 	}
 
 	#[test]

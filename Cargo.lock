@@ -869,6 +869,7 @@ name = "loupe-cli"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "loupe-core",
  "loupe-proto",

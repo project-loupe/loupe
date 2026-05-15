@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use loupe_server::init::{run_init, DataDirLayout};
+use loupe_server::init::{run_init_with_options, DataDirLayout, InitOptions};
 use loupe_server::{serve, AppState, Config, FileConfig};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
@@ -41,6 +41,14 @@ struct InitArgs {
 	/// SAN lists.
 	#[arg(long = "hostname", value_name = "HOSTNAME", default_values_t = vec!["localhost".to_owned(), "127.0.0.1".to_owned()])]
 	hostnames: Vec<String>,
+	/// Print sourceable LOUPE_* env assignments carrying the generated
+	/// server/admin PEMs and master key. Useful for Docker bootstrap.
+	#[arg(long, default_value_t = false)]
+	emit_env: bool,
+	/// Do not persist generated PEM/key files under the data dir. Must
+	/// be paired with --emit-env so the caller can capture the secrets.
+	#[arg(long, default_value_t = false, requires = "emit_env")]
+	no_persist_secrets: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -125,8 +133,17 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 	// Operators who manage the key in a secret store / systemd cred /
 	// vault stay in control of where it lives.
 	let caller_key = read_master_key_from_env()?;
-	let out = run_init(&args.data_dir, &args.hostnames, caller_key)
-		.with_context(|| format!("initialising data dir {}", args.data_dir.display()))?;
+	let out = run_init_with_options(
+		&args.data_dir,
+		&args.hostnames,
+		caller_key,
+		InitOptions { persist_secrets: !args.no_persist_secrets },
+	)
+	.with_context(|| format!("initialising data dir {}", args.data_dir.display()))?;
+	if args.emit_env {
+		print_init_env(&out);
+		return Ok(());
+	}
 	let layout = DataDirLayout::at(&args.data_dir);
 	println!("loupe data dir initialised at {}", out.layout.root.display());
 	println!();
@@ -154,6 +171,29 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 	println!("KEEP THIS SECRET — written once, never re-derivable.");
 	println!("{}", out.admin_bundle.key_pem.trim_end());
 	Ok(())
+}
+
+fn print_init_env(out: &loupe_server::init::InitOutput) {
+	for (name, value) in init_env_assignments(out) {
+		println!("{name}={value}");
+	}
+}
+
+fn init_env_assignments(out: &loupe_server::init::InitOutput) -> Vec<(&'static str, String)> {
+	vec![
+		("LOUPE_MASTER_KEY", out.master_key.to_hex()),
+		("LOUPE_SERVER_CERT_PEM_B64", b64(&out.server_bundle.cert_pem)),
+		("LOUPE_SERVER_KEY_PEM_B64", b64(&out.server_bundle.key_pem)),
+		("LOUPE_CA_CERT_PEM_B64", b64(&out.ca_cert_pem)),
+		("LOUPE_CA_KEY_PEM_B64", b64(&out.ca_key_pem)),
+		("LOUPE_ADMIN_CERT_PEM_B64", b64(&out.admin_bundle.cert_pem)),
+		("LOUPE_ADMIN_KEY_PEM_B64", b64(&out.admin_bundle.key_pem)),
+	]
+}
+
+fn b64(value: &str) -> String {
+	use base64::Engine as _;
+	base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -348,5 +388,42 @@ mod tests {
 			"default SAN list must include `127.0.0.1`: {:?}",
 			args.hostnames,
 		);
+	}
+
+	#[test]
+	fn init_env_assignments_are_complete_single_line_values() {
+		let tmp = tempfile::tempdir().unwrap();
+		let out = loupe_server::init::run_init_with_options(
+			tmp.path(),
+			&["localhost".to_owned()],
+			None,
+			InitOptions { persist_secrets: false },
+		)
+		.unwrap();
+
+		let assignments = init_env_assignments(&out);
+		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
+		assert_eq!(
+			names,
+			vec![
+				"LOUPE_MASTER_KEY",
+				"LOUPE_SERVER_CERT_PEM_B64",
+				"LOUPE_SERVER_KEY_PEM_B64",
+				"LOUPE_CA_CERT_PEM_B64",
+				"LOUPE_CA_KEY_PEM_B64",
+				"LOUPE_ADMIN_CERT_PEM_B64",
+				"LOUPE_ADMIN_KEY_PEM_B64",
+			]
+		);
+		for (name, value) in &assignments {
+			assert!(!value.is_empty(), "{name} value must be present");
+			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+		}
+		assert_eq!(assignments[0].1, out.master_key.to_hex());
+
+		use base64::Engine as _;
+		let server_cert =
+			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
+		assert_eq!(String::from_utf8(server_cert).unwrap(), out.server_bundle.cert_pem);
 	}
 }
