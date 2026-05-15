@@ -350,9 +350,25 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 		poc_unified: None,
 		fingerprint: "confirmed-fp".into(),
 	};
+	let second_confirmed = Finding {
+		scanner_id: "test".into(),
+		severity: Severity::Critical,
+		title: "Second confirmed finding with a direct title".into(),
+		description: "This one should be dispatched separately".into(),
+		file_path: Some("src/critical.rs".into()),
+		line_start: Some(9),
+		line_end: Some(11),
+		cwe: None,
+		patch_unified: None,
+		poc_unified: None,
+		fingerprint: "second-confirmed-fp".into(),
+	};
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
-		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![confirmed] })
+		.json(&FindingsBatch {
+			protocol_version: PROTOCOL_VERSION,
+			findings: vec![confirmed, second_confirmed],
+		})
 		.send()
 		.await
 		.unwrap();
@@ -415,10 +431,19 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 		states,
 		vec![
 			("confirmed-fp".to_owned(), "reported".to_owned()),
+			("second-confirmed-fp".to_owned(), "reported".to_owned()),
 			("validating-fp".to_owned(), "validating".to_owned()),
 		]
 	);
-	assert_eq!(stub_state.captured.lock().unwrap().len(), 1);
+	let captured = stub_state.captured.lock().unwrap().clone();
+	assert_eq!(captured.len(), 2);
+	let titles: Vec<_> =
+		captured.iter().map(|issue| issue.body["title"].as_str().unwrap_or("")).collect();
+	assert_eq!(
+		titles,
+		vec!["high: Confirmed finding", "critical: Second confirmed finding with a direct title"]
+	);
+	assert!(titles.iter().all(|title| !title.contains("[loupe]")), "titles: {titles:?}");
 
 	server.shutdown().await;
 }

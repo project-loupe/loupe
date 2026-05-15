@@ -704,7 +704,6 @@ async fn dispatch_confirmed_rows(
 		return Ok(());
 	}
 	let ids: Vec<i64> = confirmed_rows.iter().map(|r| r.id).collect();
-	let findings_for_report: Vec<_> = confirmed_rows.into_iter().map(finding_from_row).collect();
 
 	if matches!(repo.reporting, ReportingDestination::Manual) {
 		match scope {
@@ -725,6 +724,32 @@ async fn dispatch_confirmed_rows(
 	let reporter =
 		reporters::select(repo, state.github_reporter.clone(), state.email_reporter.clone())
 			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
+
+	if matches!(repo.reporting, ReportingDestination::GithubIssue { .. }) {
+		for row in confirmed_rows {
+			let finding_id = row.id;
+			let finding = finding_from_row(row);
+			let findings_for_report = [finding];
+			let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
+			match scope {
+				DispatchScope::Finding(_) => tracing::info!(
+					finding_id,
+					external_id = receipt.external_id.as_deref(),
+					"dispatched finding"
+				),
+				DispatchScope::Job(job_id) => tracing::info!(
+					job_id,
+					finding_id,
+					external_id = receipt.external_id.as_deref(),
+					"dispatched finding"
+				),
+			}
+			mark_reported(state, &[finding_id], now)?;
+		}
+		return Ok(());
+	}
+
+	let findings_for_report: Vec<_> = confirmed_rows.into_iter().map(finding_from_row).collect();
 	let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
 	match scope {
 		DispatchScope::Finding(finding_id) => tracing::info!(

@@ -341,7 +341,7 @@ async fn confirmed_verdict_dispatches_the_finding() {
 	// GitHub stub captured exactly one issue.
 	let captured = stub.captured.lock().unwrap().clone();
 	assert_eq!(captured.len(), 1);
-	assert!(captured[0]["title"].as_str().unwrap().contains("high finding"));
+	assert_eq!(captured[0]["title"].as_str().unwrap(), "high: OOB index");
 
 	server.shutdown().await;
 }
