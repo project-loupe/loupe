@@ -38,11 +38,16 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service", "server"] }
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
-# `rustls-tls-manual-roots-no-provider` keeps reqwest from pinning a
-# crypto provider; we explicitly add the `ring` provider via the
-# `rustls` workspace dep below, which both reqwest and tokio-rustls
-# share. `aws-lc-rs` is excluded.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
+# `rustls-tls-webpki-roots` gives reqwest a compiled-in Mozilla root
+# store (via the `webpki-roots` crate) so the GitHub reporter can talk
+# to api.github.com without depending on the host's `ca-certificates`
+# package. mTLS callers (worker→server, admin→server) still pin the
+# private loupe CA via `add_root_certificate`; webpki-roots are
+# additive and harmless on those paths since the loupe server cert
+# does not chain to a public root. Crypto provider is `ring`, pulled
+# in explicitly via the `rustls` workspace dep below; `aws-lc-rs` is
+# excluded.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }

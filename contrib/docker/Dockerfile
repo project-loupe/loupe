@@ -21,8 +21,12 @@ ARG BKB_MCP_VERSION=0.2.0
 RUN cargo install bkb-mcp --version "${BKB_MCP_VERSION}" --locked
 
 FROM debian:bookworm-slim AS loupe-server
+# No `ca-certificates` here: loupe-server's only outbound TLS is the
+# GitHub reporter, which uses reqwest + rustls with webpki-roots
+# compiled into the binary (see workspace Cargo.toml). Sendmail is
+# local. Worker / admin mTLS pins the private loupe CA explicitly.
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ca-certificates tini \
+	&& apt-get install -y --no-install-recommends tini \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& useradd --uid 10001 --user-group --home-dir /var/lib/loupe --create-home --shell /usr/sbin/nologin loupe
 COPY --from=app-builder /src/target/release/loupe-server /usr/local/bin/loupe-server
