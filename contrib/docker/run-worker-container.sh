@@ -38,6 +38,7 @@ exec podman run \
 	--rm \
 	--replace \
 	--pull=never \
+	--log-driver=none \
 	--privileged \
 	--name "$CONTAINER_NAME" \
 	--volume "$CACHE_DIR:/var/cache/loupe-worker" \

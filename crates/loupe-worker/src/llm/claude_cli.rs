@@ -30,11 +30,12 @@ use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
 	SANDBOX_LOUPE_BIN,
 };
-use super::{LlmBackend, LlmRequest, LlmResponse};
+use super::{summarize_cli_stream_for_error, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
+const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 
 /// Fixed sandbox path for the per-call MCP config file claude reads.
 /// The host-side scratch dir (a `tempfile::TempDir`) bind-mounts
@@ -107,17 +108,6 @@ fn prepare_mcp_scratch(
 		"loupe-mcp: prepared per-call scratch config",
 	);
 	Ok(McpScratch { dir, config_path })
-}
-
-/// Cap a borrow at `n` chars; appends an ellipsis if the original was
-/// longer. Used to keep error messages from blowing up when the CLI
-/// dumps multi-MB diagnostics on a non-zero exit.
-fn truncate(s: &str, n: usize) -> String {
-	let mut buf: String = s.chars().take(n).collect();
-	if s.chars().nth(n).is_some() {
-		buf.push('…');
-	}
-	buf.replace('\n', " ")
 }
 
 pub struct ClaudeCliBackend {
@@ -285,9 +275,11 @@ impl LlmBackend for ClaudeCliBackend {
 			// chose. Trim and truncate so a multi-MB diagnostic dump
 			// doesn't drown the log line.
 			let combined = format!(
-				"stderr=`{}` stdout=`{}`",
-				truncate(&stderr_text, 400),
-				truncate(&stdout_text, 400),
+				"stderr(chars={})=`{}` stdout(chars={})=`{}`",
+				stderr_text.chars().count(),
+				summarize_cli_stream_for_error(&stderr_text, MAX_CLI_DIAGNOSTIC_CHARS),
+				stdout_text.chars().count(),
+				summarize_cli_stream_for_error(&stdout_text, MAX_CLI_DIAGNOSTIC_CHARS),
 			);
 			return Err(anyhow!("claude CLI exited with {}: {}", status, combined));
 		}

@@ -39,6 +39,7 @@ exec podman run \
 	--rm \
 	--replace \
 	--pull=never \
+	--log-driver=none \
 	--name "$CONTAINER_NAME" \
 	--publish "$PUBLISH" \
 	--volume "$DATA_DIR:/var/lib/loupe" \

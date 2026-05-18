@@ -32,11 +32,12 @@ use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
 	SANDBOX_LOUPE_BIN,
 };
-use super::{codex_home_dir, LlmBackend, LlmRequest, LlmResponse};
+use super::{codex_home_dir, summarize_cli_stream_for_error, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "codex-cli";
 const CODEX_BIN: &str = "codex";
+const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 
 /// Render a Rust string as a TOML basic-string literal: wraps in
 /// double quotes, escapes the few characters TOML cares about (`\`,
@@ -69,17 +70,6 @@ fn toml_string_literal(s: &str) -> String {
 fn toml_string_array(items: &[String]) -> String {
 	let parts: Vec<String> = items.iter().map(|s| toml_string_literal(s)).collect();
 	format!("[{}]", parts.join(", "))
-}
-
-/// Cap a borrow at `n` chars; appends an ellipsis if the original was
-/// longer. Used to keep error messages from blowing up when the CLI
-/// dumps multi-MB diagnostics on a non-zero exit.
-fn truncate(s: &str, n: usize) -> String {
-	let mut buf: String = s.chars().take(n).collect();
-	if s.chars().nth(n).is_some() {
-		buf.push('…');
-	}
-	buf.replace('\n', " ")
 }
 
 pub struct CodexCliBackend {
@@ -264,9 +254,11 @@ impl LlmBackend for CodexCliBackend {
 				"codex-cli: subprocess failed",
 			);
 			let combined = format!(
-				"stderr=`{}` stdout=`{}`",
-				truncate(&stderr_text, 400),
-				truncate(&stdout_text, 400),
+				"stderr(chars={})=`{}` stdout(chars={})=`{}`",
+				stderr_text.chars().count(),
+				summarize_cli_stream_for_error(&stderr_text, MAX_CLI_DIAGNOSTIC_CHARS),
+				stdout_text.chars().count(),
+				summarize_cli_stream_for_error(&stdout_text, MAX_CLI_DIAGNOSTIC_CHARS),
 			);
 			return Err(anyhow!("codex CLI exited with {}: {}", status, combined));
 		}

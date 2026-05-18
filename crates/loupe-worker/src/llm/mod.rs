@@ -36,6 +36,31 @@ pub use codex_cli::CodexCliBackend;
 pub use mcp::{McpContext, McpTlsSource};
 use tokio_util::sync::CancellationToken;
 
+const CLI_STREAM_OMISSION: &str = " ... ";
+
+/// Collapse a CLI output stream into a single log-line snippet while
+/// preserving both the beginning and the end. Agent CLIs often print a
+/// long startup banner first and the actionable error last; head-only
+/// truncation hides the part an operator needs.
+pub(crate) fn summarize_cli_stream_for_error(s: &str, max_chars: usize) -> String {
+	let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+	let len = collapsed.chars().count();
+	if len <= max_chars {
+		return collapsed;
+	}
+	if max_chars <= CLI_STREAM_OMISSION.chars().count() + 2 {
+		return collapsed.chars().take(max_chars).collect();
+	}
+
+	let omission_len = CLI_STREAM_OMISSION.chars().count();
+	let head_len = max_chars / 3;
+	let tail_len = max_chars.saturating_sub(head_len + omission_len);
+	let head: String = collapsed.chars().take(head_len).collect();
+	let tail_rev: Vec<char> = collapsed.chars().rev().take(tail_len).collect();
+	let tail: String = tail_rev.into_iter().rev().collect();
+	format!("{head}{CLI_STREAM_OMISSION}{tail}")
+}
+
 /// Default per-call wall-clock budget. Per-file LLM invocations should
 /// fit comfortably within this; if they don't, the call is aborted and
 /// the file is treated as having produced no findings (logged warning).
@@ -315,6 +340,21 @@ mod tests {
 
 		assert!(claude_auth_available());
 		assert!(codex_auth_available());
+	}
+
+	#[test]
+	fn cli_error_summary_preserves_the_actionable_tail() {
+		let stderr = format!(
+			"{}\nERROR: stream disconnected before completion: proxy refused websocket",
+			"OpenAI Codex startup banner ".repeat(80)
+		);
+
+		let summary = summarize_cli_stream_for_error(&stderr, 180);
+
+		assert!(summary.contains("OpenAI Codex startup banner"), "got: {summary}");
+		assert!(summary.contains("proxy refused websocket"), "got: {summary}");
+		assert!(summary.contains(CLI_STREAM_OMISSION), "got: {summary}");
+		assert!(!summary.contains('\n'), "summary must stay single-line: {summary}");
 	}
 
 	#[test]
