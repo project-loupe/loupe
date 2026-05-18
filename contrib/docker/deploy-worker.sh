@@ -13,6 +13,8 @@ REMOTE_CONF="${LOUPE_WORKER_REMOTE_CONF:-/etc/loupe-container/worker.conf}"
 REMOTE_WORKER_CONFIG="${LOUPE_WORKER_CONFIG_FILE:-/etc/loupe-container/worker.config.toml}"
 CONTAINER_WORKER_CONFIG="${LOUPE_WORKER_CONFIG_CONTAINER:-/etc/loupe/worker.config.toml}"
 REMOTE_SECRET="${LOUPE_WORKER_SECRET_FILE:-/etc/loupe-container/worker.secrets.env}"
+LOCAL_CODEX_AUTH_JSON="${CODEX_AUTH_JSON_PATH:-}"
+REMOTE_CODEX_AUTH_DIR="${LOUPE_CODEX_AUTH_REMOTE_DIR:-/etc/loupe-container/codex}"
 LOAD_IMAGE="${LOUPE_WORKER_LOAD_IMAGE:-0}"
 PULL_IMAGE="${LOUPE_WORKER_PULL_IMAGE:-0}"
 START_GRACE_SECONDS="${LOUPE_WORKER_START_GRACE_SECONDS:-3}"
@@ -111,6 +113,9 @@ build_conf_file() {
 		write_conf_var LOUPE_WORKER_CACHE_DIR "${LOUPE_WORKER_CACHE_DIR:-/var/cache/loupe-worker-container}"
 		write_conf_var LOUPE_WORKER_CONFIG_HOST "$REMOTE_WORKER_CONFIG"
 		write_conf_var LOUPE_WORKER_CONFIG_CONTAINER "$CONTAINER_WORKER_CONFIG"
+		if [ -n "$LOCAL_CODEX_AUTH_JSON" ]; then
+			write_conf_var LOUPE_CODEX_AUTH_DIR "$REMOTE_CODEX_AUTH_DIR"
+		fi
 		if [ -n "${RUST_LOG+x}" ]; then
 			write_conf_var RUST_LOG "$RUST_LOG"
 		fi
@@ -188,8 +193,15 @@ for name in \
 do
 	require_secret "$name"
 done
-if ! secret_set ANTHROPIC_API_KEY && ! secret_set OPENAI_API_KEY; then
-	echo "error: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY for the worker" >&2
+if [ -n "$LOCAL_CODEX_AUTH_JSON" ] && [ ! -r "$LOCAL_CODEX_AUTH_JSON" ]; then
+	echo "error: CODEX_AUTH_JSON_PATH does not point to a readable file: $LOCAL_CODEX_AUTH_JSON" >&2
+	exit 2
+fi
+if [ -n "$LOCAL_CODEX_AUTH_JSON" ] && secret_set OPENAI_API_KEY; then
+	echo "warning: both CODEX_AUTH_JSON_PATH and OPENAI_API_KEY are set; codex may prefer OPENAI_API_KEY" >&2
+fi
+if ! secret_set ANTHROPIC_API_KEY && ! secret_set OPENAI_API_KEY && [ -z "$LOCAL_CODEX_AUTH_JSON" ]; then
+	echo "error: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or CODEX_AUTH_JSON_PATH for the worker" >&2
 	exit 2
 fi
 
@@ -258,6 +270,25 @@ trap - EXIT
 '
 emit_secret_env | ssh "$SSH_TARGET" \
 	"sudo bash -c $(remote_quote "$secret_writer") bash $(remote_quote "$REMOTE_SECRET") 10002"
+
+if [ -n "$LOCAL_CODEX_AUTH_JSON" ]; then
+	echo "==> Writing persistent codex auth.json to $SSH_TARGET:$REMOTE_CODEX_AUTH_DIR/auth.json"
+	codex_auth_writer='
+set -euo pipefail
+dir="$1"
+install -d -o 10002 -g 10002 -m 0700 "$dir"
+tmp="$(mktemp "$dir/.auth.json.XXXXXX")"
+trap "rm -f \"$tmp\"" EXIT
+cat > "$tmp"
+chown 10002:10002 "$tmp"
+chmod 0600 "$tmp"
+mv "$tmp" "$dir/auth.json"
+trap - EXIT
+'
+	ssh "$SSH_TARGET" \
+		"sudo bash -c $(remote_quote "$codex_auth_writer") bash $(remote_quote "$REMOTE_CODEX_AUTH_DIR")" \
+		<"$LOCAL_CODEX_AUTH_JSON"
+fi
 
 echo "==> Restarting $SERVICE_NAME"
 ssh "$SSH_TARGET" sudo systemctl restart "$SERVICE_NAME"
