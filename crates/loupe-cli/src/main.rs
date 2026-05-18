@@ -221,7 +221,13 @@ struct WorkerRegisterArgs {
 #[derive(Debug, Subcommand)]
 enum JobCmd {
 	List,
-	Get { id: i64 },
+	Get {
+		id: i64,
+	},
+	/// Requeue a failed job.
+	Retry {
+		id: i64,
+	},
 }
 
 #[derive(Debug, Subcommand)]
@@ -342,6 +348,10 @@ async fn main() -> Result<()> {
 			JobCmd::Get { id } => {
 				let (client, base) = client_and_url(&conn)?;
 				job_get(&client, base, id).await
+			},
+			JobCmd::Retry { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				job_retry(&client, base, id).await
 			},
 		},
 		Cmd::Finding(c) => match c {
@@ -726,6 +736,17 @@ async fn job_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Resu
 	Ok(())
 }
 
+async fn job_retry(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/jobs/{id}/retry"))).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("retry job: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	let job: JobInfo = resp.json().await?;
+	println!("job_id={} state={:?} attempts={}", job.job_id, job.state, job.attempts);
+	Ok(())
+}
+
 async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i64) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))).send().await?;
 	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
@@ -949,6 +970,23 @@ mod tests {
 			panic!("expected finding retry-report command");
 		};
 		assert_eq!(id, 11);
+	}
+
+	#[test]
+	fn job_retry_parses() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"job",
+			"retry",
+			"33",
+		])
+		.unwrap();
+		let Cmd::Job(JobCmd::Retry { id }) = cli.cmd else {
+			panic!("expected job retry command");
+		};
+		assert_eq!(id, 33);
 	}
 
 	#[test]

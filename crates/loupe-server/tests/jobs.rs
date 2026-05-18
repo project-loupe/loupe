@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use loupe_core::{Finding, Severity};
 use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, LeaseEnvelope, LeaseRequest,
-	LeaseResponse, ListFindingsResponse, RegisterRepoRequest, RegisterWorkerRequest,
+	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, LeaseEnvelope, LeasePayload,
+	LeaseRequest, LeaseResponse, ListFindingsResponse, RegisterRepoRequest, RegisterWorkerRequest,
 	RegisterWorkerResponse, ReportingSetup, ScanRequest, ScanResponse, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
@@ -173,6 +173,24 @@ async fn lease_job(worker: &reqwest::Client) -> LeaseEnvelope {
 	}
 }
 
+async fn lease_verify_job(worker: &reqwest::Client) -> LeaseEnvelope {
+	let resp = worker
+		.post("https://loupe-server/v1/jobs/lease")
+		.json(&LeaseRequest {
+			protocol_version: PROTOCOL_VERSION,
+			capabilities: vec!["verify:llm".into()],
+			wait_seconds: 0,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert!(resp.status().is_success());
+	match resp.json::<LeaseResponse>().await.unwrap() {
+		LeaseResponse::Lease(env) => *env,
+		LeaseResponse::Empty { .. } => panic!("verify queue should not be empty"),
+	}
+}
+
 async fn submit_finding(worker: &reqwest::Client, job_id: i64, finding: Finding) {
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{job_id}/findings"))
@@ -308,6 +326,195 @@ async fn end_to_end_scan_lifecycle() {
 		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM scan_history", [], |r| r.get(0))?))
 			.unwrap();
 	assert_eq!(history_count, 1);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_can_retry_failed_verify_job() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_env = lease_job(&f.worker).await;
+	assert_eq!(scan_env.job_id, scan.job_id);
+	submit_finding(&f.worker, scan_env.job_id, finding("Needs verification", "fp-verify")).await;
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let verify_env = lease_verify_job(&f.worker).await;
+	let finding_id = match &verify_env.payload {
+		LeasePayload::Verify { finding_id, .. } => *finding_id,
+		other => panic!("expected verify payload, got {other:?}"),
+	};
+
+	let before_deadline: i64 =
+		f.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT validating_deadline FROM findings WHERE id = ?1",
+				[finding_id],
+				|r| r.get(0),
+			)?)
+		})
+		.unwrap();
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some("codex CLI exited with exit status: 1".into()),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let retried: serde_json::Value = f
+		.admin
+		.post(format!("https://loupe-server/v1/jobs/{}/retry", verify_env.job_id))
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+	assert_eq!(retried["job_id"], verify_env.job_id);
+	assert_eq!(retried["state"], "queued");
+	assert_eq!(retried["attempts"], 0);
+
+	let (state, attempts, error, after_deadline): (String, i64, Option<String>, i64) =
+		f.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT j.state, j.attempts, j.error, f.validating_deadline
+				   FROM jobs j
+				   JOIN findings f ON f.id = j.target_finding_id
+				  WHERE j.id = ?1",
+				[verify_env.job_id],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+			)?)
+		})
+		.unwrap();
+	assert_eq!(state, "queued");
+	assert_eq!(attempts, 0);
+	assert!(error.is_none());
+	assert!(after_deadline >= before_deadline);
+
+	let retried_env = lease_verify_job(&f.worker).await;
+	assert_eq!(retried_env.job_id, verify_env.job_id);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_revives_deadline_dismissed_verify_target() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_env = lease_job(&f.worker).await;
+	assert_eq!(scan_env.job_id, scan.job_id);
+	submit_finding(&f.worker, scan_env.job_id, finding("Deadline retry", "fp-deadline")).await;
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let verify_env = lease_verify_job(&f.worker).await;
+	let finding_id = match &verify_env.payload {
+		LeasePayload::Verify { finding_id, .. } => *finding_id,
+		other => panic!("expected verify payload, got {other:?}"),
+	};
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some("codex CLI exited with exit status: 1".into()),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	f.db.with_conn(|c| {
+		c.execute("UPDATE findings SET validating_deadline = 100 WHERE id = ?1", [finding_id])?;
+		Ok(loupe_storage::findings::reap_stale_validating(c, 200)?)
+	})
+	.unwrap();
+	let dismissed: String =
+		f.db.with_conn(|c| {
+			Ok(c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| r.get(0))?)
+		})
+		.unwrap();
+	assert_eq!(dismissed, "dismissed");
+
+	let retried: serde_json::Value = f
+		.admin
+		.post(format!("https://loupe-server/v1/jobs/{}/retry", verify_env.job_id))
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+	assert_eq!(retried["job_id"], verify_env.job_id);
+	assert_eq!(retried["state"], "queued");
+
+	let (state, dismissed_at): (String, Option<i64>) =
+		f.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT state, dismissed_at FROM findings WHERE id = ?1",
+				[finding_id],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)?)
+		})
+		.unwrap();
+	assert_eq!(state, "validating");
+	assert!(dismissed_at.is_none());
 
 	f.handle.shutdown().await;
 }
