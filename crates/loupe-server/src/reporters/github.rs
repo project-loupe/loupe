@@ -161,6 +161,10 @@ fn render_body(repo: &RepoRow, finding: &Finding) -> String {
 		out.push_str("\n```\n\n");
 	}
 
+	out.push_str(
+		"_This finding was discovered by [Project Loupe](https://github.com/project-loupe/loupe)._\n",
+	);
+
 	out
 }
 
@@ -235,6 +239,9 @@ mod tests {
 		assert!(body.contains("- location: `src/lib.rs:4-6`"));
 		assert!(body.contains("## Proof of Concept"));
 		assert!(body.contains("## Suggested Fix"));
+		assert!(body.ends_with(
+			"_This finding was discovered by [Project Loupe](https://github.com/project-loupe/loupe)._\n"
+		));
 		assert!(!body.contains("This issue tracks one loupe finding"));
 		assert!(!body.contains("finished a scan"));
 		assert!(!body.contains("Findings:"));
