@@ -132,11 +132,8 @@ fn compact_title(raw: &str) -> String {
 
 fn render_body(repo: &RepoRow, finding: &Finding) -> String {
 	let mut out = String::new();
-	out.push_str(&format!(
-		"This issue tracks one loupe finding in `{}/{}` (clone url `{}`).\n\n",
-		repo.owner, repo.repo, repo.clone_url
-	));
 	out.push_str("## Finding\n\n");
+	out.push_str(&format!("- repo: `{}/{}` (`{}`)\n", repo.owner, repo.repo, repo.clone_url));
 	out.push_str(&format!("- title: {}\n", finding.title));
 	out.push_str(&format!("- severity: `{}`\n", finding.severity));
 	if let Some(location) = render_location(finding) {
@@ -231,12 +228,14 @@ mod tests {
 	#[test]
 	fn body_describes_one_finding_not_a_scan_batch() {
 		let body = render_body(&repo(), &finding());
-		assert!(body.contains("This issue tracks one loupe finding"));
+		assert!(body.starts_with("## Finding\n\n"));
+		assert!(body.contains("- repo: `acme/widget` (`https://github.com/acme/widget.git`)"));
 		assert!(body.contains("- title: Out-of-bounds index in idx"));
 		assert!(body.contains("- severity: `high`"));
 		assert!(body.contains("- location: `src/lib.rs:4-6`"));
 		assert!(body.contains("## Proof of Concept"));
 		assert!(body.contains("## Suggested Fix"));
+		assert!(!body.contains("This issue tracks one loupe finding"));
 		assert!(!body.contains("finished a scan"));
 		assert!(!body.contains("Findings:"));
 	}
