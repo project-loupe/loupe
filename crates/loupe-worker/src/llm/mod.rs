@@ -36,6 +36,12 @@ pub use codex_cli::CodexCliBackend;
 pub use mcp::{McpContext, McpTlsSource};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliModelConfig {
+	pub model: String,
+	pub effort: String,
+}
+
 const CLI_STREAM_OMISSION: &str = " ... ";
 
 /// Collapse a CLI output stream into a single log-line snippet while
@@ -193,9 +199,8 @@ pub fn claude_auth_available() -> bool {
 /// [`crate::llm::claude_cli::McpContext`] for the attachment plumbing and
 /// [`crate::llm::prompts::DISCOVERY`] for the conditional prompt section.
 ///
-/// Install via `cargo install bkb-mcp`; the binary needs to reach
-/// the BKB HTTP API server (default `http://127.0.0.1:3000`,
-/// override with `BKB_API_URL`).
+/// Install via `cargo install bkb-mcp`; the worker config controls
+/// the `BKB_API_URL` passed to the child.
 pub fn bkb_mcp_available() -> Option<PathBuf> {
 	let path = std::env::var_os("PATH")?;
 	for dir in std::env::split_paths(&path) {
@@ -273,18 +278,31 @@ fn home_path(child: &str) -> Option<PathBuf> {
 /// Logs the choice at info level so operators can see which backend
 /// is actually verifying without having to inspect process listings.
 pub fn build_verifier_backend(
-	mcp: Option<McpContext>, codex_ready: bool, claude_ready: bool,
+	mcp: Option<McpContext>, codex_ready: bool, claude_ready: bool, codex_agent: CliModelConfig,
+	claude_agent: CliModelConfig, log_agent_output: bool,
 ) -> Result<Arc<dyn LlmBackend>> {
 	if codex_ready {
-		tracing::info!("verifier backend: codex (cross-model second opinion)");
-		let mut backend = CodexCliBackend::new();
+		tracing::info!(
+			model = %codex_agent.model,
+			effort = %codex_agent.effort,
+			"verifier backend: codex (cross-model second opinion)"
+		);
+		let mut backend = CodexCliBackend::new()
+			.with_agent_config(codex_agent)
+			.with_log_agent_output(log_agent_output);
 		if let Some(ctx) = mcp {
 			backend = backend.with_mcp_context(ctx);
 		}
 		Ok(Arc::new(backend))
 	} else if claude_ready {
-		tracing::info!("verifier backend: claude (codex unavailable; same-family fallback)");
-		let mut backend = ClaudeCliBackend::new();
+		tracing::info!(
+			model = %claude_agent.model,
+			effort = %claude_agent.effort,
+			"verifier backend: claude (codex unavailable; same-family fallback)"
+		);
+		let mut backend = ClaudeCliBackend::new()
+			.with_agent_config(claude_agent)
+			.with_log_agent_output(log_agent_output);
 		if let Some(ctx) = mcp {
 			backend = backend.with_mcp_context(ctx);
 		}
@@ -371,13 +389,18 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_prefers_codex_then_claude() {
-		let backend = build_verifier_backend(None, true, true).unwrap();
+		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
+		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let backend =
+			build_verifier_backend(None, true, true, codex.clone(), claude.clone(), false).unwrap();
 		assert_eq!(backend.id(), "codex-cli");
 
-		let backend = build_verifier_backend(None, false, true).unwrap();
+		let backend =
+			build_verifier_backend(None, false, true, codex.clone(), claude.clone(), false)
+				.unwrap();
 		assert_eq!(backend.id(), "claude-cli");
 
-		let err = match build_verifier_backend(None, false, false) {
+		let err = match build_verifier_backend(None, false, false, codex, claude, false) {
 			Ok(_) => panic!("missing verifier backend should be rejected"),
 			Err(e) => e,
 		};

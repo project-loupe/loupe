@@ -55,21 +55,8 @@ pub struct ScannerConfig {
 
 impl Default for ScannerConfig {
 	fn default() -> Self {
-		// `LOUPE_MAX_CONCURRENT_FILES` is a debug knob: a personal
-		// Anthropic/OpenAI account can hit per-account concurrency
-		// limits with 8-way parallel claude invocations, which manifests
-		// as "every session in the first batch times out at 30s with
-		// empty stdout." Setting this env var to 1–2 lets an operator
-		// confirm the rate-limit theory without touching code.
-		// The per-repo `scanner_config` JSON override (applied via
-		// `apply_patch` later) still wins over this default.
-		let max_concurrent_files = std::env::var("LOUPE_MAX_CONCURRENT_FILES")
-			.ok()
-			.and_then(|v| v.parse::<usize>().ok())
-			.filter(|&n| n > 0)
-			.unwrap_or(8);
 		Self {
-			max_concurrent_files,
+			max_concurrent_files: 8,
 			max_file_bytes: 64 * 1024,
 			per_request_timeout: DEFAULT_REQUEST_TIMEOUT,
 			include_extensions: default_extensions(),

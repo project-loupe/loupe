@@ -29,14 +29,18 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
-	SANDBOX_LOUPE_BIN,
+	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
-use super::{codex_home_dir, summarize_cli_stream_for_error, LlmBackend, LlmRequest, LlmResponse};
+use super::{
+	codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest,
+	LlmResponse,
+};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "codex-cli";
 const CODEX_BIN: &str = "codex";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+pub const DEFAULT_CODEX_EFFORT: &str = "xhigh";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 
 /// Render a Rust string as a TOML basic-string literal: wraps in
@@ -74,16 +78,36 @@ fn toml_string_array(items: &[String]) -> String {
 
 pub struct CodexCliBackend {
 	bin: String,
+	agent: CliModelConfig,
 	mcp: Option<McpContext>,
+	log_agent_output: bool,
 }
 
 impl CodexCliBackend {
 	pub fn new() -> Self {
-		Self { bin: CODEX_BIN.to_owned(), mcp: None }
+		Self {
+			bin: CODEX_BIN.to_owned(),
+			agent: CliModelConfig {
+				model: DEFAULT_CODEX_MODEL.to_owned(),
+				effort: DEFAULT_CODEX_EFFORT.to_owned(),
+			},
+			mcp: None,
+			log_agent_output: false,
+		}
 	}
 
 	pub fn with_bin(bin: impl Into<String>) -> Self {
-		Self { bin: bin.into(), mcp: None }
+		Self { bin: bin.into(), ..Self::new() }
+	}
+
+	pub fn with_agent_config(mut self, agent: CliModelConfig) -> Self {
+		self.agent = agent;
+		self
+	}
+
+	pub fn with_log_agent_output(mut self, enabled: bool) -> Self {
+		self.log_agent_output = enabled;
+		self
 	}
 
 	/// Attach an MCP server to every invocation. When set, each call
@@ -112,6 +136,8 @@ impl LlmBackend for CodexCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			workdir = %req.workdir.display(),
+			model = %self.agent.model,
+			effort = %self.agent.effort,
 			prompt_chars = req.prompt.chars().count(),
 			timeout_ms = req.timeout.as_millis() as u64,
 			"codex-cli: invoking",
@@ -180,7 +206,7 @@ impl LlmBackend for CodexCliBackend {
 					overrides.push("mcp_servers.bkb.args=[]".to_owned());
 					overrides.push(format!(
 						"mcp_servers.bkb.env={{ BKB_API_URL = {} }}",
-						toml_string_literal(BKB_API_URL)
+						toml_string_literal(&ctx.bkb_api_url)
 					));
 				}
 				overrides
@@ -196,13 +222,9 @@ impl LlmBackend for CodexCliBackend {
 		};
 
 		let mut cmd = sandbox.build(&self.bin);
-		cmd.arg("exec")
-			.arg("--dangerously-bypass-approvals-and-sandbox")
-			.arg("--skip-git-repo-check");
-		for ov in &mcp_overrides {
-			cmd.arg("-c").arg(ov);
+		for arg in codex_invocation_args(&self.agent, &mcp_overrides, &req.prompt) {
+			cmd.arg(arg);
 		}
-		cmd.arg(&req.prompt);
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
 		let mut child = cmd
@@ -265,6 +287,21 @@ impl LlmBackend for CodexCliBackend {
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("codex CLI stdout was not UTF-8: {e}"))?;
+		if self.log_agent_output {
+			tracing::info!(
+				backend = BACKEND_ID,
+				agent_stdout = %text,
+				"codex-cli: agent stdout (full)"
+			);
+			if !stderr.is_empty() {
+				let stderr_text = String::from_utf8_lossy(&stderr);
+				tracing::info!(
+					backend = BACKEND_ID,
+					agent_stderr = %stderr_text,
+					"codex-cli: agent stderr (full)"
+				);
+			}
+		}
 		tracing::debug!(
 			backend = BACKEND_ID,
 			elapsed_ms = started.elapsed().as_millis() as u64,
@@ -274,6 +311,26 @@ impl LlmBackend for CodexCliBackend {
 		);
 		Ok(LlmResponse { text, backend_id: BACKEND_ID })
 	}
+}
+
+fn codex_invocation_args(
+	agent: &CliModelConfig, mcp_overrides: &[String], prompt: &str,
+) -> Vec<String> {
+	let mut args = vec![
+		"exec".to_owned(),
+		"--dangerously-bypass-approvals-and-sandbox".to_owned(),
+		"--skip-git-repo-check".to_owned(),
+		"--model".to_owned(),
+		agent.model.clone(),
+		"-c".to_owned(),
+		format!("model_reasoning_effort={}", toml_string_literal(&agent.effort)),
+	];
+	for ov in mcp_overrides {
+		args.push("-c".to_owned());
+		args.push(ov.clone());
+	}
+	args.push(prompt.to_owned());
+	args
 }
 
 #[cfg(test)]
@@ -408,5 +465,19 @@ mod tests {
 		let arr = parsed["k"].as_array().expect("must be array");
 		let back: Vec<String> = arr.iter().map(|v| v.as_str().unwrap().to_owned()).collect();
 		assert_eq!(back, items);
+	}
+
+	#[test]
+	fn invocation_args_include_configured_model_and_effort() {
+		let args = codex_invocation_args(
+			&CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() },
+			&["mcp_servers.loupe.env={}".to_owned()],
+			"hello",
+		);
+
+		assert!(args.windows(2).any(|w| w == ["--model", "gpt-test"]));
+		assert!(args.windows(2).any(|w| w == ["-c", r#"model_reasoning_effort="xhigh""#]));
+		assert!(args.windows(2).any(|w| w == ["-c", "mcp_servers.loupe.env={}"]));
+		assert_eq!(args.last().map(String::as_str), Some("hello"));
 	}
 }

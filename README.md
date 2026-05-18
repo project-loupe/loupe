@@ -66,14 +66,12 @@ Before installing, the host needs:
   `bkb_lookup_blip`, `bkb_find_commit`, `bkb_get_document`,
   `bkb_get_references`, `bkb_timeline`) so the agent can pull spec +
   historical context the worktree alone won't carry. Install with
-  `cargo install bkb-mcp`. The worker pins `BKB_API_URL` to
+  `cargo install bkb-mcp`. The worker sets `BKB_API_URL` to
   `https://bitcoinknowledge.dev` (the public hosted instance) for
-  every spawn so behaviour is uniform across the fleet regardless
-  of what bkb-mcp's compiled-in default happens to be — operators
-  pointing at a self-hosted BKB instance should patch the
-  `BKB_API_URL` constant in `crates/loupe-worker/src/llm/claude_cli.rs`
-  and rebuild. Absence is silent: workers without bkb-mcp run
-  normally and the agent's prompt doesn't mention bkb at all.
+  every spawn by default; operators pointing at a self-hosted BKB
+  instance can override `[bkb].api_url` in the worker config. Absence
+  is silent: workers without bkb-mcp run normally and the agent's
+  prompt doesn't mention bkb at all.
 - **A GitHub personal access token** for each target tracker repo,
   only if you intend to use the GitHub-issue reporter (skip this
   prereq when registering repos with `--no-reporting` for manual
@@ -237,6 +235,20 @@ loupe-worker \
   --key        /etc/loupe/worker.key \
   --cache-dir  /var/lib/loupe/cache
 ```
+
+Worker settings can also live in TOML:
+
+```bash
+cp contrib/worker-config.toml /etc/loupe/worker.config.toml
+$EDITOR /etc/loupe/worker.config.toml
+loupe-worker run --config /etc/loupe/worker.config.toml
+```
+
+The worker config owns non-secret runtime settings: server URL, TLS
+file paths, cache settings, logging, Claude/Codex model + effort,
+scanner defaults, and BKB API URL. CLI flags and matching env vars
+override the config. API keys and PEM contents still belong in env or
+secret files.
 
 The worker auto-detects authenticated `claude` and `codex` CLIs at
 startup and wires the LLM scanners accordingly:

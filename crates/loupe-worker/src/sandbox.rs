@@ -28,8 +28,7 @@ pub const DISABLE_SANDBOX_ENV: &str = "LOUPE_DISABLE_SANDBOX";
 /// should warn loudly). Errors if `bwrap` is missing AND the disable
 /// env var is unset — that's a hard fatal for the worker.
 pub fn probe_at_startup() -> Result<bool> {
-	let disabled = std::env::var_os(DISABLE_SANDBOX_ENV).is_some_and(|v| !v.is_empty());
-	if disabled {
+	if sandbox_disabled() {
 		return Ok(false);
 	}
 	let status = std::process::Command::new(BWRAP_BIN)
@@ -67,7 +66,7 @@ impl SandboxBuilder {
 	/// New builder targeting a worktree on disk. The `workdir` is bind-
 	/// mounted read-only into the sandbox at `/workdir`.
 	pub fn new(workdir: impl Into<PathBuf>) -> Self {
-		let disabled = std::env::var_os(DISABLE_SANDBOX_ENV).is_some_and(|v| !v.is_empty());
+		let disabled = sandbox_disabled();
 		Self {
 			workdir: workdir.into(),
 			allow_network: false,
@@ -237,6 +236,16 @@ impl SandboxBuilder {
 		}
 		cmd
 	}
+}
+
+fn sandbox_disabled() -> bool {
+	std::env::var_os(DISABLE_SANDBOX_ENV).is_some_and(|v| {
+		let value = v.to_string_lossy();
+		if value.is_empty() {
+			return false;
+		}
+		!matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+	})
 }
 
 fn sandbox_path() -> String {
@@ -570,6 +579,21 @@ mod tests {
 		b.disabled = true;
 		let cmd = b.build("/bin/echo");
 		assert_eq!(cmd.as_std().get_program(), "/bin/echo");
+	}
+
+	#[test]
+	fn disable_sandbox_env_accepts_false_values() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		let old = std::env::var_os(DISABLE_SANDBOX_ENV);
+		std::env::set_var(DISABLE_SANDBOX_ENV, "false");
+		assert!(!sandbox_disabled());
+		std::env::set_var(DISABLE_SANDBOX_ENV, "1");
+		assert!(sandbox_disabled());
+		if let Some(old) = old {
+			std::env::set_var(DISABLE_SANDBOX_ENV, old);
+		} else {
+			std::env::remove_var(DISABLE_SANDBOX_ENV);
+		}
 	}
 
 	#[tokio::test]

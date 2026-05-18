@@ -63,7 +63,6 @@ RUN chmod 0755 /usr/local/bin/loupe-container-entrypoint \
 	&& install -d -o loupe-worker -g loupe-worker -m 0700 /var/lib/loupe-worker /var/cache/loupe-worker /run/loupe
 USER loupe-worker
 WORKDIR /var/lib/loupe-worker
-ENV HOME=/var/lib/loupe-worker \
-	LOUPE_CACHE_DIR=/var/cache/loupe-worker
+ENV HOME=/var/lib/loupe-worker
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/loupe-container-entrypoint"]
 CMD ["loupe-worker", "run"]

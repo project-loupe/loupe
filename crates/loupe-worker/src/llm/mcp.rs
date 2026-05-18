@@ -29,7 +29,7 @@ pub const SANDBOX_CLIENT_CERT: &str = "/loupe/worker.pem";
 pub const SANDBOX_CLIENT_KEY: &str = "/loupe/worker.key";
 pub const SANDBOX_BKB_MCP_BIN: &str = "/loupe/bkb-mcp";
 
-/// BKB HTTP API endpoint loupe always pins for the bkb-mcp child.
+/// Default BKB HTTP API endpoint for the bkb-mcp child.
 ///
 /// bkb-mcp's own compiled-in default (`http://127.0.0.1:3000`) is
 /// handy for a developer running the BKB stack locally but useless
@@ -38,11 +38,9 @@ pub const SANDBOX_BKB_MCP_BIN: &str = "/loupe/bkb-mcp";
 /// out of the box pointing at the public hosted instance, with
 /// uniform behaviour across the worker fleet.
 ///
-/// Operators with a self-hosted BKB instance: patch this constant
-/// (recompile) — there's no env-var escape hatch on purpose, so
-/// findings emitted by different workers can't disagree about
-/// where their bkb context came from.
-pub const BKB_API_URL: &str = "https://bitcoinknowledge.dev";
+/// Operators with a self-hosted BKB instance can override this through
+/// the worker config.
+pub const DEFAULT_BKB_API_URL: &str = "https://bitcoinknowledge.dev";
 
 /// Everything the MCP child needs to talk back to loupe-server.
 /// Built once at worker startup from the `loupe-worker run` CLI
@@ -63,6 +61,8 @@ pub struct McpContext {
 	/// alongside loupe's `submit_finding`. None means "host doesn't
 	/// have bkb-mcp installed; advertise loupe only."
 	pub bkb_mcp_path: Option<PathBuf>,
+	/// HTTP API endpoint for the optional bkb-mcp child.
+	pub bkb_api_url: String,
 }
 
 #[derive(Debug, Clone)]

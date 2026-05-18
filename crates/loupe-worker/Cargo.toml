@@ -30,6 +30,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 walkdir = { workspace = true }
@@ -38,7 +39,6 @@ walkdir = { workspace = true }
 loupe-server = { path = "../loupe-server" }
 loupe-storage = { path = "../loupe-storage" }
 tempfile = { workspace = true }
-toml = { workspace = true }
 
 [lints]
 workspace = true

@@ -144,7 +144,11 @@ contrib/docker/deploy-worker.sh
 
 The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 `0600`, owned by the container UID `10002`. It contains the worker certificate
-bundle and whichever LLM API keys are set.
+bundle and whichever LLM API keys are set. It also writes
+`/etc/loupe-container/worker.config.toml` for non-secret worker settings
+(cache, logging, scanner defaults, BKB API URL, and Claude/Codex
+model/effort), mounts it read-only into the container, and sets
+`LOUPE_WORKER_CONFIG`.
 
 ## Secret Handling
 

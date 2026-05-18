@@ -1,0 +1,47 @@
+# Sample loupe-worker config. Settings here act as defaults; matching
+# CLI flags or env vars override them at startup.
+#
+# Point the worker at it with `loupe-worker run --config
+# /etc/loupe/worker.config.toml` or
+# `LOUPE_WORKER_CONFIG=/etc/loupe/worker.config.toml`.
+#
+# Path-typed fields are interpreted relative to the directory holding
+# this file.
+
+[server]
+url = "https://loupe.example.com:8443"
+
+[tls]
+# Optional when worker TLS PEM/base64 env vars are set.
+ca_cert = "ca.pem"
+cert = "worker.pem"
+key = "worker.key"
+
+[cache]
+dir = "/var/cache/loupe-worker"
+max_gb = 40
+
+[runtime]
+max_workdir_gb = 5
+disable_sandbox = false
+
+[logging]
+level = "info"
+json = false
+agent_output = false
+
+[agents.claude]
+model = "claude-opus-4-7"
+effort = "max"
+
+[agents.codex]
+model = "gpt-5.5"
+effort = "xhigh"
+
+[scanner_defaults]
+max_concurrent_files = 8
+max_file_bytes = 65536
+per_request_timeout_seconds = 1800
+
+[bkb]
+api_url = "https://bitcoinknowledge.dev"

@@ -27,14 +27,15 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
-	SANDBOX_LOUPE_BIN,
+	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
-use super::{summarize_cli_stream_for_error, LlmBackend, LlmRequest, LlmResponse};
+use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-7";
+pub const DEFAULT_CLAUDE_EFFORT: &str = "max";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 
 /// Fixed sandbox path for the per-call MCP config file claude reads.
@@ -83,8 +84,8 @@ fn prepare_mcp_scratch(
 	// Conditionally attach bkb-mcp. The binary is bind-mounted under
 	// /loupe/bkb-mcp by the caller (see `run` below). bkb-mcp itself
 	// is a thin client to the BKB HTTP API: we always override its
-	// compiled-in localhost default to the public hosted instance
-	// (see [`BKB_API_URL`]) by setting `BKB_API_URL` in the per-MCP
+	// compiled-in localhost default to the worker-configured API URL
+	// by setting `BKB_API_URL` in the per-MCP
 	// `env` block — that's MCP-server-scoped, doesn't leak into
 	// claude or other potential sibling MCP children.
 	if ctx.bkb_mcp_path.is_some() {
@@ -94,7 +95,7 @@ fn prepare_mcp_scratch(
 				"type": "stdio",
 				"command": SANDBOX_BKB_MCP_BIN,
 				"args": [],
-				"env": { "BKB_API_URL": BKB_API_URL }
+				"env": { "BKB_API_URL": ctx.bkb_api_url.as_str() }
 			}),
 		);
 	}
@@ -112,16 +113,36 @@ fn prepare_mcp_scratch(
 
 pub struct ClaudeCliBackend {
 	bin: String,
+	agent: CliModelConfig,
 	mcp: Option<McpContext>,
+	log_agent_output: bool,
 }
 
 impl ClaudeCliBackend {
 	pub fn new() -> Self {
-		Self { bin: CLAUDE_BIN.to_owned(), mcp: None }
+		Self {
+			bin: CLAUDE_BIN.to_owned(),
+			agent: CliModelConfig {
+				model: DEFAULT_CLAUDE_MODEL.to_owned(),
+				effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
+			},
+			mcp: None,
+			log_agent_output: false,
+		}
 	}
 
 	pub fn with_bin(bin: impl Into<String>) -> Self {
-		Self { bin: bin.into(), mcp: None }
+		Self { bin: bin.into(), ..Self::new() }
+	}
+
+	pub fn with_agent_config(mut self, agent: CliModelConfig) -> Self {
+		self.agent = agent;
+		self
+	}
+
+	pub fn with_log_agent_output(mut self, enabled: bool) -> Self {
+		self.log_agent_output = enabled;
+		self
 	}
 
 	/// Attach an MCP server to every invocation. When set, each call
@@ -150,6 +171,8 @@ impl LlmBackend for ClaudeCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			workdir = %req.workdir.display(),
+			model = %self.agent.model,
+			effort = %self.agent.effort,
 			prompt_chars = req.prompt.chars().count(),
 			timeout_ms = req.timeout.as_millis() as u64,
 			"claude-cli: invoking",
@@ -215,7 +238,9 @@ impl LlmBackend for ClaudeCliBackend {
 		};
 
 		let mut cmd = sandbox.build(&self.bin);
-		cmd.arg("--dangerously-skip-permissions").arg("-p").arg(&req.prompt);
+		for arg in claude_invocation_args(&self.agent, &req.prompt) {
+			cmd.arg(arg);
+		}
 		if _mcp_scratch.is_some() {
 			cmd.arg("--mcp-config").arg(SANDBOX_MCP_CONFIG);
 		}
@@ -288,14 +313,14 @@ impl LlmBackend for ClaudeCliBackend {
 			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
 		// Debug instrumentation hooks (no-ops when env vars unset):
 		//
-		// - LOUPE_LOG_AGENT_OUTPUT=1 dumps the full agent stdout/stderr at
-		//   info level so a debugging session can see the agent's prose
-		//   (the regular flow only logs char counts).
+		// - worker config `[logging].agent_output = true` dumps the full
+		//   agent stdout/stderr at info level so a debugging session can
+		//   see the agent's prose (the regular flow only logs char counts).
 		// - claude's stderr on a *successful* exit is otherwise dropped;
 		//   we surface non-empty stderr content at info regardless when
 		//   the env var is set, which catches claude's own diagnostics
 		//   ("rate-limit hit, retrying", auth warnings, etc.).
-		if std::env::var_os("LOUPE_LOG_AGENT_OUTPUT").is_some_and(|v| !v.is_empty()) {
+		if self.log_agent_output {
 			tracing::info!(
 				backend = BACKEND_ID,
 				agent_stdout = %text,
@@ -319,6 +344,18 @@ impl LlmBackend for ClaudeCliBackend {
 		);
 		Ok(LlmResponse { text, backend_id: BACKEND_ID })
 	}
+}
+
+fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
+	vec![
+		"--dangerously-skip-permissions".to_owned(),
+		"--model".to_owned(),
+		agent.model.clone(),
+		"--effort".to_owned(),
+		agent.effort.clone(),
+		"-p".to_owned(),
+		prompt.to_owned(),
+	]
 }
 
 #[cfg(test)]
@@ -410,5 +447,17 @@ mod tests {
 				|| msg.contains("exited"),
 			"unexpected error: {err}"
 		);
+	}
+
+	#[test]
+	fn invocation_args_include_configured_model_and_effort() {
+		let args = claude_invocation_args(
+			&CliModelConfig { model: "claude-test".into(), effort: "xhigh".into() },
+			"hello",
+		);
+
+		assert!(args.windows(2).any(|w| w == ["--model", "claude-test"]));
+		assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
+		assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
 	}
 }

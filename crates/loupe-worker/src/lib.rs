@@ -1,6 +1,7 @@
 //! `loupe-worker` library surface.
 
 pub mod client;
+pub mod config;
 pub mod fingerprint;
 pub mod llm;
 pub mod mcp;

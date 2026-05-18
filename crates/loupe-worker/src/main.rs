@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_verifier_backend, claude_auth_available, claude_available,
 	codex_auth_available, codex_available, ClaudeCliBackend, McpContext, McpTlsSource,
@@ -37,16 +38,19 @@ enum Cmd {
 	/// Run the long-running scan/verify worker loop. Default when no
 	/// subcommand is given, so the existing
 	/// `loupe-worker --server-url ... ...` invocation keeps working.
-	Run(RunArgs),
+	Run(Box<RunArgs>),
 	/// Serve the MCP protocol over stdio for one agent invocation.
 	/// Spawned by `claude --mcp-config <file>` from inside the
 	/// sandbox the runner sets up; reads JSON-RPC from stdin, writes
 	/// to stdout, logs to stderr.
-	McpServe(McpServeArgs),
+	McpServe(Box<McpServeArgs>),
 }
 
 #[derive(Debug, Parser)]
 struct RunArgs {
+	/// Path to worker config TOML. CLI/env values override file settings.
+	#[arg(long, env = "LOUPE_WORKER_CONFIG")]
+	config: Option<PathBuf>,
 	/// Base URL of the loupe-server (e.g. https://loupe-server:8443).
 	#[arg(long, env = "LOUPE_SERVER_URL")]
 	server_url: Option<reqwest::Url>,
@@ -81,8 +85,47 @@ struct RunArgs {
 	#[arg(long, env = "LOUPE_CACHE_DIR")]
 	cache_dir: Option<PathBuf>,
 	/// Maximum cache size in GB before LRU eviction kicks in.
-	#[arg(long, default_value_t = 40)]
-	max_cache_gb: u64,
+	#[arg(long, env = "LOUPE_MAX_CACHE_GB")]
+	max_cache_gb: Option<u64>,
+	/// Maximum checked-out worktree size in GB before a job fails.
+	#[arg(long, env = "LOUPE_MAX_WORKDIR_GB")]
+	max_workdir_gb: Option<u64>,
+	/// Disable bubblewrap sandboxing. Intended for development only.
+	#[arg(long, env = "LOUPE_DISABLE_SANDBOX", value_parser = clap::builder::BoolishValueParser::new())]
+	disable_sandbox: Option<bool>,
+	/// Logging level: trace, debug, info, warn, or error.
+	#[arg(long, env = "LOUPE_LOG_LEVEL")]
+	log_level: Option<String>,
+	/// Emit structured JSON logs.
+	#[arg(long, env = "LOUPE_LOG_JSON", value_parser = clap::builder::BoolishValueParser::new())]
+	log_json: Option<bool>,
+	/// Dump full successful agent stdout/stderr at info level.
+	#[arg(long, env = "LOUPE_LOG_AGENT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
+	log_agent_output: Option<bool>,
+	/// Claude model for every Claude-backed invocation.
+	#[arg(long, env = "LOUPE_CLAUDE_MODEL")]
+	claude_model: Option<String>,
+	/// Claude effort level: low, medium, high, xhigh, or max.
+	#[arg(long, env = "LOUPE_CLAUDE_EFFORT")]
+	claude_effort: Option<String>,
+	/// Codex model for every Codex-backed invocation.
+	#[arg(long, env = "LOUPE_CODEX_MODEL")]
+	codex_model: Option<String>,
+	/// Codex reasoning effort: none, low, medium, high, or xhigh.
+	#[arg(long, env = "LOUPE_CODEX_EFFORT")]
+	codex_effort: Option<String>,
+	/// Fleet-wide default for concurrent per-file LLM sessions.
+	#[arg(long, env = "LOUPE_MAX_CONCURRENT_FILES")]
+	max_concurrent_files: Option<usize>,
+	/// Fleet-wide default max source file size for LLM review.
+	#[arg(long, env = "LOUPE_MAX_FILE_BYTES")]
+	max_file_bytes: Option<u64>,
+	/// Fleet-wide default per-agent request timeout.
+	#[arg(long, env = "LOUPE_PER_REQUEST_TIMEOUT_SECONDS")]
+	per_request_timeout_seconds: Option<u64>,
+	/// BKB HTTP API URL for the optional bkb-mcp child.
+	#[arg(long, env = "LOUPE_BKB_API_URL")]
+	bkb_api_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -138,20 +181,36 @@ struct McpServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	init_tracing();
 	let cli = Cli::parse();
 	match cli.cmd {
-		Some(Cmd::Run(args)) => run_worker(args).await,
-		Some(Cmd::McpServe(args)) => run_mcp_serve(args).await,
+		Some(Cmd::Run(args)) => {
+			let cfg = load_worker_config(&args)?;
+			init_tracing(&cfg.logging);
+			run_worker(*args, cfg).await
+		},
+		Some(Cmd::McpServe(args)) => {
+			init_tracing_from_env();
+			run_mcp_serve(*args).await
+		},
 		// Default subcommand for backwards compatibility with the
 		// existing `loupe-worker --server-url ...` invocation pattern.
-		None => run_worker(cli.run).await,
+		None => {
+			let cfg = load_worker_config(&cli.run)?;
+			init_tracing(&cfg.logging);
+			run_worker(cli.run, cfg).await
+		},
 	}
 }
 
-async fn run_worker(args: RunArgs) -> Result<()> {
-	let server_url = args.server_url.context("--server-url / LOUPE_SERVER_URL is required")?;
-	let cache_dir = args.cache_dir.context("--cache-dir / LOUPE_CACHE_DIR is required")?;
+async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
+	let server_url = cfg
+		.server_url
+		.clone()
+		.context("--server-url / LOUPE_SERVER_URL / [server].url in worker config is required")?;
+	let cache_dir = cfg.cache.dir.clone();
+	if cfg.runtime.disable_sandbox {
+		std::env::set_var(sandbox::DISABLE_SANDBOX_ENV, "1");
+	}
 	let tls = read_worker_tls(
 		args.ca_cert_pem,
 		args.ca_cert_pem_b64,
@@ -159,9 +218,9 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		args.cert_pem_b64,
 		args.key_pem,
 		args.key_pem_b64,
-		args.ca_cert,
-		args.cert,
-		args.key,
+		cfg.tls.ca_cert.clone(),
+		cfg.tls.cert.clone(),
+		cfg.tls.key.clone(),
 	)?;
 
 	let client = Arc::new(ServerClient::new(
@@ -170,7 +229,7 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		&tls.key_pem,
 		server_url.clone(),
 	)?);
-	let cache = Arc::new(RepoCache::new(cache_dir.clone(), args.max_cache_gb * 1_073_741_824)?);
+	let cache = Arc::new(RepoCache::new(cache_dir.clone(), cfg.cache.max_gb * 1_073_741_824)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 
@@ -256,12 +315,21 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		server_url: server_url.to_string(),
 		tls: tls.source,
 		bkb_mcp_path: bkb_mcp_path.clone(),
+		bkb_api_url: cfg.bkb.api_url.clone(),
 	};
 
 	if claude {
-		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx.clone()));
-		scanners
-			.push(Arc::new(LlmCodeReviewScanner::new(backend).with_bkb(bkb_mcp_path.is_some())));
+		let backend = Arc::new(
+			ClaudeCliBackend::new()
+				.with_agent_config(cfg.agents.claude.clone())
+				.with_log_agent_output(cfg.logging.agent_output)
+				.with_mcp_context(mcp_ctx.clone()),
+		);
+		scanners.push(Arc::new(
+			LlmCodeReviewScanner::new(backend)
+				.with_config(cfg.scanner_defaults.clone())
+				.with_bkb(bkb_mcp_path.is_some()),
+		));
 		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
 	} else {
 		tracing::info!(
@@ -275,11 +343,19 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 	// for the new verify-mode tool surface (`submit_verdict` /
 	// `submit_patch` / `validate_patch`); without it, the agent
 	// has no way to commit a verdict.
-	let backend = build_verifier_backend(Some(mcp_ctx), codex, claude)?;
+	let backend = build_verifier_backend(
+		Some(mcp_ctx),
+		codex,
+		claude,
+		cfg.agents.codex.clone(),
+		cfg.agents.claude.clone(),
+		cfg.logging.agent_output,
+	)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
-	let runner = Runner::new(client, cache, scanners);
+	let runner =
+		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
 
 	let cancel = CancellationToken::new();
 	let cancel_for_signal = cancel.clone();
@@ -327,6 +403,33 @@ async fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
 		"loupe-mcp: starting stdio server",
 	);
 	mcp::run_stdio_server(client, args.repo_id, args.job_id, args.finding_id, args.workdir).await
+}
+
+fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
+	WorkerConfig::load(
+		args.config.as_deref(),
+		WorkerConfigOverrides {
+			server_url: args.server_url.clone(),
+			ca_cert: args.ca_cert.clone(),
+			cert: args.cert.clone(),
+			key: args.key.clone(),
+			cache_dir: args.cache_dir.clone(),
+			max_cache_gb: args.max_cache_gb,
+			max_workdir_gb: args.max_workdir_gb,
+			disable_sandbox: args.disable_sandbox,
+			log_level: args.log_level.clone(),
+			log_json: args.log_json,
+			log_agent_output: args.log_agent_output,
+			claude_model: args.claude_model.clone(),
+			claude_effort: args.claude_effort.clone(),
+			codex_model: args.codex_model.clone(),
+			codex_effort: args.codex_effort.clone(),
+			max_concurrent_files: args.max_concurrent_files,
+			max_file_bytes: args.max_file_bytes,
+			per_request_timeout_seconds: args.per_request_timeout_seconds,
+			bkb_api_url: args.bkb_api_url.clone(),
+		},
+	)
 }
 
 struct WorkerTls {
@@ -421,8 +524,9 @@ fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
 }
 
 /// Initialise tracing. Defaults to the human-readable formatter; set
-/// `LOUPE_LOG_JSON=1` to switch to structured JSON output. Filter level
-/// is taken from `RUST_LOG`.
+/// `[logging].json = true` or `LOUPE_LOG_JSON=true` to switch to
+/// structured JSON output. `RUST_LOG` remains the compatibility escape
+/// hatch for module-level filters; otherwise `[logging].level` is used.
 ///
 /// MCP-serve mode pipes its tracing to stderr explicitly: stdout is
 /// reserved for the JSON-RPC stream, and the agent will choke on any
@@ -430,11 +534,10 @@ fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
 /// (also stderr by `tracing_subscriber` default), so the change is
 /// invisible to the long-running worker but load-bearing for the MCP
 /// child.
-fn init_tracing() {
-	let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-	let json = std::env::var_os("LOUPE_LOG_JSON").map(|v| !v.is_empty()).unwrap_or(false);
-	if json {
+fn init_tracing(logging: &LoggingConfig) {
+	let env_filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&logging.level));
+	if logging.json {
 		tracing_subscriber::fmt()
 			.json()
 			.with_writer(std::io::stderr)
@@ -442,6 +545,28 @@ fn init_tracing() {
 			.init();
 	} else {
 		tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(env_filter).init();
+	}
+}
+
+fn init_tracing_from_env() {
+	let logging = LoggingConfig {
+		level: "info".to_owned(),
+		json: bool_env("LOUPE_LOG_JSON").unwrap_or(false),
+		agent_output: false,
+	};
+	init_tracing(&logging);
+}
+
+fn bool_env(name: &str) -> Option<bool> {
+	let value = std::env::var_os(name)?;
+	let value = value.to_string_lossy();
+	if value.is_empty() {
+		return Some(false);
+	}
+	match value.to_ascii_lowercase().as_str() {
+		"1" | "true" | "yes" | "on" => Some(true),
+		"0" | "false" | "no" | "off" => Some(false),
+		_ => Some(true),
 	}
 }
 
