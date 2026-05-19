@@ -47,9 +47,10 @@ pub struct ScannerConfig {
 	/// File extensions the walk will consider, lower-cased and without
 	/// the leading dot (e.g. `["rs", "cpp"]`).
 	pub include_extensions: Vec<String>,
-	/// Substrings that disqualify a path. We match against the full
-	/// path string (forward-slash form on Unix), so `/target` matches
-	/// `…/target/release/foo.rs` and `node_modules` matches anywhere.
+	/// Exclusion patterns that disqualify a path. Built-in patterns
+	/// use `dir:<name>` for exact path components and `file:<glob>`
+	/// for basename matches. Legacy custom strings still match as
+	/// path substrings, except `/name` matches an exact component.
 	pub exclude_path_substrings: Vec<String>,
 }
 
@@ -127,34 +128,35 @@ fn default_extensions() -> Vec<String> {
 fn default_excludes() -> Vec<String> {
 	[
 		// Rust / Java / general "tests" dirs and matching filename suffixes.
-		"tests",
-		"/test",
-		"examples",
-		"__tests__",
-		"/test_",
-		"_test.",
-		".test.",
-		".spec.",
+		"dir:tests",
+		"dir:test",
+		"dir:examples",
+		"dir:__tests__",
+		"file:test_*.*",
+		"file:*_test.*",
+		"file:*_tests.*",
+		"file:*.test.*",
+		"file:*.spec.*",
 		// Build artefacts across ecosystems.
-		"/target",
-		"/build",
-		"/dist",
-		"/out",
-		"/.next",
-		"/.nuxt",
-		"/coverage",
+		"dir:target",
+		"dir:build",
+		"dir:dist",
+		"dir:out",
+		"dir:.next",
+		"dir:.nuxt",
+		"dir:coverage",
 		// Vendored deps.
-		"node_modules",
-		"/vendor",
-		"/.venv",
-		"/venv",
-		"/env",
+		"dir:node_modules",
+		"dir:vendor",
+		"dir:.venv",
+		"dir:venv",
+		"dir:env",
 		// Caches.
-		"__pycache__",
-		"/.tox",
-		"/.gradle",
-		"/.mypy_cache",
-		"/.pytest_cache",
+		"dir:__pycache__",
+		"dir:.tox",
+		"dir:.gradle",
+		"dir:.mypy_cache",
+		"dir:.pytest_cache",
 	]
 	.into_iter()
 	.map(String::from)
@@ -475,16 +477,72 @@ fn parse_workspace_members(cargo_toml: &Path) -> Option<Vec<String>> {
 }
 
 fn is_excluded_dir(path: &Path, cfg: &ScannerConfig) -> bool {
-	let s = path.to_string_lossy();
-	if s.contains("/.git/") || s.ends_with("/.git") {
+	if has_component(path, ".git") {
 		return true;
 	}
-	cfg.exclude_path_substrings.iter().any(|sub| s.contains(sub.as_str()))
+	cfg.exclude_path_substrings.iter().any(|pattern| matches_exclude(path, pattern))
 }
 
 fn is_excluded_path(path: &Path, excludes: &[String]) -> bool {
-	let s = path.to_string_lossy();
-	excludes.iter().any(|e| s.contains(e.as_str()))
+	excludes.iter().any(|pattern| matches_exclude(path, pattern))
+}
+
+fn matches_exclude(path: &Path, pattern: &str) -> bool {
+	if let Some(component) = pattern.strip_prefix("dir:") {
+		return has_component(path, component);
+	}
+	if let Some(glob) = pattern.strip_prefix("file:") {
+		return path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.map(|name| wildcard_match(glob, name))
+			.unwrap_or(false);
+	}
+	if let Some(component) = pattern.strip_prefix('/') {
+		if !component.contains('/') {
+			return has_component(path, component);
+		}
+	}
+	path.to_string_lossy().contains(pattern)
+}
+
+fn has_component(path: &Path, needle: &str) -> bool {
+	path.components().any(|component| component.as_os_str() == needle)
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+	let mut remainder = text;
+	let mut parts = pattern.split('*').peekable();
+	let anchored_start = !pattern.starts_with('*');
+	let anchored_end = !pattern.ends_with('*');
+
+	if let Some(first) = parts.next() {
+		if !first.is_empty() {
+			if anchored_start {
+				let Some(rest) = remainder.strip_prefix(first) else { return false };
+				remainder = rest;
+			} else if let Some(pos) = remainder.find(first) {
+				remainder = &remainder[pos + first.len()..];
+			} else {
+				return false;
+			}
+		}
+	}
+
+	let mut last = "";
+	for part in parts {
+		last = part;
+		if part.is_empty() {
+			continue;
+		}
+		if let Some(pos) = remainder.find(part) {
+			remainder = &remainder[pos + part.len()..];
+		} else {
+			return false;
+		}
+	}
+
+	!anchored_end || last.is_empty() || remainder.is_empty()
 }
 
 fn has_allowed_extension(path: &Path, exts: &[String]) -> bool {
@@ -548,8 +606,8 @@ mod tests {
 			assert!(cfg.include_extensions.iter().any(|e| e == ext), "missing: {ext}");
 		}
 		// node_modules and target are excluded out of the box.
-		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "node_modules"));
-		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "/target"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:node_modules"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:target"));
 	}
 
 	#[test]
@@ -604,6 +662,52 @@ mod tests {
 		assert!(names.iter().any(|n| n == "src/index.js"), "real source missing: {names:?}");
 		assert!(names.iter().all(|n| !n.contains("node_modules")), "leak: {names:?}");
 		assert!(names.iter().all(|n| !n.starts_with("dist/")), "leak: {names:?}");
+	}
+
+	#[test]
+	fn directory_excludes_match_exact_components_not_prefixes() {
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(
+			tmp.path(),
+			&[
+				("src/outbound_payment.rs", "// production source\n"),
+				("src/out/generated.rs", "// generated output\n"),
+				("src/distill.rs", "// production source\n"),
+				("src/dist/bundle.rs", "// generated output\n"),
+			],
+		);
+
+		let files = walk_source_files(tmp.path(), &ScannerConfig::default());
+		let names: Vec<String> = files
+			.iter()
+			.map(|p| p.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned())
+			.collect();
+		assert!(names.iter().any(|n| n == "src/outbound_payment.rs"), "names: {names:?}");
+		assert!(names.iter().any(|n| n == "src/distill.rs"), "names: {names:?}");
+		assert!(names.iter().all(|n| !n.starts_with("src/out/")), "names: {names:?}");
+		assert!(names.iter().all(|n| !n.starts_with("src/dist/")), "names: {names:?}");
+	}
+
+	#[test]
+	fn file_test_patterns_match_common_test_names() {
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(
+			tmp.path(),
+			&[
+				("src/lib.rs", "// production source\n"),
+				("src/test_utils.rs", "// test helper\n"),
+				("src/accountable_tests.rs", "// test module\n"),
+				("src/payment.test.ts", "// js-style test\n"),
+				("src/payment.spec.ts", "// js-style test\n"),
+			],
+		);
+
+		let files = walk_source_files(tmp.path(), &ScannerConfig::default());
+		let names: Vec<String> = files
+			.iter()
+			.map(|p| p.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned())
+			.collect();
+		assert_eq!(names, vec!["src/lib.rs"]);
 	}
 
 	#[test]
