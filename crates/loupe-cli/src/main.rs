@@ -5,7 +5,7 @@
 
 mod render;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -641,12 +641,39 @@ async fn worker_register(
 	}
 	let serialised = serde_json::to_string_pretty(&bundle)?;
 	if let Some(path) = a.out {
-		std::fs::write(&path, &serialised)
-			.with_context(|| format!("writing bundle to {}", path.display()))?;
+		write_secret_file(&path, serialised.as_bytes())?;
 		println!("worker_id={} bundle written to {}", bundle.worker_id, path.display());
 	} else {
 		println!("{serialised}");
 	}
+	Ok(())
+}
+
+/// Persist secret material without exposing it to group/other users.
+///
+/// The worker registration bundle includes an mTLS private key, so we
+/// create it atomically with owner-only permissions and refuse to
+/// overwrite an existing path that may already have weaker permissions.
+fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
+	use std::io::Write;
+
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(0o600);
+	}
+
+	let mut file =
+		options.open(path).with_context(|| format!("creating secret file {}", path.display()))?;
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		file.set_permissions(std::fs::Permissions::from_mode(0o600))
+			.with_context(|| format!("setting permissions on {}", path.display()))?;
+	}
+	file.write_all(contents).with_context(|| format!("writing secret file {}", path.display()))?;
 	Ok(())
 }
 
@@ -868,6 +895,52 @@ mod tests {
 		])
 		.expect_err("clap should reject --out with --emit-env");
 		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
+
+	#[cfg(unix)]
+	fn unique_temp_dir(prefix: &str) -> PathBuf {
+		let suffix =
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let dir = std::env::temp_dir().join(format!("{prefix}-{}-{suffix}", std::process::id()));
+		std::fs::create_dir(&dir).unwrap();
+		dir
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn worker_bundle_file_is_owner_only() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = unique_temp_dir("loupectl-worker-bundle-perms");
+		let path = dir.join("worker.json");
+
+		write_secret_file(&path, b"{\"client_key_pem\":\"PRIVATE KEY\"}").unwrap();
+
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		assert_eq!(
+			mode, 0o600,
+			"worker bundle persisted by --out must be owner-only, got mode {mode:o}",
+		);
+	}
+
+	#[test]
+	fn secret_file_refuses_to_overwrite_existing_path() {
+		let suffix =
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let dir = std::env::temp_dir()
+			.join(format!("loupectl-worker-bundle-overwrite-{}-{suffix}", std::process::id()));
+		std::fs::create_dir(&dir).unwrap();
+		let path = dir.join("worker.json");
+		std::fs::write(&path, b"existing").unwrap();
+
+		let err = write_secret_file(&path, b"replacement").expect_err("existing path is refused");
+		let contents = std::fs::read(&path).unwrap();
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		assert!(err.to_string().contains("creating secret file"), "unexpected error: {err}");
+		assert_eq!(contents, b"existing");
 	}
 
 	#[test]
