@@ -220,6 +220,7 @@ struct WorkerRegisterArgs {
 
 #[derive(Debug, Subcommand)]
 enum JobCmd {
+	/// List jobs with the newest row printed last.
 	List,
 	Get {
 		id: i64,
@@ -232,7 +233,7 @@ enum JobCmd {
 
 #[derive(Debug, Subcommand)]
 enum FindingCmd {
-	/// List recent findings for a repo (newest first, capped server-side).
+	/// List recent findings for a repo (recent page, newest row printed last).
 	List { repo_id: i64 },
 	/// FTS5 keyword search over a repo's findings (title, description,
 	/// file path). Free-form keywords are sanitized server-side; the
@@ -747,7 +748,7 @@ async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Re
 async fn job_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
 	let resp = client.get(url(base, "/v1/jobs")).send().await?;
 	let jobs: Vec<JobInfo> = resp.error_for_status()?.json().await?;
-	for j in jobs {
+	for j in jobs.into_iter().rev() {
 		println!(
 			"{:>4}\trepo={}\tkind={:?}\tstate={:?}\tattempts={}\thead={:?}",
 			j.job_id, j.repo_id, j.kind, j.state, j.attempts, j.head_sha,
@@ -777,7 +778,7 @@ async fn job_retry(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Re
 async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i64) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))).send().await?;
 	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
-	for f in body.findings {
+	for f in body.findings.into_iter().rev() {
 		let loc = match (f.file_path.as_deref(), f.line_start) {
 			(Some(p), Some(l)) => format!("{p}:{l}"),
 			(Some(p), None) => p.to_string(),
