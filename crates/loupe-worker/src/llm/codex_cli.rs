@@ -81,6 +81,8 @@ pub struct CodexCliBackend {
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
 	log_agent_output: bool,
+	#[cfg(test)]
+	disable_sandbox: bool,
 }
 
 impl CodexCliBackend {
@@ -93,6 +95,8 @@ impl CodexCliBackend {
 			},
 			mcp: None,
 			log_agent_output: false,
+			#[cfg(test)]
+			disable_sandbox: false,
 		}
 	}
 
@@ -107,6 +111,12 @@ impl CodexCliBackend {
 
 	pub fn with_log_agent_output(mut self, enabled: bool) -> Self {
 		self.log_agent_output = enabled;
+		self
+	}
+
+	#[cfg(test)]
+	fn with_sandbox_disabled_for_tests(mut self) -> Self {
+		self.disable_sandbox = true;
 		self
 	}
 
@@ -144,7 +154,16 @@ impl LlmBackend for CodexCliBackend {
 		);
 		let started = std::time::Instant::now();
 
-		let mut sandbox = SandboxBuilder::new(&req.workdir)
+		#[cfg(test)]
+		let sandbox_builder = if self.disable_sandbox {
+			SandboxBuilder::disabled_for_tests(&req.workdir)
+		} else {
+			SandboxBuilder::new(&req.workdir)
+		};
+		#[cfg(not(test))]
+		let sandbox_builder = SandboxBuilder::new(&req.workdir);
+
+		let mut sandbox = sandbox_builder
 			.allow_network()
 			// Per-user installs (`npm i -g @openai/codex` with a non-root
 			// prefix, etc.) live outside the default sandbox mounts —
@@ -226,6 +245,7 @@ impl LlmBackend for CodexCliBackend {
 			cmd.arg(arg);
 		}
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+		cmd.kill_on_drop(true);
 
 		let mut child = cmd
 			.spawn()
@@ -335,6 +355,7 @@ fn codex_invocation_args(
 
 #[cfg(test)]
 mod tests {
+	use std::path::Path;
 	use std::time::Duration;
 
 	use tokio_util::sync::CancellationToken;
@@ -359,6 +380,54 @@ mod tests {
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
+	}
+
+	#[cfg(unix)]
+	fn sh_single_quote(path: &Path) -> String {
+		format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+	}
+
+	#[cfg(unix)]
+	fn write_fake_cli(bin_path: &Path, pid_path: &Path, survived_path: &Path) {
+		use std::os::unix::fs::PermissionsExt;
+
+		std::fs::write(
+			bin_path,
+			format!(
+				"#!/bin/sh\necho $$ > {}\nsleep 2\necho survived > {}\nsleep 30\n",
+				sh_single_quote(pid_path),
+				sh_single_quote(survived_path),
+			),
+		)
+		.unwrap();
+		std::fs::set_permissions(bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+	}
+
+	#[cfg(unix)]
+	fn process_is_running(pid: &str) -> bool {
+		let output = std::process::Command::new("ps")
+			.args(["-o", "stat=", "-p", pid])
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null())
+			.output();
+		let Ok(output) = output else {
+			return false;
+		};
+		if !output.status.success() {
+			return false;
+		}
+		let stat = String::from_utf8_lossy(&output.stdout);
+		let stat = stat.trim();
+		!stat.is_empty() && !stat.starts_with('Z')
+	}
+
+	#[cfg(unix)]
+	fn kill_pid(pid: &str) {
+		let _ = std::process::Command::new("kill")
+			.args(["-9", pid])
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status();
 	}
 
 	#[tokio::test]
@@ -426,6 +495,45 @@ mod tests {
 				|| msg.contains("exited")
 				|| msg.contains("preparing sandbox"),
 			"unexpected error: {err}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn timeout_kills_subprocess() {
+		let workdir = tempfile::tempdir().unwrap();
+		let scratch = tempfile::tempdir().unwrap();
+		let bin_path = scratch.path().join("fake-codex");
+		let pid_path = scratch.path().join("pid");
+		let survived_path = scratch.path().join("survived");
+		write_fake_cli(&bin_path, &pid_path, &survived_path);
+
+		let backend =
+			CodexCliBackend::with_bin(bin_path.to_string_lossy()).with_sandbox_disabled_for_tests();
+		let req = LlmRequest {
+			prompt: "irrelevant".into(),
+			workdir: workdir.path().to_path_buf(),
+			timeout: Duration::from_millis(500),
+			cancel: CancellationToken::new(),
+			repo_id: None,
+			job_id: None,
+			finding_id: None,
+		};
+
+		let err = backend.run(req).await.expect_err("must time out");
+		assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
+
+		tokio::time::sleep(Duration::from_millis(2500)).await;
+
+		let pid = std::fs::read_to_string(&pid_path).expect("fake CLI wrote pid");
+		let pid = pid.trim();
+		if process_is_running(pid) {
+			kill_pid(pid);
+			panic!("subprocess pid {pid} survived past run() timeout");
+		}
+		assert!(
+			!survived_path.exists(),
+			"fake CLI continued executing after run() returned a timeout",
 		);
 	}
 
