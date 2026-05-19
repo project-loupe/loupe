@@ -8,6 +8,8 @@ pub mod llm_code_review;
 pub mod llm_verifier;
 pub mod regex_secrets;
 
-pub use llm_code_review::{LlmCodeReviewScanner, ScannerConfig as LlmScannerConfig};
+pub use llm_code_review::LlmCodeReviewScanner;
 pub use llm_verifier::LlmVerifierScanner;
 pub use regex_secrets::RegexSecretsScanner;
+
+pub use crate::source_discovery::ScannerConfig as LlmScannerConfig;

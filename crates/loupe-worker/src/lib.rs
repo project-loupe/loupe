@@ -10,6 +10,7 @@ pub mod runner;
 pub mod sandbox;
 pub mod scanner;
 pub mod scanners;
+pub(crate) mod source_discovery;
 
 pub use client::ServerClient;
 pub use repo_cache::{RepoCache, RepoKey};
