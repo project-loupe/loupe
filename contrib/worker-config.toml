@@ -40,7 +40,7 @@ effort = "xhigh"
 
 [scanner_defaults]
 max_concurrent_files = 8
-max_file_bytes = 65536
+max_file_bytes = 2097152
 per_request_timeout_seconds = 1800
 
 [bkb]

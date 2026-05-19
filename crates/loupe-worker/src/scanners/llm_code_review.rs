@@ -57,7 +57,7 @@ impl Default for ScannerConfig {
 	fn default() -> Self {
 		Self {
 			max_concurrent_files: 8,
-			max_file_bytes: 64 * 1024,
+			max_file_bytes: 2 * 1024 * 1024,
 			per_request_timeout: DEFAULT_REQUEST_TIMEOUT,
 			include_extensions: default_extensions(),
 			exclude_path_substrings: default_excludes(),
@@ -543,6 +543,7 @@ mod tests {
 	#[test]
 	fn defaults_cover_common_languages() {
 		let cfg = ScannerConfig::default();
+		assert_eq!(cfg.max_file_bytes, 2 * 1024 * 1024);
 		for ext in ["rs", "c", "cpp", "h", "hpp", "js", "ts", "py", "go", "java", "swift"] {
 			assert!(cfg.include_extensions.iter().any(|e| e == ext), "missing: {ext}");
 		}

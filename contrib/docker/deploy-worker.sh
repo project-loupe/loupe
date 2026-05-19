@@ -151,7 +151,7 @@ build_worker_config_file() {
 
 		printf '[scanner_defaults]\n'
 		printf 'max_concurrent_files = %s\n' "${LOUPE_MAX_CONCURRENT_FILES:-8}"
-		printf 'max_file_bytes = %s\n' "${LOUPE_MAX_FILE_BYTES:-65536}"
+		printf 'max_file_bytes = %s\n' "${LOUPE_MAX_FILE_BYTES:-2097152}"
 		printf 'per_request_timeout_seconds = %s\n\n' "${LOUPE_PER_REQUEST_TIMEOUT_SECONDS:-1800}"
 
 		printf '[bkb]\n'

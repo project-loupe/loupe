@@ -15,7 +15,7 @@ const DEFAULT_CACHE_DIR: &str = "/var/cache/loupe-worker";
 const DEFAULT_MAX_CACHE_GB: u64 = 40;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_MAX_CONCURRENT_FILES: usize = 8;
-const DEFAULT_MAX_FILE_BYTES: u64 = 64 * 1024;
+const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -465,6 +465,7 @@ mod tests {
 		assert_eq!(cfg.agents.claude.effort, "max");
 		assert_eq!(cfg.agents.codex.model, "gpt-5.5");
 		assert_eq!(cfg.agents.codex.effort, "xhigh");
+		assert_eq!(cfg.scanner_defaults.max_file_bytes, 2 * 1024 * 1024);
 		assert_eq!(cfg.bkb.api_url, "https://bitcoinknowledge.dev");
 	}
 
