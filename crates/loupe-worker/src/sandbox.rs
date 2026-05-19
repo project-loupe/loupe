@@ -76,6 +76,17 @@ impl SandboxBuilder {
 		}
 	}
 
+	#[cfg(test)]
+	pub(crate) fn disabled_for_tests(workdir: impl Into<PathBuf>) -> Self {
+		Self {
+			workdir: workdir.into(),
+			allow_network: false,
+			disabled: true,
+			extra_ro_binds: Vec::new(),
+			forward_env: Vec::new(),
+		}
+	}
+
 	/// Permit outbound network. Used by LLM backends that need to reach
 	/// their provider over HTTPS. Off by default — most scanners
 	/// shouldn't need network access at all.
