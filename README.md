@@ -265,8 +265,8 @@ startup and wires the LLM scanners accordingly:
   fall into by accident; install at least one agent CLI and provide
   its API key or login state.
 
-> **LLM usage warning:** scan jobs may consume paid, metered, or
-> rate-limited LLM usage. The discovery scanner currently uses
+> **Note:** scan jobs use LLM providers and may count against paid,
+> metered, or rate-limited usage. The discovery scanner currently uses
 > `claude-cli` and can launch one Claude agent session per discovered
 > source file, so large repositories may trigger hundreds or thousands
 > of Claude CLI invocations. `codex` is used for verifier jobs after a
