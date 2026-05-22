@@ -57,6 +57,8 @@ Before installing, the host needs:
   family than discovery; falls back to `claude` if `codex` isn't
   installed. The verifier shells out to `codex exec
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
+  For API-key auth, set `CODEX_API_KEY`; `OPENAI_API_KEY` remains a
+  compatibility alias in the Docker deploy helper.
   See https://github.com/openai/codex for install instructions.
 - **`bkb-mcp`** (optional) on PATH on workers scanning bitcoin /
   lightning / cashu codebases. When the binary is present at startup,

@@ -47,14 +47,23 @@ require_secret() {
 	fi
 }
 
-emit_secret_env_var() {
+emit_secret_env_value() {
 	local name="$1"
-	local value="${!name}"
+	local value="$2"
 	if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
 		echo "error: secret env var $name must be a single line" >&2
 		exit 2
 	fi
 	printf '%s=%s\n' "$name" "$value"
+}
+
+emit_secret_env_var() {
+	local name="$1"
+	emit_secret_env_value "$name" "${!name}"
+}
+
+codex_api_key_set() {
+	secret_set CODEX_API_KEY || secret_set OPENAI_API_KEY
 }
 
 emit_secret_env() {
@@ -69,6 +78,11 @@ emit_secret_env() {
 			emit_secret_env_var "$name"
 		fi
 	done
+	if secret_set CODEX_API_KEY; then
+		emit_secret_env_var CODEX_API_KEY
+	elif secret_set OPENAI_API_KEY; then
+		emit_secret_env_value CODEX_API_KEY "$OPENAI_API_KEY"
+	fi
 }
 
 write_conf_var() {
@@ -197,11 +211,11 @@ if [ -n "$LOCAL_CODEX_AUTH_JSON" ] && [ ! -r "$LOCAL_CODEX_AUTH_JSON" ]; then
 	echo "error: CODEX_AUTH_JSON_PATH does not point to a readable file: $LOCAL_CODEX_AUTH_JSON" >&2
 	exit 2
 fi
-if [ -n "$LOCAL_CODEX_AUTH_JSON" ] && secret_set OPENAI_API_KEY; then
-	echo "warning: both CODEX_AUTH_JSON_PATH and OPENAI_API_KEY are set; codex may prefer OPENAI_API_KEY" >&2
+if [ -n "$LOCAL_CODEX_AUTH_JSON" ] && codex_api_key_set; then
+	echo "warning: CODEX_AUTH_JSON_PATH and an API key are both set; codex may prefer CODEX_API_KEY" >&2
 fi
-if ! secret_set ANTHROPIC_API_KEY && ! secret_set OPENAI_API_KEY && [ -z "$LOCAL_CODEX_AUTH_JSON" ]; then
-	echo "error: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or CODEX_AUTH_JSON_PATH for the worker" >&2
+if ! secret_set ANTHROPIC_API_KEY && ! codex_api_key_set && [ -z "$LOCAL_CODEX_AUTH_JSON" ]; then
+	echo "error: set ANTHROPIC_API_KEY, CODEX_API_KEY, OPENAI_API_KEY, or CODEX_AUTH_JSON_PATH for the worker" >&2
 	exit 2
 fi
 

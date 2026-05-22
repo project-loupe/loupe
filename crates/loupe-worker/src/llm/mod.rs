@@ -25,6 +25,7 @@ pub mod codex_cli;
 pub mod mcp;
 pub mod prompts;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -251,11 +252,19 @@ pub fn codex_home_dir() -> Option<PathBuf> {
 /// Return true when the worker has auth material the codex CLI can use
 /// without running an interactive login during a scan.
 pub fn codex_auth_available() -> bool {
-	env_present("OPENAI_API_KEY") || codex_home_dir().is_some_and(|p| p.join("auth.json").exists())
+	codex_api_key_env().is_some() || codex_home_dir().is_some_and(|p| p.join("auth.json").exists())
+}
+
+pub(crate) fn codex_api_key_env() -> Option<OsString> {
+	env_value("CODEX_API_KEY").or_else(|| env_value("OPENAI_API_KEY"))
 }
 
 fn env_present(name: &str) -> bool {
-	std::env::var_os(name).is_some_and(|v| !v.is_empty())
+	env_value(name).is_some()
+}
+
+fn env_value(name: &str) -> Option<OsString> {
+	std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
 fn home_path(child: &str) -> Option<PathBuf> {
@@ -355,9 +364,24 @@ mod tests {
 		let _guard = ENV_LOCK.lock().unwrap();
 		let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", "anthropic-key");
 		let _openai = EnvGuard::set("OPENAI_API_KEY", "openai-key");
+		let _codex = EnvGuard::unset("CODEX_API_KEY");
 
 		assert!(claude_auth_available());
 		assert!(codex_auth_available());
+	}
+
+	#[test]
+	fn codex_auth_checks_codex_api_key() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		let _openai = EnvGuard::unset("OPENAI_API_KEY");
+		let _codex = EnvGuard::set("CODEX_API_KEY", "codex-key");
+		let dir = tempfile::tempdir().unwrap();
+		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());
+
+		assert!(
+			codex_auth_available(),
+			"CODEX_API_KEY should enable codex auth without OPENAI_API_KEY or auth.json"
+		);
 	}
 
 	#[test]
@@ -379,6 +403,7 @@ mod tests {
 	fn codex_auth_checks_codex_home_auth_json() {
 		let _guard = ENV_LOCK.lock().unwrap();
 		let _openai = EnvGuard::unset("OPENAI_API_KEY");
+		let _codex = EnvGuard::unset("CODEX_API_KEY");
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
 		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());

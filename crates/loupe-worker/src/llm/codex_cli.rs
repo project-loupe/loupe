@@ -2,7 +2,7 @@
 //!
 //! Mirrors [`ClaudeCliBackend`]'s shape: runs the agent inside the
 //! bubblewrap sandbox the worker builds, forwards the model auth env
-//! var (`OPENAI_API_KEY`), and bind-mounts the operator's `~/.codex/`
+//! var (`CODEX_API_KEY`), and bind-mounts the operator's `~/.codex/`
 //! config dir so a `codex login`-style OAuth credential can flow in.
 //!
 //! Wire shape: `codex exec --dangerously-bypass-approvals-and-sandbox
@@ -32,8 +32,8 @@ use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
 use super::{
-	codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest,
-	LlmResponse,
+	codex_api_key_env, codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend,
+	LlmRequest, LlmResponse,
 };
 use crate::sandbox::SandboxBuilder;
 
@@ -172,6 +172,9 @@ impl LlmBackend for CodexCliBackend {
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
 			.forward_env("OPENAI_API_KEY");
+		if let Some(api_key) = codex_api_key_env() {
+			sandbox = sandbox.set_env("CODEX_API_KEY", api_key);
+		}
 		if let Some(codex_dir) = codex_home_dir() {
 			// Bind only the credential + config files read-only,
 			// rather than the whole `~/.codex/` tree. Codex writes a
@@ -183,7 +186,7 @@ impl LlmBackend for CodexCliBackend {
 			//
 			// `--ro-bind-try` (used inside SandboxBuilder) makes a
 			// missing source a no-op — env-only auth (just
-			// `OPENAI_API_KEY`) Just Works on hosts that never ran
+			// `CODEX_API_KEY`) Just Works on hosts that never ran
 			// `codex login`, and a missing `config.toml` is fine since
 			// codex falls back to defaults.
 			sandbox = sandbox
@@ -433,7 +436,8 @@ mod tests {
 	#[tokio::test]
 	async fn cli_backend_round_trip_against_real_codex() {
 		// Live test: needs `codex` + `bwrap` and either an
-		// `OPENAI_API_KEY` in env or a `~/.codex/auth.json` from
+		// `CODEX_API_KEY` / `OPENAI_API_KEY` in env or a
+		// `~/.codex/auth.json` from
 		// `codex login`. The auth dir is bind-mounted read-only into
 		// the sandbox, so OAuth flows that would write back token-
 		// refresh state can fail; in practice codex's refresh updates
@@ -444,12 +448,13 @@ mod tests {
 			eprintln!("skipping: codex or bwrap missing");
 			return;
 		}
-		let auth_present = std::env::var_os("OPENAI_API_KEY").is_some()
+		let auth_present = std::env::var_os("CODEX_API_KEY").is_some()
+			|| std::env::var_os("OPENAI_API_KEY").is_some()
 			|| std::env::var_os("HOME").is_some_and(|h| {
 				std::path::PathBuf::from(h).join(".codex").join("auth.json").exists()
 			});
 		if !auth_present {
-			eprintln!("skipping: no OPENAI_API_KEY and no ~/.codex/auth.json");
+			eprintln!("skipping: no CODEX_API_KEY, OPENAI_API_KEY, or ~/.codex/auth.json");
 			return;
 		}
 

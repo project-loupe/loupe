@@ -134,7 +134,7 @@ set +a
 
 export ANTHROPIC_API_KEY=...
 # Optional, enables Codex verifier:
-export OPENAI_API_KEY=...
+export CODEX_API_KEY=...
 export LOUPE_SERVER_URL=https://loupe.example.com:8443
 
 LOUPE_WORKER_SSH=deploy@worker \
@@ -148,12 +148,15 @@ bundle and whichever LLM API keys are set. It also writes
 `/etc/loupe-container/worker.config.toml` for non-secret worker settings
 (cache, logging, scanner defaults, BKB API URL, and Claude/Codex
 model/effort), mounts it read-only into the container, and sets
-`LOUPE_WORKER_CONFIG`.
+`LOUPE_WORKER_CONFIG`. For Codex, prefer `CODEX_API_KEY`; for compatibility
+the deploy script also writes `CODEX_API_KEY` from `OPENAI_API_KEY` when
+`CODEX_API_KEY` is absent.
 
-As a temporary alternative to `OPENAI_API_KEY`, a worker can use Codex login
+As a temporary alternative to `CODEX_API_KEY`, a worker can use Codex login
 state from an explicit local `auth.json` path:
 
 ```bash
+unset CODEX_API_KEY
 unset OPENAI_API_KEY
 export CODEX_AUTH_JSON_PATH="$HOME/.codex/auth.json"
 ```

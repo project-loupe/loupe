@@ -268,7 +268,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		);
 	}
 	if codex_installed && !codex_auth {
-		tracing::warn!("`codex` is installed but no OPENAI_API_KEY or codex auth.json was found");
+		tracing::warn!(
+			"`codex` is installed but no CODEX_API_KEY, OPENAI_API_KEY, or codex auth.json was found"
+		);
 	}
 	// bwrap is the security boundary for every agent subprocess; if
 	// it's missing and LOUPE_DISABLE_SANDBOX isn't set, refuse to run.

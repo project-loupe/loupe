@@ -10,6 +10,7 @@
 //! hosts without `bwrap`; the worker logs a loud warning if it's set,
 //! and the helper produces a plain `Command` instead of a wrapped one.
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
@@ -60,6 +61,8 @@ pub struct SandboxBuilder {
 	/// Env vars to forward into the sandbox by name (the value is
 	/// looked up from the worker's own env at `build()` time).
 	forward_env: Vec<&'static str>,
+	/// Env vars to set to caller-provided values.
+	set_env: Vec<(&'static str, OsString)>,
 }
 
 impl SandboxBuilder {
@@ -73,6 +76,7 @@ impl SandboxBuilder {
 			disabled,
 			extra_ro_binds: Vec::new(),
 			forward_env: Vec::new(),
+			set_env: Vec::new(),
 		}
 	}
 
@@ -84,6 +88,7 @@ impl SandboxBuilder {
 			disabled: true,
 			extra_ro_binds: Vec::new(),
 			forward_env: Vec::new(),
+			set_env: Vec::new(),
 		}
 	}
 
@@ -109,6 +114,14 @@ impl SandboxBuilder {
 	/// authenticate.
 	pub fn forward_env(mut self, name: &'static str) -> Self {
 		self.forward_env.push(name);
+		self
+	}
+
+	/// Set an env var to a caller-provided value inside the sandbox.
+	/// This is useful when a backend accepts one env name but Loupe
+	/// supports a compatibility alias at the worker boundary.
+	pub fn set_env(mut self, name: &'static str, value: impl Into<OsString>) -> Self {
+		self.set_env.push((name, value.into()));
 		self
 	}
 
@@ -170,6 +183,9 @@ impl SandboxBuilder {
 		if self.disabled {
 			let mut cmd = Command::new(program);
 			cmd.current_dir(&self.workdir);
+			for (name, value) in &self.set_env {
+				cmd.env(name, value);
+			}
 			return cmd;
 		}
 
@@ -230,6 +246,9 @@ impl SandboxBuilder {
 			if let Some(value) = std::env::var_os(name) {
 				cmd.arg("--setenv").arg(name).arg(value);
 			}
+		}
+		for (name, value) in &self.set_env {
+			cmd.arg("--setenv").arg(name).arg(value);
 		}
 
 		cmd.arg("--").arg(program);
@@ -691,5 +710,34 @@ mod tests {
 		);
 
 		std::env::remove_var("LOUPE_SANDBOX_TEST_SECRET");
+	}
+
+	#[test]
+	fn set_env_passes_caller_provided_values() {
+		let cmd = SandboxBuilder::new("/tmp")
+			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", "explicit-value")
+			.build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+
+		assert!(
+			args.windows(3).any(|w| {
+				w[0] == "--setenv"
+					&& w[1] == "LOUPE_SANDBOX_TEST_EXPLICIT"
+					&& w[2] == "explicit-value"
+			}),
+			"args: {args:?}"
+		);
+	}
+
+	#[test]
+	fn disabled_sandbox_sets_caller_provided_values() {
+		let cmd = SandboxBuilder::disabled_for_tests("/tmp")
+			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", "explicit-value")
+			.build("/bin/true");
+
+		assert!(cmd.as_std().get_envs().any(|(key, value)| {
+			key == "LOUPE_SANDBOX_TEST_EXPLICIT" && value.is_some_and(|v| v == "explicit-value")
+		}));
 	}
 }
