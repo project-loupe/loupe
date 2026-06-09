@@ -99,7 +99,7 @@ fn default_extensions() -> Vec<String> {
 		"php", // JVM family.
 		"java", "kt", "kts", "scala", "groovy", // Swift.
 		"swift",  // .NET.
-		"cs", "fs", "fsx", "vb", // Misc.
+		"cs", "fs", "fsi", "fsx", "vb", // Misc.
 		"dart", "ex", "exs", "rs.in",
 	]
 	.into_iter()
@@ -318,7 +318,7 @@ fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRo
 
 fn add_dotnet_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
 	for marker_dir in
-		marker_dirs_by_extension(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"])
+		dotnet_marker_dirs(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"])
 	{
 		roots.roots.push(marker_dir);
 	}
@@ -335,9 +335,8 @@ fn marker_dirs(workdir: &Path, cfg: &ScannerConfig, marker: &str) -> Vec<PathBuf
 		.collect()
 }
 
-fn marker_dirs_by_extension(workdir: &Path, cfg: &ScannerConfig, exts: &[&str]) -> Vec<PathBuf> {
+fn dotnet_marker_dirs(workdir: &Path, cfg: &ScannerConfig, exts: &[&str]) -> Vec<PathBuf> {
 	walkdir::WalkDir::new(workdir)
-		.max_depth(5)
 		.into_iter()
 		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
 		.filter_map(Result::ok)
@@ -426,7 +425,6 @@ fn is_dotnet_output_path(path: &Path, output_dir: &str) -> bool {
 	path.ancestors().any(|candidate| {
 		candidate.file_name().and_then(|name| name.to_str()) == Some(output_dir)
 			&& candidate.parent().map(has_dotnet_project_marker).unwrap_or(false)
-			&& path.strip_prefix(candidate).map(has_dotnet_target_framework_tail).unwrap_or(false)
 	})
 }
 
@@ -447,31 +445,6 @@ fn has_dotnet_project_marker(dir: &Path) -> bool {
 				})
 				.unwrap_or(false)
 	})
-}
-
-fn has_dotnet_target_framework_tail(path: &Path) -> bool {
-	let components: Vec<String> =
-		path.components().map(|component| component.as_os_str().to_string_lossy().into()).collect();
-
-	components.iter().enumerate().any(|(idx, component)| {
-		is_dotnet_target_framework(component) && idx < components.len().saturating_sub(1)
-	})
-}
-
-fn is_dotnet_target_framework(component: &str) -> bool {
-	let component = component.to_ascii_lowercase();
-	suffix_starts_with_digit(&component, "net")
-		|| suffix_starts_with_digit(&component, "netcoreapp")
-		|| suffix_starts_with_digit(&component, "netstandard")
-		|| suffix_starts_with_digit(&component, "netframework")
-}
-
-fn suffix_starts_with_digit(value: &str, prefix: &str) -> bool {
-	value
-		.strip_prefix(prefix)
-		.and_then(|suffix| suffix.chars().next())
-		.map(|c| c.is_ascii_digit())
-		.unwrap_or(false)
 }
 
 fn has_allowed_extension(path: &Path, exts: &[String]) -> bool {
@@ -522,7 +495,7 @@ mod tests {
 		assert_eq!(cfg.max_file_bytes, 2 * 1024 * 1024);
 		for ext in [
 			"rs", "c", "cpp", "h", "hpp", "js", "ts", "tsx", "py", "go", "java", "swift", "cs",
-			"fs", "fsx", "vb",
+			"fs", "fsi", "fsx", "vb",
 		] {
 			assert!(cfg.include_extensions.iter().any(|e| e == ext), "missing: {ext}");
 		}
@@ -681,11 +654,13 @@ mod tests {
 			("src/Web/Controllers/HomeController.cs", "class HomeController {}\n"),
 			("src/Domain/Domain.fsproj", "<Project />\n"),
 			("src/Domain/Model.fs", "module Model\n"),
+			("src/Domain/Model.fsi", "module Model\n"),
 			("src/Domain/Scripts/Seed.fsx", "printfn \"seed\"\n"),
 			("src/Legacy/Legacy.vbproj", "<Project />\n"),
 			("src/Legacy/Module.vb", "Module Legacy\nEnd Module\n"),
 			("src/Web/bin/Debug/net8.0/Generated.cs", "class Generated {}\n"),
 			("src/Web/obj/Debug/net8.0/AssemblyInfo.cs", "class AssemblyInfo {}\n"),
+			("src/Web/obj/Debug/GeneratedFile.cs", "class GeneratedFile {}\n"),
 		] {
 			let p = tmp.path().join(path);
 			if let Some(parent) = p.parent() {
@@ -700,6 +675,7 @@ mod tests {
 			"src/Web/Program.cs",
 			"src/Web/Controllers/HomeController.cs",
 			"src/Domain/Model.fs",
+			"src/Domain/Model.fsi",
 			"src/Domain/Scripts/Seed.fsx",
 			"src/Legacy/Module.vb",
 		] {
@@ -707,6 +683,28 @@ mod tests {
 		}
 		assert!(names.iter().all(|n| !n.contains("/bin/")), "bin leak: {names:?}");
 		assert!(names.iter().all(|n| !n.contains("/obj/")), "obj leak: {names:?}");
+	}
+
+	#[test]
+	fn deeply_nested_dotnet_projects_are_discovered() {
+		let tmp = tempfile::tempdir().unwrap();
+
+		for (path, body) in [
+			("src/services/api/v2/foo/app/Foo.csproj", "<Project />\n"),
+			("src/services/api/v2/foo/app/Program.cs", "class Program {}\n"),
+		] {
+			let p = tmp.path().join(path);
+			if let Some(parent) = p.parent() {
+				std::fs::create_dir_all(parent).unwrap();
+			}
+			std::fs::write(p, body).unwrap();
+		}
+
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		assert!(
+			names.iter().any(|n| n == "src/services/api/v2/foo/app/Program.cs"),
+			"names: {names:?}"
+		);
 	}
 
 	#[test]
