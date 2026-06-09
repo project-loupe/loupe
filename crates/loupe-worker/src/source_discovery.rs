@@ -28,9 +28,10 @@ pub struct ScannerConfig {
 	/// the leading dot (e.g. `["rs", "cpp"]`).
 	pub include_extensions: Vec<String>,
 	/// Exclusion patterns that disqualify a path. Built-in patterns
-	/// use `dir:<name>` for exact path components and `file:<glob>`
-	/// for basename matches. Legacy custom strings still match as
-	/// path substrings, except `/name` matches an exact component.
+	/// use `dir:<name>` for exact path components, `file:<glob>` for
+	/// basename matches, and `dotnet-output:<name>` for .NET build
+	/// output directories. Legacy custom strings still match as path
+	/// substrings, except `/name` matches an exact component.
 	pub exclude_path_substrings: Vec<String>,
 }
 
@@ -121,8 +122,8 @@ fn default_excludes() -> Vec<String> {
 		"dir:fuzz",
 		// Build artefacts across ecosystems.
 		"dir:target",
-		"dir:bin",
-		"dir:obj",
+		"dotnet-output:bin",
+		"dotnet-output:obj",
 		"dir:build",
 		"dir:dist",
 		"dir:out",
@@ -406,6 +407,9 @@ fn matches_exclude(path: &Path, pattern: &str) -> bool {
 			.map(|name| Pattern::new(glob).map(|p| p.matches(name)).unwrap_or(false))
 			.unwrap_or(false);
 	}
+	if let Some(component) = pattern.strip_prefix("dotnet-output:") {
+		return is_dotnet_output_path(path, component);
+	}
 	if let Some(component) = pattern.strip_prefix('/') {
 		if !component.contains('/') {
 			return has_component(path, component);
@@ -416,6 +420,58 @@ fn matches_exclude(path: &Path, pattern: &str) -> bool {
 
 fn has_component(path: &Path, needle: &str) -> bool {
 	path.components().any(|component| component.as_os_str() == needle)
+}
+
+fn is_dotnet_output_path(path: &Path, output_dir: &str) -> bool {
+	path.ancestors().any(|candidate| {
+		candidate.file_name().and_then(|name| name.to_str()) == Some(output_dir)
+			&& candidate.parent().map(has_dotnet_project_marker).unwrap_or(false)
+			&& path.strip_prefix(candidate).map(has_dotnet_target_framework_tail).unwrap_or(false)
+	})
+}
+
+fn has_dotnet_project_marker(dir: &Path) -> bool {
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return false;
+	};
+	entries.filter_map(Result::ok).any(|entry| {
+		entry.file_type().map(|file_type| file_type.is_file()).unwrap_or(false)
+			&& entry
+				.path()
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.map(|ext| {
+					["csproj", "fsproj", "vbproj"]
+						.iter()
+						.any(|allowed| allowed.eq_ignore_ascii_case(ext))
+				})
+				.unwrap_or(false)
+	})
+}
+
+fn has_dotnet_target_framework_tail(path: &Path) -> bool {
+	let components: Vec<String> =
+		path.components().map(|component| component.as_os_str().to_string_lossy().into()).collect();
+
+	components.iter().enumerate().any(|(idx, component)| {
+		is_dotnet_target_framework(component) && idx < components.len().saturating_sub(1)
+	})
+}
+
+fn is_dotnet_target_framework(component: &str) -> bool {
+	let component = component.to_ascii_lowercase();
+	suffix_starts_with_digit(&component, "net")
+		|| suffix_starts_with_digit(&component, "netcoreapp")
+		|| suffix_starts_with_digit(&component, "netstandard")
+		|| suffix_starts_with_digit(&component, "netframework")
+}
+
+fn suffix_starts_with_digit(value: &str, prefix: &str) -> bool {
+	value
+		.strip_prefix(prefix)
+		.and_then(|suffix| suffix.chars().next())
+		.map(|c| c.is_ascii_digit())
+		.unwrap_or(false)
 }
 
 fn has_allowed_extension(path: &Path, exts: &[String]) -> bool {
@@ -472,8 +528,8 @@ mod tests {
 		}
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:node_modules"));
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:target"));
-		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:bin"));
-		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:obj"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dotnet-output:bin"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dotnet-output:obj"));
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:fuzz"));
 	}
 
@@ -559,6 +615,32 @@ mod tests {
 			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
 		}
 		assert!(names.iter().all(|n| !n.starts_with("fuzz/")), "names: {names:?}");
+	}
+
+	#[test]
+	fn rust_src_bin_targets_are_discovered() {
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(
+			tmp.path(),
+			&[
+				("src/lib.rs", "// library\n"),
+				("src/bin/cli.rs", "// binary\n"),
+				("src/bin/net8.rs", "// binary with tfm-like name\n"),
+				("src/bin/net8/main.rs", "// nested binary with tfm-like name\n"),
+				("src/bin/admin/main.rs", "// nested binary\n"),
+			],
+		);
+
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		for expected in [
+			"src/lib.rs",
+			"src/bin/cli.rs",
+			"src/bin/net8.rs",
+			"src/bin/net8/main.rs",
+			"src/bin/admin/main.rs",
+		] {
+			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+		}
 	}
 
 	#[test]
