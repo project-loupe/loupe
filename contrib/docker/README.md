@@ -133,6 +133,8 @@ set -a
 set +a
 
 export ANTHROPIC_API_KEY=...
+# Or use a long-lived headless token from `claude setup-token`:
+# export CLAUDE_CODE_OAUTH_TOKEN=...
 # Optional, enables Codex scan or verifier jobs:
 export CODEX_API_KEY=...
 # Optional, defaults preserve Claude scan + Codex verifier when ready:
@@ -147,7 +149,7 @@ contrib/docker/deploy-worker.sh
 
 The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 `0600`, owned by the container UID `10002`. It contains the worker certificate
-bundle and whichever LLM API keys are set. It also writes
+bundle and whichever LLM credentials are set. It also writes
 `/etc/loupe-container/worker.config.toml` for non-secret worker settings
 (cache, logging, job-agent selection, scanner defaults, BKB API URL, and
 Claude/Codex model/effort), mounts it read-only into the container, and sets
@@ -165,10 +167,10 @@ protected host-side env file per service so systemd can restart the container
 after a crash or VM reboot without another deploy.
 
 Each secret env file is a single-line `NAME=value` file. TLS PEM material is
-stored in the generated `_B64` env vars; API keys are stored directly. The file
-is bind-mounted read-only into the container at `/run/loupe/secrets.env`, and
-the container entrypoint allowlists and exports those variables before starting
-Loupe.
+stored in the generated `_B64` env vars; API keys and OAuth tokens are stored
+directly. The file is bind-mounted read-only into the container at
+`/run/loupe/secrets.env`, and the container entrypoint allowlists and exports
+those variables before starting Loupe.
 
 The secret file stays outside the container's writable filesystem and survives
 container replacement. Root on the host can inspect it, and root can also

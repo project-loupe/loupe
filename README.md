@@ -269,7 +269,9 @@ is used for each job kind:
 - **No authenticated agent CLI** → worker refuses to start. A
   "regex-only" loupe-worker isn't a deployment we want operators to
   fall into by accident; install at least one agent CLI and provide
-  its API key (or Claude login state).
+  its API key. For Claude, `ANTHROPIC_API_KEY` or a headless
+  `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`); interactive
+  subscription login state is not mounted into the sandbox.
 
 > **Note:** scan jobs use LLM providers and may count against paid,
 > metered, or rate-limited usage. The discovery scanner launches one

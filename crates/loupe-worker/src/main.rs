@@ -198,7 +198,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	//   default: prefer codex, falling back to claude.
 	// - explicit claude/codex selections fail startup when unavailable.
 	// - no authenticated CLI still hard-fatals at startup. Docker
-	//   images can install both CLIs, but missing API keys should fail
+	//   images can install both CLIs, but missing credentials should fail
 	//   before a worker leases jobs.
 	let claude_installed = claude_available();
 	let codex_installed = codex_available();
@@ -210,7 +210,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		anyhow::bail!(
 			"no authenticated LLM agent CLI available \
 			 (claude: installed={}, auth={}; codex: installed={}, auth={}). \
-			 Install at least one CLI and provide its API key before starting the worker.",
+			 Install at least one CLI and provide an environment credential before starting the worker.",
 			claude_installed,
 			claude_auth,
 			codex_installed,
@@ -219,7 +219,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	}
 	if claude_installed && !claude_auth {
 		tracing::warn!(
-			"`claude` is installed but no ANTHROPIC_API_KEY or ~/.claude.json auth was found"
+			"`claude` is installed but no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN was found"
 		);
 	}
 	if codex_installed && !codex_auth {

@@ -64,12 +64,17 @@ codex_api_key_set() {
 	secret_set CODEX_API_KEY || secret_set OPENAI_API_KEY
 }
 
+claude_auth_set() {
+	secret_set ANTHROPIC_API_KEY || secret_set CLAUDE_CODE_OAUTH_TOKEN
+}
+
 emit_secret_env() {
 	for name in \
 		LOUPE_WORKER_CA_CERT_PEM_B64 \
 		LOUPE_WORKER_CERT_PEM_B64 \
 		LOUPE_WORKER_KEY_PEM_B64 \
-		ANTHROPIC_API_KEY
+		ANTHROPIC_API_KEY \
+		CLAUDE_CODE_OAUTH_TOKEN
 	do
 		if secret_set "$name"; then
 			emit_secret_env_var "$name"
@@ -205,8 +210,8 @@ for name in \
 do
 	require_secret "$name"
 done
-if ! secret_set ANTHROPIC_API_KEY && ! codex_api_key_set; then
-	echo "error: set ANTHROPIC_API_KEY, CODEX_API_KEY, or OPENAI_API_KEY for the worker" >&2
+if ! claude_auth_set && ! codex_api_key_set; then
+	echo "error: set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CODEX_API_KEY, or OPENAI_API_KEY for the worker" >&2
 	exit 2
 fi
 

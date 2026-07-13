@@ -211,9 +211,15 @@ pub fn claude_available() -> bool {
 }
 
 /// Return true when the worker has auth material the claude CLI can
-/// use without running an interactive login during a scan.
+/// use non-interactively inside the sandbox.
+///
+/// Only environment credentials count: `ANTHROPIC_API_KEY`, or a
+/// `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Subscription
+/// login state under `~/.claude` is deliberately not mounted, and its
+/// OAuth refresh needs to write — which the read-only sandbox forbids
+/// — so a bare `~/.claude.json` no longer counts as usable auth.
 pub fn claude_auth_available() -> bool {
-	env_present("ANTHROPIC_API_KEY") || home_path(".claude.json").is_some_and(|p| p.exists())
+	env_present("ANTHROPIC_API_KEY") || env_present("CLAUDE_CODE_OAUTH_TOKEN")
 }
 
 /// Probe PATH for `bkb-mcp` (Bitcoin Knowledge Base MCP server).
@@ -282,10 +288,6 @@ fn env_present(name: &str) -> bool {
 
 fn env_value(name: &str) -> Option<OsString> {
 	std::env::var_os(name).filter(|v| !v.is_empty())
-}
-
-fn home_path(child: &str) -> Option<PathBuf> {
-	std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(child))
 }
 
 /// Build the scan [`LlmBackend`] according to the configured agent
@@ -466,6 +468,31 @@ mod tests {
 
 		assert!(claude_auth_available());
 		assert!(codex_auth_available());
+	}
+
+	#[test]
+	fn claude_auth_requires_env_token_not_a_stale_config_file() {
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let _anthropic = EnvGuard::unset("ANTHROPIC_API_KEY");
+		let _oauth = EnvGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
+		let home = tempfile::tempdir().unwrap();
+		std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+		let _home = EnvGuard::set("HOME", home.path().as_os_str());
+
+		// A leftover `~/.claude.json` carries no usable credential once
+		// `~/.claude` (with `.credentials.json`) is no longer mounted,
+		// and OAuth refresh cannot write into the read-only sandbox. It
+		// must not make the worker advertise Claude as ready.
+		assert!(
+			!claude_auth_available(),
+			"a stale ~/.claude.json must not masquerade as usable Claude auth"
+		);
+
+		let _token = EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token");
+		assert!(
+			claude_auth_available(),
+			"CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) must satisfy Claude auth"
+		);
 	}
 
 	#[test]

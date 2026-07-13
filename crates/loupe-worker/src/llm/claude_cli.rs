@@ -37,6 +37,10 @@ pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_CLAUDE_EFFORT: &str = "max";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 
+fn claude_mcp_args() -> [&'static str; 3] {
+	["--mcp-config", SANDBOX_MCP_CONFIG, "--strict-mcp-config"]
+}
+
 /// Fixed sandbox path for the per-call MCP config file claude reads.
 /// The host-side scratch dir (a `tempfile::TempDir`) bind-mounts
 /// onto this path; dropping the scratch dir unlinks the source
@@ -70,10 +74,10 @@ fn prepare_mcp_scratch(ctx: &McpContext, broker: &McpBroker, repo_id: i64) -> Re
 			// — see the bind_ro calls above.
 			"command": SANDBOX_LOUPE_BIN,
 			"args": args,
-			// The MCP child inherits the bwrap'd env, which has
-			// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
-			// (irrelevant for the MCP child but harmless). No
-			// extra env needed at this layer.
+			// The MCP child inherits the bwrap'd env, including any
+			// explicit Claude credential forwarded to the agent
+			// (irrelevant for the MCP child but harmless). No extra
+			// env is needed at this layer.
 			"env": {}
 		}),
 	);
@@ -201,22 +205,11 @@ impl LlmBackend for ClaudeCliBackend {
 			// without this.
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
-			// Forward auth: ANTHROPIC_API_KEY for env-based auth, plus
-			// any user-managed login state under ~/.claude/* which
-			// `claude /login` writes to.
-			.forward_env("ANTHROPIC_API_KEY");
-		if let Some(home) = std::env::var_os("HOME") {
-			let host_home = std::path::PathBuf::from(home);
-			let claude_dir = host_home.join(".claude");
-			let claude_json = host_home.join(".claude.json");
-			// Sandbox $HOME is /home/scanner; map the operator's
-			// claude state into the equivalent paths there. `--ro-bind-try`
-			// (used inside SandboxBuilder) makes missing sources a
-			// no-op, so a host without these files just skips.
-			sandbox = sandbox
-				.bind_ro(claude_dir, "/home/scanner/.claude")
-				.bind_ro(claude_json, "/home/scanner/.claude.json");
-		}
+			// Forward the environment credential the CLI uses
+			// non-interactively: an API key, or a headless OAuth token
+			// from `claude setup-token`. Both are set only when present.
+			.forward_env("ANTHROPIC_API_KEY")
+			.forward_env("CLAUDE_CODE_OAUTH_TOKEN");
 
 		// Optional MCP attachment. Held in a local so its `TempDir`
 		// lives until after the subprocess returns — dropping it
@@ -249,7 +242,7 @@ impl LlmBackend for ClaudeCliBackend {
 			cmd.arg(arg);
 		}
 		if _mcp_scratch.is_some() {
-			cmd.arg("--mcp-config").arg(SANDBOX_MCP_CONFIG);
+			cmd.args(claude_mcp_args());
 		}
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		cmd.kill_on_drop(true);
@@ -393,12 +386,45 @@ fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+	use std::ffi::OsString;
 	use std::path::Path;
 	use std::time::Duration;
 
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
+	use crate::PROCESS_ENV_LOCK;
+
+	struct EnvGuard {
+		name: &'static str,
+		old: Option<OsString>,
+	}
+
+	impl EnvGuard {
+		fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+			let old = std::env::var_os(name);
+			std::env::set_var(name, value);
+			Self { name, old }
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			if let Some(old) = &self.old {
+				std::env::set_var(self.name, old);
+			} else {
+				std::env::remove_var(self.name);
+			}
+		}
+	}
+
+	#[test]
+	fn agent_uses_only_per_job_mcp_config() {
+		assert!(
+			claude_mcp_args().contains(&"--strict-mcp-config"),
+			"Claude must ignore MCP servers outside Loupe's per-job config"
+		);
+	}
 
 	fn claude_present(bin: &str) -> bool {
 		std::process::Command::new(bin)
@@ -418,6 +444,69 @@ mod tests {
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "current_thread")]
+	async fn sandbox_uses_headless_token_without_host_login_state() {
+		use std::os::unix::fs::PermissionsExt;
+
+		if !bwrap_present() {
+			eprintln!("skipping: bwrap missing");
+			return;
+		}
+
+		let _lock = PROCESS_ENV_LOCK.lock().await;
+		let workdir = tempfile::tempdir().unwrap();
+		let scratch = tempfile::tempdir().unwrap();
+		let home = scratch.path().join("home");
+		let bin_dir = scratch.path().join("bin");
+		std::fs::create_dir_all(&home).unwrap();
+		std::fs::create_dir_all(&bin_dir).unwrap();
+		std::fs::write(home.join(".claude.json"), "host-login-state-canary").unwrap();
+
+		let bin_path = bin_dir.join("fake-claude");
+		std::fs::write(
+			&bin_path,
+			"#!/bin/sh\n\
+			if [ -e /home/scanner/.claude.json ]; then\n\
+			  echo LEAKED\n\
+			elif [ \"${CLAUDE_CODE_OAUTH_TOKEN-}\" = \"loupe-test-oauth-token\" ]; then\n\
+			  echo SAFE\n\
+			else\n\
+			  echo MISSING_TOKEN\n\
+			fi\n",
+		)
+		.unwrap();
+		std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let mut path_entries = vec![bin_dir];
+		if let Some(path) = std::env::var_os("PATH") {
+			path_entries.extend(std::env::split_paths(&path));
+		}
+		let path = std::env::join_paths(path_entries).unwrap();
+		let _path = EnvGuard::set("PATH", &path);
+		let _home = EnvGuard::set("HOME", &home);
+		let _token = EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "loupe-test-oauth-token");
+
+		let backend = ClaudeCliBackend::with_bin("fake-claude");
+		let req = LlmRequest {
+			prompt: "irrelevant".into(),
+			workdir: workdir.path().to_path_buf(),
+			timeout: Duration::from_secs(5),
+			cancel: CancellationToken::new(),
+			repo_id: None,
+			job_id: None,
+			job_capability: None,
+			finding_id: None,
+		};
+
+		let response = backend.run(req).await.expect("fake Claude CLI should run");
+		assert_eq!(
+			response.text.trim(),
+			"SAFE",
+			"the agent must receive only explicit headless auth, not host Claude login state"
+		);
 	}
 
 	#[cfg(unix)]
@@ -470,19 +559,16 @@ mod tests {
 
 	#[tokio::test]
 	async fn cli_backend_round_trip_against_real_claude() {
-		// Live test: needs `claude` + `bwrap` + an `ANTHROPIC_API_KEY`
-		// in env. The API-key requirement is because the sandbox
-		// mounts `~/.claude` read-only, so OAuth-based logins (which
-		// expect to write back token-refresh state) can fail. Env-
-		// based auth has no write path and works cleanly.
+		// Live test: needs `claude` + `bwrap` + an explicit environment
+		// credential. Host Claude configuration is never mounted.
 		if !claude_present("claude") || !bwrap_present() {
 			eprintln!("skipping: claude or bwrap missing");
 			return;
 		}
-		if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
-			eprintln!(
-				"skipping: no ANTHROPIC_API_KEY in env (sandbox blocks OAuth refresh writes)"
-			);
+		if std::env::var_os("ANTHROPIC_API_KEY").is_none()
+			&& std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_none()
+		{
+			eprintln!("skipping: no Claude environment credential");
 			return;
 		}
 
