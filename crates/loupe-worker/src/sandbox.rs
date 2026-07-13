@@ -197,6 +197,8 @@ impl SandboxBuilder {
 		}
 
 		let mut cmd = Command::new(BWRAP_BIN);
+		cmd.env_clear();
+		cmd.env("PATH", sandbox_path());
 		cmd.arg("--die-with-parent");
 		cmd.arg("--clearenv");
 
@@ -768,6 +770,45 @@ mod tests {
 		assert!(!args.iter().any(|a| a == "do-not-leak"), "args: {args:?}");
 
 		std::env::remove_var("LOUPE_SANDBOX_TEST_SECRET");
+	}
+
+	#[tokio::test]
+	async fn wrapped_command_hides_unforwarded_host_environment_from_proc() {
+		let (child, _workdir) = {
+			let _guard = PROCESS_ENV_LOCK.lock().await;
+			if !bwrap_present() {
+				eprintln!("skipping: bwrap not installed");
+				return;
+			}
+
+			let old = std::env::var_os("LOUPE_SANDBOX_TEST_UNFORWARDED_SECRET");
+			std::env::set_var("LOUPE_SANDBOX_TEST_UNFORWARDED_SECRET", "do-not-leak-through-bwrap");
+
+			let tmp = tempfile::tempdir().unwrap();
+			let mut cmd = SandboxBuilder::new(tmp.path()).build("/bin/sh");
+			cmd.arg("-c")
+				.arg(
+					"grep -aFq do-not-leak-through-bwrap /proc/1/environ && echo LEAK || echo CLEAN",
+				)
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped());
+			let child = cmd.spawn().unwrap();
+
+			if let Some(old) = old {
+				std::env::set_var("LOUPE_SANDBOX_TEST_UNFORWARDED_SECRET", old);
+			} else {
+				std::env::remove_var("LOUPE_SANDBOX_TEST_UNFORWARDED_SECRET");
+			}
+			(child, tmp)
+		};
+
+		let out = child.wait_with_output().await.unwrap();
+		assert!(out.status.success(), "sandbox failed: {}", String::from_utf8_lossy(&out.stderr),);
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		assert!(
+			stdout.contains("CLEAN"),
+			"unforwarded host env leaked through /proc/1/environ: {stdout}",
+		);
 	}
 
 	#[test]
