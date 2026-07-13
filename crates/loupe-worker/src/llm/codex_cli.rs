@@ -1,9 +1,9 @@
 //! Backend that shells out to the `codex` CLI (OpenAI Codex).
 //!
 //! Mirrors [`ClaudeCliBackend`]'s shape: runs the agent inside the
-//! bubblewrap sandbox the worker builds, forwards the model auth env
-//! var (`CODEX_API_KEY`), and bind-mounts the operator's `~/.codex/`
-//! config dir so a `codex login`-style OAuth credential can flow in.
+//! bubblewrap sandbox the worker builds and forwards only the selected
+//! API token as `CODEX_API_KEY`. User-level Codex configuration and
+//! login state are not mounted into the sandbox.
 //!
 //! Wire shape: `codex exec --dangerously-bypass-approvals-and-sandbox
 //! --skip-git-repo-check "$prompt"`. The bypass flag is the codex
@@ -31,10 +31,7 @@ use tokio::time::timeout;
 use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
-use super::{
-	codex_api_key_env, codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend,
-	LlmRequest, LlmResponse,
-};
+use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "codex-cli";
@@ -42,6 +39,17 @@ const CODEX_BIN: &str = "codex";
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_CODEX_EFFORT: &str = "xhigh";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
+
+fn codex_agent_env(
+	codex_api_key: Option<std::ffi::OsString>, openai_api_key: Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+	codex_api_key
+		.filter(|value| !value.is_empty())
+		.or_else(|| openai_api_key.filter(|value| !value.is_empty()))
+		.into_iter()
+		.map(|api_key| ("CODEX_API_KEY", api_key))
+		.collect()
+}
 
 /// Render a Rust string as a TOML basic-string literal: wraps in
 /// double quotes, escapes the few characters TOML cares about (`\`,
@@ -170,30 +178,12 @@ impl LlmBackend for CodexCliBackend {
 			// surface the install tree so the wrapped subprocess can
 			// `exec` it.
 			.allow_binary(&self.bin)
-			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
-			.forward_env("OPENAI_API_KEY");
-		if let Some(api_key) = codex_api_key_env() {
-			sandbox = sandbox.set_env("CODEX_API_KEY", api_key);
+			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?;
+		for (name, value) in
+			codex_agent_env(std::env::var_os("CODEX_API_KEY"), std::env::var_os("OPENAI_API_KEY"))
+		{
+			sandbox = sandbox.set_env(name, value);
 		}
-		if let Some(codex_dir) = codex_home_dir() {
-			// Bind only the credential + config files read-only,
-			// rather than the whole `~/.codex/` tree. Codex writes a
-			// models cache and (sometimes) an installation_id to its
-			// home dir on every invocation; binding the parent
-			// read-only fails those writes with EROFS. Leaving the
-			// parent as the sandbox tmpfs keeps `auth.json` /
-			// `config.toml` reachable and the cache writable per call.
-			//
-			// `--ro-bind-try` (used inside SandboxBuilder) makes a
-			// missing source a no-op — env-only auth (just
-			// `CODEX_API_KEY`) Just Works on hosts that never ran
-			// `codex login`, and a missing `config.toml` is fine since
-			// codex falls back to defaults.
-			sandbox = sandbox
-				.bind_ro(codex_dir.join("auth.json"), "/home/scanner/.codex/auth.json")
-				.bind_ro(codex_dir.join("config.toml"), "/home/scanner/.codex/config.toml");
-		}
-
 		// Optional MCP attachment. Codex doesn't take a "config-file"
 		// flag like claude's `--mcp-config`; instead it accepts
 		// `-c <key>=<toml-literal>` overrides on the command line.
@@ -358,12 +348,27 @@ fn codex_invocation_args(
 
 #[cfg(test)]
 mod tests {
+	use std::ffi::OsString;
 	use std::path::Path;
 	use std::time::Duration;
 
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
+
+	#[test]
+	fn agent_receives_only_the_selected_codex_api_key() {
+		let env = codex_agent_env(
+			Some(OsString::from("selected-codex-key")),
+			Some(OsString::from("unrelated-openai-key")),
+		);
+
+		assert_eq!(
+			env,
+			vec![("CODEX_API_KEY", OsString::from("selected-codex-key"))],
+			"the Codex sandbox must not receive an unrelated OPENAI_API_KEY",
+		);
+	}
 
 	fn codex_present(bin: &str) -> bool {
 		std::process::Command::new(bin)
@@ -435,26 +440,17 @@ mod tests {
 
 	#[tokio::test]
 	async fn cli_backend_round_trip_against_real_codex() {
-		// Live test: needs `codex` + `bwrap` and either an
-		// `CODEX_API_KEY` / `OPENAI_API_KEY` in env or a
-		// `~/.codex/auth.json` from
-		// `codex login`. The auth dir is bind-mounted read-only into
-		// the sandbox, so OAuth flows that would write back token-
-		// refresh state can fail; in practice codex's refresh updates
-		// the file *before* the call and the in-memory token survives
-		// the session. Skip if either binary is missing or no auth
-		// material is present — same shape as the claude live test.
+		// Live test: needs `codex` + `bwrap` and a `CODEX_API_KEY` or
+		// `OPENAI_API_KEY` in env. Skip if either binary is missing or
+		// no API token is present — same shape as the claude live test.
 		if !codex_present("codex") || !bwrap_present() {
 			eprintln!("skipping: codex or bwrap missing");
 			return;
 		}
 		let auth_present = std::env::var_os("CODEX_API_KEY").is_some()
-			|| std::env::var_os("OPENAI_API_KEY").is_some()
-			|| std::env::var_os("HOME").is_some_and(|h| {
-				std::path::PathBuf::from(h).join(".codex").join("auth.json").exists()
-			});
+			|| std::env::var_os("OPENAI_API_KEY").is_some();
 		if !auth_present {
-			eprintln!("skipping: no CODEX_API_KEY, OPENAI_API_KEY, or ~/.codex/auth.json");
+			eprintln!("skipping: no CODEX_API_KEY or OPENAI_API_KEY");
 			return;
 		}
 

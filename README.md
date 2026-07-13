@@ -270,7 +270,7 @@ is used for each job kind:
 - **No authenticated agent CLI** → worker refuses to start. A
   "regex-only" loupe-worker isn't a deployment we want operators to
   fall into by accident; install at least one agent CLI and provide
-  its API key or login state.
+  its API key (or Claude login state).
 
 > **Note:** scan jobs use LLM providers and may count against paid,
 > metered, or rate-limited usage. The discovery scanner launches one

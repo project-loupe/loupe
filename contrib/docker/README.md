@@ -153,22 +153,9 @@ bundle and whichever LLM API keys are set. It also writes
 Claude/Codex model/effort), mounts it read-only into the container, and sets
 `LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT` and `LOUPE_VERIFY_AGENT` accept
 `auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
-startup if that CLI is not authenticated. For Codex, prefer `CODEX_API_KEY`;
+startup if that CLI is not authenticated. For Codex, use `CODEX_API_KEY`;
 for compatibility the deploy script also writes `CODEX_API_KEY` from
 `OPENAI_API_KEY` when `CODEX_API_KEY` is absent.
-
-As a temporary alternative to `CODEX_API_KEY`, a worker can use Codex login
-state from an explicit local `auth.json` path:
-
-```bash
-unset CODEX_API_KEY
-unset OPENAI_API_KEY
-export CODEX_AUTH_JSON_PATH="$HOME/.codex/auth.json"
-```
-
-The worker deploy copies that file to
-`/etc/loupe-container/codex/auth.json` on the worker host with mode `0600`
-and mounts it read-only at `/var/lib/loupe-worker/.codex/auth.json`.
 
 ## Secret Handling
 

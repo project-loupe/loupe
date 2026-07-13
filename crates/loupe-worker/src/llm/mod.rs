@@ -262,20 +262,10 @@ pub fn codex_available() -> bool {
 		.unwrap_or(false)
 }
 
-/// Directory codex should read for login-state files when env-based
-/// auth is not used. `CODEX_HOME` mirrors codex's own config-home
-/// override; otherwise we use `~/.codex`.
-pub fn codex_home_dir() -> Option<PathBuf> {
-	if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-		return Some(PathBuf::from(home));
-	}
-	home_path(".codex")
-}
-
 /// Return true when the worker has auth material the codex CLI can use
 /// without running an interactive login during a scan.
 pub fn codex_auth_available() -> bool {
-	codex_api_key_env().is_some() || codex_home_dir().is_some_and(|p| p.join("auth.json").exists())
+	codex_api_key_env().is_some()
 }
 
 pub(crate) fn codex_api_key_env() -> Option<OsString> {
@@ -430,11 +420,9 @@ fn build_codex_backend(
 #[cfg(test)]
 mod tests {
 	use std::ffi::OsString;
-	use std::sync::Mutex;
 
 	use super::*;
-
-	static ENV_LOCK: Mutex<()> = Mutex::new(());
+	use crate::PROCESS_ENV_LOCK;
 
 	struct EnvGuard {
 		name: &'static str,
@@ -467,7 +455,7 @@ mod tests {
 
 	#[test]
 	fn provider_auth_checks_accept_api_keys() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", "anthropic-key");
 		let _openai = EnvGuard::set("OPENAI_API_KEY", "openai-key");
 		let _codex = EnvGuard::unset("CODEX_API_KEY");
@@ -478,16 +466,11 @@ mod tests {
 
 	#[test]
 	fn codex_auth_checks_codex_api_key() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		let _openai = EnvGuard::unset("OPENAI_API_KEY");
 		let _codex = EnvGuard::set("CODEX_API_KEY", "codex-key");
-		let dir = tempfile::tempdir().unwrap();
-		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());
 
-		assert!(
-			codex_auth_available(),
-			"CODEX_API_KEY should enable codex auth without OPENAI_API_KEY or auth.json"
-		);
+		assert!(codex_auth_available(), "CODEX_API_KEY should enable codex authentication");
 	}
 
 	#[test]
@@ -503,19 +486,6 @@ mod tests {
 		assert!(summary.contains("proxy refused websocket"), "got: {summary}");
 		assert!(summary.contains(CLI_STREAM_OMISSION), "got: {summary}");
 		assert!(!summary.contains('\n'), "summary must stay single-line: {summary}");
-	}
-
-	#[test]
-	fn codex_auth_checks_codex_home_auth_json() {
-		let _guard = ENV_LOCK.lock().unwrap();
-		let _openai = EnvGuard::unset("OPENAI_API_KEY");
-		let _codex = EnvGuard::unset("CODEX_API_KEY");
-		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
-		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());
-
-		assert_eq!(codex_home_dir().as_deref(), Some(dir.path()));
-		assert!(codex_auth_available());
 	}
 
 	#[test]
