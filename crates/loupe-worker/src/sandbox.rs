@@ -200,6 +200,7 @@ impl SandboxBuilder {
 		cmd.env_clear();
 		cmd.env("PATH", sandbox_path());
 		cmd.arg("--die-with-parent");
+		cmd.arg("--new-session");
 		cmd.arg("--clearenv");
 
 		if self.allow_network {
@@ -808,6 +809,20 @@ mod tests {
 		assert!(
 			stdout.contains("CLEAN"),
 			"unforwarded host env leaked through /proc/1/environ: {stdout}",
+		);
+	}
+
+	#[test]
+	fn wrapped_command_isolates_controlling_terminal() {
+		// `build` reads PATH, so it still needs the environment lock.
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+
+		assert!(
+			args.iter().any(|arg| arg == "--new-session"),
+			"sandbox must isolate the controlling terminal with --new-session: {args:?}",
 		);
 	}
 
