@@ -16,7 +16,10 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: V1_INITIAL }];
+const MIGRATIONS: &[Migration] = &[
+	Migration { version: 1, sql: V1_INITIAL },
+	Migration { version: 2, sql: V2_JOB_CAPABILITIES },
+];
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {
@@ -267,6 +270,50 @@ CREATE TABLE scan_history (
 CREATE INDEX idx_history_repo ON scan_history(repo_id, finished_at DESC);
 "#;
 
+/// v2 — every active lease receives a one-time capability. Existing
+/// leases are requeued because no plaintext capability exists for them.
+const V2_JOB_CAPABILITIES: &str = r#"
+ALTER TABLE jobs ADD COLUMN job_capability_hash BLOB;
+CREATE UNIQUE INDEX idx_jobs_capability
+    ON jobs(job_capability_hash)
+    WHERE job_capability_hash IS NOT NULL;
+
+-- A verifier may have committed its durable verdict immediately before
+-- the server was upgraded. Treat that job as complete rather than
+-- requeuing it and asking another verifier to submit a second verdict.
+UPDATE jobs
+   SET state = 'succeeded',
+       worker_id = NULL,
+       lease_expires_at = NULL,
+       job_capability_hash = NULL,
+       finished_at = COALESCE(
+           finished_at,
+           (SELECT MAX(created_at)
+              FROM finding_verifications
+             WHERE job_id = jobs.id)
+       ),
+       error = NULL
+ WHERE state = 'leased'
+   AND kind = 'verify'
+   AND EXISTS (
+       SELECT 1
+         FROM finding_verifications
+        WHERE job_id = jobs.id
+   );
+
+UPDATE jobs
+   SET state = 'queued',
+       worker_id = NULL,
+       lease_expires_at = NULL,
+       job_capability_hash = NULL,
+       attempts = 0,
+       started_at = NULL,
+       finished_at = NULL,
+       error = NULL,
+       head_sha = NULL
+ WHERE state = 'leased';
+"#;
+
 #[cfg(test)]
 mod tests {
 	use rusqlite::Connection;
@@ -318,6 +365,53 @@ mod tests {
 		apply_pending(&mut c).unwrap();
 		let v_after = current_schema_version(&c).unwrap();
 		assert_eq!(v_before, v_after);
+	}
+
+	#[test]
+	fn capability_migration_does_not_requeue_a_recorded_verdict() {
+		let mut c = Connection::open_in_memory().unwrap();
+		c.execute_batch(V1_INITIAL).unwrap();
+		c.execute("INSERT INTO schema_meta (id, version, applied_at) VALUES (1, 1, 0)", [])
+			.unwrap();
+		c.execute_batch(
+			"INSERT INTO workers
+			   (id, name, kind, cert_fingerprint, created_at)
+			 VALUES (1, 'worker', 'worker', x'01', 0);
+			 INSERT INTO registered_repos
+			   (id, clone_url, host, owner, repo, scanner_config, reporting, created_at)
+			 VALUES (1, 'https://github.com/o/r.git', 'github.com', 'o', 'r', '{}',
+			         '{\"kind\":\"manual\"}', 0);
+			 INSERT INTO jobs
+			   (id, repo_id, kind, state, worker_id, lease_expires_at, attempts, enqueued_at, started_at)
+			 VALUES (1, 1, 'scan', 'succeeded', NULL, NULL, 1, 0, 1),
+			        (2, 1, 'verify', 'leased', 1, 100, 1, 2, 3),
+			        (3, 1, 'scan', 'leased', 1, 100, 1, 4, 5);
+			 INSERT INTO findings
+			   (id, repo_id, job_id, scanner_id, severity, title, description,
+			    fingerprint, state, created_at)
+			 VALUES (1, 1, 1, 'scanner', 'medium', 'title', 'description',
+			         'fingerprint', 'confirmed', 10);
+			 INSERT INTO finding_verifications
+			   (finding_id, job_id, verdict, notes, created_at)
+			 VALUES (1, 2, 'confirmed', 'already recorded', 50);",
+		)
+		.unwrap();
+
+		apply_pending(&mut c).unwrap();
+
+		let verify: (String, Option<i64>, Option<i64>) = c
+			.query_row("SELECT state, worker_id, finished_at FROM jobs WHERE id = 2", [], |row| {
+				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+			})
+			.unwrap();
+		let scan_state: String =
+			c.query_row("SELECT state FROM jobs WHERE id = 3", [], |row| row.get(0)).unwrap();
+		assert_eq!(
+			verify,
+			("succeeded".into(), None, Some(50)),
+			"a persisted verdict must make its interrupted verify job terminal",
+		);
+		assert_eq!(scan_state, "queued", "ordinary interrupted leases must be requeued");
 	}
 
 	#[test]

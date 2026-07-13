@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use loupe_core::{Finding, RepoSpec, Verdict};
+use loupe_proto::JobCapability;
 use tokio_util::sync::CancellationToken;
 
 /// Outcome of `Scanner::verify`. Discriminates the two ways a
@@ -51,9 +52,10 @@ pub struct ScanContext {
 	pub repo_id: i64,
 	/// Server-side job id from the lease envelope. The agent's MCP
 	/// `submit_finding` tool uses it to POST findings to
-	/// `/v1/jobs/{job_id}/findings` directly — submission no longer
-	/// goes through the runner's batch call at end-of-scan.
+	/// `/v1/jobs/{job_id}/llm-findings` through the trusted broker —
+	/// submission no longer goes through the runner's batch call.
 	pub job_id: i64,
+	pub job_capability: JobCapability,
 	pub head_sha: String,
 	pub base_sha: Option<String>,
 	pub config: serde_json::Value,
@@ -68,8 +70,9 @@ pub struct VerifyContext {
 	/// MCP-driven verifier path: the agent's `submit_verdict` /
 	/// `submit_patch` tools POST against `/v1/jobs/{job_id}/...`,
 	/// so the LLM-backed scanner forwards this id into `LlmRequest`
-	/// (and the MCP server gets it via `--job-id`).
+	/// (and the host-side MCP broker is scoped to it).
 	pub job_id: i64,
+	pub job_capability: JobCapability,
 	/// Server-side finding id this verify job is targeting. Same
 	/// purpose as `job_id` but for the verify-mode tool catalog —
 	/// the MCP server only flips into verify mode when it sees both

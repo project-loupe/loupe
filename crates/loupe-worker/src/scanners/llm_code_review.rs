@@ -6,7 +6,7 @@
 //! `get_finding_by_id` for duplicates, generates a regression-test
 //! PoC, and (only if it's confident) calls `submit_finding`. The MCP
 //! `submit_finding` tool POSTs straight to
-//! `/v1/jobs/{job_id}/findings`, so submissions land on the server
+//! `/v1/jobs/{job_id}/llm-findings`, so submissions land on the server
 //! before this scanner returns. The scanner's own return value is
 //! always an empty `Vec<Finding>` — its job is orchestration, not
 //! emission.
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use loupe_core::Finding;
+pub use loupe_proto::LLM_CODE_REVIEW_SCANNER_ID as SCANNER_ID;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -29,8 +30,6 @@ use crate::llm::prompts::{self, DISCOVERY};
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::scanner::{ScanContext, Scanner};
 use crate::source_discovery::{walk_source_files, ScannerConfig, ScannerConfigPatch};
-
-pub const SCANNER_ID: &str = "llm-code-review";
 const CAPABILITIES: &[&str] = &["scan:llm"];
 
 pub struct LlmCodeReviewScanner {
@@ -105,6 +104,7 @@ impl Scanner for LlmCodeReviewScanner {
 				&files,
 				ctx.repo_id,
 				ctx.job_id,
+				ctx.job_capability.clone(),
 				self.bkb_hint,
 				&ctx.cancel,
 			)
@@ -147,7 +147,8 @@ impl LlmCodeReviewScanner {
 	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
-		bkb_hint: &'static str, cancel: &CancellationToken,
+		job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
+		cancel: &CancellationToken,
 	) -> usize {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
@@ -161,10 +162,21 @@ impl LlmCodeReviewScanner {
 			let workdir = workdir.to_path_buf();
 			let path = path.clone();
 			let cancel = cancel.clone();
+			let job_capability = job_capability.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				run_one(backend, &workdir, &path, &cfg_owned, repo_id, job_id, bkb_hint, cancel)
-					.await
+				run_one(
+					backend,
+					&workdir,
+					&path,
+					&cfg_owned,
+					repo_id,
+					job_id,
+					job_capability,
+					bkb_hint,
+					cancel,
+				)
+				.await
 			}));
 		}
 
@@ -191,7 +203,8 @@ impl LlmCodeReviewScanner {
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
-	job_id: i64, bkb_hint: &'static str, cancel: CancellationToken,
+	job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
+	cancel: CancellationToken,
 ) -> Result<(), ()> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
 	let prompt = prompts::render(DISCOVERY, &[("file", &rel), ("bkb_hint", bkb_hint)]);
@@ -204,6 +217,7 @@ async fn run_one(
 		cancel,
 		repo_id: Some(repo_id),
 		job_id: Some(job_id),
+		job_capability: Some(job_capability),
 		finding_id: None,
 	};
 	match backend.run(req).await {
@@ -239,6 +253,7 @@ mod tests {
 			workdir: workdir.to_path_buf(),
 			repo_id: 1,
 			job_id: 1,
+			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),

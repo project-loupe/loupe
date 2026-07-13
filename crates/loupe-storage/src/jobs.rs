@@ -46,6 +46,19 @@ pub struct JobRow {
 	pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseIdentity<'a> {
+	pub job_id: i64,
+	pub worker_id: i64,
+	pub capability_hash: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveLease<'a> {
+	pub identity: LeaseIdentity<'a>,
+	pub now: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewJob {
 	pub repo_id: i64,
@@ -106,6 +119,7 @@ pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i6
 /// `attempts` and stamps `worker_id`, `lease_expires_at`, `started_at`.
 pub fn lease_next(
 	conn: &Connection, worker_id: i64, accepts_verify: bool, now: i64, lease_seconds: i64,
+	job_capability_hash: &[u8],
 ) -> rusqlite::Result<Option<JobRow>> {
 	let lease_until = now + lease_seconds;
 	let target_state =
@@ -116,7 +130,8 @@ pub fn lease_next(
 		       worker_id = ?2,
 		       lease_expires_at = ?3,
 		       attempts = attempts + 1,
-		       started_at = COALESCE(started_at, ?4)
+		       started_at = COALESCE(started_at, ?4),
+		       job_capability_hash = ?6
 		 WHERE id = (
 		     SELECT id FROM jobs
 		     WHERE state = 'queued'
@@ -129,7 +144,14 @@ pub fn lease_next(
 		 RETURNING {JOB_COLUMNS}",
 	))?;
 	let mut iter = stmt.query_map(
-		params![target_state.as_str(), worker_id, lease_until, now, accepts_verify as i64],
+		params![
+			target_state.as_str(),
+			worker_id,
+			lease_until,
+			now,
+			accepts_verify as i64,
+			job_capability_hash,
+		],
 		row_to_job,
 	)?;
 	match iter.next() {
@@ -138,11 +160,12 @@ pub fn lease_next(
 	}
 }
 
-/// Extend a lease. Returns `Ok(false)` if the job isn't currently
-/// leased to `worker_id` (which means the caller's token is stale and
-/// they should drop the work).
+/// Extend a lease. Returns `Ok(None)` if the job isn't currently and
+/// actively leased to `worker_id` (which means the caller's token is
+/// stale and they should drop the work).
 pub fn heartbeat(
 	conn: &Connection, job_id: i64, worker_id: i64, now: i64, lease_seconds: i64,
+	job_capability_hash: &[u8],
 ) -> rusqlite::Result<Option<i64>> {
 	let lease_until = now + lease_seconds;
 	let leased_state =
@@ -150,8 +173,10 @@ pub fn heartbeat(
 	let n = conn.execute(
 		"UPDATE jobs
 		   SET lease_expires_at = ?1
-		 WHERE id = ?2 AND state = ?3 AND worker_id = ?4",
-		params![lease_until, job_id, leased_state.as_str(), worker_id],
+		 WHERE id = ?2 AND state = ?3 AND worker_id = ?4
+		   AND job_capability_hash = ?5
+		   AND lease_expires_at >= ?6",
+		params![lease_until, job_id, leased_state.as_str(), worker_id, job_capability_hash, now],
 	)?;
 	Ok(if n > 0 { Some(lease_until) } else { None })
 }
@@ -159,7 +184,7 @@ pub fn heartbeat(
 /// Mark a leased job as complete. Caller picks the new state
 /// (`succeeded` or `failed`).
 pub fn complete(
-	conn: &Connection, job_id: i64, worker_id: i64, new_state: JobState, head_sha: Option<&str>,
+	conn: &Connection, lease: LeaseIdentity<'_>, new_state: JobState, head_sha: Option<&str>,
 	error: Option<&str>, now: i64,
 ) -> rusqlite::Result<bool> {
 	let transition = match new_state {
@@ -179,16 +204,21 @@ pub fn complete(
 		       head_sha = COALESCE(?2, head_sha),
 		       error = ?3,
 		       finished_at = ?4,
-		       lease_expires_at = NULL
-		 WHERE id = ?5 AND state = ?6 AND worker_id = ?7",
+		       lease_expires_at = NULL,
+		       job_capability_hash = NULL
+		 WHERE id = ?5 AND state = ?6 AND worker_id = ?7
+		   AND job_capability_hash = ?8
+		   AND lease_expires_at >= ?9",
 		params![
 			target_state.as_str(),
 			head_sha,
 			error,
 			now,
-			job_id,
+			lease.job_id,
 			JobState::Leased.as_str(),
-			worker_id,
+			lease.worker_id,
+			lease.capability_hash,
+			now,
 		],
 	)?;
 	Ok(n > 0)
@@ -210,6 +240,7 @@ pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<
 		   SET state = ?2,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
+		       job_capability_hash = NULL,
 		       finished_at = ?3,
 		       error = ?4
 		 WHERE id = ?1 AND state IN ('queued','leased')",
@@ -310,6 +341,7 @@ pub fn requeue_failed(
 		   SET state = ?1,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
+		       job_capability_hash = NULL,
 		       attempts = 0,
 		       started_at = NULL,
 		       finished_at = NULL,
@@ -349,6 +381,50 @@ pub struct JobFilter {
 	pub limit: Option<i64>,
 }
 
+/// Resolve an opaque capability to its one exact, live lease.
+pub fn get_active_by_capability_hash(
+	conn: &Connection, worker_id: i64, job_capability_hash: &[u8], now: i64,
+) -> rusqlite::Result<Option<JobRow>> {
+	conn.query_row(
+		&format!(
+			"SELECT {JOB_COLUMNS} FROM jobs
+			 WHERE worker_id = ?1
+			   AND job_capability_hash = ?2
+			   AND state = 'leased'
+			   AND lease_expires_at IS NOT NULL
+			   AND lease_expires_at >= ?3"
+		),
+		params![worker_id, job_capability_hash, now],
+		row_to_job,
+	)
+	.optional()
+}
+
+/// Run a mutation in one transaction tied to the exact lease the
+/// caller previously authorized. Returning `None` means that lease is
+/// no longer active and the mutation was not run.
+pub fn with_active_lease_transaction<T>(
+	conn: &mut Connection, lease: ActiveLease<'_>,
+	mutate: impl FnOnce(&Connection, &JobRow) -> rusqlite::Result<T>,
+) -> rusqlite::Result<Option<T>> {
+	let tx = conn.transaction()?;
+	let Some(row) = get_active_by_capability_hash(
+		&tx,
+		lease.identity.worker_id,
+		lease.identity.capability_hash,
+		lease.now,
+	)?
+	else {
+		return Ok(None);
+	};
+	if row.id != lease.identity.job_id {
+		return Ok(None);
+	}
+	let value = mutate(&tx, &row)?;
+	tx.commit()?;
+	Ok(Some(value))
+}
+
 pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRow>> {
 	let mut clauses: Vec<String> = Vec::new();
 	let mut args: Vec<Value> = Vec::new();
@@ -375,6 +451,7 @@ pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRo
 		},
 		None => "",
 	};
+
 	let sql = format!(
 		"SELECT {JOB_COLUMNS}
 		 FROM jobs{where_sql}
@@ -446,6 +523,7 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		   SET state = ?2,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
+		       job_capability_hash = NULL,
 		       started_at = NULL
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
@@ -457,6 +535,7 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		   SET state = ?3,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
+		       job_capability_hash = NULL,
 		       finished_at = ?1,
 		       error = COALESCE(error, ?4)
 		 WHERE state = 'leased'
@@ -505,6 +584,8 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicU64, Ordering};
+
 	use loupe_core::{Finding, ReportingDestination, Severity};
 
 	use super::*;
@@ -512,6 +593,45 @@ mod tests {
 	use crate::secrets::{self, SecretKind};
 	use crate::workers::{self, WorkerKind};
 	use crate::Db;
+
+	static NEXT_TEST_CAPABILITY: AtomicU64 = AtomicU64::new(1);
+
+	fn lease_next(
+		conn: &Connection, worker_id: i64, accepts_verify: bool, now: i64, lease_seconds: i64,
+	) -> rusqlite::Result<Option<JobRow>> {
+		let mut hash = [0u8; 32];
+		hash[..8]
+			.copy_from_slice(&NEXT_TEST_CAPABILITY.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+		super::lease_next(conn, worker_id, accepts_verify, now, lease_seconds, &hash)
+	}
+
+	fn active_capability_hash(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<u8>> {
+		conn.query_row("SELECT job_capability_hash FROM jobs WHERE id = ?1", [job_id], |row| {
+			row.get(0)
+		})
+	}
+
+	fn heartbeat(
+		conn: &Connection, job_id: i64, worker_id: i64, now: i64, lease_seconds: i64,
+	) -> rusqlite::Result<Option<i64>> {
+		let hash = active_capability_hash(conn, job_id)?;
+		super::heartbeat(conn, job_id, worker_id, now, lease_seconds, &hash)
+	}
+
+	fn complete(
+		conn: &Connection, job_id: i64, worker_id: i64, new_state: JobState,
+		head_sha: Option<&str>, error: Option<&str>, now: i64,
+	) -> rusqlite::Result<bool> {
+		let hash = active_capability_hash(conn, job_id)?;
+		super::complete(
+			conn,
+			LeaseIdentity { job_id, worker_id, capability_hash: &hash },
+			new_state,
+			head_sha,
+			error,
+			now,
+		)
+	}
 
 	fn db_with_repo_and_worker() -> (Db, i64, i64) {
 		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
@@ -833,8 +953,40 @@ mod tests {
 		.unwrap();
 		let leased =
 			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
-		let new_until = db.with_conn(|c| Ok(heartbeat(c, leased.id, worker_id, 200, 60)?)).unwrap();
-		assert_eq!(new_until, Some(260));
+		let new_until = db.with_conn(|c| Ok(heartbeat(c, leased.id, worker_id, 150, 60)?)).unwrap();
+		assert_eq!(new_until, Some(210));
+	}
+
+	#[test]
+	fn heartbeat_cannot_revive_an_expired_lease() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
+
+		let new_until = db.with_conn(|c| Ok(heartbeat(c, leased.id, worker_id, 161, 60)?)).unwrap();
+
+		assert_eq!(new_until, None, "an expired lease must not be renewable");
+		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		assert_eq!(
+			row.lease_expires_at,
+			Some(160),
+			"a rejected heartbeat must not extend the lease"
+		);
 	}
 
 	#[test]
@@ -860,7 +1012,7 @@ mod tests {
 		let other_worker_id = db
 			.with_conn(|c| Ok(workers::insert(c, "w2", WorkerKind::Worker, &[2u8; 32], 0)?))
 			.unwrap();
-		let res = db.with_conn(|c| Ok(heartbeat(c, leased.id, other_worker_id, 200, 60)?)).unwrap();
+		let res = db.with_conn(|c| Ok(heartbeat(c, leased.id, other_worker_id, 150, 60)?)).unwrap();
 		assert_eq!(res, None, "stranger heartbeat must not extend the lease");
 	}
 
@@ -904,6 +1056,60 @@ mod tests {
 	}
 
 	#[test]
+	fn active_lease_transaction_rejects_an_invalidated_capability() {
+		use std::cell::Cell;
+
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let job_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					100,
+				)?)
+			})
+			.unwrap();
+		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?))
+			.unwrap()
+			.expect("job should be leased");
+		let capability_hash = db.with_conn(|c| Ok(active_capability_hash(c, job_id)?)).unwrap();
+
+		let cancelled = db.with_conn(|c| Ok(cancel(c, job_id, 201)?)).unwrap();
+		assert!(matches!(cancelled, CancelOutcome::Cancelled(_)));
+
+		let mutation_ran = Cell::new(false);
+		let result = db
+			.with_conn(|c| {
+				Ok(with_active_lease_transaction(
+					c,
+					ActiveLease {
+						identity: LeaseIdentity {
+							job_id,
+							worker_id,
+							capability_hash: &capability_hash,
+						},
+						now: 201,
+					},
+					|_, _| {
+						mutation_ran.set(true);
+						Ok(())
+					},
+				)?)
+			})
+			.unwrap();
+
+		assert!(result.is_none(), "an invalidated capability must not authorize a mutation");
+		assert!(!mutation_ran.get(), "the protected mutation must not run");
+	}
+
+	#[test]
 	fn complete_succeeded_terminates_job() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
@@ -925,14 +1131,48 @@ mod tests {
 			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
 		let ok = db
 			.with_conn(|c| {
-				Ok(complete(c, leased.id, worker_id, JobState::Succeeded, Some("abc"), None, 200)?)
+				Ok(complete(c, leased.id, worker_id, JobState::Succeeded, Some("abc"), None, 150)?)
 			})
 			.unwrap();
 		assert!(ok);
 		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
 		assert_eq!(row.state, JobState::Succeeded);
 		assert_eq!(row.head_sha.as_deref(), Some("abc"));
-		assert_eq!(row.finished_at, Some(200));
+		assert_eq!(row.finished_at, Some(150));
+	}
+
+	#[test]
+	fn complete_rejects_an_expired_lease() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
+
+		let completed = db
+			.with_conn(|c| {
+				Ok(complete(c, leased.id, worker_id, JobState::Succeeded, Some("abc"), None, 161)?)
+			})
+			.unwrap();
+
+		assert!(!completed, "an expired lease must not complete a job");
+		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		assert_eq!(row.state, JobState::Leased);
+		assert!(row.head_sha.is_none(), "a rejected completion must not record a revision");
+		assert!(row.finished_at.is_none(), "a rejected completion must not finish the job");
 	}
 
 	#[test]

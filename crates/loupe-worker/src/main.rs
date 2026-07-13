@@ -4,11 +4,9 @@
 //!
 //! - `run` (default when no subcommand is given): the long-running
 //!   worker loop — leases jobs, runs scanners, submits findings.
-//! - `mcp-serve`: a one-shot stdio MCP server, spawned as a child of
-//!   the configured agent for the duration of one discovery /
-//!   validation call. Talks to the same `loupe-server` over the same
-//!   mTLS cert; the only difference is the surface (JSON-RPC over
-//!   stdio vs. the long-poll lease loop).
+//! - `mcp-proxy`: a credential-free stdio/Unix-socket bridge spawned
+//!   inside an agent sandbox. The trusted MCP broker stays in the
+//!   parent worker process.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,10 +16,10 @@ use clap::{Parser, Subcommand};
 use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
-	claude_available, codex_auth_available, codex_available, JobAgent, McpContext, McpTlsSource,
+	claude_available, codex_auth_available, codex_available, JobAgent, McpContext,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
-use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
+use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -39,10 +37,9 @@ enum Cmd {
 	/// subcommand is given, so the existing
 	/// `loupe-worker --server-url ... ...` invocation keeps working.
 	Run(Box<RunArgs>),
-	/// Serve the MCP protocol over stdio for one agent invocation.
-	/// Spawned by an agent CLI from inside the sandbox the runner sets
-	/// up; reads JSON-RPC from stdin, writes to stdout, logs to stderr.
-	McpServe(Box<McpServeArgs>),
+	/// Bridge MCP stdio to one host-side Unix socket. This subcommand
+	/// receives no server URL, mTLS credentials, job id, or capability.
+	McpProxy(McpProxyArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -89,7 +86,7 @@ struct RunArgs {
 	/// Maximum checked-out worktree size in GB before a job fails.
 	#[arg(long, env = "LOUPE_MAX_WORKDIR_GB")]
 	max_workdir_gb: Option<u64>,
-	/// Disable bubblewrap sandboxing. Intended for development only.
+	/// Legacy option. Enabling it is rejected; LLM workers require bubblewrap.
 	#[arg(long, env = "LOUPE_DISABLE_SANDBOX", value_parser = clap::builder::BoolishValueParser::new())]
 	disable_sandbox: Option<bool>,
 	/// Logging level: trace, debug, info, warn, or error.
@@ -134,54 +131,9 @@ struct RunArgs {
 }
 
 #[derive(Debug, Parser)]
-struct McpServeArgs {
-	/// Base URL of the loupe-server.
-	#[arg(long, env = "LOUPE_SERVER_URL")]
-	server_url: reqwest::Url,
-	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_WORKER_CERT")]
-	cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_WORKER_KEY")]
-	key: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<String>,
-	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<String>,
-	#[arg(long, env = "LOUPE_WORKER_CERT_PEM", hide_env_values = true)]
-	cert_pem: Option<String>,
-	#[arg(long, env = "LOUPE_WORKER_CERT_PEM_B64", hide_env_values = true)]
-	cert_pem_b64: Option<String>,
-	#[arg(long, env = "LOUPE_WORKER_KEY_PEM", hide_env_values = true)]
-	key_pem: Option<String>,
-	#[arg(long, env = "LOUPE_WORKER_KEY_PEM_B64", hide_env_values = true)]
-	key_pem_b64: Option<String>,
-	/// Repo id the agent is currently scanning. Tool calls scope to
-	/// this repo automatically — there's no cross-repo lookup at the
-	/// agent surface.
-	#[arg(long, env = "LOUPE_REPO_ID")]
-	repo_id: i64,
-	/// Job id the agent is currently working on. Required for the
-	/// `submit_finding` tool — submissions POST to
-	/// `/v1/jobs/{job_id}/findings`. When omitted (e.g. a future
-	/// read-only MCP usage) the tool is not advertised.
-	#[arg(long, env = "LOUPE_JOB_ID")]
-	job_id: Option<i64>,
-	/// Finding id this verify session is reasoning about. When set,
-	/// the MCP server enters verify mode: `submit_finding` is
-	/// hidden; `submit_verdict`, `submit_patch`, and `validate_patch`
-	/// are advertised instead. Setting this without `--job-id` is a
-	/// configuration bug — verdict POSTs need a job to attribute the
-	/// verification row to — and the MCP server bails at startup
-	/// rather than silently degrading.
-	#[arg(long, env = "LOUPE_FINDING_ID")]
-	finding_id: Option<i64>,
-	/// Path to the worktree the agent is reasoning over. The MCP
-	/// server reads source files from here to compute fingerprints
-	/// for `submit_finding`. Inside the bwrap sandbox this is
-	/// `/workdir`; bare runs use the host worktree path.
-	#[arg(long, env = "LOUPE_WORKDIR")]
-	workdir: PathBuf,
+struct McpProxyArgs {
+	#[arg(long)]
+	socket: PathBuf,
 }
 
 #[tokio::main]
@@ -193,9 +145,9 @@ async fn main() -> Result<()> {
 			init_tracing(&cfg.logging);
 			run_worker(*args, cfg).await
 		},
-		Some(Cmd::McpServe(args)) => {
+		Some(Cmd::McpProxy(args)) => {
 			init_tracing_from_env();
-			run_mcp_serve(*args).await
+			run_mcp_proxy(args).await
 		},
 		// Default subcommand for backwards compatibility with the
 		// existing `loupe-worker --server-url ...` invocation pattern.
@@ -273,18 +225,11 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	if codex_installed && !codex_auth {
 		tracing::warn!("`codex` is installed but no CODEX_API_KEY or OPENAI_API_KEY was found");
 	}
-	// bwrap is the security boundary for every agent subprocess; if
-	// it's missing and LOUPE_DISABLE_SANDBOX isn't set, refuse to run.
-	match sandbox::probe_at_startup() {
-		Ok(true) => {
-			sandbox::smoketest(&cache_dir).context("bubblewrap sandbox smoketest failed")?;
-			tracing::info!("bubblewrap available; LLM scanners sandboxed");
-		},
-		Ok(false) => {
-			tracing::warn!("LOUPE_DISABLE_SANDBOX is set; LLM scanners running without isolation")
-		},
-		Err(e) => return Err(e.context("LLM scanner requires bubblewrap")),
-	}
+	// bwrap is the security boundary for every agent subprocess; a
+	// missing binary or attempted bypass is a startup error.
+	sandbox::probe_at_startup().context("LLM scanner requires bubblewrap")?;
+	sandbox::smoketest(&cache_dir).context("bubblewrap sandbox smoketest failed")?;
+	tracing::info!("bubblewrap available; LLM scanners sandboxed");
 
 	// Optional bkb-mcp auto-attach. When the operator has installed
 	// `bkb-mcp` (cargo install bkb-mcp), the discovery agent gets the
@@ -305,18 +250,14 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		);
 	}
 
-	// Build the MCP context once: same paths feed both the
-	// discovery and verifier backends. Resolve the worker binary's
-	// host path so the sandbox can bind-mount it for the MCP child
-	// to exec. `current_exe()` returns the executable currently
-	// running; the agent's MCP child will be `loupe-worker
-	// mcp-serve`, served by the same binary.
+	// The agent gets only this binary's credential-free proxy mode and
+	// a per-invocation Unix socket. The authenticated client remains in
+	// the trusted parent process.
 	let worker_binary = std::env::current_exe()
 		.context("resolving the loupe-worker binary path for MCP bind-mount")?;
 	let mcp_ctx = McpContext {
 		worker_binary,
-		server_url: server_url.to_string(),
-		tls: tls.source,
+		client: client.clone(),
 		bkb_mcp_path: bkb_mcp_path.clone(),
 		bkb_api_url: cfg.bkb.api_url.clone(),
 	};
@@ -370,39 +311,26 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	Ok(())
 }
 
-async fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
-	let tls = read_worker_tls(
-		args.ca_cert_pem,
-		args.ca_cert_pem_b64,
-		args.cert_pem,
-		args.cert_pem_b64,
-		args.key_pem,
-		args.key_pem_b64,
-		args.ca_cert,
-		args.cert,
-		args.key,
-	)?;
-	let client = Arc::new(ServerClient::new(
-		&tls.ca_cert_pem,
-		&tls.cert_pem,
-		&tls.key_pem,
-		args.server_url,
-	)?);
-	if args.finding_id.is_some() && args.job_id.is_none() {
-		anyhow::bail!(
-			"--finding-id requires --job-id (verdict POSTs need a job to attribute \
-			 the verification row to). This is a worker-side configuration bug; \
-			 caller should pass both or neither."
-		);
-	}
-	tracing::info!(
-		repo_id = args.repo_id,
-		job_id = ?args.job_id,
-		finding_id = ?args.finding_id,
-		workdir = %args.workdir.display(),
-		"loupe-mcp: starting stdio server",
-	);
-	mcp::run_stdio_server(client, args.repo_id, args.job_id, args.finding_id, args.workdir).await
+async fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
+	use tokio::io::{AsyncWriteExt, BufReader};
+
+	let stream = tokio::net::UnixStream::connect(&args.socket)
+		.await
+		.with_context(|| format!("connecting MCP broker socket at {}", args.socket.display()))?;
+	let (socket_read, mut socket_write) = stream.into_split();
+	let mut socket_read = BufReader::new(socket_read);
+	let mut stdin = tokio::io::stdin();
+	let mut stdout = tokio::io::stdout();
+	let to_broker = async {
+		tokio::io::copy(&mut stdin, &mut socket_write).await?;
+		socket_write.shutdown().await
+	};
+	let from_broker = async {
+		tokio::io::copy(&mut socket_read, &mut stdout).await?;
+		stdout.flush().await
+	};
+	tokio::try_join!(to_broker, from_broker)?;
+	Ok(())
 }
 
 fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
@@ -438,7 +366,6 @@ struct WorkerTls {
 	ca_cert_pem: String,
 	cert_pem: String,
 	key_pem: String,
-	source: McpTlsSource,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,7 +400,6 @@ fn read_worker_tls(
 				"LOUPE_WORKER_KEY_PEM",
 				"LOUPE_WORKER_KEY_PEM_B64",
 			)?,
-			source: McpTlsSource::Env,
 		});
 	}
 
@@ -489,16 +415,7 @@ fn read_worker_tls(
 		.with_context(|| format!("reading worker cert at {}", cert.display()))?;
 	let key_pem = std::fs::read_to_string(&key)
 		.with_context(|| format!("reading worker key at {}", key.display()))?;
-	Ok(WorkerTls {
-		ca_cert_pem,
-		cert_pem,
-		key_pem,
-		source: McpTlsSource::Paths {
-			ca_cert_path: ca_cert,
-			client_cert_path: cert,
-			client_key_path: key,
-		},
-	})
+	Ok(WorkerTls { ca_cert_pem, cert_pem, key_pem })
 }
 
 fn has_value(value: &Option<String>) -> bool {
@@ -530,12 +447,10 @@ fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
 /// structured JSON output. `RUST_LOG` remains the compatibility escape
 /// hatch for module-level filters; otherwise `[logging].level` is used.
 ///
-/// MCP-serve mode pipes its tracing to stderr explicitly: stdout is
+/// MCP-proxy mode pipes its tracing to stderr explicitly: stdout is
 /// reserved for the JSON-RPC stream, and the agent will choke on any
 /// non-JSON noise mixed in. Worker mode uses the default writer
-/// (also stderr by `tracing_subscriber` default), so the change is
-/// invisible to the long-running worker but load-bearing for the MCP
-/// child.
+/// (also stderr by `tracing_subscriber` default).
 fn init_tracing(logging: &LoggingConfig) {
 	let env_filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
 		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&logging.level));
@@ -603,7 +518,6 @@ mod tests {
 		assert_eq!(tls.ca_cert_pem, ca);
 		assert_eq!(tls.cert_pem, cert);
 		assert_eq!(tls.key_pem, key);
-		assert!(matches!(tls.source, McpTlsSource::Env));
 	}
 
 	#[test]

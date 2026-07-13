@@ -14,9 +14,9 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use git2::{Repository, Signature};
-use loupe_core::{Finding, Severity};
+use loupe_core::Severity;
 use loupe_proto::{
-	FindingsBatch, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
+	LlmFindingSubmission, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
 	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
@@ -202,7 +202,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 
 	// Stub LLM backend simulating one agent session per file. In
 	// production the agent's MCP `submit_finding` tool POSTs to
-	// `/v1/jobs/{job_id}/findings`; the stub mirrors that by calling
+	// `/v1/jobs/{job_id}/llm-findings`; the stub mirrors that by calling
 	// `submit_findings` directly on the worker's mTLS-cert-bearing
 	// ServerClient. Body content is canned but the route, auth, and
 	// downstream pipeline (insert → reporting dispatch) are real.
@@ -211,33 +211,30 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 		let server_client = server_client_for_stub.clone();
 		async move {
 			let job_id = req.job_id.expect("test stub requires job_id (one-pass agent flow)");
-			let finding = Finding {
-				scanner_id: "llm-code-review".into(),
+			let job_capability = req.job_capability.expect("test stub requires a job capability");
+			let finding = LlmFindingSubmission {
+				protocol_version: PROTOCOL_VERSION,
 				severity: Severity::High,
 				title: "Out-of-bounds index in idx".into(),
 				description:
-					"`idx` indexes the slice without bounds checking, causing a panic on empty input."
+					"An attacker controls `idx`, which indexes the slice without bounds checking and reliably panics the service on empty input."
 						.into(),
-				file_path: Some("src/lib.rs".into()),
-				line_start: Some(1),
-				line_end: Some(1),
+				file_path: "src/lib.rs".into(),
+				line_start: 1,
+				line_end: 1,
 				cwe: Some("CWE-129".into()),
-				patch_unified: None,
-				poc_unified: Some(
+				poc_unified:
 					"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n\
 					 +#[test] fn oob_panic() { idx(&[], 0); }\n"
 						.into(),
-				),
 				// Test fingerprint: the real MCP server computes this
 				// from the worktree, but here the path is short-cut.
 				// UNIQUE(repo_id, fingerprint) silently dedups so we
 				// don't care about cosmetic stability — only that
 				// it's stable within this test.
-				fingerprint: "test-fp-oob-idx".into(),
+				fingerprint: "d".repeat(64),
 			};
-			let batch =
-				FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] };
-			server_client.submit_findings(job_id, &batch).await?;
+			server_client.submit_llm_finding(job_id, &job_capability, &finding).await?;
 			Ok(String::new())
 		}
 	}));

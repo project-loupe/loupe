@@ -16,8 +16,9 @@
 //! codex via `-c mcp_servers.<name>.command="..."` /
 //! `-c mcp_servers.<name>.args=[...]` overrides — codex's MCP
 //! config surface is TOML, but the `-c` overrides take TOML literals
-//! one key at a time, so we stream the same `mcp_serve_args` list
-//! that the claude backend writes to its JSON scratch file.
+//! one key at a time. The sandboxed agent reaches Loupe through a
+//! credential-free proxy while the host-side broker retains the job
+//! capability and worker credentials.
 //!
 //! [`ClaudeCliBackend`]: super::ClaudeCliBackend
 
@@ -29,7 +30,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
+	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
@@ -77,7 +78,7 @@ fn toml_string_literal(s: &str) -> String {
 
 /// Render a slice of strings as a TOML inline array of basic strings.
 /// Codex parses each `-c` value as TOML, so an args list passed as
-/// `["mcp-serve", "--server-url", "...", ...]` round-trips into the
+/// `["mcp-proxy", "--socket", "..." ]` round-trips into the
 /// MCP server config's `args` field.
 fn toml_string_array(items: &[String]) -> String {
 	let parts: Vec<String> = items.iter().map(|s| toml_string_literal(s)).collect();
@@ -191,18 +192,14 @@ impl LlmBackend for CodexCliBackend {
 		// env) so the loupe MCP server (and bkb-mcp when present)
 		// shows up in the agent's tool catalog without polluting the
 		// operator's `~/.codex/config.toml`.
+		let mut mcp_broker = None;
 		let mcp_overrides: Vec<String> = match (&self.mcp, req.repo_id) {
-			(Some(ctx), Some(repo_id)) => {
-				let sandbox_workdir = if std::env::var_os(crate::sandbox::DISABLE_SANDBOX_ENV)
-					.is_some_and(|v| !v.is_empty())
-				{
-					req.workdir.to_string_lossy().into_owned()
-				} else {
-					"/workdir".to_owned()
-				};
-				sandbox = bind_mcp_into_sandbox(sandbox, ctx);
-				let args =
-					mcp_serve_args(ctx, repo_id, req.job_id, req.finding_id, &sandbox_workdir);
+			(Some(ctx), Some(_)) => {
+				let broker = McpBroker::start_for_request(ctx, &req)
+					.await
+					.context("starting host-side MCP broker")?;
+				sandbox = bind_mcp_into_sandbox(sandbox, ctx, &broker);
+				let args = broker.sandbox_args();
 				let mut overrides = Vec::new();
 				overrides.push(format!(
 					"mcp_servers.loupe.command={}",
@@ -221,6 +218,7 @@ impl LlmBackend for CodexCliBackend {
 						toml_string_literal(&ctx.bkb_api_url)
 					));
 				}
+				mcp_broker = Some(broker);
 				overrides
 			},
 			(Some(_), None) => {
@@ -248,22 +246,21 @@ impl LlmBackend for CodexCliBackend {
 		let stderr_handle = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
 		let cancel = req.cancel.clone();
-		let wait_fut = async move {
-			tokio::select! {
-				biased;
-				_ = cancel.cancelled() => {
-					let _ = child.kill().await;
-					Err(anyhow!("cancelled"))
-				}
-				res = child.wait() => res.map_err(Into::into),
-			}
-		};
-
-		let (status, stdout, stderr) = match timeout(req.timeout, async {
+		let run_outcome = timeout(req.timeout, async {
 			let mut stdout_buf = Vec::new();
 			let mut stderr_buf = Vec::new();
 			let mut so = stdout_handle;
 			let mut se = stderr_handle;
+			let wait_fut = async {
+				tokio::select! {
+					biased;
+					_ = cancel.cancelled() => {
+						let _ = child.kill().await;
+						Err(anyhow!("cancelled"))
+					}
+					res = child.wait() => res.map_err(Into::into),
+				}
+			};
 			let (status, _, _) = tokio::join!(
 				wait_fut,
 				so.read_to_end(&mut stdout_buf),
@@ -271,8 +268,31 @@ impl LlmBackend for CodexCliBackend {
 			);
 			Result::<_>::Ok((status?, stdout_buf, stderr_buf))
 		})
-		.await
-		{
+		.await;
+
+		// `kill_on_drop` only sends the signal. Explicitly kill and wait
+		// after a timeout, cancellation, or wait error so broker shutdown
+		// cannot race an agent or proxy that is still exiting. If
+		// termination itself fails, abort the broker rather than preserving
+		// authority for that process.
+		if !matches!(&run_outcome, Ok(Ok(_))) {
+			if let Err(error) = child.kill().await {
+				drop(mcp_broker.take());
+				return Err(anyhow::Error::from(error)
+					.context("terminating codex CLI before broker shutdown"));
+			}
+		}
+
+		// The agent process is gone by now, so drain the broker before
+		// propagating any failure. A verify session buffers its verdict
+		// until the MCP stream closes; aborting the broker on the error
+		// paths would discard a verdict the agent had already produced.
+		let broker_outcome = match mcp_broker.take() {
+			Some(broker) => broker.finish().await.context("finishing host-side MCP broker"),
+			None => Ok(()),
+		};
+
+		let (status, stdout, stderr) = match run_outcome {
 			Ok(inner) => inner?,
 			Err(_) => return Err(anyhow!("codex CLI timed out after {:?}", req.timeout)),
 		};
@@ -297,6 +317,9 @@ impl LlmBackend for CodexCliBackend {
 			);
 			return Err(anyhow!("codex CLI exited with {}: {}", status, combined));
 		}
+		// Reported last: a CLI failure explains a broker failure, so the
+		// CLI diagnostic is the more useful error to surface.
+		broker_outcome?;
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("codex CLI stdout was not UTF-8: {e}"))?;
@@ -412,21 +435,21 @@ mod tests {
 	}
 
 	#[cfg(unix)]
-	fn process_is_running(pid: &str) -> bool {
+	fn process_state(pid: &str) -> Option<String> {
 		let output = std::process::Command::new("ps")
 			.args(["-o", "stat=", "-p", pid])
 			.stdout(Stdio::piped())
 			.stderr(Stdio::null())
 			.output();
 		let Ok(output) = output else {
-			return false;
+			return None;
 		};
 		if !output.status.success() {
-			return false;
+			return None;
 		}
 		let stat = String::from_utf8_lossy(&output.stdout);
 		let stat = stat.trim();
-		!stat.is_empty() && !stat.starts_with('Z')
+		(!stat.is_empty()).then(|| stat.to_owned())
 	}
 
 	#[cfg(unix)]
@@ -465,6 +488,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			job_capability: None,
 			finding_id: None,
 		};
 		let resp = backend.run(req).await.expect("codex responded");
@@ -484,6 +508,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			job_capability: None,
 			finding_id: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
@@ -518,20 +543,24 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			job_capability: None,
 			finding_id: None,
 		};
 
 		let err = backend.run(req).await.expect_err("must time out");
 		assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
 
-		tokio::time::sleep(Duration::from_millis(2500)).await;
-
 		let pid = std::fs::read_to_string(&pid_path).expect("fake CLI wrote pid");
 		let pid = pid.trim();
-		if process_is_running(pid) {
-			kill_pid(pid);
-			panic!("subprocess pid {pid} survived past run() timeout");
+		if let Some(state) = process_state(pid) {
+			if !state.starts_with('Z') {
+				kill_pid(pid);
+			}
+			panic!("subprocess pid {pid} was not reaped before run() returned: state={state}");
 		}
+
+		tokio::time::sleep(Duration::from_millis(2500)).await;
+
 		assert!(
 			!survived_path.exists(),
 			"fake CLI continued executing after run() returned a timeout",
@@ -555,17 +584,15 @@ mod tests {
 
 	#[test]
 	fn toml_string_array_round_trips_through_a_real_toml_parser() {
-		// `mcp_serve_args` produces a Vec<String>; the array form has
+		// MCP proxy arguments use a Vec<String>; the array form has
 		// to parse back as TOML so codex's `-c key=value` override
 		// can read it. Pin the round-trip explicitly — string
 		// concatenation bugs in the array helper would otherwise only
 		// surface at runtime when codex rejects the override.
 		let items = vec![
-			"mcp-serve".to_owned(),
-			"--server-url".to_owned(),
-			"https://loupe-server:8443".to_owned(),
-			"--workdir".to_owned(),
-			"/workdir".to_owned(),
+			"mcp-proxy".to_owned(),
+			"--socket".to_owned(),
+			"/loupe/mcp/session.sock".to_owned(),
 		];
 		let rendered = toml_string_array(&items);
 		// Wrap in a key=value pair so we can use the standard `toml`

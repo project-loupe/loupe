@@ -42,8 +42,7 @@ Before installing, the host needs:
 - **`bubblewrap`** (`bwrap`) on PATH on every machine running
   `loupe-worker` *with the LLM scanner enabled*. The worker
   hard-fatals at startup if the LLM scanner is on but `bwrap` is
-  missing — set `LOUPE_DISABLE_SANDBOX=1` to override on dev
-  machines that genuinely cannot install it. Debian/Ubuntu:
+  missing or if `LOUPE_DISABLE_SANDBOX=1` is set. Debian/Ubuntu:
   `sudo apt-get install bubblewrap`. Fedora/RHEL: `sudo dnf install
   bubblewrap`. macOS does not have a port; LLM scanning runs on Linux
   workers only.
@@ -283,7 +282,7 @@ is used for each job kind:
 > configuration first if usage limits matter.
 
 The worker also probes for `bwrap` at startup and exits 1 if it is
-missing (set `LOUPE_DISABLE_SANDBOX=1` to bypass for dev work).
+missing. Sandboxing cannot be bypassed for an LLM-enabled worker.
 Cache size defaults to 40 GB and evicts LRU clones above the cap.
 
 Verifier jobs only get queued when a repo resolves to
@@ -646,7 +645,7 @@ crates/
   loupe-tls       internal CA + cert minting + fingerprint helpers
   loupe-storage   SQLCipher DAO surface, FTS5 index, schema-versioned migrations
   loupe-server    daemon binary + mTLS routes + reporters + scheduler/reaper
-  loupe-worker    worker binary (`run` + `mcp-serve` subcommands) +
+  loupe-worker    worker binary (`run` + credential-free `mcp-proxy`) +
                   scanner trait + LLM backend + versioned MCP tool surface +
                   bwrap sandbox
   loupe-cli       loupectl admin CLI

@@ -9,8 +9,8 @@
 //!
 //! - [`ClaudeCliBackend`] shells out to Anthropic's `claude` CLI.
 //!   Carries optional MCP context so each invocation can call back
-//!   into `loupe-worker mcp-serve` over stdio JSON-RPC — used by the
-//!   discovery scanner to query prior findings and submit new ones.
+//!   into a credential-free proxy connected to the parent worker's
+//!   host-side MCP broker.
 //! - [`CodexCliBackend`] shells out to OpenAI's `codex` CLI. Carries
 //!   the same optional MCP context via Codex CLI config overrides.
 //!
@@ -32,7 +32,8 @@ use anyhow::Result;
 use clap::ValueEnum;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
-pub use mcp::{McpContext, McpTlsSource};
+use loupe_proto::JobCapability;
+pub use mcp::McpContext;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
@@ -163,10 +164,13 @@ pub struct LlmRequest {
 	pub repo_id: Option<i64>,
 	/// Job id for the scan currently in progress. Required for the
 	/// `submit_finding` MCP tool to POST to
-	/// `/v1/jobs/{job_id}/findings`; without it, that tool is not
+	/// `/v1/jobs/{job_id}/llm-findings`; without it, that tool is not
 	/// advertised. `None` falls back to query-only MCP usage (the
 	/// agent can read prior findings but can't write new ones).
 	pub job_id: Option<i64>,
+	/// Opaque authority for the exact active lease. It remains in the
+	/// trusted host broker and is never passed to the agent process.
+	pub job_capability: Option<JobCapability>,
 	/// Finding id for a verify-kind session. When `Some`, the MCP
 	/// server enters verify mode: `submit_finding` is hidden;
 	/// `submit_verdict`, `submit_patch`, and `validate_patch` are

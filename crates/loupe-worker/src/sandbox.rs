@@ -6,11 +6,9 @@
 //! Network is unshared by default; LLM backends opt in via
 //! [`SandboxBuilder::allow_network`].
 //!
-//! `LOUPE_DISABLE_SANDBOX=1` exists as a development escape hatch on
-//! hosts without `bwrap`; the worker logs a loud warning if it's set,
-//! and the helper produces a plain `Command` instead of a wrapped one.
+//! The worker fails closed when `LOUPE_DISABLE_SANDBOX` is enabled.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
@@ -20,29 +18,35 @@ use tokio::process::Command;
 /// Path to the bwrap binary. Resolved once and cached.
 const BWRAP_BIN: &str = "bwrap";
 
-/// Env var that disables the sandbox entirely. Dev-only; production
-/// deployments should leave this unset and install bubblewrap.
+/// Legacy environment variable. Enabling it is rejected because the
+/// repository-controlled agent must never run with the worker's host
+/// privileges.
 pub const DISABLE_SANDBOX_ENV: &str = "LOUPE_DISABLE_SANDBOX";
 
-/// Probe for `bwrap` once at startup. Returns `Ok(true)` if `bwrap` is
-/// available, `Ok(false)` if `LOUPE_DISABLE_SANDBOX` is set (caller
-/// should warn loudly). Errors if `bwrap` is missing AND the disable
-/// env var is unset — that's a hard fatal for the worker.
-pub fn probe_at_startup() -> Result<bool> {
-	if sandbox_disabled() {
-		return Ok(false);
+fn ensure_sandbox_enabled(disabled: bool) -> Result<()> {
+	if disabled {
+		anyhow::bail!(
+			"{DISABLE_SANDBOX_ENV} is not supported: LLM agents require bubblewrap isolation"
+		);
 	}
+	Ok(())
+}
+
+/// Require a usable `bwrap` at startup. Enabling
+/// `LOUPE_DISABLE_SANDBOX` or omitting bwrap is a hard startup error,
+/// so returning at all means the sandbox is available.
+pub fn probe_at_startup() -> Result<()> {
+	ensure_sandbox_enabled(sandbox_disabled())?;
 	let status = std::process::Command::new(BWRAP_BIN)
 		.arg("--version")
 		.stdout(Stdio::null())
 		.stderr(Stdio::null())
 		.status();
 	match status {
-		Ok(s) if s.success() => Ok(true),
+		Ok(s) if s.success() => Ok(()),
 		Ok(s) => Err(anyhow::anyhow!("bwrap probe exited with {s}")),
 		Err(e) => Err(anyhow::Error::from(e).context(format!(
-			"`{BWRAP_BIN}` not found on PATH; install bubblewrap or set {DISABLE_SANDBOX_ENV}=1 \
-			 to opt out (dev only)"
+			"`{BWRAP_BIN}` not found on PATH; install bubblewrap (sandbox bypass is not supported)"
 		))),
 	}
 }
@@ -50,7 +54,8 @@ pub fn probe_at_startup() -> Result<bool> {
 /// Builder for a sandboxed `tokio::process::Command`. Default posture:
 /// worktree mounted read-only at `/workdir`, fresh tmpfs `/tmp` and
 /// `$HOME`, `--unshare-all`, `--die-with-parent`, working directory set
-/// to `/workdir`.
+/// to neutral `/home/scanner`. The worktree remains readable at
+/// `/workdir` without becoming the instruction-discovery root.
 pub struct SandboxBuilder {
 	workdir: PathBuf,
 	allow_network: bool,
@@ -68,12 +73,15 @@ pub struct SandboxBuilder {
 impl SandboxBuilder {
 	/// New builder targeting a worktree on disk. The `workdir` is bind-
 	/// mounted read-only into the sandbox at `/workdir`.
+	///
+	/// Always wraps. `LOUPE_DISABLE_SANDBOX` is rejected at startup by
+	/// [`probe_at_startup`], so consulting it again here would only
+	/// add a second, quieter way to lose isolation.
 	pub fn new(workdir: impl Into<PathBuf>) -> Self {
-		let disabled = sandbox_disabled();
 		Self {
 			workdir: workdir.into(),
 			allow_network: false,
-			disabled,
+			disabled: false,
 			extra_ro_binds: Vec::new(),
 			forward_env: Vec::new(),
 			set_env: Vec::new(),
@@ -175,10 +183,9 @@ impl SandboxBuilder {
 	}
 
 	/// Build a `Command` for `program`. The command runs inside the
-	/// sandbox; its `args()` should be appended by the caller as
-	/// normal. When the sandbox is disabled (`LOUPE_DISABLE_SANDBOX=1`)
-	/// returns a bare `Command::new(program)` with `current_dir` set to
-	/// the worktree.
+	/// sandbox; its `args()` should be appended by the caller as normal.
+	/// Test-only disabled builders return a bare command rooted at the
+	/// worktree.
 	pub fn build(&self, program: &str) -> Command {
 		if self.disabled {
 			let mut cmd = Command::new(program);
@@ -239,7 +246,7 @@ impl SandboxBuilder {
 
 		// Worktree: read-only.
 		cmd.arg("--ro-bind").arg(&self.workdir).arg("/workdir");
-		cmd.args(["--chdir", "/workdir"]);
+		cmd.args(["--chdir", "/home/scanner"]);
 
 		// Forwarded env vars. Skip those that aren't set on the host.
 		for name in &self.forward_env {
@@ -269,8 +276,13 @@ impl SandboxBuilder {
 }
 
 fn sandbox_disabled() -> bool {
-	std::env::var_os(DISABLE_SANDBOX_ENV).is_some_and(|v| {
-		let value = v.to_string_lossy();
+	let value = std::env::var_os(DISABLE_SANDBOX_ENV);
+	sandbox_disabled_value(value.as_deref())
+}
+
+fn sandbox_disabled_value(value: Option<&OsStr>) -> bool {
+	value.is_some_and(|value| {
+		let value = value.to_string_lossy();
 		if value.is_empty() {
 			return false;
 		}
@@ -407,11 +419,9 @@ pub fn smoketest(workdir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use std::io::Write;
-	use std::sync::Mutex;
 
 	use super::*;
-
-	static ENV_LOCK: Mutex<()> = Mutex::new(());
+	use crate::PROCESS_ENV_LOCK;
 
 	fn bwrap_present() -> bool {
 		std::process::Command::new(BWRAP_BIN)
@@ -508,6 +518,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn build_runs_a_command_inside_the_sandbox() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
 		if !bwrap_present() {
 			eprintln!("skipping: bwrap not installed");
 			return;
@@ -524,11 +535,15 @@ mod tests {
 		);
 		let stdout = String::from_utf8_lossy(&out.stdout);
 		assert!(stdout.contains("hello"), "stdout: {stdout}");
-		assert!(stdout.contains("/workdir"), "should be in /workdir, got: {stdout}");
+		assert!(
+			stdout.contains("/home/scanner"),
+			"should start outside the repository, got: {stdout}"
+		);
 	}
 
 	#[tokio::test]
 	async fn worktree_mount_is_read_only() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
 		if !bwrap_present() {
 			eprintln!("skipping: bwrap not installed");
 			return;
@@ -555,6 +570,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn tmp_is_fresh_per_invocation() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
 		if !bwrap_present() {
 			eprintln!("skipping: bwrap not installed");
 			return;
@@ -585,6 +601,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn unshare_net_blocks_outbound_connections() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
 		if !bwrap_present() {
 			eprintln!("skipping: bwrap not installed");
 			return;
@@ -604,7 +621,9 @@ mod tests {
 
 	#[test]
 	fn disabled_sandbox_returns_bare_command() {
-		// Use a builder that thinks the env var is set.
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		// Force the test-only unwrapped path; no environment variable
+		// can reach it.
 		let mut b = SandboxBuilder::new("/tmp");
 		b.disabled = true;
 		let cmd = b.build("/bin/echo");
@@ -613,21 +632,82 @@ mod tests {
 
 	#[test]
 	fn disable_sandbox_env_accepts_false_values() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		for value in [None, Some(""), Some("0"), Some("false"), Some("no"), Some("off")] {
+			assert!(
+				!sandbox_disabled_value(value.map(OsStr::new)),
+				"{value:?} should stay enabled"
+			);
+		}
+		for value in ["1", "true", "yes", "on"] {
+			assert!(sandbox_disabled_value(Some(OsStr::new(value))), "{value:?} should disable");
+		}
+	}
+
+	#[test]
+	fn startup_rejects_the_legacy_disable_request() {
+		// Drive the probe itself, not just `ensure_sandbox_enabled`:
+		// startup must reject the legacy request explicitly instead of
+		// silently ignoring stale deployment configuration. The builder
+		// independently guarantees that production commands always wrap.
+		// Rejection happens before the `bwrap` spawn, so this stays
+		// hermetic and never shells out.
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		let old = std::env::var_os(DISABLE_SANDBOX_ENV);
-		std::env::set_var(DISABLE_SANDBOX_ENV, "false");
-		assert!(!sandbox_disabled());
 		std::env::set_var(DISABLE_SANDBOX_ENV, "1");
-		assert!(sandbox_disabled());
+
+		let result = probe_at_startup();
+
 		if let Some(old) = old {
 			std::env::set_var(DISABLE_SANDBOX_ENV, old);
 		} else {
 			std::env::remove_var(DISABLE_SANDBOX_ENV);
 		}
+		let error = result.expect_err("worker must fail closed when sandboxing is disabled");
+		assert!(
+			error.to_string().contains(DISABLE_SANDBOX_ENV),
+			"the startup error must name the variable the operator set: {error}",
+		);
+	}
+
+	#[test]
+	fn builder_ignores_the_legacy_sandbox_bypass_variable() {
+		// `probe_at_startup` rejects the variable, so a builder that
+		// still consults it is a second, silent way to lose isolation
+		// — for anything constructed outside the startup path.
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let old = std::env::var_os(DISABLE_SANDBOX_ENV);
+		std::env::set_var(DISABLE_SANDBOX_ENV, "1");
+
+		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+
+		if let Some(old) = old {
+			std::env::set_var(DISABLE_SANDBOX_ENV, old);
+		} else {
+			std::env::remove_var(DISABLE_SANDBOX_ENV);
+		}
+		assert_eq!(
+			program, BWRAP_BIN,
+			"the builder must not unwrap the sandbox for a stray environment variable",
+		);
+	}
+
+	#[test]
+	fn agent_starts_outside_the_untrusted_repository() {
+		// `build` reads PATH, so it still needs the environment lock.
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+		assert!(
+			args.windows(2).any(|pair| pair == ["--chdir", "/home/scanner"]),
+			"agent must not auto-load instructions from the repository root: {args:?}",
+		);
 	}
 
 	#[tokio::test]
 	async fn bind_ro_under_tmpfs_home_remains_visible() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
 		// Regression: bwrap processes args in order, so a tmpfs
 		// emitted *after* a bind on a path inside that tmpfs will
 		// hide the bind. We emit tmpfs first; this test pins that
@@ -662,9 +742,9 @@ mod tests {
 
 	#[test]
 	fn allow_network_flag_emits_share_net() {
-		let mut b = SandboxBuilder::new("/tmp");
-		b.disabled = false; // even if env says disabled, force the wrapped path
-		let cmd = b.allow_network().build("/bin/true");
+		// `build` reads PATH, so it still needs the environment lock.
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let cmd = SandboxBuilder::new("/tmp").allow_network().build("/bin/true");
 		// Inspect the args of the bwrap invocation (program is bwrap).
 		assert_eq!(cmd.as_std().get_program(), "bwrap");
 		let args: Vec<String> =
@@ -675,7 +755,7 @@ mod tests {
 
 	#[test]
 	fn wrapped_command_starts_from_clear_environment() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		std::env::set_var("LOUPE_SANDBOX_TEST_SECRET", "do-not-leak");
 
 		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
@@ -692,7 +772,7 @@ mod tests {
 
 	#[test]
 	fn forward_env_explicitly_passes_allowlisted_values() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		std::env::set_var("LOUPE_SANDBOX_TEST_SECRET", "forwarded-value");
 
 		let cmd =
@@ -714,6 +794,7 @@ mod tests {
 
 	#[test]
 	fn set_env_passes_caller_provided_values() {
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		let cmd = SandboxBuilder::new("/tmp")
 			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", "explicit-value")
 			.build("/bin/true");

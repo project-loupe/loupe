@@ -5,7 +5,7 @@ use thiserror::Error;
 ///
 /// Bump this only on a wire-incompatible change; additive fields don't
 /// require it because of `#[serde(default)]` / `skip_serializing_if`.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Returned by the server (in a 400 body) when a client speaks a version
 /// outside the server's supported window.
@@ -39,19 +39,29 @@ mod tests {
 
 	#[test]
 	fn current_version_is_in_window() {
-		assert!(check_protocol_version(PROTOCOL_VERSION, 1, 1).is_ok());
+		assert!(
+			check_protocol_version(PROTOCOL_VERSION, PROTOCOL_VERSION, PROTOCOL_VERSION).is_ok()
+		);
 	}
 
 	#[test]
 	fn future_version_is_rejected() {
-		let err = check_protocol_version(2, 1, 1).unwrap_err();
-		assert_eq!(err, ProtocolMismatch { client: 2, server_min: 1, server_max: 1 });
-		assert!(err.to_string().contains("client sent 2"));
+		let future = PROTOCOL_VERSION + 1;
+		let err = check_protocol_version(future, PROTOCOL_VERSION, PROTOCOL_VERSION).unwrap_err();
+		assert_eq!(
+			err,
+			ProtocolMismatch {
+				client: future,
+				server_min: PROTOCOL_VERSION,
+				server_max: PROTOCOL_VERSION,
+			}
+		);
+		assert!(err.to_string().contains(&format!("client sent {future}")));
 	}
 
 	#[test]
 	fn ancient_version_is_rejected() {
-		assert!(check_protocol_version(0, 1, 1).is_err());
+		assert!(check_protocol_version(1, PROTOCOL_VERSION, PROTOCOL_VERSION).is_err());
 	}
 
 	#[test]

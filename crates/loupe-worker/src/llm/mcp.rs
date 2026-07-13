@@ -1,150 +1,283 @@
-//! Shared MCP-attachment plumbing for both LLM backends.
+//! Host-side MCP broker plumbing shared by both agent backends.
 //!
-//! Both `claude` and `codex` need to advertise the same loupe MCP
-//! server (and optionally bkb-mcp) to the agent at invocation time.
-//! The sandbox-side paths are identical across backends — only the
-//! mechanism for *telling the CLI to load the config* differs:
-//!
-//! - claude takes `--mcp-config <file>` pointing at a JSON file the
-//!   per-call scratch dir holds.
-//! - codex takes `-c mcp_servers.<name>.command="..."` repeated for
-//!   each TOML key under `mcp_servers.<name>`; no scratch file.
-//!
-//! Each backend wraps the same args list (this module's
-//! [`mcp_serve_args`]) into its CLI's preferred shape. The sandbox
-//! bind-mounts and cert paths are identical, so [`bind_mcp_into_sandbox`]
-//! does that work in one place.
+//! The sandbox sees only a Unix socket and a small proxy subcommand.
+//! The trusted worker process retains the server client, mTLS key,
+//! job capability, repository id, and job id.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::{Context, Result};
+use tokio::io::BufReader;
+use tokio::net::UnixListener;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use super::LlmRequest;
 use crate::sandbox::SandboxBuilder;
+use crate::ServerClient;
 
-/// Fixed sandbox paths the MCP child resolves at runtime. Inside the
-/// bwrap sandbox the agent only ever sees these, regardless of
-/// where the host install actually lives — the bind mounts in
-/// [`bind_mcp_into_sandbox`] keep the abstraction watertight.
 pub const SANDBOX_LOUPE_BIN: &str = "/loupe/loupe-worker";
-pub const SANDBOX_CA_CERT: &str = "/loupe/ca.pem";
-pub const SANDBOX_CLIENT_CERT: &str = "/loupe/worker.pem";
-pub const SANDBOX_CLIENT_KEY: &str = "/loupe/worker.key";
+pub const SANDBOX_MCP_DIR: &str = "/loupe/mcp";
+pub const SANDBOX_MCP_SOCKET: &str = "/loupe/mcp/session.sock";
 pub const SANDBOX_BKB_MCP_BIN: &str = "/loupe/bkb-mcp";
-
-/// Default BKB HTTP API endpoint for the bkb-mcp child.
-///
-/// bkb-mcp's own compiled-in default (`http://127.0.0.1:3000`) is
-/// handy for a developer running the BKB stack locally but useless
-/// on a fresh worker host that has only `cargo install`'d the
-/// client. Loupe overrides unconditionally so the bkb tools work
-/// out of the box pointing at the public hosted instance, with
-/// uniform behaviour across the worker fleet.
-///
-/// Operators with a self-hosted BKB instance can override this through
-/// the worker config.
 pub const DEFAULT_BKB_API_URL: &str = "https://bitcoinknowledge.dev";
 
-/// Everything the MCP child needs to talk back to loupe-server.
-/// Built once at worker startup from the `loupe-worker run` CLI
-/// flags and stashed on the backend; per-call data (the repo id /
-/// job id) arrives through [`super::LlmRequest`].
-#[derive(Debug, Clone)]
+/// How long `finish` waits for an accepted session to drain. Only a
+/// session that is still serving can consume this; an unclaimed
+/// listener is released immediately.
+#[cfg(not(test))]
+const BROKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const BROKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
 pub struct McpContext {
-	/// Path to the loupe-worker binary on the host. Usually
-	/// `std::env::current_exe()` for the worker itself, so the same
-	/// binary serves both `run` and `mcp-serve` modes.
 	pub worker_binary: PathBuf,
-	/// loupe-server URL the MCP child will call back to.
-	pub server_url: String,
-	pub tls: McpTlsSource,
-	/// Optional `bkb-mcp` binary path. When `Some`, the per-call MCP
-	/// config gets a second server entry exposing bkb's spec /
-	/// historical-context tools (`bkb_search`, `bkb_lookup_bip`, …)
-	/// alongside loupe's `submit_finding`. None means "host doesn't
-	/// have bkb-mcp installed; advertise loupe only."
+	pub client: Arc<ServerClient>,
 	pub bkb_mcp_path: Option<PathBuf>,
-	/// HTTP API endpoint for the optional bkb-mcp child.
 	pub bkb_api_url: String,
 }
 
-#[derive(Debug, Clone)]
-pub enum McpTlsSource {
-	Paths { ca_cert_path: PathBuf, client_cert_path: PathBuf, client_key_path: PathBuf },
-	Env,
+/// One invocation's trusted broker. Dropping it aborts an unclaimed
+/// socket listener; `finish` releases an unclaimed listener and waits
+/// for verify-session flushing on a claimed one.
+pub struct McpBroker {
+	dir: tempfile::TempDir,
+	task: Option<JoinHandle<Result<()>>>,
+	/// Releases the listener when the agent exited without ever
+	/// connecting. Signalled only from `finish`, and only observed
+	/// before a connection is accepted, so it cannot interrupt a
+	/// session that is mid-flush.
+	shutdown: CancellationToken,
 }
 
-/// Build the args list that gets appended to `loupe-worker
-/// mcp-serve` for one MCP-attached agent invocation. Cert + binary
-/// paths come from the sandbox fixed paths above; per-call data
-/// (`repo_id`, `job_id`, `finding_id`, `sandbox_workdir`) is wired
-/// by the caller.
-///
-/// `job_id` is optional — the MCP server hides `submit_finding` when
-/// it isn't supplied (e.g. a future read-only diagnostic flow).
-/// `finding_id`, when present, flips the MCP server into verify
-/// mode: it advertises `submit_verdict` / `submit_patch` /
-/// `validate_patch` instead of `submit_finding` / `validate_poc`.
-/// Both backends emit the same args list; only the wrapper around
-/// it (a JSON file vs. `-c` overrides) differs.
-pub fn mcp_serve_args(
-	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
-	sandbox_workdir: &str,
-) -> Vec<String> {
-	let mut args: Vec<String> = vec![
-		"mcp-serve".into(),
-		"--server-url".into(),
-		ctx.server_url.clone(),
-		"--repo-id".into(),
-		repo_id.to_string(),
-		"--workdir".into(),
-		sandbox_workdir.to_owned(),
-	];
-	if matches!(ctx.tls, McpTlsSource::Paths { .. }) {
-		args.splice(
-			3..3,
-			[
-				"--ca-cert".into(),
-				SANDBOX_CA_CERT.into(),
-				"--cert".into(),
-				SANDBOX_CLIENT_CERT.into(),
-				"--key".into(),
-				SANDBOX_CLIENT_KEY.into(),
-			],
+impl McpBroker {
+	/// Start a broker with the complete authority and repository scope
+	/// carried by one LLM request.
+	pub async fn start_for_request(ctx: &McpContext, request: &LlmRequest) -> Result<Self> {
+		let repo_id = request.repo_id.context("MCP request is missing its repo id")?;
+		let job_capability =
+			request.job_capability.clone().context("MCP request is missing its job capability")?;
+		let job_id = request.job_id;
+		let finding_id = request.finding_id;
+		if finding_id.is_some() && job_id.is_none() {
+			anyhow::bail!("verify-mode MCP broker requires both finding_id and job_id");
+		}
+		let workdir = request.workdir.clone();
+		let dir = tempfile::Builder::new()
+			.prefix("loupe-mcp-broker-")
+			.tempdir()
+			.context("creating MCP broker directory")?;
+		let socket = dir.path().join("session.sock");
+		let listener = UnixListener::bind(&socket)
+			.with_context(|| format!("binding MCP broker socket at {}", socket.display()))?;
+		let client = ctx.client.clone();
+		let shutdown = CancellationToken::new();
+		let accept_shutdown = shutdown.clone();
+		let task = tokio::spawn(async move {
+			let accepted = tokio::select! {
+				biased;
+				// If both branches are ready, the agent connected before
+				// shutdown began. Drain that established session instead of
+				// discarding requests already queued on the socket.
+				result = listener.accept() => {
+					Some(result.context("accepting MCP proxy connection")?)
+				},
+				_ = accept_shutdown.cancelled() => None,
+			};
+			// The agent finished without ever starting its MCP client.
+			// There is nothing to serve and nothing to flush.
+			let Some((stream, _)) = accepted else { return Ok(()) };
+			let (read, write) = stream.into_split();
+			crate::mcp::run_stream_server(
+				crate::mcp::McpSessionContext {
+					client,
+					job_capability,
+					repo_id,
+					job_id,
+					finding_id,
+					workdir,
+				},
+				BufReader::new(read),
+				write,
+			)
+			.await
+		});
+		Ok(Self { dir, task: Some(task), shutdown })
+	}
+
+	pub fn sandbox_args(&self) -> Vec<String> {
+		vec!["mcp-proxy".into(), "--socket".into(), SANDBOX_MCP_SOCKET.into()]
+	}
+
+	pub fn host_dir(&self) -> &Path {
+		self.dir.path()
+	}
+
+	/// Wait for the session to drain. Call this on every path out of an
+	/// agent invocation, including failure and timeout: the broker
+	/// outlives the sandboxed agent, so a verify session's buffered
+	/// verdict still reaches the server even when the CLI itself died.
+	pub async fn finish(mut self) -> Result<()> {
+		self.shutdown.cancel();
+		let mut task = self.task.take().expect("broker task is present until finish");
+		match tokio::time::timeout(BROKER_SHUTDOWN_TIMEOUT, &mut task).await {
+			Ok(result) => {
+				result.context("MCP broker task panicked")??;
+				Ok(())
+			},
+			Err(_) => {
+				// Dropping a JoinHandle detaches its task. Abort and await it
+				// explicitly so a wedged session cannot retain the server
+				// client and job capability after this invocation returns.
+				task.abort();
+				let _ = task.await;
+				anyhow::bail!("timed out waiting for MCP broker shutdown")
+			},
+		}
+	}
+}
+
+impl Drop for McpBroker {
+	fn drop(&mut self) {
+		if let Some(task) = self.task.take() {
+			task.abort();
+		}
+	}
+}
+
+pub fn bind_mcp_into_sandbox(
+	sandbox: SandboxBuilder, ctx: &McpContext, broker: &McpBroker,
+) -> SandboxBuilder {
+	let mut sandbox = sandbox
+		.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN)
+		.bind_ro(broker.host_dir(), SANDBOX_MCP_DIR);
+	if let Some(bkb_path) = &ctx.bkb_mcp_path {
+		sandbox = sandbox.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
+	}
+	sandbox
+}
+
+#[cfg(test)]
+mod tests {
+	use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+	use tokio::net::UnixStream;
+	use tokio_util::sync::CancellationToken;
+
+	use super::*;
+
+	fn test_context() -> McpContext {
+		McpContext {
+			worker_binary: "/usr/bin/true".into(),
+			client: Arc::new(ServerClient::from_parts(
+				reqwest::Client::new(),
+				"https://loupe-server:8443".parse().unwrap(),
+			)),
+			bkb_mcp_path: None,
+			bkb_api_url: DEFAULT_BKB_API_URL.into(),
+		}
+	}
+
+	fn test_request() -> LlmRequest {
+		LlmRequest {
+			prompt: "irrelevant".into(),
+			workdir: PathBuf::from("/tmp"),
+			timeout: Duration::from_secs(5),
+			cancel: CancellationToken::new(),
+			repo_id: Some(1),
+			job_id: Some(7),
+			job_capability: Some(loupe_proto::JobCapability::from_secret("test-capability")),
+			finding_id: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn broker_finishes_when_no_agent_ever_connects() {
+		// An agent CLI can exit successfully without ever starting its
+		// MCP client. The broker must not turn that into a failure: it
+		// blocks in `accept()` forever, so waiting on the task would
+		// burn the shutdown timeout and then report an error for a run
+		// that actually succeeded.
+		let broker = McpBroker::start_for_request(&test_context(), &test_request()).await.unwrap();
+
+		let started = std::time::Instant::now();
+		broker.finish().await.expect("an unclaimed broker must finish cleanly");
+
+		assert!(
+			started.elapsed() < BROKER_SHUTDOWN_TIMEOUT,
+			"finishing an unclaimed broker waited for the shutdown timeout",
 		);
 	}
-	if let Some(j) = job_id {
-		args.push("--job-id".into());
-		args.push(j.to_string());
-	}
-	if let Some(f) = finding_id {
-		args.push("--finding-id".into());
-		args.push(f.to_string());
-	}
-	args
-}
 
-/// Bind the worker binary, mTLS cert/key/CA, and (optionally) the
-/// bkb-mcp binary into the sandbox at the fixed paths above. Idempotent
-/// across both backends — same mounts, same paths.
-pub fn bind_mcp_into_sandbox(sandbox: SandboxBuilder, ctx: &McpContext) -> SandboxBuilder {
-	let mut sb = sandbox.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN);
-	match &ctx.tls {
-		McpTlsSource::Paths { ca_cert_path, client_cert_path, client_key_path } => {
-			sb = sb
-				.bind_ro(ca_cert_path.clone(), SANDBOX_CA_CERT)
-				.bind_ro(client_cert_path.clone(), SANDBOX_CLIENT_CERT)
-				.bind_ro(client_key_path.clone(), SANDBOX_CLIENT_KEY);
-		},
-		McpTlsSource::Env => {
-			sb = sb
-				.forward_env("LOUPE_WORKER_CA_CERT_PEM")
-				.forward_env("LOUPE_WORKER_CA_CERT_PEM_B64")
-				.forward_env("LOUPE_WORKER_CERT_PEM")
-				.forward_env("LOUPE_WORKER_CERT_PEM_B64")
-				.forward_env("LOUPE_WORKER_KEY_PEM");
-			sb = sb.forward_env("LOUPE_WORKER_KEY_PEM_B64");
-		},
+	#[tokio::test(flavor = "current_thread")]
+	async fn broker_drains_a_connection_queued_before_shutdown() {
+		// Keep the broker task from running until both accept and shutdown
+		// are ready. Shutdown must not discard a connection the agent
+		// established before it exited.
+		for attempt in 0..64 {
+			let broker =
+				McpBroker::start_for_request(&test_context(), &test_request()).await.unwrap();
+			let socket = broker.host_dir().join("session.sock");
+			let stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+			stream.set_nonblocking(true).unwrap();
+			let mut client = BufReader::new(UnixStream::from_std(stream).unwrap());
+			client
+				.get_mut()
+				.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+				.await
+				.unwrap();
+			client.get_mut().shutdown().await.unwrap();
+
+			broker.finish().await.unwrap();
+
+			let mut response = String::new();
+			let read = client.read_line(&mut response).await;
+			assert!(
+				matches!(read, Ok(bytes) if bytes > 0) && response.contains("\"id\":1"),
+				"queued MCP connection was discarded during shutdown on attempt {attempt}: \
+				 read={read:?}, response={response:?}",
+			);
+		}
 	}
-	if let Some(bkb_path) = &ctx.bkb_mcp_path {
-		sb = sb.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
+
+	#[tokio::test]
+	async fn broker_aborts_a_session_that_misses_the_shutdown_deadline() {
+		let broker = McpBroker::start_for_request(&test_context(), &test_request()).await.unwrap();
+		let socket = broker.host_dir().join("session.sock");
+		let mut client = BufReader::new(UnixStream::connect(socket).await.unwrap());
+		client
+			.get_mut()
+			.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+			.await
+			.unwrap();
+		let mut response = String::new();
+		client.read_line(&mut response).await.unwrap();
+		assert!(response.contains("\"id\":1"), "broker did not accept the test session");
+
+		let error = broker.finish().await.expect_err("an open session must hit the deadline");
+		assert!(error.to_string().contains("timed out"), "unexpected shutdown error: {error}");
+
+		let mut trailing = String::new();
+		let bytes = tokio::time::timeout(Duration::from_secs(1), client.read_line(&mut trailing))
+			.await
+			.expect("timed-out broker task remained detached and kept its authority")
+			.unwrap();
+		assert_eq!(bytes, 0, "broker left the session open after its shutdown deadline");
 	}
-	sb
+
+	#[test]
+	fn agent_sandbox_receives_no_loupe_credentials() {
+		let dir = tempfile::tempdir().unwrap();
+		let broker = McpBroker { dir, task: None, shutdown: CancellationToken::new() };
+		let ctx = test_context();
+		let cmd =
+			bind_mcp_into_sandbox(SandboxBuilder::new("/tmp"), &ctx, &broker).build("/bin/true");
+		let rendered = format!("{:?}", cmd.as_std());
+		assert!(!rendered.contains("worker.key"), "private key leaked into sandbox: {rendered}");
+		assert!(!rendered.contains("worker.pem"), "worker certificate leaked: {rendered}");
+		assert!(!rendered.contains("loupe-server:8443"), "server endpoint leaked: {rendered}");
+		assert!(!rendered.contains("LOUPE_WORKER_"), "worker credentials leaked: {rendered}");
+	}
 }

@@ -81,9 +81,10 @@ async fn whoami_resolves_admin_role() {
 	let c = client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
 	let resp = c.get("https://loupe-server/v1/whoami").send().await.unwrap();
 	assert!(resp.status().is_success(), "whoami returned {}", resp.status());
+	let expected_protocol = PROTOCOL_VERSION.to_string();
 	assert_eq!(
 		resp.headers().get(PROTOCOL_VERSION_HEADER).and_then(|v| v.to_str().ok()),
-		Some("1")
+		Some(expected_protocol.as_str())
 	);
 	let body: serde_json::Value = resp.json().await.unwrap();
 	assert_eq!(body["kind"], "admin");
