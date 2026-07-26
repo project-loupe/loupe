@@ -24,6 +24,19 @@ const BWRAP_BIN: &str = "bwrap";
 /// deployments should leave this unset and install bubblewrap.
 pub const DISABLE_SANDBOX_ENV: &str = "LOUPE_DISABLE_SANDBOX";
 
+/// Standard outbound-proxy env vars (both cases), including NO_PROXY so
+/// loopback exemptions survive. Forwarded into the sandbox when set.
+const PROXY_ENV_VARS: [&str; 8] = [
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+	"no_proxy",
+];
+
 /// Probe for `bwrap` once at startup. Returns `Ok(true)` if `bwrap` is
 /// available, `Ok(false)` if `LOUPE_DISABLE_SANDBOX` is set (caller
 /// should warn loudly). Errors if `bwrap` is missing AND the disable
@@ -245,6 +258,14 @@ impl SandboxBuilder {
 		for name in &self.forward_env {
 			if let Some(value) = std::env::var_os(name) {
 				cmd.arg("--setenv").arg(name).arg(value);
+			}
+		}
+		// Proxy config, forwarded when the sandbox has network access.
+		if self.allow_network {
+			for name in PROXY_ENV_VARS {
+				if let Some(value) = std::env::var_os(name) {
+					cmd.arg("--setenv").arg(name).arg(value);
+				}
 			}
 		}
 		for (name, value) in &self.set_env {
