@@ -202,8 +202,9 @@ impl SandboxBuilder {
 
 		// Read-only system directories. /lib and /lib64 are platform-
 		// dependent: glibc systems have /lib64, musl typically does not.
-		// We bind whichever exists.
-		for ro in ["/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"] {
+		// /nix/store covers Nix-based hosts, where the FHS dirs are just
+		// symlink farms into it. We bind whichever of these exists.
+		for ro in ["/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin", "/nix/store"] {
 			if Path::new(ro).exists() {
 				cmd.args(["--ro-bind-try", ro, ro]);
 			}
