@@ -390,8 +390,10 @@ fn locate_on_path(name: &str) -> Option<PathBuf> {
 /// invocation fail; calling this once at startup surfaces that early
 /// rather than mid-job.
 pub fn smoketest(workdir: &Path) -> Result<()> {
-	let builder = SandboxBuilder::new(workdir);
-	let mut cmd = builder.build("/bin/true");
+	// Resolve `true` on PATH rather than hardcoding `/bin/true`, which
+	// is absent on non-FHS hosts.
+	let builder = SandboxBuilder::new(workdir).allow_binary("true")?;
+	let mut cmd = builder.build("true");
 	cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
 	let output = std::process::Command::new(cmd.as_std().get_program())
 		.args(cmd.as_std().get_args())
