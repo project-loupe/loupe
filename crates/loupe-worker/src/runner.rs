@@ -430,7 +430,43 @@ async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::Temp
 	})
 	.await
 	.map_err(|e| anyhow::anyhow!("checkout task panicked: {e}"))??;
+	for path in unpopulated_submodules(tmp.path()) {
+		tracing::warn!(
+			submodule = %path,
+			"submodule directory is empty; its contents are absent from this checkout \
+			 and scanners will not see them"
+		);
+	}
 	Ok((tmp, head_sha))
+}
+
+/// Submodule paths declared in `.gitmodules` that are empty on disk.
+///
+/// `git clone --bare` does not fetch submodules, and checking a tree out of a
+/// bare clone writes gitlink entries as empty directories. A repository that
+/// keeps dependencies in submodules is therefore only partly present in the
+/// worktree, and a scanner will analyse a fraction of the program without
+/// anything in its output saying so.
+///
+/// This warns rather than fetching. Many repositories vendor submodules that
+/// are irrelevant to a review, and materialising them unconditionally would
+/// multiply an operator's scan cost without being asked. The goal is only that
+/// an incomplete checkout is never silent.
+fn unpopulated_submodules(workdir: &Path) -> Vec<String> {
+	let Ok(text) = std::fs::read_to_string(workdir.join(".gitmodules")) else {
+		return Vec::new();
+	};
+	text.lines()
+		.filter_map(|line| {
+			let rest = line.trim().strip_prefix("path")?.trim_start();
+			let rest = rest.strip_prefix('=')?.trim();
+			(!rest.is_empty()).then(|| rest.to_owned())
+		})
+		.filter(|rel| match std::fs::read_dir(workdir.join(rel)) {
+			Ok(mut entries) => entries.next().is_none(),
+			Err(_) => true,
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -455,6 +491,29 @@ mod tests {
 		async fn scan(&self, _: &ScanContext) -> Result<Vec<loupe_core::Finding>> {
 			Ok(vec![])
 		}
+	}
+
+	#[test]
+	fn unpopulated_submodules_reports_only_empty_paths() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+		std::fs::write(
+			root.join(".gitmodules"),
+			"[submodule \"external/empty\"]\n\tpath = external/empty\n\turl = https://example.invalid/e.git\n\
+			 [submodule \"external/filled\"]\n\tpath = external/filled\n\turl = https://example.invalid/f.git\n",
+		)
+		.unwrap();
+		std::fs::create_dir_all(root.join("external/empty")).unwrap();
+		std::fs::create_dir_all(root.join("external/filled")).unwrap();
+		std::fs::write(root.join("external/filled/src.c"), "int main(void){return 0;}\n").unwrap();
+
+		assert_eq!(unpopulated_submodules(root), vec!["external/empty".to_owned()]);
+	}
+
+	#[test]
+	fn unpopulated_submodules_is_empty_without_gitmodules() {
+		let tmp = tempfile::tempdir().unwrap();
+		assert!(unpopulated_submodules(tmp.path()).is_empty());
 	}
 
 	#[test]
