@@ -46,6 +46,13 @@ pub struct CacheConfig {
 pub struct RuntimeConfig {
 	pub max_workdir_bytes: u64,
 	pub disable_sandbox: bool,
+	/// Clone submodules declared in `.gitmodules` into the checkout.
+	///
+	/// Off by default: a bare clone cannot carry submodule contents, and
+	/// materialising them multiplies the file count a scan pays for. Turn it
+	/// on for targets whose dependencies live in submodules and are part of
+	/// what you are reviewing.
+	pub fetch_submodules: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +85,7 @@ pub struct WorkerConfigOverrides {
 	pub max_cache_gb: Option<u64>,
 	pub max_workdir_gb: Option<u64>,
 	pub disable_sandbox: Option<bool>,
+	pub fetch_submodules: Option<bool>,
 	pub log_level: Option<String>,
 	pub log_json: Option<bool>,
 	pub log_agent_output: Option<bool>,
@@ -148,6 +156,7 @@ pub struct RuntimeSection {
 	pub max_workdir_gb: Option<u64>,
 	#[serde(default)]
 	pub disable_sandbox: Option<bool>,
+	pub fetch_submodules: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -236,6 +245,9 @@ impl WorkerConfig {
 		if let Some(v) = file.runtime.max_workdir_gb {
 			self.runtime.max_workdir_bytes = gb_to_bytes(v);
 		}
+		if let Some(v) = file.runtime.fetch_submodules {
+			self.runtime.fetch_submodules = v;
+		}
 		if let Some(v) = file.runtime.disable_sandbox {
 			self.runtime.disable_sandbox = v;
 		}
@@ -302,6 +314,9 @@ impl WorkerConfig {
 		}
 		if let Some(v) = overrides.max_workdir_gb {
 			self.runtime.max_workdir_bytes = gb_to_bytes(v);
+		}
+		if let Some(v) = overrides.fetch_submodules {
+			self.runtime.fetch_submodules = v;
 		}
 		if let Some(v) = overrides.disable_sandbox {
 			self.runtime.disable_sandbox = v;
@@ -394,6 +409,7 @@ impl Default for WorkerConfig {
 			runtime: RuntimeConfig {
 				max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 				disable_sandbox: false,
+				fetch_submodules: false,
 			},
 			logging: LoggingConfig {
 				level: DEFAULT_LOG_LEVEL.to_owned(),

@@ -38,6 +38,7 @@ pub struct Runner {
 	scanners: Vec<Arc<dyn Scanner>>,
 	capabilities: Vec<String>,
 	max_workdir_bytes: u64,
+	fetch_submodules: bool,
 }
 
 impl Runner {
@@ -48,13 +49,36 @@ impl Runner {
 			.iter()
 			.flat_map(|s| s.capabilities().iter().map(|c| (*c).to_owned()))
 			.collect();
-		Self { client, cache, scanners, capabilities, max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES }
+		Self {
+			client,
+			cache,
+			scanners,
+			capabilities,
+			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
+			fetch_submodules: false,
+		}
 	}
 
 	/// Override the per-job workdir size cap. A scan whose checkout
 	/// exceeds this size fails immediately; the host's disk stays safe.
 	pub fn with_max_workdir_bytes(mut self, bytes: u64) -> Self {
 		self.max_workdir_bytes = bytes;
+		self
+	}
+
+	/// Materialise submodules declared in `.gitmodules` after checkout.
+	///
+	/// Off by default. A bare clone cannot carry submodule contents, so a
+	/// repository that keeps dependencies in submodules is otherwise scanned
+	/// with those paths empty. Turning this on clones each declared submodule
+	/// at the commit the superproject pins.
+	///
+	/// It is opt-in because scan cost scales with file count: materialising
+	/// submodules on a repository that vendors large irrelevant trees can
+	/// multiply an operator's bill without them asking for it. The `--max-
+	/// workdir-bytes` cap still applies to the resulting checkout.
+	pub fn with_fetch_submodules(mut self, fetch: bool) -> Self {
+		self.fetch_submodules = fetch;
 		self
 	}
 
@@ -156,7 +180,9 @@ impl Runner {
 					return Ok((None, 0));
 				};
 				let (workdir, head_sha) =
-					match checkout_revision(&ensured.path, &reviewed_sha).await {
+					match checkout_revision(&ensured.path, &reviewed_sha, self.fetch_submodules)
+						.await
+					{
 						Ok(ok) => ok,
 						Err(first_error) => {
 							tracing::warn!(
@@ -171,7 +197,13 @@ impl Runner {
 								.cache
 								.reclone_repo(&key, &clone_url, github_pat.as_deref())
 								.await?;
-							match checkout_revision(&ensured.path, &reviewed_sha).await {
+							match checkout_revision(
+								&ensured.path,
+								&reviewed_sha,
+								self.fetch_submodules,
+							)
+							.await
+							{
 								Ok(ok) => ok,
 								Err(second_error) => {
 									self.submit_revision_unavailable_verdict(
@@ -249,23 +281,33 @@ impl Runner {
 			},
 			LeasePayload::Scan { since_sha } => {
 				tracing::info!(job_id = env.job_id, "checking out worktree");
-				let (workdir, head_sha) =
-					match checkout_latest(&ensured.path, env.head_branch.as_deref()).await {
-						Ok(ok) => ok,
-						Err(first_error) => {
-							tracing::warn!(
-								job_id = env.job_id,
-								error = %first_error,
-								"scan checkout failed from refreshed cache; re-cloning",
-							);
-							drop(ensured);
-							ensured = self
-								.cache
-								.reclone_repo(&key, &clone_url, github_pat.as_deref())
-								.await?;
-							checkout_latest(&ensured.path, env.head_branch.as_deref()).await?
-						},
-					};
+				let (workdir, head_sha) = match checkout_latest(
+					&ensured.path,
+					env.head_branch.as_deref(),
+					self.fetch_submodules,
+				)
+				.await
+				{
+					Ok(ok) => ok,
+					Err(first_error) => {
+						tracing::warn!(
+							job_id = env.job_id,
+							error = %first_error,
+							"scan checkout failed from refreshed cache; re-cloning",
+						);
+						drop(ensured);
+						ensured = self
+							.cache
+							.reclone_repo(&key, &clone_url, github_pat.as_deref())
+							.await?;
+						checkout_latest(
+							&ensured.path,
+							env.head_branch.as_deref(),
+							self.fetch_submodules,
+						)
+						.await?
+					},
+				};
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				tracing::info!(
 					job_id = env.job_id,
@@ -375,15 +417,18 @@ impl Runner {
 /// to `branch` (or the remote/default HEAD if `None`). Returns the
 /// worktree dir (a `TempDir` for cleanup) plus the resolved commit SHA.
 pub async fn checkout_latest(
-	bare: &Path, branch: Option<&str>,
+	bare: &Path, branch: Option<&str>, fetch_submodules: bool,
 ) -> Result<(tempfile::TempDir, String)> {
-	checkout(bare, CheckoutTarget::Latest { branch: branch.map(str::to_owned) }).await
+	checkout(bare, CheckoutTarget::Latest { branch: branch.map(str::to_owned) }, fetch_submodules)
+		.await
 }
 
 /// Produce a fresh worktree from the bare clone at `bare` checked out
 /// to one exact commit SHA.
-pub async fn checkout_revision(bare: &Path, sha: &str) -> Result<(tempfile::TempDir, String)> {
-	checkout(bare, CheckoutTarget::Revision(sha.to_owned())).await
+pub async fn checkout_revision(
+	bare: &Path, sha: &str, fetch_submodules: bool,
+) -> Result<(tempfile::TempDir, String)> {
+	checkout(bare, CheckoutTarget::Revision(sha.to_owned()), fetch_submodules).await
 }
 
 enum CheckoutTarget {
@@ -391,7 +436,9 @@ enum CheckoutTarget {
 	Revision(String),
 }
 
-async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::TempDir, String)> {
+async fn checkout(
+	bare: &Path, target: CheckoutTarget, fetch_submodules: bool,
+) -> Result<(tempfile::TempDir, String)> {
 	let bare = bare.to_path_buf();
 	let tmp = tempfile::tempdir().context("creating temp worktree dir")?;
 	let workdir = tmp.path().to_path_buf();
@@ -426,6 +473,9 @@ async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::Temp
 		opts.target_dir(&workdir).recreate_missing(true).force();
 		repo.checkout_tree(tree.as_object(), Some(&mut opts))
 			.context("checking out tree into worktree dir")?;
+		if fetch_submodules {
+			materialise_submodules(&tree, &workdir);
+		}
 		Ok(commit.id().to_string())
 	})
 	.await
@@ -434,10 +484,111 @@ async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::Temp
 		tracing::warn!(
 			submodule = %path,
 			"submodule directory is empty; its contents are absent from this checkout \
-			 and scanners will not see them"
+			 and scanners will not see them. Set fetch_submodules to include them."
 		);
 	}
 	Ok((tmp, head_sha))
+}
+
+/// `(path, url)` pairs declared in a `.gitmodules` file.
+///
+/// Deliberately tolerant: `.gitmodules` is INI-ish, and a submodule whose
+/// stanza we fail to parse should be skipped rather than failing the scan.
+fn parse_gitmodules(text: &str) -> Vec<(String, String)> {
+	let mut out: Vec<(String, String)> = Vec::new();
+	let (mut path, mut url) = (None::<String>, None::<String>);
+	let mut flush = |path: &mut Option<String>, url: &mut Option<String>| {
+		if let (Some(p), Some(u)) = (path.take(), url.take()) {
+			out.push((p, u));
+		}
+	};
+	for line in text.lines() {
+		let line = line.trim();
+		if line.starts_with('[') {
+			flush(&mut path, &mut url);
+		} else if let Some(v) =
+			line.strip_prefix("path").and_then(|r| r.trim_start().strip_prefix('='))
+		{
+			path = Some(v.trim().to_owned());
+		} else if let Some(v) =
+			line.strip_prefix("url").and_then(|r| r.trim_start().strip_prefix('='))
+		{
+			url = Some(v.trim().to_owned());
+		}
+	}
+	flush(&mut path, &mut url);
+	out
+}
+
+/// Clone each declared submodule into `workdir` at the commit the
+/// superproject pins.
+///
+/// The pinned commit lives in the superproject's tree as a gitlink entry, so
+/// we read the OID from `tree` rather than trusting the submodule's default
+/// branch — a scan must analyse the code this revision actually builds
+/// against, not whatever upstream has moved to since.
+///
+/// Failures are logged and skipped, never fatal. A submodule that has moved,
+/// gone private, or needs credentials should degrade the scan's coverage, not
+/// abort a job that can still produce useful findings on the rest of the tree.
+/// The empty-directory warning still fires for anything that did not land.
+fn materialise_submodules(tree: &git2::Tree<'_>, workdir: &Path) {
+	let text = match std::fs::read_to_string(workdir.join(".gitmodules")) {
+		Ok(t) => t,
+		Err(_) => return,
+	};
+	for (rel, url) in parse_gitmodules(&text) {
+		let pinned = match tree.get_path(Path::new(&rel)) {
+			Ok(entry) => entry.id(),
+			Err(e) => {
+				tracing::warn!(submodule = %rel, error = %e, "no gitlink entry for submodule; skipping");
+				continue;
+			},
+		};
+		let dest = workdir.join(&rel);
+		if let Some(parent) = dest.parent() {
+			let _ = std::fs::create_dir_all(parent);
+		}
+		let _ = std::fs::remove_dir(&dest);
+		let cloned = std::process::Command::new("git")
+			.args(["clone", "--quiet", "--no-checkout", &url])
+			.arg(&dest)
+			.output();
+		match cloned {
+			Ok(o) if o.status.success() => {},
+			Ok(o) => {
+				tracing::warn!(
+					submodule = %rel,
+					stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+					"cloning submodule failed; its contents stay absent from this checkout"
+				);
+				continue;
+			},
+			Err(e) => {
+				tracing::warn!(submodule = %rel, error = %e, "spawning git clone for submodule failed");
+				continue;
+			},
+		}
+		let checked_out = std::process::Command::new("git")
+			.arg("-C")
+			.arg(&dest)
+			.args(["checkout", "--quiet", "--detach", &pinned.to_string()])
+			.output();
+		match checked_out {
+			Ok(o) if o.status.success() => {
+				tracing::info!(submodule = %rel, commit = %pinned, "materialised submodule");
+			},
+			Ok(o) => tracing::warn!(
+				submodule = %rel,
+				commit = %pinned,
+				stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+				"submodule cloned but the pinned commit could not be checked out"
+			),
+			Err(e) => {
+				tracing::warn!(submodule = %rel, error = %e, "spawning git checkout for submodule failed")
+			},
+		}
+	}
 }
 
 /// Submodule paths declared in `.gitmodules` that are empty on disk.
@@ -491,6 +642,106 @@ mod tests {
 		async fn scan(&self, _: &ScanContext) -> Result<Vec<loupe_core::Finding>> {
 			Ok(vec![])
 		}
+	}
+
+	#[test]
+	fn parse_gitmodules_pairs_path_with_url() {
+		let text =
+			"[submodule \"external/a\"]\n\tpath = external/a\n\turl = https://x.invalid/a.git\n\
+		            [submodule \"external/b\"]\n\turl = https://x.invalid/b.git\n\tpath = external/b\n\
+		            [submodule \"broken\"]\n\tpath = external/c\n";
+		assert_eq!(
+			parse_gitmodules(text),
+			vec![
+				("external/a".to_owned(), "https://x.invalid/a.git".to_owned()),
+				("external/b".to_owned(), "https://x.invalid/b.git".to_owned()),
+			]
+		);
+	}
+
+	/// `materialise_submodules` must clone the dependency at the commit the
+	/// superproject pins, not at whatever the dependency's branch has moved to.
+	/// Scanning a revision means scanning what it actually builds against.
+	#[test]
+	fn materialise_submodules_uses_the_pinned_commit_not_the_tip() {
+		fn git(dir: &std::path::Path, args: &[&str]) {
+			let out = Command::new("git")
+				.current_dir(dir)
+				.args(args)
+				.env("GIT_AUTHOR_NAME", "t")
+				.env("GIT_AUTHOR_EMAIL", "t@t")
+				.env("GIT_COMMITTER_NAME", "t")
+				.env("GIT_COMMITTER_EMAIL", "t@t")
+				.output()
+				.unwrap();
+			assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+		}
+		fn head(dir: &std::path::Path) -> String {
+			String::from_utf8(
+				Command::new("git")
+					.current_dir(dir)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap()
+					.stdout,
+			)
+			.unwrap()
+			.trim()
+			.to_owned()
+		}
+
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+
+		// Dependency with two commits; the superproject will pin the first.
+		let dep = root.join("dep");
+		std::fs::create_dir_all(&dep).unwrap();
+		git(&dep, &["init", "--quiet", "-b", "main"]);
+		std::fs::write(dep.join("lib.c"), "int pinned(void){return 1;}\n").unwrap();
+		git(&dep, &["add", "-A"]);
+		git(&dep, &["commit", "--quiet", "-m", "pinned"]);
+		let pinned = head(&dep);
+		std::fs::write(dep.join("lib.c"), "int moved_on(void){return 2;}\n").unwrap();
+		git(&dep, &["add", "-A"]);
+		git(&dep, &["commit", "--quiet", "-m", "later tip"]);
+		assert_ne!(pinned, head(&dep));
+
+		// Superproject with a gitlink at the pinned commit.
+		let sup = root.join("sup");
+		std::fs::create_dir_all(&sup).unwrap();
+		git(&sup, &["init", "--quiet", "-b", "main"]);
+		std::fs::write(
+			sup.join(".gitmodules"),
+			format!(
+				"[submodule \"external/dep\"]\n\tpath = external/dep\n\turl = {}\n",
+				dep.display()
+			),
+		)
+		.unwrap();
+		std::fs::write(sup.join("main.c"), "int main(void){return 0;}\n").unwrap();
+		git(&sup, &["add", "-A"]);
+		git(
+			&sup,
+			&["update-index", "--add", "--cacheinfo", &format!("160000,{pinned},external/dep")],
+		);
+		git(&sup, &["commit", "--quiet", "-m", "pin dep"]);
+
+		let repo = git2::Repository::open(&sup).unwrap();
+		let tree = repo.head().unwrap().peel_to_commit().unwrap().tree().unwrap();
+
+		// A worktree as a bare checkout leaves it: .gitmodules present, path empty.
+		let work = root.join("work");
+		std::fs::create_dir_all(work.join("external/dep")).unwrap();
+		std::fs::copy(sup.join(".gitmodules"), work.join(".gitmodules")).unwrap();
+		assert_eq!(unpopulated_submodules(&work), vec!["external/dep".to_owned()]);
+
+		materialise_submodules(&tree, &work);
+
+		let body = std::fs::read_to_string(work.join("external/dep/lib.c"))
+			.expect("submodule contents must be present after materialising");
+		assert!(body.contains("pinned"), "expected the pinned commit, got: {body}");
+		assert!(!body.contains("moved_on"), "must not follow the dependency's later tip");
+		assert!(unpopulated_submodules(&work).is_empty());
 	}
 
 	#[test]
@@ -588,14 +839,15 @@ mod tests {
 			String::from_utf8_lossy(&output.stderr)
 		);
 
-		let (latest_workdir, latest_sha) = checkout_latest(&bare, Some("main")).await.unwrap();
+		let (latest_workdir, latest_sha) =
+			checkout_latest(&bare, Some("main"), false).await.unwrap();
 		assert_eq!(latest_sha, second);
 		assert_eq!(
 			std::fs::read_to_string(latest_workdir.path().join("file.txt")).unwrap(),
 			"two\n"
 		);
 
-		let (review_workdir, reviewed_sha) = checkout_revision(&bare, &first).await.unwrap();
+		let (review_workdir, reviewed_sha) = checkout_revision(&bare, &first, false).await.unwrap();
 		assert_eq!(reviewed_sha, first);
 		assert_eq!(
 			std::fs::read_to_string(review_workdir.path().join("file.txt")).unwrap(),

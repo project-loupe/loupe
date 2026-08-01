@@ -24,6 +24,12 @@ max_gb = 40
 [runtime]
 max_workdir_gb = 5
 disable_sandbox = false
+# Clone submodules declared in .gitmodules into the checkout. Off by default:
+# a bare clone cannot carry submodule contents, so without this a repository
+# that keeps dependencies in submodules is scanned with those paths empty.
+# Turn it on when the dependencies are part of what you are reviewing - scan
+# cost scales with the resulting file count.
+fetch_submodules = false
 
 [logging]
 level = "info"

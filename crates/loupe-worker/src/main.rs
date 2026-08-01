@@ -92,6 +92,10 @@ struct RunArgs {
 	/// Disable bubblewrap sandboxing. Intended for development only.
 	#[arg(long, env = "LOUPE_DISABLE_SANDBOX", value_parser = clap::builder::BoolishValueParser::new())]
 	disable_sandbox: Option<bool>,
+	/// Clone submodules declared in `.gitmodules` into the checkout. Off by
+	/// default; scan cost scales with the resulting file count.
+	#[arg(long, env = "LOUPE_FETCH_SUBMODULES", value_parser = clap::builder::BoolishValueParser::new())]
+	fetch_submodules: Option<bool>,
 	/// Logging level: trace, debug, info, warn, or error.
 	#[arg(long, env = "LOUPE_LOG_LEVEL")]
 	log_level: Option<String>,
@@ -356,8 +360,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
-	let runner =
-		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
+	let runner = Runner::new(client, cache, scanners)
+		.with_max_workdir_bytes(cfg.runtime.max_workdir_bytes)
+		.with_fetch_submodules(cfg.runtime.fetch_submodules);
 
 	let cancel = CancellationToken::new();
 	let cancel_for_signal = cancel.clone();
@@ -419,6 +424,7 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 			max_cache_gb: args.max_cache_gb,
 			max_workdir_gb: args.max_workdir_gb,
 			disable_sandbox: args.disable_sandbox,
+			fetch_submodules: args.fetch_submodules,
 			log_level: args.log_level.clone(),
 			log_json: args.log_json,
 			log_agent_output: args.log_agent_output,
