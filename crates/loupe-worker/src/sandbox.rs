@@ -203,7 +203,7 @@ impl SandboxBuilder {
 		// Read-only system directories. /lib and /lib64 are platform-
 		// dependent: glibc systems have /lib64, musl typically does not.
 		// We bind whichever exists.
-		for ro in ["/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"] {
+		for ro in ["/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin", "/nix"] {
 			if Path::new(ro).exists() {
 				cmd.args(["--ro-bind-try", ro, ro]);
 			}
