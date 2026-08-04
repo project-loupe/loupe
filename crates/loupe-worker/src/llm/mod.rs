@@ -21,6 +21,7 @@ pub mod claude_cli;
 pub mod codex_cli;
 pub mod mcp;
 pub mod prompts;
+pub mod rate_limit;
 
 use std::ffi::OsString;
 use std::path::PathBuf;

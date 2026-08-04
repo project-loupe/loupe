@@ -22,10 +22,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use loupe_core::Finding;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::prompts::{self, DISCOVERY};
+use crate::llm::rate_limit::{is_rate_limit_error, AdaptiveConcurrency};
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::scanner::{ScanContext, Scanner};
 use crate::source_discovery::{walk_source_files, ScannerConfig, ScannerConfigPatch};
@@ -141,7 +141,14 @@ impl Scanner for LlmCodeReviewScanner {
 }
 
 impl LlmCodeReviewScanner {
-	/// Fan out one agent session per file with bounded concurrency.
+	/// Fan out one agent session per file with adaptive concurrency.
+	///
+	/// Starts at `cfg.max_concurrent_files`. When an agent session hits
+	/// a provider rate limit (429 / exceeded retry limit / etc.), the
+	/// shared limiter halves concurrency and sleeps with exponential
+	/// backoff so the remaining files don't thrash the same quota.
+	/// Successful sessions slowly restore the ceiling.
+	///
 	/// Returns the count of session-level errors; per-session "no
 	/// finding" is a success (not an error).
 	#[allow(clippy::too_many_arguments)]
@@ -149,22 +156,38 @@ impl LlmCodeReviewScanner {
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
 		bkb_hint: &'static str, cancel: &CancellationToken,
 	) -> usize {
-		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
+		let limiter = AdaptiveConcurrency::new(cfg.max_concurrent_files);
+		tracing::info!(
+			max_concurrent_files = limiter.max(),
+			"llm-code-review: adaptive concurrency armed"
+		);
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
 			if cancel.is_cancelled() {
 				break;
 			}
-			let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
+			// Acquire before spawn so the launcher itself backs off when
+			// the provider is hot — otherwise we'd queue every file as a
+			// task that immediately stampedes the API the moment cooldown
+			// ends.
+			let ticket = limiter.acquire().await;
+			if cancel.is_cancelled() {
+				drop(ticket);
+				break;
+			}
 			let backend = self.backend.clone();
 			let cfg_owned = cfg.clone();
 			let workdir = workdir.to_path_buf();
 			let path = path.clone();
 			let cancel = cancel.clone();
+			let limiter = Arc::clone(&limiter);
 			handles.push(tokio::spawn(async move {
-				let _permit = permit;
-				run_one(backend, &workdir, &path, &cfg_owned, repo_id, job_id, bkb_hint, cancel)
-					.await
+				let _ticket = ticket;
+				run_one(
+					backend, &workdir, &path, &cfg_owned, repo_id, job_id, bkb_hint, cancel,
+					&limiter,
+				)
+				.await
 			}));
 		}
 
@@ -179,6 +202,11 @@ impl LlmCodeReviewScanner {
 				},
 			}
 		}
+		tracing::info!(
+			final_limit = limiter.current_limit(),
+			max = limiter.max(),
+			"llm-code-review: fan-out complete"
+		);
 		errors
 	}
 }
@@ -188,14 +216,21 @@ impl LlmCodeReviewScanner {
 /// counts these and fails the scan when every attempt errors. A
 /// healthy session that produced no submission still returns `Ok(())`
 /// — the agent decided there was nothing to report.
+///
+/// Rate-limit failures are reported to `limiter` so the rest of the
+/// fan-out slows down; other errors leave concurrency unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
-	job_id: i64, bkb_hint: &'static str, cancel: CancellationToken,
+	job_id: i64, bkb_hint: &'static str, cancel: CancellationToken, limiter: &AdaptiveConcurrency,
 ) -> Result<(), ()> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
 	let prompt = prompts::render(DISCOVERY, &[("file", &rel), ("bkb_hint", bkb_hint)]);
-	tracing::info!(file = %rel, "llm-code-review: launching agent session");
+	tracing::info!(
+		file = %rel,
+		concurrency_limit = limiter.current_limit(),
+		"llm-code-review: launching agent session"
+	);
 	let started = std::time::Instant::now();
 	let req = LlmRequest {
 		prompt,
@@ -208,6 +243,7 @@ async fn run_one(
 	};
 	match backend.run(req).await {
 		Ok(r) => {
+			limiter.record_success();
 			tracing::debug!(
 				file = %rel,
 				elapsed_ms = started.elapsed().as_millis() as u64,
@@ -217,7 +253,18 @@ async fn run_one(
 			Ok(())
 		},
 		Err(e) => {
-			tracing::warn!(file = %rel, error = %e, "agent session failed");
+			if is_rate_limit_error(&e) {
+				limiter.record_rate_limit(&format!("{e:#}"));
+				tracing::warn!(
+					file = %rel,
+					error = %e,
+					concurrency_limit = limiter.current_limit(),
+					"agent session failed (rate limit) — fan-out will slow down"
+				);
+			} else {
+				limiter.record_other_error();
+				tracing::warn!(file = %rel, error = %e, "agent session failed");
+			}
 			Err(())
 		},
 	}
