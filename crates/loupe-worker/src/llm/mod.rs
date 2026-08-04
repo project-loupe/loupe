@@ -22,6 +22,7 @@ pub mod codex_cli;
 pub mod mcp;
 pub mod prompts;
 pub mod rate_limit;
+pub mod usage;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -36,6 +37,7 @@ pub use codex_cli::CodexCliBackend;
 pub use mcp::{McpContext, McpTlsSource};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
+pub use usage::{TokenUsage, UsageEvent, UsageRecorder};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliModelConfig {
@@ -186,12 +188,19 @@ pub struct LlmRequest {
 	/// `submit_verdict`, `submit_patch`, and `validate_patch` are
 	/// advertised instead. `None` keeps the discovery-mode catalog.
 	pub finding_id: Option<i64>,
+	/// Optional human label for usage accounting (e.g. relative file
+	/// path being scanned). Stored in the usage JSONL row; not sent
+	/// to the model.
+	pub usage_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
 	pub text: String,
 	pub backend_id: &'static str,
+	/// Token usage for this session when the backend can report it
+	/// (Codex `exec --json` token_count events). `None` when unknown.
+	pub usage: Option<TokenUsage>,
 }
 
 #[async_trait::async_trait]
@@ -312,9 +321,11 @@ fn home_path(child: &str) -> Option<PathBuf> {
 /// selection. `auto` preserves the historical behaviour: Claude owns
 /// LLM discovery when ready; Codex-only workers advertise verify-only
 /// unless the operator explicitly selects Codex for scan jobs.
+#[allow(clippy::too_many_arguments)]
 pub fn build_scan_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
 	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+	usage: Option<Arc<UsageRecorder>>,
 ) -> Result<Option<Arc<dyn LlmBackend>>> {
 	match selection {
 		JobAgent::Auto if claude_ready => {
@@ -323,7 +334,7 @@ pub fn build_scan_backend(
 				effort = %claude_agent.effort,
 				"scan backend: claude (auto)"
 			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
+			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output, usage)))
 		},
 		JobAgent::Auto => {
 			tracing::info!(
@@ -338,7 +349,7 @@ pub fn build_scan_backend(
 				effort = %claude_agent.effort,
 				"scan backend: claude (configured)"
 			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
+			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output, usage)))
 		},
 		JobAgent::Codex => {
 			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
@@ -347,7 +358,7 @@ pub fn build_scan_backend(
 				effort = %codex_agent.effort,
 				"scan backend: codex (configured)"
 			);
-			Ok(Some(build_codex_backend(mcp, codex_agent, log_agent_output)))
+			Ok(Some(build_codex_backend(mcp, codex_agent, log_agent_output, usage)))
 		},
 	}
 }
@@ -366,9 +377,11 @@ pub fn build_scan_backend(
 ///
 /// Logs the choice at info level so operators can see which backend
 /// is actually verifying without having to inspect process listings.
+#[allow(clippy::too_many_arguments)]
 pub fn build_verifier_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
 	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+	usage: Option<Arc<UsageRecorder>>,
 ) -> Result<Arc<dyn LlmBackend>> {
 	match selection {
 		JobAgent::Auto if codex_ready => {
@@ -377,7 +390,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (auto)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, log_agent_output, usage.clone()))
 		},
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
@@ -385,7 +398,7 @@ pub fn build_verifier_backend(
 				effort = %claude_agent.effort,
 				"verifier backend: claude (auto, codex unavailable)"
 			);
-			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
+			Ok(build_claude_backend(mcp, claude_agent, log_agent_output, usage.clone()))
 		},
 		JobAgent::Auto => anyhow::bail!("no authenticated verifier backend available"),
 		JobAgent::Claude => {
@@ -395,7 +408,7 @@ pub fn build_verifier_backend(
 				effort = %claude_agent.effort,
 				"verifier backend: claude (configured)"
 			);
-			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
+			Ok(build_claude_backend(mcp, claude_agent, log_agent_output, usage.clone()))
 		},
 		JobAgent::Codex => {
 			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
@@ -404,7 +417,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (configured)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, log_agent_output, usage.clone()))
 		},
 	}
 }
@@ -421,22 +434,30 @@ fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<(
 
 fn build_claude_backend(
 	mcp: Option<McpContext>, agent: CliModelConfig, log_agent_output: bool,
+	usage: Option<Arc<UsageRecorder>>,
 ) -> Arc<dyn LlmBackend> {
 	let mut backend =
 		ClaudeCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
+	if let Some(u) = usage {
+		backend = backend.with_usage_recorder(u);
+	}
 	Arc::new(backend)
 }
 
 fn build_codex_backend(
 	mcp: Option<McpContext>, agent: CliModelConfig, log_agent_output: bool,
+	usage: Option<Arc<UsageRecorder>>,
 ) -> Arc<dyn LlmBackend> {
 	let mut backend =
 		CodexCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
+	}
+	if let Some(u) = usage {
+		backend = backend.with_usage_recorder(u);
 	}
 	Arc::new(backend)
 }
@@ -555,6 +576,7 @@ mod tests {
 			codex.clone(),
 			claude.clone(),
 			false,
+			None,
 		)
 		.unwrap()
 		.expect("claude-ready auto scan should register");
@@ -568,6 +590,7 @@ mod tests {
 			codex.clone(),
 			claude,
 			false,
+			None,
 		)
 		.unwrap();
 		assert!(
@@ -599,6 +622,7 @@ mod tests {
 			codex.clone(),
 			claude.clone(),
 			false,
+			None,
 		)
 		.unwrap()
 		.expect("explicit codex scan should register when codex is ready");
@@ -612,6 +636,7 @@ mod tests {
 			codex,
 			claude,
 			false,
+			None,
 		) {
 			Ok(_) => panic!("explicit unavailable codex scan should fail"),
 			Err(e) => e,
@@ -641,6 +666,7 @@ mod tests {
 			codex.clone(),
 			claude.clone(),
 			false,
+			None,
 		)
 		.unwrap();
 		assert_eq!(backend.id(), "codex-cli");
@@ -653,6 +679,7 @@ mod tests {
 			codex.clone(),
 			claude.clone(),
 			false,
+			None,
 		)
 		.unwrap();
 		assert_eq!(backend.id(), "claude-cli");
@@ -665,6 +692,7 @@ mod tests {
 			codex,
 			claude,
 			false,
+			None,
 		) {
 			Ok(_) => panic!("missing verifier backend should be rejected"),
 			Err(e) => e,
@@ -695,6 +723,7 @@ mod tests {
 			codex.clone(),
 			claude.clone(),
 			false,
+			None,
 		)
 		.unwrap();
 		assert_eq!(backend.id(), "claude-cli");
@@ -707,6 +736,7 @@ mod tests {
 			codex,
 			claude,
 			false,
+			None,
 		) {
 			Ok(_) => panic!("explicit unavailable claude verifier should fail"),
 			Err(e) => e,
@@ -789,7 +819,7 @@ pub mod testing {
 
 		async fn run(&self, req: LlmRequest) -> Result<LlmResponse> {
 			let text = (self.f)(req).await?;
-			Ok(LlmResponse { text, backend_id: self.id })
+			Ok(LlmResponse { text, backend_id: self.id, usage: None })
 		}
 	}
 }

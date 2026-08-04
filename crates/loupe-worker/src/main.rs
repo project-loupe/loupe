@@ -19,6 +19,7 @@ use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
 	claude_available, codex_auth_available, codex_available, JobAgent, McpContext, McpTlsSource,
+	UsageRecorder,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -323,6 +324,18 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		bkb_api_url: cfg.bkb.api_url.clone(),
 	};
 
+	// Durable token accounting under the cache dir so funding /
+	// capacity planning can be answered from JSONL + summary without
+	// scraping provider dashboards. Optional USD estimates via
+	// LOUPE_USAGE_INPUT_USD_PER_MTOK / LOUPE_USAGE_OUTPUT_USD_PER_MTOK.
+	let usage_recorder = match UsageRecorder::open(&cache_dir) {
+		Ok(r) => Some(r),
+		Err(e) => {
+			tracing::warn!(error = %e, "usage recorder unavailable; continuing without token accounting");
+			None
+		},
+	};
+
 	let scan_codex = cfg.agents.scan_model.clone().unwrap_or_else(|| cfg.agents.codex.clone());
 	let scan_claude = cfg.agents.scan_model.clone().unwrap_or_else(|| cfg.agents.claude.clone());
 	if let Some(backend) = build_scan_backend(
@@ -333,6 +346,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		scan_codex,
 		scan_claude,
 		cfg.logging.agent_output,
+		usage_recorder.clone(),
 	)? {
 		scanners.push(Arc::new(
 			LlmCodeReviewScanner::new(backend)
@@ -357,6 +371,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		verify_codex,
 		verify_claude,
 		cfg.logging.agent_output,
+		usage_recorder,
 	)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");

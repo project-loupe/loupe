@@ -31,6 +31,7 @@ use tokio::time::timeout;
 use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
+use super::usage::{now_ms, parse_codex_jsonl, UsageEvent, UsageRecorder};
 use super::{
 	codex_api_key_env, codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend,
 	LlmRequest, LlmResponse,
@@ -81,6 +82,7 @@ pub struct CodexCliBackend {
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
 	log_agent_output: bool,
+	usage: Option<std::sync::Arc<UsageRecorder>>,
 	#[cfg(test)]
 	disable_sandbox: bool,
 }
@@ -97,9 +99,15 @@ impl CodexCliBackend {
 			},
 			mcp: None,
 			log_agent_output: false,
+			usage: None,
 			#[cfg(test)]
 			disable_sandbox: false,
 		}
+	}
+
+	pub fn with_usage_recorder(mut self, usage: std::sync::Arc<UsageRecorder>) -> Self {
+		self.usage = Some(usage);
+		self
 	}
 
 	pub fn with_bin(bin: impl Into<String>) -> Self {
@@ -306,30 +314,68 @@ impl LlmBackend for CodexCliBackend {
 		if !status.success() {
 			let stderr_text = String::from_utf8_lossy(&stderr);
 			let stdout_text = String::from_utf8_lossy(&stdout);
+			let (_partial_text, partial_usage) = parse_codex_jsonl(&stdout_text);
 			tracing::debug!(
 				backend = BACKEND_ID,
 				exit = ?status.code(),
 				stdout_chars = stdout.len(),
 				stderr_chars = stderr.len(),
 				elapsed_ms = started.elapsed().as_millis() as u64,
+				partial_total_tokens = partial_usage.as_ref().map(|u| u.total_tokens),
 				"codex-cli: subprocess failed",
 			);
+			// Surface partial usage in the error string so the scanner can
+			// still attribute spend on failed/rate-limited sessions.
+			let usage_note = partial_usage
+				.as_ref()
+				.map(|u| {
+					format!(
+						" usage={{input:{},cached_input:{},output:{},reasoning_output:{},total:{}}}",
+						u.input_tokens,
+						u.cached_input_tokens,
+						u.output_tokens,
+						u.reasoning_output_tokens,
+						u.total_tokens
+					)
+				})
+				.unwrap_or_default();
 			let combined = format!(
-				"stderr(chars={})=`{}` stdout(chars={})=`{}`",
+				"stderr(chars={})=`{}` stdout(chars={})=`{}`{}",
 				stderr_text.chars().count(),
 				summarize_cli_stream_for_error(&stderr_text, MAX_CLI_DIAGNOSTIC_CHARS),
 				stdout_text.chars().count(),
 				summarize_cli_stream_for_error(&stdout_text, MAX_CLI_DIAGNOSTIC_CHARS),
+				usage_note,
 			);
+			if let Some(rec) = &self.usage {
+				let u = partial_usage.clone().unwrap_or_default();
+				rec.record(UsageEvent {
+					ts_unix_ms: now_ms(),
+					backend: BACKEND_ID.to_owned(),
+					model: self.agent.model.clone(),
+					provider: self.agent.provider.clone(),
+					repo_id: req.repo_id,
+					job_id: req.job_id,
+					finding_id: req.finding_id,
+					file: req.usage_label.clone(),
+					ok: false,
+					elapsed_ms: started.elapsed().as_millis() as u64,
+					usage: u,
+					estimated_usd: None,
+				});
+			}
 			return Err(anyhow!("codex CLI exited with {}: {}", status, combined));
 		}
 
-		let text = String::from_utf8(stdout)
+		let raw = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("codex CLI stdout was not UTF-8: {e}"))?;
+		// `--json` emits JSONL events on stdout. Pull the final agent
+		// message + cumulative token_count usage out of the stream.
+		let (text, usage) = parse_codex_jsonl(&raw);
 		if self.log_agent_output {
 			tracing::info!(
 				backend = BACKEND_ID,
-				agent_stdout = %text,
+				agent_stdout = %raw,
 				"codex-cli: agent stdout (full)"
 			);
 			if !stderr.is_empty() {
@@ -344,11 +390,28 @@ impl LlmBackend for CodexCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			elapsed_ms = started.elapsed().as_millis() as u64,
-			stdout_chars = text.chars().count(),
+			stdout_chars = raw.chars().count(),
 			stderr_chars = stderr.len(),
+			total_tokens = usage.as_ref().map(|u| u.total_tokens),
 			"codex-cli: subprocess succeeded",
 		);
-		Ok(LlmResponse { text, backend_id: BACKEND_ID })
+		if let Some(rec) = &self.usage {
+			rec.record(UsageEvent {
+				ts_unix_ms: now_ms(),
+				backend: BACKEND_ID.to_owned(),
+				model: self.agent.model.clone(),
+				provider: self.agent.provider.clone(),
+				repo_id: req.repo_id,
+				job_id: req.job_id,
+				finding_id: req.finding_id,
+				file: req.usage_label.clone(),
+				ok: true,
+				elapsed_ms: started.elapsed().as_millis() as u64,
+				usage: usage.clone().unwrap_or_default(),
+				estimated_usd: None,
+			});
+		}
+		Ok(LlmResponse { text, backend_id: BACKEND_ID, usage })
 	}
 }
 
@@ -359,6 +422,8 @@ fn codex_invocation_args(
 		"exec".to_owned(),
 		"--dangerously-bypass-approvals-and-sandbox".to_owned(),
 		"--skip-git-repo-check".to_owned(),
+		// JSONL events on stdout — required for token_count usage accounting.
+		"--json".to_owned(),
 		"--model".to_owned(),
 		agent.model.clone(),
 		"-c".to_owned(),
@@ -490,6 +555,7 @@ mod tests {
 			repo_id: None,
 			job_id: None,
 			finding_id: None,
+			usage_label: None,
 		};
 		let resp = backend.run(req).await.expect("codex responded");
 		assert_eq!(resp.backend_id, BACKEND_ID);
@@ -509,6 +575,7 @@ mod tests {
 			repo_id: None,
 			job_id: None,
 			finding_id: None,
+			usage_label: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();
@@ -543,6 +610,7 @@ mod tests {
 			repo_id: None,
 			job_id: None,
 			finding_id: None,
+			usage_label: None,
 		};
 
 		let err = backend.run(req).await.expect_err("must time out");
@@ -613,6 +681,7 @@ mod tests {
 			"hello",
 		);
 
+		assert!(args.iter().any(|a| a == "--json"), "codex must emit JSONL for usage accounting");
 		assert!(args.windows(2).any(|w| w == ["--model", "gpt-test"]));
 		assert!(args.windows(2).any(|w| w == ["-c", r#"model_reasoning_effort="xhigh""#]));
 		assert!(args.windows(2).any(|w| w == ["-c", "mcp_servers.loupe.env={}"]));

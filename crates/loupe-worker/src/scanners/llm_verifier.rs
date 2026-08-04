@@ -89,6 +89,7 @@ impl Scanner for LlmVerifierScanner {
 			repo_id: Some(ctx.repo_id),
 			job_id: Some(ctx.job_id),
 			finding_id: Some(ctx.finding_id),
+			usage_label: Some(format!("finding:{}", ctx.finding_id)),
 		};
 		let _resp = self.backend.run(req).await?;
 

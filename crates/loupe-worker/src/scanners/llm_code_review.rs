@@ -240,6 +240,7 @@ async fn run_one(
 		repo_id: Some(repo_id),
 		job_id: Some(job_id),
 		finding_id: None,
+		usage_label: Some(rel.clone()),
 	};
 	match backend.run(req).await {
 		Ok(r) => {

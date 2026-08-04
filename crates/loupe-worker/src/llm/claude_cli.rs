@@ -29,6 +29,7 @@ use tokio::time::timeout;
 use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
+use super::usage::{now_ms, UsageEvent, UsageRecorder};
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
@@ -116,6 +117,7 @@ pub struct ClaudeCliBackend {
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
 	log_agent_output: bool,
+	usage: Option<std::sync::Arc<UsageRecorder>>,
 	#[cfg(test)]
 	disable_sandbox: bool,
 }
@@ -132,9 +134,15 @@ impl ClaudeCliBackend {
 			},
 			mcp: None,
 			log_agent_output: false,
+			usage: None,
 			#[cfg(test)]
 			disable_sandbox: false,
 		}
+	}
+
+	pub fn with_usage_recorder(mut self, usage: std::sync::Arc<UsageRecorder>) -> Self {
+		self.usage = Some(usage);
+		self
 	}
 
 	pub fn with_bin(bin: impl Into<String>) -> Self {
@@ -364,7 +372,25 @@ impl LlmBackend for ClaudeCliBackend {
 			stderr_chars = stderr.len(),
 			"claude-cli: subprocess succeeded",
 		);
-		Ok(LlmResponse { text, backend_id: BACKEND_ID })
+		if let Some(rec) = &self.usage {
+			// Claude text mode doesn't expose token counts yet; still record
+			// the session so funding spreadsheets see call volume.
+			rec.record(UsageEvent {
+				ts_unix_ms: now_ms(),
+				backend: BACKEND_ID.to_owned(),
+				model: self.agent.model.clone(),
+				provider: self.agent.provider.clone(),
+				repo_id: req.repo_id,
+				job_id: req.job_id,
+				finding_id: req.finding_id,
+				file: req.usage_label.clone(),
+				ok: true,
+				elapsed_ms: started.elapsed().as_millis() as u64,
+				usage: Default::default(),
+				estimated_usd: None,
+			});
+		}
+		Ok(LlmResponse { text, backend_id: BACKEND_ID, usage: None })
 	}
 }
 
@@ -485,6 +511,7 @@ mod tests {
 			repo_id: None,
 			job_id: None,
 			finding_id: None,
+			usage_label: None,
 		};
 		let resp = backend.run(req).await.expect("claude responded");
 		assert_eq!(resp.backend_id, BACKEND_ID);
@@ -504,6 +531,7 @@ mod tests {
 			repo_id: None,
 			job_id: None,
 			finding_id: None,
+			usage_label: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();
@@ -540,6 +568,7 @@ mod tests {
 			repo_id: None,
 			job_id: None,
 			finding_id: None,
+			usage_label: None,
 		};
 
 		let err = backend.run(req).await.expect_err("must time out");
