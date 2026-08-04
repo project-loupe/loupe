@@ -127,6 +127,8 @@ impl ClaudeCliBackend {
 			agent: CliModelConfig {
 				model: DEFAULT_CLAUDE_MODEL.to_owned(),
 				effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
+				provider: None,
+				api_key_env: None,
 			},
 			mcp: None,
 			log_agent_output: false,
@@ -560,7 +562,12 @@ mod tests {
 	#[test]
 	fn invocation_args_include_configured_model_and_effort() {
 		let args = claude_invocation_args(
-			&CliModelConfig { model: "claude-test".into(), effort: "xhigh".into() },
+			&CliModelConfig {
+				model: "claude-test".into(),
+				effort: "xhigh".into(),
+				provider: None,
+				api_key_env: None,
+			},
 			"hello",
 		);
 

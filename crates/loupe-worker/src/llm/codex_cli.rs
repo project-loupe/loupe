@@ -92,6 +92,8 @@ impl CodexCliBackend {
 			agent: CliModelConfig {
 				model: DEFAULT_CODEX_MODEL.to_owned(),
 				effort: DEFAULT_CODEX_EFFORT.to_owned(),
+				provider: None,
+				api_key_env: None,
 			},
 			mcp: None,
 			log_agent_output: false,
@@ -172,7 +174,21 @@ impl LlmBackend for CodexCliBackend {
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
 			.forward_env("OPENAI_API_KEY");
-		if let Some(api_key) = codex_api_key_env() {
+		// Resolve the auth key for THIS invocation's provider. When the
+		// agent carries an api_key_env (e.g. MOONSHOT_API_KEY for the
+		// verify role's Kimi provider), read that var from the worker's
+		// own env and inject it as CODEX_API_KEY; otherwise fall back to
+		// the default CODEX_API_KEY / OPENAI_API_KEY. codex sends the
+		// resolved value as the bearer token to the active provider's
+		// base_url, so scan (Z.AI) and verify (Moonshot) can use
+		// distinct keys.
+		let effective_api_key = self
+			.agent
+			.api_key_env
+			.as_deref()
+			.and_then(|name| std::env::var_os(name).filter(|v| !v.is_empty()))
+			.or_else(codex_api_key_env);
+		if let Some(api_key) = effective_api_key {
 			sandbox = sandbox.set_env("CODEX_API_KEY", api_key);
 		}
 		if let Some(codex_dir) = codex_home_dir() {
@@ -348,6 +364,10 @@ fn codex_invocation_args(
 		"-c".to_owned(),
 		format!("model_reasoning_effort={}", toml_string_literal(&agent.effort)),
 	];
+	if let Some(provider) = &agent.provider {
+		args.push("-c".to_owned());
+		args.push(format!("model_provider={}", toml_string_literal(provider)));
+	}
 	for ov in mcp_overrides {
 		args.push("-c".to_owned());
 		args.push(ov.clone());
@@ -583,7 +603,12 @@ mod tests {
 	#[test]
 	fn invocation_args_include_configured_model_and_effort() {
 		let args = codex_invocation_args(
-			&CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() },
+			&CliModelConfig {
+				model: "gpt-test".into(),
+				effort: "xhigh".into(),
+				provider: None,
+				api_key_env: None,
+			},
 			&["mcp_servers.loupe.env={}".to_owned()],
 			"hello",
 		);

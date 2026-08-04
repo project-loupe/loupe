@@ -323,13 +323,15 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		bkb_api_url: cfg.bkb.api_url.clone(),
 	};
 
+	let scan_codex = cfg.agents.scan_model.clone().unwrap_or_else(|| cfg.agents.codex.clone());
+	let scan_claude = cfg.agents.scan_model.clone().unwrap_or_else(|| cfg.agents.claude.clone());
 	if let Some(backend) = build_scan_backend(
 		Some(mcp_ctx.clone()),
 		cfg.agents.scan,
 		claude,
 		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		scan_codex,
+		scan_claude,
 		cfg.logging.agent_output,
 	)? {
 		scanners.push(Arc::new(
@@ -344,13 +346,16 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// for the verify-mode tool surface (`submit_verdict` /
 	// `submit_patch` / `validate_patch`); without it, the agent has
 	// no way to commit a verdict.
+	let verify_codex = cfg.agents.verify_model.clone().unwrap_or_else(|| cfg.agents.codex.clone());
+	let verify_claude =
+		cfg.agents.verify_model.clone().unwrap_or_else(|| cfg.agents.claude.clone());
 	let backend = build_verifier_backend(
 		Some(mcp_ctx),
 		cfg.agents.verify,
 		claude,
 		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		verify_codex,
+		verify_claude,
 		cfg.logging.agent_output,
 	)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));

@@ -40,6 +40,19 @@ use tokio_util::sync::CancellationToken;
 pub struct CliModelConfig {
 	pub model: String,
 	pub effort: String,
+	/// Optional Codex `model_provider` override. When set, every codex
+	/// invocation emits `-c model_provider=<provider>` so two roles that
+	/// share the codex backend can target different OpenAI-compatible
+	/// providers (e.g. scan -> Z.AI GLM, verify -> Moonshot Kimi).
+	/// Ignored by the claude backend.
+	pub provider: Option<String>,
+	/// Optional name of an env var (read from the worker's own
+	/// environment) whose value is injected as CODEX_API_KEY for
+	/// this codex invocation. Routes a distinct API key per provider
+	/// (e.g. MOONSHOT_API_KEY for the verify role's Kimi provider)
+	/// without relying on codex's per-provider env_key support. None
+	/// falls back to CODEX_API_KEY / OPENAI_API_KEY.
+	pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
@@ -520,8 +533,18 @@ mod tests {
 
 	#[test]
 	fn scan_backend_auto_preserves_claude_only_discovery_default() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: "gpt-test".into(),
+			effort: "xhigh".into(),
+			provider: None,
+			api_key_env: None,
+		};
+		let claude = CliModelConfig {
+			model: "claude-test".into(),
+			effort: "max".into(),
+			provider: None,
+			api_key_env: None,
+		};
 
 		let backend = build_scan_backend(
 			None,
@@ -536,9 +559,16 @@ mod tests {
 		.expect("claude-ready auto scan should register");
 		assert_eq!(backend.id(), "claude-cli");
 
-		let backend =
-			build_scan_backend(None, JobAgent::Auto, false, true, codex.clone(), claude, false)
-				.unwrap();
+		let backend = build_scan_backend(
+			None,
+			JobAgent::Auto,
+			false,
+			true,
+			codex.clone(),
+			claude,
+			false,
+		)
+		.unwrap();
 		assert!(
 			backend.is_none(),
 			"auto scan should not switch to codex unless explicitly configured"
@@ -547,8 +577,18 @@ mod tests {
 
 	#[test]
 	fn scan_backend_allows_explicit_codex_and_fails_when_unavailable() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: "gpt-test".into(),
+			effort: "xhigh".into(),
+			provider: None,
+			api_key_env: None,
+		};
+		let claude = CliModelConfig {
+			model: "claude-test".into(),
+			effort: "max".into(),
+			provider: None,
+			api_key_env: None,
+		};
 
 		let backend = build_scan_backend(
 			None,
@@ -563,8 +603,15 @@ mod tests {
 		.expect("explicit codex scan should register when codex is ready");
 		assert_eq!(backend.id(), "codex-cli");
 
-		let err = match build_scan_backend(None, JobAgent::Codex, true, false, codex, claude, false)
-		{
+		let err = match build_scan_backend(
+			None,
+			JobAgent::Codex,
+			true,
+			false,
+			codex,
+			claude,
+			false,
+		) {
 			Ok(_) => panic!("explicit unavailable codex scan should fail"),
 			Err(e) => e,
 		};
@@ -573,8 +620,18 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_auto_prefers_codex_then_claude() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: "gpt-test".into(),
+			effort: "xhigh".into(),
+			provider: None,
+			api_key_env: None,
+		};
+		let claude = CliModelConfig {
+			model: "claude-test".into(),
+			effort: "max".into(),
+			provider: None,
+			api_key_env: None,
+		};
 		let backend = build_verifier_backend(
 			None,
 			JobAgent::Auto,
@@ -616,8 +673,18 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_honors_explicit_selection() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: "gpt-test".into(),
+			effort: "xhigh".into(),
+			provider: None,
+			api_key_env: None,
+		};
+		let claude = CliModelConfig {
+			model: "claude-test".into(),
+			effort: "max".into(),
+			provider: None,
+			api_key_env: None,
+		};
 
 		let backend = build_verifier_backend(
 			None,
@@ -631,12 +698,18 @@ mod tests {
 		.unwrap();
 		assert_eq!(backend.id(), "claude-cli");
 
-		let err =
-			match build_verifier_backend(None, JobAgent::Claude, false, true, codex, claude, false)
-			{
-				Ok(_) => panic!("explicit unavailable claude verifier should fail"),
-				Err(e) => e,
-			};
+		let err = match build_verifier_backend(
+			None,
+			JobAgent::Claude,
+			false,
+			true,
+			codex,
+			claude,
+			false,
+		) {
+			Ok(_) => panic!("explicit unavailable claude verifier should fail"),
+			Err(e) => e,
+		};
 		assert!(err.to_string().contains("verify agent `claude`"), "got: {err}");
 	}
 }

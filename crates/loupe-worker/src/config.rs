@@ -61,6 +61,8 @@ pub struct AgentsConfig {
 	pub verify: JobAgent,
 	pub claude: CliModelConfig,
 	pub codex: CliModelConfig,
+	pub scan_model: Option<CliModelConfig>,
+	pub verify_model: Option<CliModelConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +174,13 @@ pub struct AgentsSection {
 	pub claude: AgentSection,
 	#[serde(default)]
 	pub codex: AgentSection,
+	/// Optional model/effort/provider override applied to the SCAN role,
+	/// regardless of which backend (codex/claude) the role selects.
+	#[serde(default)]
+	pub scan_model: Option<AgentSection>,
+	/// Optional model/effort/provider override applied to the VERIFY role.
+	#[serde(default)]
+	pub verify_model: Option<AgentSection>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -181,6 +190,10 @@ pub struct AgentSection {
 	pub model: Option<String>,
 	#[serde(default)]
 	pub effort: Option<String>,
+	#[serde(default)]
+	pub provider: Option<String>,
+	#[serde(default)]
+	pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -265,6 +278,28 @@ impl WorkerConfig {
 		}
 		if let Some(v) = file.agents.codex.effort {
 			self.agents.codex.effort = v;
+		}
+		if let Some(v) = file.agents.claude.provider {
+			self.agents.claude.provider = Some(v);
+		}
+		if let Some(v) = file.agents.codex.provider {
+			self.agents.codex.provider = Some(v);
+		}
+		if let Some(section) = file.agents.scan_model {
+			self.agents.scan_model = Some(CliModelConfig {
+				model: section.model.unwrap_or_else(|| self.agents.codex.model.clone()),
+				effort: section.effort.unwrap_or_else(|| self.agents.codex.effort.clone()),
+				provider: section.provider,
+				api_key_env: section.api_key_env,
+			});
+		}
+		if let Some(section) = file.agents.verify_model {
+			self.agents.verify_model = Some(CliModelConfig {
+				model: section.model.unwrap_or_else(|| self.agents.codex.model.clone()),
+				effort: section.effort.unwrap_or_else(|| self.agents.codex.effort.clone()),
+				provider: section.provider,
+				api_key_env: section.api_key_env,
+			});
 		}
 		if let Some(v) = file.scanner_defaults.max_concurrent_files {
 			self.scanner_defaults.max_concurrent_files = v;
@@ -360,6 +395,22 @@ impl WorkerConfig {
 			&self.agents.codex.effort,
 			&["none", "low", "medium", "high", "xhigh"],
 		)?;
+		if let Some(m) = &self.agents.scan_model {
+			validate_nonempty("agents.scan_model.model", &m.model)?;
+			validate_effort(
+				"agents.scan_model.effort",
+				&m.effort,
+				&["none", "low", "medium", "high", "xhigh", "max"],
+			)?;
+		}
+		if let Some(m) = &self.agents.verify_model {
+			validate_nonempty("agents.verify_model.model", &m.model)?;
+			validate_effort(
+				"agents.verify_model.effort",
+				&m.effort,
+				&["none", "low", "medium", "high", "xhigh", "max"],
+			)?;
+		}
 		validate_effort(
 			"logging.level",
 			&self.logging.level,
@@ -406,11 +457,17 @@ impl Default for WorkerConfig {
 				claude: CliModelConfig {
 					model: DEFAULT_CLAUDE_MODEL.to_owned(),
 					effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
+					provider: None,
+					api_key_env: None,
 				},
 				codex: CliModelConfig {
 					model: DEFAULT_CODEX_MODEL.to_owned(),
 					effort: DEFAULT_CODEX_EFFORT.to_owned(),
+					provider: None,
+					api_key_env: None,
 				},
+				scan_model: None,
+				verify_model: None,
 			},
 			scanner_defaults: LlmScannerConfig {
 				max_concurrent_files: DEFAULT_MAX_CONCURRENT_FILES,
@@ -491,6 +548,44 @@ mod tests {
 		assert_eq!(cfg.agents.codex.effort, "xhigh");
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 2 * 1024 * 1024);
 		assert_eq!(cfg.bkb.api_url, "https://bitcoinknowledge.dev");
+	}
+
+	#[test]
+	fn verify_model_override_replaces_codex_config_for_verify_role() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("verify.toml");
+		std::fs::write(
+			&path,
+			r#"
+[agents]
+scan = "codex"
+verify = "codex"
+
+[agents.codex]
+model = "glm-5.2"
+effort = "high"
+provider = "zai"
+
+[agents.verify_model]
+model = "kimi-k3"
+effort = "high"
+provider = "moonshot"
+api_key_env = "MOONSHOT_API_KEY"
+"#,
+		)
+		.unwrap();
+		let cfg = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap();
+		// scan role keeps the codex default (GLM / Z.AI), no per-role key env.
+		assert_eq!(cfg.agents.codex.model, "glm-5.2");
+		assert_eq!(cfg.agents.codex.provider.as_deref(), Some("zai"));
+		assert!(cfg.agents.codex.api_key_env.is_none());
+		// verify role is overridden to Kimi / Moonshot with its own key env.
+		let v = cfg.agents.verify_model.expect("verify_model override set");
+		assert_eq!(v.model, "kimi-k3");
+		assert_eq!(v.provider.as_deref(), Some("moonshot"));
+		assert_eq!(v.api_key_env.as_deref(), Some("MOONSHOT_API_KEY"));
+		// scan_model stays unset when only verify_model is configured.
+		assert!(cfg.agents.scan_model.is_none());
 	}
 
 	#[test]
