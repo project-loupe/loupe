@@ -24,6 +24,9 @@ pub struct RepoRow {
 	pub last_scanned_at: Option<i64>,
 	pub created_at: i64,
 	pub disabled_at: Option<i64>,
+	/// FK into `secrets` for a private-repo clone token. `None` for public
+	/// repos (or repos whose clone URL carries creds inline — discouraged).
+	pub clone_token_secret_id: Option<i64>,
 }
 
 impl RepoRow {
@@ -48,14 +51,16 @@ pub struct NewRepo {
 	/// `None` lets the server default decide; `Some(_)` pins the per-repo
 	/// override on insert.
 	pub require_approval: Option<bool>,
+	pub clone_token_secret_id: Option<i64>,
 }
 
 pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i64> {
 	conn.execute(
 		"INSERT INTO registered_repos
 		   (clone_url, host, owner, repo, default_branch, scan_interval_seconds,
-		    scanner_config, reporting, verification_enabled, require_approval, created_at)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+		    scanner_config, reporting, verification_enabled, require_approval, created_at,
+		    clone_token_secret_id)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
 		params![
 			new.clone_url,
 			new.host,
@@ -68,6 +73,7 @@ pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i6
 			new.verification_enabled as i64,
 			new.require_approval.map(|b| b as i64),
 			now,
+			new.clone_token_secret_id,
 		],
 	)?;
 	Ok(conn.last_insert_rowid())
@@ -200,7 +206,8 @@ pub fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Re
 const SELECT_REPO_COLUMNS: &str = r#"
 SELECT id, clone_url, host, owner, repo, default_branch, scan_interval_seconds,
        scanner_config, reporting, verification_enabled, require_approval,
-       last_scanned_sha, last_scanned_at, created_at, disabled_at
+       last_scanned_sha, last_scanned_at, created_at, disabled_at,
+       clone_token_secret_id
 FROM registered_repos
 "#;
 
@@ -228,6 +235,7 @@ fn row_to_repo(row: &rusqlite::Row) -> rusqlite::Result<RepoRow> {
 		last_scanned_at: row.get(12)?,
 		created_at: row.get(13)?,
 		disabled_at: row.get(14)?,
+		clone_token_secret_id: row.get(15)?,
 	})
 }
 
@@ -255,6 +263,7 @@ mod tests {
 			},
 			verification_enabled: false,
 			require_approval: None,
+			clone_token_secret_id: None,
 		}
 	}
 
@@ -324,6 +333,7 @@ mod tests {
 			},
 			verification_enabled: false,
 			require_approval: None,
+			clone_token_secret_id: None,
 		};
 		// Repo B: scanned at t=1000, interval=60. Due at t=1060.
 		let b = NewRepo {

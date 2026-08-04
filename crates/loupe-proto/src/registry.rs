@@ -37,6 +37,11 @@ pub enum ReportingSetup {
 pub struct RegisterRepoRequest {
 	pub protocol_version: u16,
 	pub clone_url: String,
+	/// Optional bearer token / PAT for cloning a PRIVATE repository. Stored
+	/// encrypted in the `secrets` table (never in `clone_url`), so it never
+	/// appears in `repo list`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub clone_token: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub branch: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +68,7 @@ impl RegisterRepoRequest {
 		Self {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: clone_url.into(),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting,
@@ -183,6 +189,7 @@ mod tests {
 		let req = RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/acme/widget.git".into(),
+			clone_token: None,
 			branch: Some("main".into()),
 			scan_interval_seconds: Some(3600),
 			reporting: ReportingSetup::GithubIssue {

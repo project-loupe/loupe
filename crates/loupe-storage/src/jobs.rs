@@ -496,6 +496,7 @@ mod tests {
 						},
 						verification_enabled: false,
 						require_approval: None,
+						clone_token_secret_id: None,
 					},
 					0,
 				)?)

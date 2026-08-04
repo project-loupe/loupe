@@ -100,6 +100,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 		.json(&RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting: ReportingSetup::GithubIssue {

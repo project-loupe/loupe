@@ -16,7 +16,14 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: V1_INITIAL }];
+const MIGRATIONS: &[Migration] =
+	&[Migration { version: 1, sql: V1_INITIAL }, Migration { version: 2, sql: V2_CLONE_TOKEN }];
+
+/// v2: add `clone_token_secret_id` so private-repo clone credentials can
+/// be stored separately from the clone URL (and thus kept out of `repo
+/// list` output). Nullable — existing rows get NULL (no clone token).
+const V2_CLONE_TOKEN: &str =
+	"ALTER TABLE registered_repos ADD COLUMN clone_token_secret_id INTEGER;";
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {

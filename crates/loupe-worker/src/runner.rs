@@ -136,9 +136,9 @@ impl Runner {
 	) -> Result<(Option<String>, usize)> {
 		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
 		let clone_url = env.repo.clone_url.clone();
-		let github_pat = env.github_pat.clone();
+		let github_pat = env.clone_token.clone().or_else(|| env.github_pat.clone());
 		let mut ensured =
-			self.cache.ensure_repo(&key, &env.repo.clone_url, env.github_pat.as_deref()).await?;
+			self.cache.ensure_repo(&key, &env.repo.clone_url, github_pat.as_deref()).await?;
 		// `ensured` (and its pin) lives until the end of this fn; the
 		// repo cache won't evict the bare clone while the worktree
 		// alternate is still in use.

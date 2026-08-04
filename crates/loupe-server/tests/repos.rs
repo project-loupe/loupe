@@ -87,6 +87,7 @@ async fn create_repo(admin: &reqwest::Client, reporting: ReportingSetup) -> i64 
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: "https://github.com/acme/widget.git".into(),
+		clone_token: None,
 		branch: Some("main".into()),
 		scan_interval_seconds: Some(3600),
 		reporting,
@@ -128,6 +129,7 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: "https://github.com/acme/widget.git".into(),
+		clone_token: None,
 		branch: Some("main".into()),
 		scan_interval_seconds: Some(3600),
 		reporting: ReportingSetup::GithubIssue {
@@ -206,6 +208,7 @@ async fn repo_registration_inherits_verification_default_unless_pinned() {
 	let inherited = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: "https://github.com/acme/inherit.git".into(),
+		clone_token: None,
 		branch: None,
 		scan_interval_seconds: None,
 		reporting: ReportingSetup::Manual,
@@ -219,6 +222,7 @@ async fn repo_registration_inherits_verification_default_unless_pinned() {
 	let pinned = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: "https://github.com/acme/pinned.git".into(),
+		clone_token: None,
 		branch: None,
 		scan_interval_seconds: None,
 		reporting: ReportingSetup::Manual,
@@ -383,6 +387,7 @@ async fn registering_with_non_https_clone_url_400s() {
 		let req = RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: clone_url.into(),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting: ReportingSetup::GithubIssue {

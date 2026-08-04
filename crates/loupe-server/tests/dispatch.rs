@@ -158,6 +158,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 		.json(&RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting: ReportingSetup::GithubIssue {
@@ -321,6 +322,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 		.json(&RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting: ReportingSetup::GithubIssue {

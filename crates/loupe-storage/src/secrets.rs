@@ -75,12 +75,14 @@ impl std::fmt::Debug for MasterKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
 	GithubPat,
+	CloneToken,
 }
 
 impl SecretKind {
 	pub fn as_str(self) -> &'static str {
 		match self {
 			SecretKind::GithubPat => "github_pat",
+			SecretKind::CloneToken => "clone_token",
 		}
 	}
 }

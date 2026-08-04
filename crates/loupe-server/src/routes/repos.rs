@@ -92,6 +92,13 @@ pub async fn create(
 				},
 				ReportingSetup::Manual => ReportingDestination::Manual,
 			};
+			let clone_token_secret_id = match &req.clone_token {
+				Some(tok) => {
+					let label = format!("clone-token:{}:{}/{}", parsed.0, parsed.1, parsed.2);
+					Some(secrets::insert(&tx, SecretKind::CloneToken, &label, tok.as_bytes(), now)?)
+				},
+				None => None,
+			};
 			let id = repos::insert(
 				&tx,
 				&NewRepo {
@@ -107,6 +114,7 @@ pub async fn create(
 						.verification_enabled
 						.unwrap_or(state.verification_default),
 					require_approval: req.require_approval,
+					clone_token_secret_id,
 				},
 				now,
 			)?;

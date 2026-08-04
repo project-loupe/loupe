@@ -185,6 +185,7 @@ async fn register_with(
 			// We patch this to the local file:// path after registration so
 			// the URL parser still sees a github.com host on the way in.
 			clone_url: format!("https://github.com/loupe/{target_repo}.git"),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting,

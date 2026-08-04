@@ -81,6 +81,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: "https://github.com/acme/widget.git".into(),
+		clone_token: None,
 		branch: Some("main".into()),
 		scan_interval_seconds: None,
 		reporting: ReportingSetup::GithubIssue {
@@ -115,6 +116,7 @@ async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: clone_url.into(),
+		clone_token: None,
 		branch: Some("main".into()),
 		scan_interval_seconds: None,
 		reporting: ReportingSetup::GithubIssue {

@@ -171,6 +171,7 @@ mod tests {
 			reporting: ReportingDestination::Email { to, from, subject_prefix },
 			verification_enabled: false,
 			require_approval: None,
+			clone_token_secret_id: None,
 			last_scanned_sha: None,
 			last_scanned_at: None,
 			created_at: 0,

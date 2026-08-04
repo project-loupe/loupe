@@ -51,6 +51,10 @@ pub struct LeaseEnvelope {
 	pub scanner_config: serde_json::Value,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub github_pat: Option<String>,
+	/// Clone credential for private repos (stored separately from the
+	/// reporting PAT). The worker prefers this over `github_pat`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub clone_token: Option<String>,
 	pub payload: LeasePayload,
 }
 
@@ -107,6 +111,7 @@ mod tests {
 			lease_expires_at: 1_700_000_600,
 			scanner_config: json!({"regex": {"enabled": true}}),
 			github_pat: None,
+			clone_token: None,
 			payload: LeasePayload::Scan { since_sha: Some("abc123".into()) },
 		};
 		let r = LeaseResponse::Lease(Box::new(env.clone()));
@@ -139,6 +144,7 @@ mod tests {
 			lease_expires_at: 1_700_000_800,
 			scanner_config: serde_json::Value::Null,
 			github_pat: None,
+			clone_token: None,
 			payload: LeasePayload::Verify {
 				finding_id: 42,
 				finding: Box::new(finding.clone()),

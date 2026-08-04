@@ -540,6 +540,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: a.clone_url,
+		clone_token: std::env::var("LOUPE_CLONE_TOKEN").ok(),
 		branch: a.branch,
 		scan_interval_seconds: a.scan_interval_seconds,
 		reporting,

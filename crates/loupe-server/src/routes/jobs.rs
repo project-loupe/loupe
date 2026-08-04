@@ -272,9 +272,16 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 		.db
 		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?
 		.ok_or_else(|| anyhow::anyhow!("repo {} for leased job not found", row.repo_id))?;
-	// No clone-side credential is stored separately. We deliberately do
-	// not ship the reporting PAT to the worker.
+	// Decrypt the per-repo clone token (private repos) for the worker.
+	// We still do not ship the reporting PAT.
 	let github_pat: Option<String> = None;
+	let clone_token: Option<String> = match repo.clone_token_secret_id {
+		Some(sid) => state
+			.db
+			.with_conn(|c| Ok(loupe_storage::secrets::read(c, sid)?))?
+			.and_then(|bytes| String::from_utf8(bytes).ok()),
+		None => None,
+	};
 
 	let payload = match row.kind {
 		JobKind::Scan => LeasePayload::Scan { since_sha: row.since_sha.clone() },
@@ -319,6 +326,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 		lease_expires_at: row.lease_expires_at.unwrap_or(0),
 		scanner_config: repo.scanner_config,
 		github_pat,
+		clone_token,
 		payload,
 	})
 }

@@ -102,6 +102,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 		.json(&RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
+			clone_token: None,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting: ReportingSetup::Email {
