@@ -10,6 +10,20 @@ use loupe_proto::{
 };
 use reqwest::Url;
 
+/// The server no longer considers this worker the holder of the job's
+/// lease — the reaper reclaimed it after the lease TTL elapsed.
+///
+/// Typed because the correct response is different from every other
+/// heartbeat error. A network blip is worth retrying; this is not.
+/// Once the lease is gone, the findings the scan submits and the
+/// completion call it ends with are all rejected, so continuing to
+/// scan produces nothing but load and, with an LLM scanner, spend.
+#[derive(Debug, thiserror::Error)]
+#[error("lease for job {job_id} is no longer held by this worker")]
+pub struct LeaseLost {
+	pub job_id: i64,
+}
+
 pub struct ServerClient {
 	http: reqwest::Client,
 	base: Url,
@@ -62,6 +76,9 @@ impl ServerClient {
 			.send()
 			.await
 			.context("heartbeat request")?;
+		if resp.status() == reqwest::StatusCode::FORBIDDEN {
+			return Err(anyhow::Error::new(LeaseLost { job_id }));
+		}
 		let resp = ensure_ok(resp).await?;
 		resp.json().await.context("decoding heartbeat")
 	}
@@ -207,6 +224,22 @@ mod tests {
 			msg.contains(body),
 			"error should include response body so worker logs show the failure reason: {msg}",
 		);
+	}
+
+	/// A reclaimed lease must be distinguishable from a transient
+	/// heartbeat failure. The runner keys its abort decision on the
+	/// type: everything else is retryable, this is not.
+	#[tokio::test]
+	async fn heartbeat_403_is_a_typed_lease_loss() {
+		let base = serve_once("HTTP/1.1 403 Forbidden", "lease not held by this worker").await;
+		let client = ServerClient::from_parts(reqwest::Client::new(), base);
+
+		let err = client.heartbeat(4242).await.expect_err("403 must be an error");
+
+		let lost = err
+			.downcast_ref::<LeaseLost>()
+			.expect("403 on heartbeat must surface as LeaseLost, not an opaque anyhow");
+		assert_eq!(lost.job_id, 4242);
 	}
 
 	async fn serve_once(status_line: &str, body: &str) -> Url {

@@ -362,6 +362,20 @@ impl Runner {
 					_ = cancel.cancelled() => return,
 					_ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
 						if let Err(e) = client.heartbeat(job_id).await {
+							if e.downcast_ref::<crate::client::LeaseLost>().is_some() {
+								// Terminal: the job belongs to someone
+								// else now. Cancelling the scan token
+								// tears down the in-flight sessions
+								// rather than letting them run to
+								// completion only to be rejected.
+								tracing::error!(
+									job_id,
+									"lease reclaimed by server; aborting scan — work from here on \
+									 would be rejected",
+								);
+								cancel.cancel();
+								return;
+							}
 							tracing::warn!(job_id, error = %e, "heartbeat failed");
 						}
 					},

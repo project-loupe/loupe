@@ -12,7 +12,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Lease lifetime in seconds. Worker must heartbeat or complete before
 /// `lease_expires_at` or the reaper will reclaim the job.
-pub const DEFAULT_LEASE_SECONDS: i64 = 600;
+///
+/// Sized for whole-repo LLM scans, which run for hours. The failure a
+/// short TTL protects against — a dead worker sitting on a job — is
+/// already caught by the 60s heartbeat, which detects a crashed worker
+/// within a minute regardless of this value. What a short TTL adds is
+/// a race the heartbeat cannot win: any pause longer than the TTL (a
+/// laptop suspending, a stalled host, a long VM freeze) lets the
+/// reaper take a live job away, and on resume the reaper's 15s tick
+/// fires before the worker's next 60s heartbeat.
+pub const DEFAULT_LEASE_SECONDS: i64 = 7200;
 
 /// Cap on retry attempts. After this many leases-then-failures, the job
 /// is moved to `failed` rather than back to `queued`.
