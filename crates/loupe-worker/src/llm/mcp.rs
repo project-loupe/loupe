@@ -71,9 +71,60 @@ pub enum McpTlsSource {
 	Env,
 }
 
+/// Where the agent's MCP child looks for the worker binary, the mTLS
+/// material, and bkb-mcp.
+///
+/// Under bubblewrap these are the fixed `/loupe/...` mount points that
+/// [`bind_mcp_into_sandbox`] creates. With `LOUPE_DISABLE_SANDBOX` set
+/// there are no mounts at all — the child sees the host filesystem —
+/// so those same paths resolve to nothing and every agent session dies
+/// before it starts. Resolve to the real host paths in that case.
+pub struct McpPaths {
+	pub loupe_bin: String,
+	pub bkb_bin: String,
+	pub ca_cert: String,
+	pub client_cert: String,
+	pub client_key: String,
+}
+
+impl McpPaths {
+	pub fn resolve(ctx: &McpContext) -> Self {
+		if !crate::sandbox::sandbox_disabled() {
+			return Self {
+				loupe_bin: SANDBOX_LOUPE_BIN.to_owned(),
+				bkb_bin: SANDBOX_BKB_MCP_BIN.to_owned(),
+				ca_cert: SANDBOX_CA_CERT.to_owned(),
+				client_cert: SANDBOX_CLIENT_CERT.to_owned(),
+				client_key: SANDBOX_CLIENT_KEY.to_owned(),
+			};
+		}
+		let (ca_cert, client_cert, client_key) = match &ctx.tls {
+			McpTlsSource::Paths { ca_cert_path, client_cert_path, client_key_path } => (
+				ca_cert_path.to_string_lossy().into_owned(),
+				client_cert_path.to_string_lossy().into_owned(),
+				client_key_path.to_string_lossy().into_owned(),
+			),
+			// Env-sourced TLS: the child reads PEMs from the inherited
+			// environment, so no paths are passed as args.
+			McpTlsSource::Env => (String::new(), String::new(), String::new()),
+		};
+		Self {
+			loupe_bin: ctx.worker_binary.to_string_lossy().into_owned(),
+			bkb_bin: ctx
+				.bkb_mcp_path
+				.as_ref()
+				.map(|p| p.to_string_lossy().into_owned())
+				.unwrap_or_else(|| SANDBOX_BKB_MCP_BIN.to_owned()),
+			ca_cert,
+			client_cert,
+			client_key,
+		}
+	}
+}
+
 /// Build the args list that gets appended to `loupe-worker
 /// mcp-serve` for one MCP-attached agent invocation. Cert + binary
-/// paths come from the sandbox fixed paths above; per-call data
+/// paths come from [`McpPaths`]; per-call data
 /// (`repo_id`, `job_id`, `finding_id`, `sandbox_workdir`) is wired
 /// by the caller.
 ///
@@ -88,6 +139,7 @@ pub fn mcp_serve_args(
 	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
 	sandbox_workdir: &str,
 ) -> Vec<String> {
+	let paths = McpPaths::resolve(ctx);
 	let mut args: Vec<String> = vec![
 		"mcp-serve".into(),
 		"--server-url".into(),
@@ -102,11 +154,11 @@ pub fn mcp_serve_args(
 			3..3,
 			[
 				"--ca-cert".into(),
-				SANDBOX_CA_CERT.into(),
+				paths.ca_cert.clone(),
 				"--cert".into(),
-				SANDBOX_CLIENT_CERT.into(),
+				paths.client_cert.clone(),
 				"--key".into(),
-				SANDBOX_CLIENT_KEY.into(),
+				paths.client_key.clone(),
 			],
 		);
 	}
@@ -147,4 +199,83 @@ pub fn bind_mcp_into_sandbox(sandbox: SandboxBuilder, ctx: &McpContext) -> Sandb
 		sb = sb.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
 	}
 	sb
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::PathBuf;
+	use std::sync::Mutex;
+
+	use super::*;
+	use crate::sandbox::DISABLE_SANDBOX_ENV;
+
+	static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+	fn ctx() -> McpContext {
+		McpContext {
+			worker_binary: PathBuf::from("/opt/loupe/bin/loupe-worker"),
+			server_url: "https://loupe.example:8443".to_owned(),
+			tls: McpTlsSource::Paths {
+				ca_cert_path: PathBuf::from("/etc/loupe/ca.pem"),
+				client_cert_path: PathBuf::from("/etc/loupe/worker.pem"),
+				client_key_path: PathBuf::from("/etc/loupe/worker.key"),
+			},
+			bkb_mcp_path: Some(PathBuf::from("/home/op/.cargo/bin/bkb-mcp")),
+			bkb_api_url: DEFAULT_BKB_API_URL.to_owned(),
+		}
+	}
+
+	#[test]
+	fn sandboxed_runs_use_the_fixed_mount_points() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		std::env::remove_var(DISABLE_SANDBOX_ENV);
+
+		let paths = McpPaths::resolve(&ctx());
+
+		assert_eq!(paths.loupe_bin, SANDBOX_LOUPE_BIN);
+		assert_eq!(paths.ca_cert, SANDBOX_CA_CERT);
+		assert_eq!(paths.client_cert, SANDBOX_CLIENT_CERT);
+		assert_eq!(paths.client_key, SANDBOX_CLIENT_KEY);
+		assert_eq!(paths.bkb_bin, SANDBOX_BKB_MCP_BIN);
+	}
+
+	/// With the sandbox disabled there are no bind mounts, so the fixed
+	/// `/loupe/...` paths point at nothing. Handing them to the agent
+	/// makes every session die instantly with "MCP config file not
+	/// found", which the scanner reports as a per-file session error —
+	/// the job still completes and the repo looks clean.
+	#[test]
+	fn sandbox_disabled_runs_resolve_to_host_paths() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		std::env::set_var(DISABLE_SANDBOX_ENV, "1");
+
+		let paths = McpPaths::resolve(&ctx());
+
+		assert_eq!(paths.loupe_bin, "/opt/loupe/bin/loupe-worker");
+		assert_eq!(paths.ca_cert, "/etc/loupe/ca.pem");
+		assert_eq!(paths.client_cert, "/etc/loupe/worker.pem");
+		assert_eq!(paths.client_key, "/etc/loupe/worker.key");
+		assert_eq!(paths.bkb_bin, "/home/op/.cargo/bin/bkb-mcp");
+		assert!(
+			!paths.loupe_bin.starts_with("/loupe/"),
+			"a /loupe/ path outside the sandbox is a mount point that does not exist",
+		);
+
+		std::env::remove_var(DISABLE_SANDBOX_ENV);
+	}
+
+	#[test]
+	fn env_sourced_tls_passes_no_cert_paths() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		std::env::set_var(DISABLE_SANDBOX_ENV, "1");
+
+		let mut c = ctx();
+		c.tls = McpTlsSource::Env;
+		let args = mcp_serve_args(&c, 7, Some(9), None, "/tmp/work");
+
+		assert!(!args.iter().any(|a| a == "--ca-cert"), "args: {args:?}");
+		assert!(args.windows(2).any(|w| w == ["--repo-id", "7"]), "args: {args:?}");
+
+		std::env::remove_var(DISABLE_SANDBOX_ENV);
+	}
 }

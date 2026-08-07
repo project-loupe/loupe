@@ -26,9 +26,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
-use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
-};
+use super::mcp::{bind_mcp_into_sandbox, mcp_serve_args, McpContext, McpPaths};
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
@@ -64,6 +62,7 @@ fn prepare_mcp_scratch(
 		.context("creating MCP scratch tempdir")?;
 	let config_path = dir.path().join("mcp-config.json");
 	let args = mcp_serve_args(ctx, repo_id, job_id, finding_id, sandbox_workdir);
+	let paths = McpPaths::resolve(ctx);
 	let mut servers = serde_json::Map::new();
 	servers.insert(
 		"loupe".to_string(),
@@ -71,8 +70,9 @@ fn prepare_mcp_scratch(
 			"type": "stdio",
 			// Inside the sandbox the worker binary is mounted at
 			// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
-			// — see the bind_ro calls above.
-			"command": SANDBOX_LOUPE_BIN,
+			// — see the bind_ro calls above. With the sandbox
+			// disabled these resolve to their host locations.
+			"command": paths.loupe_bin,
 			"args": args,
 			// The MCP child inherits the bwrap'd env, which has
 			// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
@@ -93,7 +93,7 @@ fn prepare_mcp_scratch(
 			"bkb".to_string(),
 			serde_json::json!({
 				"type": "stdio",
-				"command": SANDBOX_BKB_MCP_BIN,
+				"command": paths.bkb_bin,
 				"args": [],
 				"env": { "BKB_API_URL": ctx.bkb_api_url.as_str() }
 			}),
@@ -260,8 +260,14 @@ impl LlmBackend for ClaudeCliBackend {
 		for arg in claude_invocation_args(&self.agent, &req.prompt) {
 			cmd.arg(arg);
 		}
-		if _mcp_scratch.is_some() {
-			cmd.arg("--mcp-config").arg(SANDBOX_MCP_CONFIG);
+		if let Some(scratch) = &_mcp_scratch {
+			// The bind_ro onto SANDBOX_MCP_CONFIG is a no-op when the
+			// sandbox is off, so point claude at the host scratch file.
+			if crate::sandbox::sandbox_disabled() {
+				cmd.arg("--mcp-config").arg(&scratch.config_path);
+			} else {
+				cmd.arg("--mcp-config").arg(SANDBOX_MCP_CONFIG);
+			}
 		}
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		cmd.kill_on_drop(true);

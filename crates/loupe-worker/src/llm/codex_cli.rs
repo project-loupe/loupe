@@ -28,9 +28,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
-use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
-};
+use super::mcp::{bind_mcp_into_sandbox, mcp_serve_args, McpContext, McpPaths};
 use super::{
 	codex_api_key_env, codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend,
 	LlmRequest, LlmResponse,
@@ -213,17 +211,18 @@ impl LlmBackend for CodexCliBackend {
 				sandbox = bind_mcp_into_sandbox(sandbox, ctx);
 				let args =
 					mcp_serve_args(ctx, repo_id, req.job_id, req.finding_id, &sandbox_workdir);
+				let paths = McpPaths::resolve(ctx);
 				let mut overrides = Vec::new();
 				overrides.push(format!(
 					"mcp_servers.loupe.command={}",
-					toml_string_literal(SANDBOX_LOUPE_BIN)
+					toml_string_literal(&paths.loupe_bin)
 				));
 				overrides.push(format!("mcp_servers.loupe.args={}", toml_string_array(&args)));
 				overrides.push("mcp_servers.loupe.env={}".to_owned());
 				if ctx.bkb_mcp_path.is_some() {
 					overrides.push(format!(
 						"mcp_servers.bkb.command={}",
-						toml_string_literal(SANDBOX_BKB_MCP_BIN)
+						toml_string_literal(&paths.bkb_bin)
 					));
 					overrides.push("mcp_servers.bkb.args=[]".to_owned());
 					overrides.push(format!(

@@ -268,7 +268,11 @@ impl SandboxBuilder {
 	}
 }
 
-fn sandbox_disabled() -> bool {
+/// Whether the sandbox is switched off for this process. Backends need
+/// this because a disabled sandbox has no bind mounts: any path that
+/// only exists as a mount point inside `bwrap` has to be resolved to
+/// its real host location instead.
+pub fn sandbox_disabled() -> bool {
 	std::env::var_os(DISABLE_SANDBOX_ENV).is_some_and(|v| {
 		let value = v.to_string_lossy();
 		if value.is_empty() {
