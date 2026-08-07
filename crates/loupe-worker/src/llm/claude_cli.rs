@@ -38,6 +38,23 @@ pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_CLAUDE_EFFORT: &str = "max";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 
+/// Environment the claude CLI needs to see *inside* the sandbox.
+///
+/// The sandbox runs with `--clearenv`, so anything absent from this
+/// list is invisible to the CLI. `ANTHROPIC_API_KEY` covers env-based
+/// auth against Anthropic itself. The other two matter for
+/// Anthropic-compatible third-party endpoints (Kimi, gateways,
+/// self-hosted proxies): `ANTHROPIC_BASE_URL` selects the endpoint and
+/// `ANTHROPIC_AUTH_TOKEN` is the bearer token those endpoints
+/// typically expect.
+///
+/// Leaving the base URL out doesn't fail loudly — the CLI just falls
+/// back to api.anthropic.com. The operator's scan appears to work
+/// while every request goes to the wrong provider, on the wrong
+/// account, with the wrong model.
+const FORWARDED_CLAUDE_ENV: &[&str] =
+	&["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"];
+
 /// Fixed sandbox path for the per-call MCP config file claude reads.
 /// The host-side scratch dir (a `tempfile::TempDir`) bind-mounts
 /// onto this path; dropping the scratch dir unlinks the source
@@ -206,10 +223,10 @@ impl LlmBackend for ClaudeCliBackend {
 			// without this.
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
-			// Forward auth: ANTHROPIC_API_KEY for env-based auth, plus
-			// any user-managed login state under ~/.claude/* which
-			// `claude /login` writes to.
-			.forward_env("ANTHROPIC_API_KEY");
+			// Forward auth and endpoint selection, plus any user-managed
+			// login state under ~/.claude/* which `claude /login` writes
+			// to. See FORWARDED_CLAUDE_ENV.
+			.forward_env_all(FORWARDED_CLAUDE_ENV);
 		if let Some(home) = std::env::var_os("HOME") {
 			let host_home = std::path::PathBuf::from(home);
 			let claude_dir = host_home.join(".claude");
@@ -567,5 +584,23 @@ mod tests {
 		assert!(args.windows(2).any(|w| w == ["--model", "claude-test"]));
 		assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
 		assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
+	}
+
+	/// The sandbox is `--clearenv`, so an endpoint override the
+	/// operator sets on the worker only reaches the CLI if it is on the
+	/// forward list. Dropping `ANTHROPIC_BASE_URL` sends every request
+	/// to api.anthropic.com instead of the configured endpoint, and
+	/// nothing about the run looks wrong.
+	#[test]
+	fn forwarded_env_carries_endpoint_selection_not_just_the_api_key() {
+		assert!(
+			FORWARDED_CLAUDE_ENV.contains(&"ANTHROPIC_BASE_URL"),
+			"base URL must survive --clearenv or third-party endpoints silently fall back",
+		);
+		assert!(
+			FORWARDED_CLAUDE_ENV.contains(&"ANTHROPIC_AUTH_TOKEN"),
+			"Anthropic-compatible endpoints authenticate with ANTHROPIC_AUTH_TOKEN",
+		);
+		assert!(FORWARDED_CLAUDE_ENV.contains(&"ANTHROPIC_API_KEY"));
 	}
 }

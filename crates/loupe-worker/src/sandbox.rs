@@ -117,6 +117,14 @@ impl SandboxBuilder {
 		self
 	}
 
+	/// Forward a whole set of env vars. Same semantics as
+	/// [`Self::forward_env`]; convenient when a backend keeps its
+	/// forwarded environment in one named list.
+	pub fn forward_env_all(mut self, names: &[&'static str]) -> Self {
+		self.forward_env.extend_from_slice(names);
+		self
+	}
+
 	/// Set an env var to a caller-provided value inside the sandbox.
 	/// This is useful when a backend accepts one env name but Loupe
 	/// supports a compatibility alias at the worker boundary.
@@ -710,6 +718,30 @@ mod tests {
 		);
 
 		std::env::remove_var("LOUPE_SANDBOX_TEST_SECRET");
+	}
+
+	#[test]
+	fn forward_env_all_passes_every_name_in_the_list() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		std::env::set_var("LOUPE_SANDBOX_TEST_ONE", "one");
+		std::env::set_var("LOUPE_SANDBOX_TEST_TWO", "two");
+
+		let cmd = SandboxBuilder::new("/tmp")
+			.forward_env_all(&["LOUPE_SANDBOX_TEST_ONE", "LOUPE_SANDBOX_TEST_TWO"])
+			.build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+
+		for (name, value) in [("LOUPE_SANDBOX_TEST_ONE", "one"), ("LOUPE_SANDBOX_TEST_TWO", "two")]
+		{
+			assert!(
+				args.windows(3).any(|w| w[0] == "--setenv" && w[1] == name && w[2] == value),
+				"{name} not forwarded; args: {args:?}"
+			);
+		}
+
+		std::env::remove_var("LOUPE_SANDBOX_TEST_ONE");
+		std::env::remove_var("LOUPE_SANDBOX_TEST_TWO");
 	}
 
 	#[test]
