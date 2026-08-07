@@ -98,7 +98,7 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting agent fan-out"
 		);
 
-		let errors = self
+		let failures = self
 			.run_all(
 				&cfg,
 				&ctx.workdir,
@@ -109,6 +109,7 @@ impl Scanner for LlmCodeReviewScanner {
 				&ctx.cancel,
 			)
 			.await;
+		let errors = failures.len();
 		// Hard-fail when every agent session errored. Without this, an
 		// LLM scanner that's completely broken (sandbox can't reach the
 		// CLI, auth missing, network blocked) would silently complete
@@ -124,14 +125,38 @@ impl Scanner for LlmCodeReviewScanner {
 				n = files.len(),
 			);
 		}
+		// Partial coverage. Every one of these files is reported to the
+		// operator as scanned, and contributes no findings — exactly
+		// what a genuinely clean file looks like. Name them, and say
+		// plainly that the repo was not fully covered, at a level that
+		// shows up in a default `info` deployment.
 		if errors > 0 {
-			tracing::warn!(
+			let timed_out: Vec<&str> =
+				failures.iter().filter(|f| f.timed_out).map(|f| f.file.as_str()).collect();
+			let other: Vec<&str> =
+				failures.iter().filter(|f| !f.timed_out).map(|f| f.file.as_str()).collect();
+			tracing::error!(
 				errored = errors,
 				total = files.len(),
-				"llm-code-review: some agent sessions errored",
+				timed_out = ?timed_out,
+				other_failures = ?other,
+				"llm-code-review: INCOMPLETE COVERAGE — these files were not reviewed and \
+				 produce no findings; do not read their absence from the findings list as clean",
 			);
+			if !timed_out.is_empty() {
+				tracing::error!(
+					count = timed_out.len(),
+					per_request_timeout_secs = cfg.per_request_timeout.as_secs(),
+					"llm-code-review: sessions hit the per-file timeout; raise \
+					 `per_request_timeout_seconds` in scanner_config and re-scan these files",
+				);
+			}
 		}
-		tracing::info!("llm-code-review finished; submissions arrived via MCP");
+		tracing::info!(
+			reviewed = files.len() - errors,
+			total = files.len(),
+			"llm-code-review finished; submissions arrived via MCP",
+		);
 		// The scanner's role is orchestration; agent submissions
 		// already landed on the server via the MCP `submit_finding`
 		// tool. The runner's `submit_findings` batch call (which
@@ -142,13 +167,13 @@ impl Scanner for LlmCodeReviewScanner {
 
 impl LlmCodeReviewScanner {
 	/// Fan out one agent session per file with bounded concurrency.
-	/// Returns the count of session-level errors; per-session "no
+	/// Returns the files whose sessions failed; per-session "no
 	/// finding" is a success (not an error).
 	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
 		bkb_hint: &'static str, cancel: &CancellationToken,
-	) -> usize {
+	) -> Vec<SessionFailure> {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
@@ -168,31 +193,36 @@ impl LlmCodeReviewScanner {
 			}));
 		}
 
-		let mut errors = 0usize;
+		let mut failures = Vec::new();
 		for h in handles {
 			match h.await {
 				Ok(Ok(())) => {},
-				Ok(Err(())) => errors += 1,
+				Ok(Err(f)) => failures.push(f),
 				Err(e) => {
 					tracing::warn!(error = %e, "agent session task panicked");
-					errors += 1;
+					failures.push(SessionFailure {
+						file: "<panicked task>".to_owned(),
+						reason: e.to_string(),
+						timed_out: false,
+					});
 				},
 			}
 		}
-		errors
+		failures
 	}
 }
 
-/// Run one agent session against `file`. Returns `Err(())` for
-/// session-level errors (sandbox / network / CLI failure); the call
-/// counts these and fails the scan when every attempt errors. A
-/// healthy session that produced no submission still returns `Ok(())`
-/// — the agent decided there was nothing to report.
+/// Run one agent session against `file`. Returns `Err(SessionFailure)`
+/// for session-level errors (sandbox / network / CLI failure /
+/// timeout); the caller collects these so the scan can report which
+/// files it did not actually cover. A healthy session that produced no
+/// submission still returns `Ok(())` — the agent decided there was
+/// nothing to report.
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
 	job_id: i64, bkb_hint: &'static str, cancel: CancellationToken,
-) -> Result<(), ()> {
+) -> Result<(), SessionFailure> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
 	let prompt = prompts::render(DISCOVERY, &[("file", &rel), ("bkb_hint", bkb_hint)]);
 	tracing::info!(file = %rel, "llm-code-review: launching agent session");
@@ -217,10 +247,23 @@ async fn run_one(
 			Ok(())
 		},
 		Err(e) => {
-			tracing::warn!(file = %rel, error = %e, "agent session failed");
-			Err(())
+			let reason = e.to_string();
+			let timed_out = reason.contains("timed out");
+			tracing::warn!(file = %rel, error = %reason, timed_out, "agent session failed");
+			Err(SessionFailure { file: rel, reason, timed_out })
 		},
 	}
+}
+
+/// One file the scanner tried and failed to review. Kept per-file
+/// rather than as a bare counter so the scan can name what it missed:
+/// a file whose session died is indistinguishable, in the findings
+/// list, from a file the agent read and found nothing wrong with.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionFailure {
+	pub file: String,
+	pub reason: String,
+	pub timed_out: bool,
 }
 
 #[cfg(test)]
@@ -307,6 +350,50 @@ mod tests {
 		let scanner = LlmCodeReviewScanner::new(backend);
 		let err = scanner.scan(&make_ctx(tmp.path())).await.expect_err("must fail");
 		assert!(err.to_string().contains("agent session"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn partial_failure_names_the_files_it_did_not_review() {
+		// The dangerous case is not "everything broke" — that already
+		// hard-fails. It's the mixed run: some files reviewed, some
+		// dead, job reports success. A file whose session timed out
+		// contributes no findings, which is exactly what a clean file
+		// looks like, so the failure has to be carried out of run_all
+		// per-file rather than as a bare count.
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n"), ("src/big.rs", "// b\n")]);
+
+		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
+			if req.prompt.contains("src/big.rs") {
+				Err(anyhow::anyhow!("claude CLI timed out after 1800s"))
+			} else {
+				Ok(String::new())
+			}
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+
+		// Mixed outcome still succeeds — the findings that did land are
+		// real and must not be thrown away.
+		let findings = scanner.scan(&make_ctx(tmp.path())).await.expect("partial run succeeds");
+		assert!(findings.is_empty());
+
+		// …but the failure must be attributable to a specific file and
+		// classified as a timeout, so the operator can raise the limit
+		// and re-scan exactly that file.
+		let failures = scanner
+			.run_all(
+				&ScannerConfig::default(),
+				tmp.path(),
+				&[tmp.path().join("src/big.rs")],
+				1,
+				1,
+				"",
+				&CancellationToken::new(),
+			)
+			.await;
+		assert_eq!(failures.len(), 1);
+		assert!(failures[0].file.ends_with("src/big.rs"), "got {:?}", failures[0].file);
+		assert!(failures[0].timed_out, "a timeout must be distinguishable: {:?}", failures[0]);
 	}
 
 	#[tokio::test]
