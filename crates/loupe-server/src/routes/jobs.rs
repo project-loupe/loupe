@@ -19,21 +19,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatRequest, HeartbeatResponse, JobInfo,
-	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ScanRequest, ScanResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	validate_llm_finding_submission, CompleteOutcome, CompleteRequest, FindingsBatch,
+	HeartbeatRequest, HeartbeatResponse, JobCapability, JobInfo, LeaseEnvelope, LeasePayload,
+	LeaseRequest, LeaseResponse, LlmFindingSubmission, ScanRequest, ScanResponse,
+	VerdictSubmission, LLM_CODE_REVIEW_SCANNER_ID, PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, secrets};
 use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
-use crate::reporters;
 use crate::state::AppState;
+use crate::{job_capability, reporters};
 
 fn now_secs() -> i64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -310,19 +311,29 @@ fn try_lease(
 	state: &AppState, worker_id: i64, accepts_verify: bool,
 ) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
 	let now = now_secs();
+	let (job_capability, job_capability_hash) = job_capability::issue();
 	let row = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::lease_next(c, worker_id, accepts_verify, now, DEFAULT_LEASE_SECONDS)?)
+			Ok(jobs::lease_next(
+				c,
+				worker_id,
+				accepts_verify,
+				now,
+				DEFAULT_LEASE_SECONDS,
+				&job_capability_hash,
+			)?)
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
 	let Some(row) = row else { return Ok(None) };
-	let env = build_lease_envelope(state, &row)
+	let env = build_lease_envelope(state, &row, job_capability)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")))?;
 	Ok(Some(env))
 }
 
-fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseEnvelope> {
+fn build_lease_envelope(
+	state: &AppState, row: &JobRow, job_capability: JobCapability,
+) -> anyhow::Result<LeaseEnvelope> {
 	let repo = state
 		.db
 		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?
@@ -362,6 +373,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 	Ok(LeaseEnvelope {
 		protocol_version: PROTOCOL_VERSION,
 		job_id: row.id,
+		job_capability,
 		repo_id: repo.id,
 		repo: loupe_core::RepoSpec {
 			host: repo.host.clone(),
@@ -381,7 +393,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 /// `POST /v1/jobs/:id/heartbeat` — worker extends its lease.
 pub async fn heartbeat(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, body: Bytes,
+	Path(job_id): Path<i64>, headers: HeaderMap, body: Bytes,
 ) -> Result<Json<HeartbeatResponse>, (StatusCode, String)> {
 	if !body.is_empty() {
 		let req: HeartbeatRequest = serde_json::from_slice(&body)
@@ -389,9 +401,19 @@ pub async fn heartbeat(
 		check_version(req.protocol_version)?;
 	}
 	let now = now_secs();
+	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
 	let lease_until = state
 		.db
-		.with_conn(|c| Ok(jobs::heartbeat(c, job_id, worker.id(), now, DEFAULT_LEASE_SECONDS)?))
+		.with_conn(|c| {
+			Ok(jobs::heartbeat(
+				c,
+				job_id,
+				worker.id(),
+				now,
+				DEFAULT_LEASE_SECONDS,
+				&authorized.capability_hash,
+			)?)
+		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("heartbeat: {e}")))?
 		.ok_or_else(|| (StatusCode::FORBIDDEN, "lease not held by this worker".to_owned()))?;
 	Ok(Json(HeartbeatResponse {
@@ -403,21 +425,21 @@ pub async fn heartbeat(
 /// `POST /v1/jobs/:id/findings` — worker submits a batch (scan jobs only).
 pub async fn submit_findings(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, Json(batch): Json<FindingsBatch>,
+	Path(job_id): Path<i64>, headers: HeaderMap, Json(batch): Json<FindingsBatch>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	check_version(batch.protocol_version)?;
 	let now = now_secs();
 
-	let row = state
-		.db
-		.with_conn(|c| Ok(jobs::get(c, job_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
-		.ok_or((StatusCode::FORBIDDEN, "no leased scan job for this worker".into()))?;
-	if row.state != JobState::Leased || row.worker_id != Some(worker.id()) {
-		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
-	}
+	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let row = &authorized.row;
 	if row.kind != JobKind::Scan {
 		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
+	}
+	if batch.findings.iter().any(|finding| finding.scanner_id == LLM_CODE_REVIEW_SCANNER_ID) {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			"LLM findings must use the strict /llm-findings endpoint".into(),
+		));
 	}
 
 	// Look up the repo's verification policy so the inserted findings
@@ -429,45 +451,101 @@ pub async fn submit_findings(
 		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".to_owned()))?;
 	let verification_required = repo.verification_enabled;
 
-	state
+	let submitted = state
 		.db
 		.with_conn(|c| {
-			let tx = c.transaction()?;
-			for f in &batch.findings {
-				findings::insert_or_ignore(
-					&tx,
-					row.repo_id,
-					row.id,
-					f,
-					verification_required,
-					now,
-				)?;
-			}
-			tx.commit()?;
-			Ok(())
+			Ok(jobs::with_active_lease_transaction(
+				c,
+				authorized.active_lease(worker.id(), now),
+				|tx, active| {
+					for f in &batch.findings {
+						findings::insert_or_ignore(
+							tx,
+							active.repo_id,
+							active.id,
+							f,
+							verification_required,
+							now,
+						)?;
+					}
+					Ok(())
+				},
+			)?)
 		})
 		.map_err(|e: loupe_storage::Error| {
 			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit findings: {e}"))
 		})?;
+	submitted.ok_or_else(job_capability::forbidden)?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/jobs/:id/llm-findings` — strict host-side MCP broker path.
+pub async fn submit_llm_finding(
+	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
+	Path(job_id): Path<i64>, headers: HeaderMap, Json(submission): Json<LlmFindingSubmission>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	check_version(submission.protocol_version)?;
+	let now = now_secs();
+	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let row = &authorized.row;
+	if row.kind != JobKind::Scan {
+		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
+	}
+	validate_llm_finding_submission(&submission)
+		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+	let repo = state
+		.db
+		.with_conn(|conn| Ok(repos::get(conn, row.repo_id)?))
+		.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {error}")))?
+		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".into()))?;
+	let finding = loupe_core::Finding {
+		scanner_id: LLM_CODE_REVIEW_SCANNER_ID.into(),
+		severity: submission.severity,
+		title: submission.title.trim().into(),
+		description: submission.description.trim().into(),
+		file_path: Some(submission.file_path),
+		line_start: Some(submission.line_start),
+		line_end: Some(submission.line_end),
+		cwe: submission.cwe,
+		patch_unified: None,
+		poc_unified: Some(submission.poc_unified),
+		fingerprint: submission.fingerprint,
+	};
+	let submitted = state
+		.db
+		.with_conn(|conn| {
+			Ok(jobs::with_active_lease_transaction(
+				conn,
+				authorized.active_lease(worker.id(), now),
+				|tx, active| {
+					findings::insert_or_ignore(
+						tx,
+						active.repo_id,
+						active.id,
+						&finding,
+						repo.verification_enabled,
+						now,
+					)
+				},
+			)?)
+		})
+		.map_err(|error| {
+			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit LLM finding: {error}"))
+		})?;
+	submitted.ok_or_else(job_capability::forbidden)?;
 	Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /v1/jobs/:id/verdict` — worker submits a verdict (verify jobs only).
 pub async fn submit_verdict(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, Json(submission): Json<VerdictSubmission>,
+	Path(job_id): Path<i64>, headers: HeaderMap, Json(submission): Json<VerdictSubmission>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
 
-	let row = state
-		.db
-		.with_conn(|c| Ok(jobs::get(c, job_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
-		.ok_or((StatusCode::FORBIDDEN, "no leased verify job for this worker".into()))?;
-	if row.state != JobState::Leased || row.worker_id != Some(worker.id()) {
-		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
-	}
+	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let row = &authorized.row;
 	if row.kind != JobKind::Verify {
 		return Err((StatusCode::BAD_REQUEST, "scan-kind jobs cannot post verdicts".into()));
 	}
@@ -510,43 +588,47 @@ pub async fn submit_verdict(
 	let new_state: Option<FindingState> = state
 		.db
 		.with_conn(|c| {
-			let tx = c.transaction()?;
-			tx.execute(
-				"INSERT INTO finding_verifications
-				   (finding_id, job_id, verdict, notes, created_at)
-				 VALUES (?1, ?2, ?3, ?4, ?5)",
-				(target_finding_id, row.id, verdict_str, &notes, now),
-			)?;
-			// Attach a verifier-proposed patch (when Confirmed and one
-			// was supplied) inside the same tx as the verdict insert,
-			// so by the time `dispatch_finding` runs after tx.commit
-			// the GitHub reporter sees the patch in the row. The
-			// storage layer's NULL-check guards against a second
-			// verifier overwriting an earlier patch — first writer
-			// wins, the audit columns pin provenance to that writer.
-			if let Some((patch_unified, patch_notes)) = patch_to_attach {
-				let _ = loupe_storage::findings::attach_proposed_patch(
-					&tx,
-					target_finding_id,
-					patch_unified,
-					patch_notes,
-					&by_cn,
-					now,
-				)?;
-			}
-			let next_state = loupe_storage::findings::roll_up_verdicts_for_finding(
-				&tx,
-				target_finding_id,
-				terminal_inconclusive,
-				require_approval,
-				now,
-			)?;
-			tx.commit()?;
-			Ok(next_state)
+			Ok(jobs::with_active_lease_transaction(
+				c,
+				authorized.active_lease(worker.id(), now),
+				|tx, active| {
+					tx.execute(
+						"INSERT INTO finding_verifications
+						   (finding_id, job_id, verdict, notes, created_at)
+						 VALUES (?1, ?2, ?3, ?4, ?5)",
+						(target_finding_id, active.id, verdict_str, &notes, now),
+					)?;
+					// Attach a verifier-proposed patch (when Confirmed and one
+					// was supplied) inside the same tx as the verdict insert,
+					// so by the time `dispatch_finding` runs after commit the
+					// GitHub reporter sees the patch in the row. The storage
+					// layer's NULL-check guards against a second verifier
+					// overwriting an earlier patch — first writer wins, the
+					// audit columns pin provenance to that writer.
+					if let Some((patch_unified, patch_notes)) = patch_to_attach {
+						let _ = loupe_storage::findings::attach_proposed_patch(
+							tx,
+							target_finding_id,
+							patch_unified,
+							patch_notes,
+							&by_cn,
+							now,
+						)?;
+					}
+					loupe_storage::findings::roll_up_verdicts_for_finding(
+						tx,
+						target_finding_id,
+						terminal_inconclusive,
+						require_approval,
+						now,
+					)
+				},
+			)?)
 		})
 		.map_err(|e: loupe_storage::Error| {
 			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit verdict: {e}"))
-		})?;
+		})?
+		.ok_or_else(job_capability::forbidden)?;
 
 	if matches!(new_state, Some(FindingState::Confirmed)) {
 		if let Err(e) = dispatch_finding(&state, target_finding_id, now).await {
@@ -565,7 +647,7 @@ pub async fn submit_verdict(
 /// incremental run knows where to pick up.
 pub async fn complete(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, Json(req): Json<CompleteRequest>,
+	Path(job_id): Path<i64>, headers: HeaderMap, Json(req): Json<CompleteRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	check_version(req.protocol_version)?;
 	let new_state = match req.outcome {
@@ -574,14 +656,8 @@ pub async fn complete(
 	};
 	let now = now_secs();
 
-	let job = state
-		.db
-		.with_conn(|c| Ok(jobs::get(c, job_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
-		.ok_or((StatusCode::FORBIDDEN, "no leased job for this worker".into()))?;
-	if job.state != JobState::Leased || job.worker_id != Some(worker.id()) {
-		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
-	}
+	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let job = &authorized.row;
 	if matches!(new_state, JobState::Succeeded) {
 		match job.kind {
 			JobKind::Scan => {
@@ -638,8 +714,7 @@ pub async fn complete(
 			let tx = c.transaction()?;
 			let updated = jobs::complete(
 				&tx,
-				job_id,
-				worker.id(),
+				authorized.lease_identity(worker.id()),
 				new_state,
 				req.head_sha.as_deref(),
 				req.error.as_deref(),

@@ -15,16 +15,18 @@ crates/
                   migrations, secrets table
   loupe-server    daemon binary + mTLS routes + reporters + scheduler/reaper
   loupe-worker    worker binary + scanner trait + LLM backend + sandbox
-                  + MCP server (mcp-serve subcommand)
+                  + host-side MCP broker (mcp-proxy subcommand)
   loupe-cli       loupectl admin CLI
   loupe-web       loupe-web local operator dashboard (loopback HTTP,
                   proxies the same admin RPCs as loupectl)
 ```
 
 Four deployable binaries: `loupe-server`, `loupe-worker`, `loupectl`, and
-`loupe-web`. The worker binary doubles as the MCP server (`loupe-worker
-mcp-serve`) — same code, different subcommand, spawned by the agent
-inside the sandbox. `loupe-web` is an optional operator convenience: it
+`loupe-web`. The MCP server runs *in the worker process*, on the trusted
+side of the sandbox boundary; the agent reaches it through a
+credential-free bridge (`loupe-worker mcp-proxy`) that forwards stdio to
+a per-invocation Unix socket. `loupe-web` is an optional operator
+convenience: it
 holds the same admin certificate `loupectl` uses and proxies the same
 routes, so it adds no new authority to the system and no new trust root.
 It binds loopback only, for the reasons in README §9.
@@ -111,19 +113,32 @@ It binds loopback only, for the reasons in README §9.
                        │    │     └──────────────────┘
                        │    │ stdio JSON-RPC (MCP)
                        │    ▼
-                       │  ┌──────────────────┐  │   mTLS (worker cert)
-                       │  │ loupe-worker     │ ─┼──────────► loupe-server
-                       │  │   mcp-serve      │  │   GET    /v1/repos/:id/
-                       │  │                  │  │            findings/search
-                       │  │ tools:           │  │   GET    /v1/findings/:id
-                       │  │ • query_prior_   │  │   POST   /v1/jobs/:id/
-                       │  │   findings       │  │            findings
-                       │  │ • get_finding_   │  │
-                       │  │   by_id          │  │
-                       │  │ • submit_finding │  │
-                       │  │ • validate_poc   │  │
-                       │  └──────────────────┘  │
-                       └────────────────────────┘
+                       │  ┌──────────────────┐  │
+                       │  │ loupe-worker     │  │  no credentials,
+                       │  │   mcp-proxy      │  │  no server URL,
+                       │  │ (stdio ⇄ socket) │  │  no job id
+                       │  └────────┬─────────┘  │
+                       └───────────┼────────────┘
+                          sandbox  │  Unix socket bind-mounted
+                        ───────────┼───────────────────────────
+                          trusted  │  worker process
+                                   ▼
+                          ┌──────────────────┐   mTLS (worker cert)
+                          │ host-side MCP    │ ──────────► loupe-server
+                          │ broker           │   + X-Loupe-Job-Capability
+                          │                  │
+                          │ holds: client,   │   GET  /v1/repos/:id/
+                          │ job capability,  │          findings/search
+                          │ repo id, job id  │   GET  /v1/findings/:id
+                          │                  │   POST /v1/jobs/:id/
+                          │ tools:           │          llm-findings
+                          │ • query_prior_   │
+                          │   findings       │
+                          │ • get_finding_   │
+                          │   by_id          │
+                          │ • submit_finding │
+                          │ • validate_poc   │
+                          └──────────────────┘
 ```
 
 The `bkb-mcp` block is dashed because it's optional: the worker
@@ -131,7 +146,7 @@ attaches it to the per-call MCP configuration only when `bkb-mcp` is
 on PATH at startup. Workers that don't have it installed run without
 that branch and the agent's prompt makes no mention of bkb tools.
 
-The `loupe-worker mcp-serve` tool list shown above is the
+The broker tool list shown above is the
 **discovery-mode** catalogue. A verify-mode session (spawned for a
 `kind=verify` job) exposes a different surface: `query_prior_findings`
 and `get_finding_by_id` carry over, while `submit_finding` /
@@ -164,28 +179,36 @@ A finding's journey from "agent saw something" to "human looked at it":
    │   │     (on a hit)            │ │   │    keep iterating)
    │   │   • generate PoC diff     │ │   │
    │   │   • validate_poc          │ │   │   (`git apply --check`)
-   │   │   • submit_finding ───────┼─┼───┼─── mTLS to loupe-server
-   │   └───────────────────────────┘ │   │   POST /v1/jobs/{id}/findings
-   │   wait for session exit         │   │   (one call per finding;
-   │ scanner returns Vec::new()      │   │    multiple per session OK)
+   │   │   • submit_finding ───────┼─┼───┼─── Unix-socket JSON-RPC
+   │   └───────────────────────────┘ │   │   to host-side MCP broker
+   │   wait for session exit         │   │
+   │ scanner returns Vec::new()      │   │
    │   (submission already happened) │   │
    └─────────────────────────────────┘   │
                   │
-                  ▼ POST /v1/jobs/{id}/complete  (no findings batch — agent
-                                                  already submitted them)
+                  ▼
+   ┌─────────────────────────────────┐
+   │ host-side MCP broker:           │
+   │   build LlmFindingSubmission    │     loupe-worker
+   │     from MCP args + worktree    │
+   │     (read source window, hash)  │
+   └─────────────────────────────────┘
+                  │ mTLS + X-Loupe-Job-Capability
+                  ▼ POST /v1/jobs/{id}/llm-findings
+                    (one call per finding; multiple per session OK)
                                          ┴───────────── network hop ─────────
    ┌─────────────────────────────────┐
-   │ submit_finding handler:         │
-   │   build Finding{fingerprint}    │
-   │     from MCP args + workdir     │
-   │     (read source window, hash)  │
-   │   INSERT OR IGNORE on findings  │  loupe-server
+   │ strict LLM finding handler:     │
+   │   validate submission           │
+   │   stamp scanner identity        │
+   │   INSERT OR IGNORE on findings  │     loupe-server
    │   on UNIQUE(repo_id,            │
    │             fingerprint)        │
    │   → state = pending             │
    └─────────────────────────────────┘
                   │
-                  ▼ POST /v1/jobs/{id}/complete
+                  ▼ POST /v1/jobs/{id}/complete  (no findings batch — broker
+                                                  already submitted them)
    ┌─────────────────────────────────┐
    │ if verification_required = 0:   │
    │   pending → confirmed           │     scan complete handler
@@ -305,17 +328,29 @@ instance. There are three client cert "roles":
      │ (loupectl)  │   │  + scanners    │   │  + verifier    │
      └─────────────┘   └────────┬───────┘   └────────────────┘
                                 │
-                                │ (worker shares its cert
-                                │  with the MCP child via
-                                │  bind-mount into bwrap)
+                                │ (the worker cert never
+                                │  crosses into bwrap; only
+                                │  a Unix socket is bound in)
                                 ▼
                        ┌────────────────┐
                        │ loupe-worker   │   in the bwrap sandbox,
-                       │   mcp-serve    │   talks back to
-                       │ (uses worker   │   loupe-server with
-                       │  cert)         │   the SAME mTLS cert
+                       │   mcp-proxy    │   forwards stdio to the
+                       │ (no cert, no   │   broker in the trusted
+                       │  URL, no id)   │   parent process
                        └────────────────┘
 ```
+
+A compromised agent therefore cannot reach `loupe-server` at all: it
+holds no certificate, and does not even learn the server URL. Every
+call it makes is mediated by the broker, which pins the request to one
+repository and one live lease through the job capability issued with
+that lease.
+
+The sandbox does not inherit the host `/etc` tree. It receives only the
+public loader, account lookup, resolver, and CA-certificate inputs needed
+by the agent runtime; Loupe configuration and worker TLS material remain
+outside the namespace even when a bare-metal deployment stores them under
+`/etc/loupe`.
 
 All secrets at rest in the SQLite DB (PATs, finding bodies, repo
 metadata) are sealed by SQLCipher under the operator's master key —

@@ -15,10 +15,9 @@
 //! - `query_prior_findings(query, limit?)` — FTS5 keyword search
 //!   over the repo's accumulated findings. Backed by
 //!   `loupe-server`'s `GET /v1/repos/{repo_id}/findings/search`
-//!   endpoint via the worker's mTLS client cert. The MCP server is
-//!   spawned per agent invocation by the worker, with the
-//!   `repo_id` baked in as a CLI arg, so the tool doesn't need to
-//!   take it as a parameter.
+//!   endpoint via the parent worker's mTLS client. The host-side MCP
+//!   broker is scoped to one immutable `repo_id`, so the tool doesn't
+//!   take repository identity as a parameter.
 //! - `get_finding_by_id(id)` — full detail view for one finding.
 //!   Used after `query_prior_findings` returns a summary and the
 //!   model wants to see the description / PoC of a hit before
@@ -27,9 +26,9 @@
 //!   description, poc_unified, cwe?)` — the agent's only path for
 //!   reporting a vulnerability. Computes the fingerprint server-
 //!   side (reading the source window from `--workdir`) and POSTs
-//!   to `/v1/jobs/{job_id}/findings`. Only registered when the
-//!   worker passed `--job-id` at MCP-server start; without a job
-//!   id, there's nowhere to attribute submissions to.
+//!   to `/v1/jobs/{job_id}/llm-findings`. Only registered when the
+//!   broker has a job id; without one, there's nowhere to attribute
+//!   submissions to.
 //! - `validate_poc(poc_unified)` — pre-flight check for the PoC
 //!   diff the agent is about to attach to a `submit_finding` call.
 //!   Runs `git apply --check` against the worktree (`--workdir`)
@@ -38,17 +37,18 @@
 //!   diff hunks before submission so we don't store a finding whose
 //!   "regression test" doesn't actually apply.
 
-use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use loupe_core::{Finding, Severity};
-use loupe_proto::{FindingsBatch, PROTOCOL_VERSION};
+use loupe_proto::{
+	validate_llm_finding_submission, JobCapability, LlmFindingSubmission, PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::scanners::llm_code_review::SCANNER_ID;
 use crate::ServerClient;
@@ -152,15 +152,15 @@ fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option
 /// consult what the first call set.
 struct Session {
 	client: Arc<ServerClient>,
+	job_capability: JobCapability,
 	repo_id: i64,
 	/// Job id the agent is reporting findings against. `None` means
 	/// `submit_finding` is unavailable — the MCP server is in
 	/// read-only mode (e.g. a future read-only diagnostic flow).
 	job_id: Option<i64>,
-	/// Worktree the agent is reasoning over. Used to read source
-	/// files for fingerprint window extraction in `submit_finding`.
-	/// Inside the bwrap sandbox this is `/workdir`; bare-mode
-	/// (`LOUPE_DISABLE_SANDBOX`) runs use the host worktree path.
+	/// Host worktree the agent is reasoning over. The trusted broker
+	/// uses it for fingerprint extraction and diff validation while
+	/// the sandbox sees the same checkout read-only at `/workdir`.
 	workdir: PathBuf,
 	/// Verify-mode state. `Some` flips the tool catalog: hides
 	/// `submit_finding` / `validate_poc`, advertises `submit_verdict`
@@ -245,11 +245,12 @@ struct RpcError {
 	data: Option<Value>,
 }
 
-/// Run the MCP server against `client` until stdin closes.
+/// Immutable authority and filesystem scope for one host-side MCP
+/// broker session.
 ///
 /// `repo_id` scopes search/lookup tools to this repo. `job_id`, when
 /// `Some`, enables `submit_finding` — submissions POST to
-/// `/v1/jobs/{job_id}/findings`. `finding_id`, when `Some`, flips
+/// `/v1/jobs/{job_id}/llm-findings`. `finding_id`, when `Some`, flips
 /// the server into verify mode (the agent sees `submit_verdict` /
 /// `submit_patch` / `validate_patch` instead of the discovery
 /// tools); `job_id` MUST also be set in verify mode so the verdict
@@ -263,11 +264,24 @@ struct RpcError {
 /// `submit_verdict`, the function returns an error so the runner
 /// posts `complete(failed)` and the validating-deadline reaper
 /// later marks the verdict inconclusive.
-pub async fn run_stdio_server(
-	client: Arc<ServerClient>, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
-	workdir: PathBuf,
-) -> Result<()> {
-	let verify = match (finding_id, job_id) {
+pub struct McpSessionContext {
+	pub client: Arc<ServerClient>,
+	pub job_capability: JobCapability,
+	pub repo_id: i64,
+	pub job_id: Option<i64>,
+	pub finding_id: Option<i64>,
+	pub workdir: PathBuf,
+}
+
+/// Run one host-side MCP broker session until the sandbox proxy closes.
+pub async fn run_stream_server<R, W>(
+	context: McpSessionContext, reader: R, mut writer: W,
+) -> Result<()>
+where
+	R: AsyncBufRead + Unpin,
+	W: AsyncWrite + Unpin,
+{
+	let verify = match (context.finding_id, context.job_id) {
 		(Some(fid), Some(_)) => Some(VerifySessionState {
 			finding_id: fid,
 			inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
@@ -279,12 +293,17 @@ pub async fn run_stdio_server(
 		},
 		(None, _) => None,
 	};
-	let session = Arc::new(Session { client, repo_id, job_id, workdir, verify });
-	let stdin = std::io::stdin();
-	let mut stdout = std::io::stdout();
+	let session = Arc::new(Session {
+		client: context.client,
+		job_capability: context.job_capability,
+		repo_id: context.repo_id,
+		job_id: context.job_id,
+		workdir: context.workdir,
+		verify,
+	});
+	let mut lines = reader.lines();
 
-	for line in stdin.lock().lines() {
-		let line = line?;
+	while let Some(line) = lines.next_line().await? {
 		if line.trim().is_empty() {
 			continue;
 		}
@@ -294,9 +313,10 @@ pub async fn run_stdio_server(
 			Ok(r) => r,
 			Err(e) => {
 				write_response(
-					&mut stdout,
+					&mut writer,
 					&Response::err(Value::Null, -32700, format!("parse error: {e}")),
-				)?;
+				)
+				.await?;
 				continue;
 			},
 		};
@@ -305,7 +325,7 @@ pub async fn run_stdio_server(
 		let Some(id) = request.id.clone() else { continue };
 
 		let response = handle_request(&session, &request, id).await;
-		write_response(&mut stdout, &response)?;
+		write_response(&mut writer, &response).await?;
 	}
 
 	if session.verify.is_some() {
@@ -649,9 +669,17 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 		Err(e) => Err(e),
 		Ok(()) => match tool_name {
 			"query_prior_findings" => {
-				tool_query_prior_findings(&session.client, session.repo_id, &arguments).await
+				tool_query_prior_findings(
+					&session.client,
+					&session.job_capability,
+					session.repo_id,
+					&arguments,
+				)
+				.await
 			},
-			"get_finding_by_id" => tool_get_finding_by_id(&session.client, &arguments).await,
+			"get_finding_by_id" => {
+				tool_get_finding_by_id(&session.client, &session.job_capability, &arguments).await
+			},
 			"submit_finding" => tool_submit_finding(session, &arguments).await,
 			"validate_poc" => tool_validate_diff(&session.workdir, &arguments, "poc_unified").await,
 			"submit_verdict" => tool_submit_verdict(session, &arguments).await,
@@ -704,13 +732,17 @@ fn check_tool_protocol_version(args: &Value) -> Result<()> {
 	Ok(())
 }
 
-async fn tool_get_finding_by_id(client: &Arc<ServerClient>, args: &Value) -> Result<String> {
+async fn tool_get_finding_by_id(
+	client: &Arc<ServerClient>, job_capability: &JobCapability, args: &Value,
+) -> Result<String> {
 	let id = args
 		.get("id")
 		.and_then(|v| v.as_i64())
 		.context("`id` argument is required and must be an integer")?;
-	let detail =
-		client.get_finding(id).await.with_context(|| format!("calling /v1/findings/{id}"))?;
+	let detail = client
+		.get_finding(id, job_capability)
+		.await
+		.with_context(|| format!("calling /v1/findings/{id}"))?;
 	let loc = format_location(detail.file_path.as_deref(), detail.line_start, detail.line_end);
 	let mut out = String::with_capacity(detail.description.len() + 256);
 	let _ = std::fmt::Write::write_fmt(
@@ -737,13 +769,13 @@ async fn tool_get_finding_by_id(client: &Arc<ServerClient>, args: &Value) -> Res
 }
 
 async fn tool_query_prior_findings(
-	client: &Arc<ServerClient>, repo_id: i64, args: &Value,
+	client: &Arc<ServerClient>, job_capability: &JobCapability, repo_id: i64, args: &Value,
 ) -> Result<String> {
 	let query = arg_str(args, "query")?;
 	let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 100);
 
 	let resp = client
-		.search_findings(repo_id, query, limit)
+		.search_findings(repo_id, job_capability, query, limit)
 		.await
 		.context("calling /v1/repos/:id/findings/search")?;
 
@@ -817,12 +849,26 @@ async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<Str
 	let title = finding.title.clone();
 	let file = finding.file_path.clone().unwrap_or_default();
 	let fingerprint = finding.fingerprint.clone();
-	let batch = FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] };
+	let submission = LlmFindingSubmission {
+		protocol_version: PROTOCOL_VERSION,
+		severity: finding.severity,
+		title: finding.title,
+		description: finding.description,
+		file_path: file.clone(),
+		line_start: finding.line_start.context("LLM finding is missing line_start")?,
+		line_end: finding.line_end.context("LLM finding is missing line_end")?,
+		cwe: finding.cwe,
+		poc_unified: finding.poc_unified.context("LLM finding is missing poc_unified")?,
+		fingerprint: fingerprint.clone(),
+	};
+	validate_local_llm_submission(&session.workdir, &submission).await?;
 	session
 		.client
-		.submit_findings(job_id, &batch)
+		.submit_llm_finding(job_id, &session.job_capability, &submission)
 		.await
-		.with_context(|| format!("submitting finding for {file} to /v1/jobs/{job_id}/findings"))?;
+		.with_context(|| {
+			format!("submitting finding for {file} to /v1/jobs/{job_id}/llm-findings")
+		})?;
 	tracing::info!(
 		job_id, repo_id = session.repo_id, %file, %title, fingerprint = %fingerprint,
 		"loupe-mcp: agent submitted a finding",
@@ -832,6 +878,40 @@ async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<Str
 		 The server applies UNIQUE(repo_id, fingerprint) on insert; if this finding hash-matches a \
 		 prior one, the row was silently skipped — that's the dedup floor and is fine."
 	))
+}
+
+async fn validate_local_llm_submission(
+	workdir: &Path, submission: &LlmFindingSubmission,
+) -> Result<()> {
+	validate_llm_finding_submission(submission).map_err(anyhow::Error::msg)?;
+	let path = workdir.join(&submission.file_path);
+	// Repository-sized reads on the broker's runtime thread: the
+	// discovery scanner fans out one agent session per file, so a
+	// blocking read here stalls every other session's tool calls.
+	let metadata = tokio::fs::metadata(&path)
+		.await
+		.with_context(|| format!("submitted file does not exist: {}", submission.file_path))?;
+	if !metadata.is_file() {
+		anyhow::bail!("submitted path is not a regular file: {}", submission.file_path);
+	}
+	let source = tokio::fs::read_to_string(&path)
+		.await
+		.with_context(|| format!("reading submitted file {}", submission.file_path))?;
+	let line_count = source.lines().count().max(1) as u64;
+	if u64::from(submission.line_end) > line_count {
+		anyhow::bail!(
+			"line_end {} exceeds {} lines in {}",
+			submission.line_end,
+			line_count,
+			submission.file_path
+		);
+	}
+	match check_diff_applies(workdir, &submission.poc_unified).await? {
+		DiffCheck::Applies => Ok(()),
+		DiffCheck::Rejects { stderr } => {
+			anyhow::bail!("poc_unified does not apply to the reviewed revision: {stderr}")
+		},
+	}
 }
 
 /// Shared `git apply --check` runner. Discovery uses it via
@@ -981,18 +1061,43 @@ enum DiffCheck {
 /// the diff would apply — safe to run against the read-only bwrap
 /// mount. Errors here are infrastructure-level (couldn't spawn git);
 /// a clean "this diff doesn't apply" is a `DiffCheck::Rejects`.
-async fn check_diff_applies(workdir: &Path, diff: &str) -> Result<DiffCheck> {
-	let mut child = tokio::process::Command::new("git")
+/// Build the `git apply --check` command with the host environment and
+/// git configuration neutralized. This validation now runs in the
+/// trusted worker process (not the sandbox), so config files and
+/// environment overrides such as `GIT_CONFIG_COUNT`, `GIT_DIR`, or
+/// `GIT_CONFIG_PARAMETERS` must not change whether an agent-supplied
+/// diff validates. Clearing the environment also keeps unrelated
+/// worker credentials out of the parser subprocess.
+fn git_apply_check_command(workdir: &Path) -> tokio::process::Command {
+	let mut cmd = tokio::process::Command::new("git");
+	configure_git_apply_check_command(&mut cmd, workdir);
+	cmd
+}
+
+fn configure_git_apply_check_command(cmd: &mut tokio::process::Command, workdir: &Path) {
+	cmd.env_clear()
+		.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 		.arg("apply")
 		.arg("--check")
 		// Read the diff from stdin via the conventional `-` filename.
 		.arg("-")
 		.current_dir(workdir)
+		.env("GIT_CONFIG_GLOBAL", "/dev/null")
+		.env("GIT_CONFIG_SYSTEM", "/dev/null")
+		.env("GIT_CONFIG_NOSYSTEM", "1")
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()
-		.context("spawning `git apply --check`")?;
+		.stderr(Stdio::piped());
+}
+
+async fn check_diff_applies(workdir: &Path, diff: &str) -> Result<DiffCheck> {
+	check_diff_applies_with_command(git_apply_check_command(workdir), diff).await
+}
+
+async fn check_diff_applies_with_command(
+	mut command: tokio::process::Command, diff: &str,
+) -> Result<DiffCheck> {
+	let mut child = command.spawn().context("spawning `git apply --check`")?;
 	{
 		let mut stdin = child.stdin.take().context("git apply stdin already taken")?;
 		stdin.write_all(diff.as_bytes()).await.context("writing diff to git apply stdin")?;
@@ -1049,11 +1154,12 @@ fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -
 	crate::fingerprint::compute(SCANNER_ID, file, &window)
 }
 
-fn write_response<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
+async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> Result<()> {
 	let line = serde_json::to_string(resp)?;
 	tracing::debug!(response = %line, "loupe-mcp: sending response");
-	writeln!(w, "{line}")?;
-	w.flush()?;
+	w.write_all(line.as_bytes()).await?;
+	w.write_all(b"\n").await?;
+	w.flush().await?;
 	Ok(())
 }
 
@@ -1112,6 +1218,7 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 		.client
 		.submit_verdict(
 			job_id,
+			&session.job_capability,
 			&loupe_proto::VerdictSubmission {
 				protocol_version: loupe_proto::PROTOCOL_VERSION,
 				verdict: final_verdict,
@@ -1143,6 +1250,95 @@ mod tests {
 			let schema = t.get("inputSchema").expect("tool needs `inputSchema`");
 			assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
 		}
+	}
+
+	fn valid_local_submission() -> (tempfile::TempDir, LlmFindingSubmission) {
+		let workdir = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(workdir.path().join("src")).unwrap();
+		std::fs::write(workdir.path().join("src/lib.rs"), "fn vulnerable() {}\n").unwrap();
+		let submission = LlmFindingSubmission {
+			protocol_version: PROTOCOL_VERSION,
+			severity: Severity::High,
+			title: "Unchecked operation terminates the service".into(),
+			description: "An attacker-controlled request reaches the vulnerable operation without validation and can reliably terminate the service process.".into(),
+			file_path: "src/lib.rs".into(),
+			line_start: 1,
+			line_end: 1,
+			cwe: Some("CWE-20".into()),
+			poc_unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn vulnerable() {}\n+#[test] fn demonstrates_failure() {}\n".into(),
+			fingerprint: "c".repeat(64),
+		};
+		(workdir, submission)
+	}
+
+	#[tokio::test]
+	async fn local_llm_validation_checks_revision_and_line_bounds() {
+		let (workdir, submission) = valid_local_submission();
+		validate_local_llm_submission(workdir.path(), &submission).await.unwrap();
+
+		let mut out_of_bounds = submission.clone();
+		out_of_bounds.line_end = 2;
+		let error = validate_local_llm_submission(workdir.path(), &out_of_bounds)
+			.await
+			.expect_err("line beyond the reviewed file must fail");
+		assert!(error.to_string().contains("exceeds"));
+
+		let mut non_applying = submission;
+		non_applying.poc_unified =
+			non_applying.poc_unified.replace("fn vulnerable() {}", "fn other() {}");
+		let error = validate_local_llm_submission(workdir.path(), &non_applying)
+			.await
+			.expect_err("PoC for different source must fail");
+		assert!(error.to_string().contains("does not apply"));
+	}
+
+	#[test]
+	fn git_apply_check_neutralizes_inherited_git_config() {
+		use std::ffi::OsStr;
+		// The diff check runs `git apply` in the trusted worker
+		// process. A host-level `~/.gitconfig` or `/etc/gitconfig`
+		// (e.g. `apply.whitespace = error`) must not be able to change
+		// whether an agent-supplied diff validates, so the command
+		// pins config resolution to empty sources.
+		let cmd = git_apply_check_command(Path::new("/tmp"));
+		let value = |key: &str| {
+			cmd.as_std()
+				.get_envs()
+				.find(|(k, _)| *k == OsStr::new(key))
+				.and_then(|(_, v)| v)
+				.map(|v| v.to_owned())
+		};
+		assert_eq!(
+			value("GIT_CONFIG_GLOBAL").as_deref(),
+			Some(OsStr::new("/dev/null")),
+			"global git config must be pinned so a host ~/.gitconfig cannot alter diff validation",
+		);
+		assert_eq!(value("GIT_CONFIG_SYSTEM").as_deref(), Some(OsStr::new("/dev/null")));
+		assert_eq!(value("GIT_CONFIG_NOSYSTEM").as_deref(), Some(OsStr::new("1")));
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn git_apply_check_ignores_inherited_environment_config() {
+		let workdir = tempfile::tempdir().unwrap();
+		let mut command = tokio::process::Command::new("git");
+		command
+			.env("GIT_CONFIG_COUNT", "1")
+			.env("GIT_CONFIG_KEY_0", "apply.whitespace")
+			.env("GIT_CONFIG_VALUE_0", "error");
+		configure_git_apply_check_command(&mut command, workdir.path());
+		let diff = "diff --git a/whitespace-probe b/whitespace-probe\n\
+			new file mode 100644\n\
+			--- /dev/null\n\
+			+++ b/whitespace-probe\n\
+			@@ -0,0 +1 @@\n\
+			+trailing \n";
+
+		let outcome = check_diff_applies_with_command(command, diff).await.unwrap();
+
+		assert!(
+			matches!(outcome, DiffCheck::Applies),
+			"inherited GIT_CONFIG_COUNT changed diff validation: {outcome:?}"
+		);
 	}
 
 	#[test]
@@ -1201,6 +1397,7 @@ mod tests {
 		));
 		Arc::new(Session {
 			client,
+			job_capability: JobCapability::from_secret("test-capability"),
 			repo_id: 1,
 			job_id: Some(42),
 			workdir: tempfile::tempdir().unwrap().keep(),

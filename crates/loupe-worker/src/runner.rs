@@ -11,8 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use loupe_core::Verdict;
 use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseEnvelope, LeasePayload, LeaseResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	CompleteOutcome, CompleteRequest, FindingsBatch, JobCapability, LeaseEnvelope, LeasePayload,
+	LeaseResponse, VerdictSubmission, PROTOCOL_VERSION,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -92,9 +92,10 @@ impl Runner {
 
 	async fn run_lease(&self, env: LeaseEnvelope, cancel: &CancellationToken) -> Result<()> {
 		let job_id = env.job_id;
+		let job_capability = env.job_capability.clone();
 		tracing::info!(job_id, repo = %env.repo.clone_url, "leased job");
 		let scan_cancel = cancel.child_token();
-		let heartbeat = self.spawn_heartbeat(job_id, scan_cancel.clone());
+		let heartbeat = self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone());
 
 		let outcome = self.execute(env, scan_cancel.clone()).await;
 
@@ -111,7 +112,7 @@ impl Runner {
 					head_sha,
 					error: None,
 				};
-				self.client.complete(job_id, &req).await?;
+				self.client.complete(job_id, &job_capability, &req).await?;
 				tracing::info!(job_id, "job succeeded");
 			},
 			Err(e) => {
@@ -122,7 +123,7 @@ impl Runner {
 					head_sha: None,
 					error: Some(e.to_string()),
 				};
-				if let Err(ce) = self.client.complete(job_id, &req).await {
+				if let Err(ce) = self.client.complete(job_id, &job_capability, &req).await {
 					tracing::warn!(job_id, error = %ce, "complete(Failed) call failed too");
 				}
 			},
@@ -148,6 +149,7 @@ impl Runner {
 				let Some(reviewed_sha) = reviewed_sha.filter(|sha| !sha.trim().is_empty()) else {
 					self.submit_revision_unavailable_verdict(
 						env.job_id,
+						&env.job_capability,
 						finding_id,
 						None,
 						"verify lease did not carry the original reviewed revision",
@@ -176,6 +178,7 @@ impl Runner {
 								Err(second_error) => {
 									self.submit_revision_unavailable_verdict(
 										env.job_id,
+										&env.job_capability,
 										finding_id,
 										Some(&reviewed_sha),
 										&second_error.to_string(),
@@ -198,6 +201,7 @@ impl Runner {
 					repo: env.repo.clone(),
 					repo_id: env.repo_id,
 					job_id: env.job_id,
+					job_capability: env.job_capability.clone(),
 					finding_id,
 					finding: *finding,
 					config: env.scanner_config,
@@ -228,6 +232,7 @@ impl Runner {
 						self.client
 							.submit_verdict(
 								env.job_id,
+								&env.job_capability,
 								&VerdictSubmission { protocol_version: PROTOCOL_VERSION, verdict },
 							)
 							.await?;
@@ -284,6 +289,7 @@ impl Runner {
 					repo: env.repo.clone(),
 					repo_id: env.repo_id,
 					job_id: env.job_id,
+					job_capability: env.job_capability.clone(),
 					head_sha: head_sha.clone(),
 					base_sha: since_sha,
 					config: env.scanner_config,
@@ -319,7 +325,7 @@ impl Runner {
 				if !all.is_empty() {
 					let batch =
 						FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all.clone() };
-					self.client.submit_findings(env.job_id, &batch).await?;
+					self.client.submit_findings(env.job_id, &env.job_capability, &batch).await?;
 				}
 				Ok((Some(head_sha), all.len()))
 			},
@@ -327,7 +333,8 @@ impl Runner {
 	}
 
 	async fn submit_revision_unavailable_verdict(
-		&self, job_id: i64, finding_id: i64, reviewed_sha: Option<&str>, detail: &str,
+		&self, job_id: i64, job_capability: &JobCapability, finding_id: i64,
+		reviewed_sha: Option<&str>, detail: &str,
 	) -> Result<()> {
 		let reason = match reviewed_sha {
 			Some(sha) => format!(
@@ -344,6 +351,7 @@ impl Runner {
 		self.client
 			.submit_verdict(
 				job_id,
+				job_capability,
 				&VerdictSubmission {
 					protocol_version: PROTOCOL_VERSION,
 					verdict: Verdict::Inconclusive { reason, terminal: true },
@@ -353,7 +361,7 @@ impl Runner {
 	}
 
 	fn spawn_heartbeat(
-		&self, job_id: i64, cancel: CancellationToken,
+		&self, job_id: i64, job_capability: JobCapability, cancel: CancellationToken,
 	) -> tokio::task::JoinHandle<()> {
 		let client = self.client.clone();
 		tokio::spawn(async move {
@@ -361,7 +369,7 @@ impl Runner {
 				tokio::select! {
 					_ = cancel.cancelled() => return,
 					_ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-						if let Err(e) = client.heartbeat(job_id).await {
+						if let Err(e) = client.heartbeat(job_id, &job_capability).await {
 							tracing::warn!(job_id, error = %e, "heartbeat failed");
 						}
 					},

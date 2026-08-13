@@ -88,6 +88,7 @@ impl Scanner for LlmVerifierScanner {
 			cancel: ctx.cancel.clone(),
 			repo_id: Some(ctx.repo_id),
 			job_id: Some(ctx.job_id),
+			job_capability: Some(ctx.job_capability.clone()),
 			finding_id: Some(ctx.finding_id),
 		};
 		let _resp = self.backend.run(req).await?;
@@ -115,6 +116,7 @@ mod tests {
 			workdir: PathBuf::from("/tmp"),
 			repo_id: 1,
 			job_id: 42,
+			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
 			finding_id: 7,
 			repo: RepoSpec {
 				host: "github.com".into(),

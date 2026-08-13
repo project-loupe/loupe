@@ -5,8 +5,8 @@
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
 	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
-	LeaseRequest, LeaseResponse, ListFindingsResponse, VerdictSubmission, PROTOCOL_VERSION,
-	PROTOCOL_VERSION_HEADER,
+	JobCapability, LeaseRequest, LeaseResponse, ListFindingsResponse, LlmFindingSubmission,
+	VerdictSubmission, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 use reqwest::Url;
 
@@ -53,11 +53,13 @@ impl ServerClient {
 		resp.json().await.context("decoding lease response")
 	}
 
-	pub async fn heartbeat(&self, job_id: i64) -> Result<HeartbeatResponse> {
+	pub async fn heartbeat(
+		&self, job_id: i64, job_capability: &JobCapability,
+	) -> Result<HeartbeatResponse> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/heartbeat"));
 		let req = HeartbeatRequest { protocol_version: PROTOCOL_VERSION };
 		let resp = self
-			.with_protocol(self.http.post(url))
+			.with_job_capability(self.http.post(url), job_capability)
 			.json(&req)
 			.send()
 			.await
@@ -66,10 +68,12 @@ impl ServerClient {
 		resp.json().await.context("decoding heartbeat")
 	}
 
-	pub async fn submit_findings(&self, job_id: i64, batch: &FindingsBatch) -> Result<()> {
+	pub async fn submit_findings(
+		&self, job_id: i64, job_capability: &JobCapability, batch: &FindingsBatch,
+	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/findings"));
 		let resp = self
-			.with_protocol(self.http.post(url))
+			.with_job_capability(self.http.post(url), job_capability)
 			.json(batch)
 			.send()
 			.await
@@ -77,10 +81,25 @@ impl ServerClient {
 		ensure_ok(resp).await.map(|_| ())
 	}
 
-	pub async fn complete(&self, job_id: i64, req: &CompleteRequest) -> Result<()> {
+	pub async fn submit_llm_finding(
+		&self, job_id: i64, job_capability: &JobCapability, finding: &LlmFindingSubmission,
+	) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/llm-findings"));
+		let resp = self
+			.with_job_capability(self.http.post(url), job_capability)
+			.json(finding)
+			.send()
+			.await
+			.context("LLM finding request")?;
+		ensure_ok(resp).await.map(|_| ())
+	}
+
+	pub async fn complete(
+		&self, job_id: i64, job_capability: &JobCapability, req: &CompleteRequest,
+	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
 		let resp = self
-			.with_protocol(self.http.post(url))
+			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
 			.send()
 			.await
@@ -88,10 +107,12 @@ impl ServerClient {
 		ensure_ok(resp).await.map(|_| ())
 	}
 
-	pub async fn submit_verdict(&self, job_id: i64, req: &VerdictSubmission) -> Result<()> {
+	pub async fn submit_verdict(
+		&self, job_id: i64, job_capability: &JobCapability, req: &VerdictSubmission,
+	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
 		let resp = self
-			.with_protocol(self.http.post(url))
+			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
 			.send()
 			.await
@@ -103,11 +124,14 @@ impl ServerClient {
 	/// MCP server's `query_prior_findings` tool calls this. `query`
 	/// is free-form keywords; the server sanitises them.
 	pub async fn search_findings(
-		&self, repo_id: i64, query: &str, limit: i64,
+		&self, repo_id: i64, job_capability: &JobCapability, query: &str, limit: i64,
 	) -> Result<ListFindingsResponse> {
 		let url = self.url(&format!("/v1/repos/{repo_id}/findings/search"));
 		let resp = self
-			.with_protocol(self.http.get(url).query(&[("q", query), ("limit", &limit.to_string())]))
+			.with_job_capability(
+				self.http.get(url).query(&[("q", query), ("limit", &limit.to_string())]),
+				job_capability,
+			)
 			.send()
 			.await
 			.context("search request")?;
@@ -119,10 +143,15 @@ impl ServerClient {
 	/// MCP `get_finding_by_id` tool when the agent wants the
 	/// description / PoC body of a search hit beyond what
 	/// `query_prior_findings` (a summary-only listing) returned.
-	pub async fn get_finding(&self, id: i64) -> Result<FindingDetail> {
+	pub async fn get_finding(
+		&self, id: i64, job_capability: &JobCapability,
+	) -> Result<FindingDetail> {
 		let url = self.url(&format!("/v1/findings/{id}"));
-		let resp =
-			self.with_protocol(self.http.get(url)).send().await.context("get_finding request")?;
+		let resp = self
+			.with_job_capability(self.http.get(url), job_capability)
+			.send()
+			.await
+			.context("get_finding request")?;
 		let resp = ensure_ok(resp).await?;
 		resp.json().await.context("decoding finding detail")
 	}
@@ -133,6 +162,12 @@ impl ServerClient {
 
 	fn with_protocol(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 		req.header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+	}
+
+	fn with_job_capability(
+		&self, req: reqwest::RequestBuilder, job_capability: &JobCapability,
+	) -> reqwest::RequestBuilder {
+		self.with_protocol(req).header(JOB_CAPABILITY_HEADER, job_capability.expose_secret())
 	}
 }
 
@@ -188,9 +223,11 @@ mod tests {
 		let body = "successful verify completion requires a submitted verdict";
 		let base = serve_once("HTTP/1.1 409 Conflict", body).await;
 		let client = ServerClient::from_parts(reqwest::Client::new(), base);
+		let job_capability = JobCapability::from_secret("test-capability");
 		let err = client
 			.complete(
 				1513,
+				&job_capability,
 				&CompleteRequest {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Succeeded,

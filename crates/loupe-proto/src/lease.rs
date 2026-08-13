@@ -1,6 +1,30 @@
 use loupe_core::{Finding, RepoSpec};
 use serde::{Deserialize, Serialize};
 
+/// Opaque, single-lease capability issued by loupe-server.
+///
+/// The custom `Debug` implementation prevents accidental disclosure in
+/// logs while serde still carries the value over the mTLS lease response.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobCapability(String);
+
+impl JobCapability {
+	pub fn from_secret(value: impl Into<String>) -> Self {
+		Self(value.into())
+	}
+
+	pub fn expose_secret(&self) -> &str {
+		&self.0
+	}
+}
+
+impl std::fmt::Debug for JobCapability {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("JobCapability([REDACTED])")
+	}
+}
+
 /// Body of `POST /v1/jobs/lease`. The worker advertises capabilities so
 /// the server can match a `kind=verify` job to a worker that runs the
 /// right verifier (`verify:secrets`, `verify:llm-review`, ...).
@@ -37,6 +61,7 @@ pub enum LeaseResponse {
 pub struct LeaseEnvelope {
 	pub protocol_version: u16,
 	pub job_id: i64,
+	pub job_capability: JobCapability,
 	/// Server-side numeric id for the registered repo. Workers
 	/// forward this through `ScanContext`/`VerifyContext` so LLM
 	/// backends can scope MCP tool calls
@@ -101,6 +126,7 @@ mod tests {
 		let env = LeaseEnvelope {
 			protocol_version: PROTOCOL_VERSION,
 			job_id: 1,
+			job_capability: JobCapability::from_secret("scan-capability"),
 			repo_id: 9,
 			repo: sample_repo(),
 			head_branch: Some("main".into()),
@@ -133,6 +159,7 @@ mod tests {
 		let env = LeaseEnvelope {
 			protocol_version: PROTOCOL_VERSION,
 			job_id: 7,
+			job_capability: JobCapability::from_secret("verify-capability"),
 			repo_id: 11,
 			repo: sample_repo(),
 			head_branch: None,
@@ -160,10 +187,11 @@ mod tests {
 	}
 
 	#[test]
-	fn verify_lease_defaults_reviewed_sha_for_old_servers() {
+	fn verify_lease_defaults_reviewed_sha_when_omitted() {
 		let raw = r#"{
-			"protocol_version":1,
+			"protocol_version":2,
 			"job_id":7,
+			"job_capability":"test-capability",
 			"repo_id":11,
 			"repo":{
 				"host":"github.com",

@@ -17,9 +17,9 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use git2::{Repository, Signature};
-use loupe_core::{Finding, Severity, Verdict, VerdictPatch};
+use loupe_core::{Severity, Verdict, VerdictPatch};
 use loupe_proto::{
-	FindingsBatch, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
+	LlmFindingSubmission, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
 	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
@@ -238,7 +238,7 @@ async fn run_flow(
 	// Stub backend: two paths, both simulating what the agent's
 	// MCP child would POST in production.
 	//   * Discovery — the agent's `submit_finding` tool POSTs to
-	//     `/v1/jobs/{job_id}/findings`; the stub does the same call
+	//     `/v1/jobs/{job_id}/llm-findings`; the stub does the same call
 	//     directly.
 	//   * Verify — the agent's `submit_verdict` (and optional
 	//     `submit_patch`) get buffered by the MCP server and
@@ -253,6 +253,8 @@ async fn run_flow(
 		async move {
 			if req.prompt.contains("independent second opinion") {
 				let job_id = req.job_id.expect("verify sessions must carry a job_id");
+				let job_capability =
+					req.job_capability.expect("verify sessions must carry a job capability");
 				assert!(
 					req.finding_id.is_some(),
 					"verify sessions must carry finding_id (otherwise MCP wouldn't \
@@ -264,6 +266,7 @@ async fn run_flow(
 				server_client
 					.submit_verdict(
 						job_id,
+						&job_capability,
 						&loupe_proto::VerdictSubmission {
 							protocol_version: PROTOCOL_VERSION,
 							verdict,
@@ -274,26 +277,24 @@ async fn run_flow(
 			}
 			// Discovery: simulate the agent calling submit_finding.
 			let job_id = req.job_id.expect("discovery sessions must carry a job_id");
-			let finding = Finding {
-				scanner_id: "llm-code-review".into(),
+			let job_capability =
+				req.job_capability.expect("discovery sessions must carry a job capability");
+			let finding = LlmFindingSubmission {
+				protocol_version: PROTOCOL_VERSION,
 				severity: Severity::High,
-				title: "OOB index".into(),
-				description: "unchecked index".into(),
-				file_path: Some("src/lib.rs".into()),
-				line_start: Some(1),
-				line_end: Some(1),
+				title: "Out-of-bounds index terminates the service".into(),
+				description: "An attacker-controlled index reaches the slice operation without a bounds check and can reliably terminate the service process.".into(),
+				file_path: "src/lib.rs".into(),
+				line_start: 1,
+				line_end: 1,
 				cwe: Some("CWE-129".into()),
-				patch_unified: None,
-				poc_unified: Some(
+				poc_unified:
 					"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n\
 					 +#[test] fn oob() { idx(&[], 0); }\n"
 						.into(),
-				),
-				fingerprint: "test-fp-oob-idx".into(),
+				fingerprint: "e".repeat(64),
 			};
-			let batch =
-				FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] };
-			server_client.submit_findings(job_id, &batch).await?;
+			server_client.submit_llm_finding(job_id, &job_capability, &finding).await?;
 			Ok(String::new())
 		}
 	}));
@@ -348,7 +349,10 @@ async fn confirmed_verdict_dispatches_the_finding() {
 	// GitHub stub captured exactly one issue.
 	let captured = stub.captured.lock().unwrap().clone();
 	assert_eq!(captured.len(), 1);
-	assert_eq!(captured[0]["title"].as_str().unwrap(), "OOB index");
+	assert_eq!(
+		captured[0]["title"].as_str().unwrap(),
+		"Out-of-bounds index terminates the service"
+	);
 
 	server.shutdown().await;
 }

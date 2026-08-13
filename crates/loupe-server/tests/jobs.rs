@@ -12,7 +12,7 @@ use loupe_proto::{
 	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ListFindingsResponse,
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
 	RetryVerifyRequest, RetryVerifyResponse, ScanRequest, ScanResponse, VerdictSubmission,
-	PROTOCOL_VERSION,
+	JOB_CAPABILITY_HEADER, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
@@ -193,9 +193,10 @@ async fn lease_verify_job(worker: &reqwest::Client) -> LeaseEnvelope {
 	}
 }
 
-async fn submit_finding(worker: &reqwest::Client, job_id: i64, finding: Finding) {
+async fn submit_finding(worker: &reqwest::Client, env: &LeaseEnvelope, finding: Finding) {
 	let resp = worker
-		.post(format!("https://loupe-server/v1/jobs/{job_id}/findings"))
+		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] })
 		.send()
 		.await
@@ -203,9 +204,9 @@ async fn submit_finding(worker: &reqwest::Client, job_id: i64, finding: Finding)
 	assert_eq!(resp.status(), 204);
 }
 
-async fn submit_many_findings(worker: &reqwest::Client, job_id: i64, count: usize) {
+async fn submit_many_findings(worker: &reqwest::Client, env: &LeaseEnvelope, count: usize) {
 	for i in 0..count {
-		submit_finding(worker, job_id, finding(&format!("Finding {i:03}"), &format!("fp-{i:03}")))
+		submit_finding(worker, env, finding(&format!("Finding {i:03}"), &format!("fp-{i:03}")))
 			.await;
 	}
 }
@@ -345,7 +346,7 @@ async fn finding_list_limit_can_exceed_default_page() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let env = lease_job(&f.worker).await;
 	assert_eq!(env.job_id, scan.job_id);
-	submit_many_findings(&f.worker, env.job_id, 101).await;
+	submit_many_findings(&f.worker, &env, 101).await;
 
 	let default_resp = f
 		.admin
@@ -410,6 +411,7 @@ async fn end_to_end_scan_lifecycle() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/heartbeat", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
@@ -433,6 +435,7 @@ async fn end_to_end_scan_lifecycle() {
 		let resp = f
 			.worker
 			.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
+			.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 			.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![f1.clone()] })
 			.send()
 			.await
@@ -444,6 +447,7 @@ async fn end_to_end_scan_lifecycle() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -531,6 +535,7 @@ async fn job_info_reports_lease_timing_and_failure_detail() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Failed,
@@ -576,11 +581,11 @@ async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 	let failed_scan = enqueue_scan(&f, f.repo_id).await;
 	let failed_env = lease_job(&f.worker).await;
 	assert_eq!(failed_env.job_id, failed_scan.job_id);
-	submit_finding(&f.worker, failed_env.job_id, finding("Partial scan finding", "fp-retryable"))
-		.await;
+	submit_finding(&f.worker, &failed_env, finding("Partial scan finding", "fp-retryable")).await;
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", failed_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, failed_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Failed,
@@ -606,11 +611,11 @@ async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 	let retried_scan = enqueue_scan(&f, f.repo_id).await;
 	let retried_env = lease_job(&f.worker).await;
 	assert_eq!(retried_env.job_id, retried_scan.job_id);
-	submit_finding(&f.worker, retried_env.job_id, finding("Partial scan finding", "fp-retryable"))
-		.await;
+	submit_finding(&f.worker, &retried_env, finding("Partial scan finding", "fp-retryable")).await;
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", retried_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, retried_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -657,6 +662,7 @@ async fn scan_success_without_head_sha_is_rejected_without_mutating_job() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -713,10 +719,11 @@ async fn verify_success_without_verdict_is_rejected_without_mutating_job() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Needs verdict", "fp-needs-verdict")).await;
+	submit_finding(&f.worker, &scan_env, finding("Needs verdict", "fp-needs-verdict")).await;
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -736,6 +743,7 @@ async fn verify_success_without_verdict_is_rejected_without_mutating_job() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -789,11 +797,11 @@ async fn verify_success_after_verdict_is_still_accepted() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Dismissed verdict", "fp-dismissed-ok"))
-		.await;
+	submit_finding(&f.worker, &scan_env, finding("Dismissed verdict", "fp-dismissed-ok")).await;
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -813,6 +821,7 @@ async fn verify_success_after_verdict_is_still_accepted() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/verdict", verify_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify_env.job_capability.expose_secret())
 		.json(&VerdictSubmission {
 			protocol_version: PROTOCOL_VERSION,
 			verdict: Verdict::Dismissed { notes: Some("false positive".into()) },
@@ -825,6 +834,7 @@ async fn verify_success_after_verdict_is_still_accepted() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -903,8 +913,7 @@ async fn cancel_leased_scan_discards_pending_findings_and_invalidates_worker() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let env = lease_job(&f.worker).await;
 	assert_eq!(env.job_id, scan.job_id);
-	submit_finding(&f.worker, env.job_id, finding("Cancelled scan finding", "fp-cancel-scan"))
-		.await;
+	submit_finding(&f.worker, &env, finding("Cancelled scan finding", "fp-cancel-scan")).await;
 
 	let resp = f
 		.admin
@@ -919,6 +928,7 @@ async fn cancel_leased_scan_discards_pending_findings_and_invalidates_worker() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/heartbeat", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&HeartbeatRequest { protocol_version: PROTOCOL_VERSION })
 		.send()
 		.await
@@ -928,6 +938,7 @@ async fn cancel_leased_scan_discards_pending_findings_and_invalidates_worker() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Failed,
@@ -965,10 +976,11 @@ async fn cancel_verify_job_leaves_target_finding_validating() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Cancel verify", "fp-cancel-verify")).await;
+	submit_finding(&f.worker, &scan_env, finding("Cancel verify", "fp-cancel-verify")).await;
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1021,6 +1033,7 @@ async fn cancel_rejects_terminal_jobs() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1057,11 +1070,12 @@ async fn admin_can_retry_failed_verify_job() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Needs verification", "fp-verify")).await;
+	submit_finding(&f.worker, &scan_env, finding("Needs verification", "fp-verify")).await;
 
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1095,6 +1109,7 @@ async fn admin_can_retry_failed_verify_job() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Failed,
@@ -1158,11 +1173,12 @@ async fn terminal_inconclusive_verdict_dismisses_finding_immediately() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Missing revision", "fp-missing-rev")).await;
+	submit_finding(&f.worker, &scan_env, finding("Missing revision", "fp-missing-rev")).await;
 
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1186,6 +1202,7 @@ async fn terminal_inconclusive_verdict_dismisses_finding_immediately() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/verdict", verify_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify_env.job_capability.expose_secret())
 		.json(&VerdictSubmission {
 			protocol_version: PROTOCOL_VERSION,
 			verdict: Verdict::Inconclusive {
@@ -1231,11 +1248,12 @@ async fn retry_revives_deadline_dismissed_verify_target() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Deadline retry", "fp-deadline")).await;
+	submit_finding(&f.worker, &scan_env, finding("Deadline retry", "fp-deadline")).await;
 
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1256,6 +1274,7 @@ async fn retry_revives_deadline_dismissed_verify_target() {
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Failed,
@@ -1322,18 +1341,15 @@ async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_fin
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
 	assert_eq!(scan_env.job_id, scan.job_id);
-	submit_finding(&f.worker, scan_env.job_id, finding("Failed verify", "fp-failed-verify")).await;
-	submit_finding(&f.worker, scan_env.job_id, finding("Queued verify", "fp-queued-verify")).await;
-	submit_finding(
-		&f.worker,
-		scan_env.job_id,
-		finding("Verifier dismissed", "fp-verifier-dismissed"),
-	)
-	.await;
+	submit_finding(&f.worker, &scan_env, finding("Failed verify", "fp-failed-verify")).await;
+	submit_finding(&f.worker, &scan_env, finding("Queued verify", "fp-queued-verify")).await;
+	submit_finding(&f.worker, &scan_env, finding("Verifier dismissed", "fp-verifier-dismissed"))
+		.await;
 
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1353,6 +1369,7 @@ async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_fin
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", failed_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, failed_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Failed,
@@ -1558,11 +1575,12 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 		("Dismissed finding", "fp-refresh-dismissed"),
 		("Reported finding", "fp-refresh-reported"),
 	] {
-		submit_finding(&f.worker, scan_env.job_id, finding(title, fingerprint)).await;
+		submit_finding(&f.worker, &scan_env, finding(title, fingerprint)).await;
 	}
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan_env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1835,10 +1853,11 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let env = lease_job(&f.worker).await;
 	assert_eq!(env.job_id, scan.job_id);
-	submit_finding(&f.worker, env.job_id, finding("Stranded pending", "fp-stranded")).await;
+	submit_finding(&f.worker, &env, finding("Stranded pending", "fp-stranded")).await;
 	let resp = f
 		.worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -1875,7 +1894,7 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 	let active_scan = enqueue_scan(&f, f.repo_id).await;
 	let active_env = lease_job(&f.worker).await;
 	assert_eq!(active_env.job_id, active_scan.job_id);
-	submit_finding(&f.worker, active_env.job_id, finding("Still scanning", "fp-active")).await;
+	submit_finding(&f.worker, &active_env, finding("Still scanning", "fp-active")).await;
 
 	let active_id: i64 =
 		f.db.with_conn(|c| {
@@ -2012,13 +2031,13 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 	let env_a = lease_job(&f.worker).await;
 	assert_eq!(env_a.job_id, scan_a.job_id);
 	assert_eq!(env_a.repo_id, f.repo_id);
-	submit_finding(&f.worker, env_a.job_id, finding("Alpha overflow", "fp-alpha")).await;
+	submit_finding(&f.worker, &env_a, finding("Alpha overflow", "fp-alpha")).await;
 
 	let scan_b = enqueue_scan(&f, repo_b).await;
 	let env_b = lease_job(&worker2).await;
 	assert_eq!(env_b.job_id, scan_b.job_id);
 	assert_eq!(env_b.repo_id, repo_b);
-	submit_finding(&worker2, env_b.job_id, finding("Beta overflow", "fp-beta")).await;
+	submit_finding(&worker2, &env_b, finding("Beta overflow", "fp-beta")).await;
 
 	let resp = f
 		.worker
@@ -2026,6 +2045,7 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 			"https://loupe-server/v1/repos/{}/findings/search?q=Alpha&limit=10",
 			f.repo_id
 		))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
@@ -2037,6 +2057,7 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 	let resp = f
 		.worker
 		.get(format!("https://loupe-server/v1/findings/{finding_a_id}"))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
@@ -2047,6 +2068,7 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 	let resp = f
 		.worker
 		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=Beta&limit=10"))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
@@ -2054,6 +2076,7 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 
 	let resp = worker2
 		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=Beta&limit=10"))
+		.header(JOB_CAPABILITY_HEADER, env_b.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
@@ -2065,10 +2088,32 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 	let resp = f
 		.worker
 		.get(format!("https://loupe-server/v1/findings/{finding_b_id}"))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
-	assert_eq!(resp.status(), 403, "worker must not fetch another repo's finding body");
+	assert_eq!(
+		resp.status(),
+		404,
+		"a foreign-repo finding must be indistinguishable from a nonexistent one"
+	);
+
+	// The same capability must return an identical 404 for an id that
+	// does not exist, so a leased worker cannot use the status code as
+	// a finding-existence oracle over another repository's ids.
+	let missing_id = finding_a_id.max(finding_b_id) + 10_000;
+	let resp = f
+		.worker
+		.get(format!("https://loupe-server/v1/findings/{missing_id}"))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(
+		resp.status(),
+		404,
+		"a nonexistent finding must return the same status as a foreign-repo one"
+	);
 
 	let resp = f
 		.admin
@@ -2096,6 +2141,7 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 			"https://loupe-server/v1/repos/{}/findings/search?q=Alpha&limit=10",
 			f.repo_id
 		))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
@@ -2104,11 +2150,230 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 	let resp = f
 		.worker
 		.get(format!("https://loupe-server/v1/findings/{finding_a_id}"))
+		.header(JOB_CAPABILITY_HEADER, env_a.job_capability.expose_secret())
 		.send()
 		.await
 		.unwrap();
 	assert_eq!(resp.status(), 403, "expired leases must not authorize finding detail reads");
 
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn job_capabilities_bind_worker_operations_to_one_lease() {
+	const CAPABILITY_HEADER: &str = "X-Loupe-Job-Capability";
+
+	async fn lease_json(worker: &reqwest::Client) -> serde_json::Value {
+		let resp = worker
+			.post("https://loupe-server/v1/jobs/lease")
+			.json(&LeaseRequest {
+				protocol_version: PROTOCOL_VERSION,
+				capabilities: vec!["scan:secrets".into()],
+				wait_seconds: 0,
+			})
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), 200);
+		resp.json().await.unwrap()
+	}
+
+	let f = bring_up_with_repo_and_worker().await;
+	let repo_b =
+		register_repo(&f, "https://github.com/acme/capability-b.git", "capability-b").await;
+	let scan_a = enqueue_scan(&f, f.repo_id).await;
+	let scan_b = enqueue_scan(&f, repo_b).await;
+
+	let lease_a = lease_json(&f.worker).await;
+	let capability_a = lease_a["job_capability"]
+		.as_str()
+		.expect("lease response must issue a job capability")
+		.to_owned();
+	assert_eq!(lease_a["job_id"].as_i64(), Some(scan_a.job_id));
+
+	let lease_b = lease_json(&f.worker).await;
+	let capability_b = lease_b["job_capability"]
+		.as_str()
+		.expect("second lease response must issue a job capability")
+		.to_owned();
+	assert_eq!(lease_b["job_id"].as_i64(), Some(scan_b.job_id));
+	assert_ne!(capability_a, capability_b, "each lease must receive a fresh capability");
+
+	let missing = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/heartbeat", scan_a.job_id))
+		.json(&HeartbeatRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(missing.status(), 403, "mTLS alone must not authorize a leased operation");
+
+	let wrong = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/heartbeat", scan_a.job_id))
+		.header(CAPABILITY_HEADER, &capability_b)
+		.json(&HeartbeatRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(wrong.status(), 403, "another job's capability must be rejected");
+
+	let accepted = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/heartbeat", scan_a.job_id))
+		.header(CAPABILITY_HEADER, &capability_a)
+		.json(&HeartbeatRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(accepted.status(), 200);
+
+	let cross_job_submission = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/findings", scan_a.job_id))
+		.header(CAPABILITY_HEADER, &capability_b)
+		.json(&FindingsBatch {
+			protocol_version: PROTOCOL_VERSION,
+			findings: vec![finding("Cross-job injection", "cross-job-injection")],
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(
+		cross_job_submission.status(),
+		403,
+		"a capability must not submit findings for a different job"
+	);
+
+	let cross_repo = f
+		.worker
+		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=anything&limit=10"))
+		.header(CAPABILITY_HEADER, &capability_a)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(cross_repo.status(), 403, "capability must be bound to its leased repo");
+
+	let own_repo = f
+		.worker
+		.get(format!("https://loupe-server/v1/repos/{repo_b}/findings/search?q=anything&limit=10"))
+		.header(CAPABILITY_HEADER, &capability_b)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(own_repo.status(), 200);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn llm_findings_cannot_bypass_strict_submission_validation() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	let cases = [
+		serde_json::json!({
+			"scanner_id": "llm-code-review",
+			"severity": "low",
+			"title": "test",
+			"description": "test",
+			"file_path": "src/lib.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"cwe": "CWE-922",
+			"poc_unified": "test",
+			"fingerprint": "x"
+		}),
+		serde_json::json!({
+			"scanner_id": "llm-code-review",
+			"severity": "medium",
+			"title": "x",
+			"description": "x",
+			"file_path": "src/lib.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"cwe": "CWE-362",
+			"poc_unified": "x",
+			"fingerprint": "0f8b8e8ffec241b5cda804ae46519428c7b139f77ea0a43cb1833c43486146f3"
+		}),
+		serde_json::json!({
+			"scanner_id": "llm-code-review",
+			"severity": "high",
+			"title": "Reject public standalone JSON-RPC binds without authentication",
+			"description": "test",
+			"file_path": "crates/clementine-tx-sender/src/config.rs",
+			"line_start": 229,
+			"line_end": 232,
+			"cwe": "CWE-306",
+			"poc_unified": "diff --git a/config.rs b/config.rs\n--- a/config.rs\n+++ b/config.rs\n@@ -1,1 +1,2 @@\n line\n+\n",
+			"fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		}),
+	];
+
+	for finding in cases {
+		let resp = f
+			.worker
+			.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
+			.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+			.json(&serde_json::json!({
+				"protocol_version": PROTOCOL_VERSION,
+				"findings": [finding]
+			}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), 400, "LLM findings must use the strict submission endpoint");
+	}
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn strict_llm_endpoint_rejects_placeholders_and_sets_scanner_identity() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	let mut submission = serde_json::json!({
+		"protocol_version": PROTOCOL_VERSION,
+		"severity": "high",
+		"title": "Unchecked index can terminate the service",
+		"description": "An attacker-controlled index reaches the slice operation without any bounds check and can reliably terminate the service process.",
+		"file_path": "src/lib.rs",
+		"line_start": 1,
+		"line_end": 1,
+		"cwe": "CWE-129",
+		"poc_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n old\n+#[test] fn triggers_bug() {}\n",
+		"fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	});
+
+	submission["description"] = serde_json::json!("test");
+	let rejected = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/llm-findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+		.json(&submission)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(rejected.status(), 400);
+
+	submission["description"] = serde_json::json!("An attacker-controlled index reaches the slice operation without any bounds check and can reliably terminate the service process.");
+	let accepted = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/llm-findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+		.json(&submission)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(accepted.status(), 204);
+
+	let scanner_id: String =
+		f.db.with_conn(|conn| {
+			Ok(conn.query_row("SELECT scanner_id FROM findings", [], |row| row.get(0))?)
+		})
+		.unwrap();
+	assert_eq!(scanner_id, "llm-code-review");
 	f.handle.shutdown().await;
 }
 

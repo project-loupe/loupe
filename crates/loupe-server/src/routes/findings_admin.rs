@@ -18,7 +18,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use loupe_core::{FindingState, JobKind, ReportingDestination};
 use loupe_proto::{
@@ -31,6 +31,7 @@ use loupe_storage::{jobs, repos};
 use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
+use crate::job_capability;
 use crate::state::AppState;
 
 /// How many findings the listing endpoint returns by default.
@@ -56,25 +57,17 @@ fn now_secs() -> i64 {
 }
 
 fn authorize_prior_finding_repo(
-	state: &AppState, authed: &AuthedWorker, repo_id: i64,
+	state: &AppState, authed: &AuthedWorker, headers: &HeaderMap, repo_id: i64,
 ) -> Result<(), (StatusCode, String)> {
 	if authed.is_admin() {
 		return Ok(());
 	}
 	let now = now_secs();
-	let allowed = state
-		.db
-		.with_conn(|c| Ok(jobs::worker_has_active_lease_for_repo(c, authed.id(), repo_id, now)?))
-		.map_err(|e| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("checking worker repo lease: {e}"))
-		})?;
-	if allowed {
+	let authorized = job_capability::authorize(state, authed, headers, now)?;
+	if authorized.row.repo_id == repo_id {
 		Ok(())
 	} else {
-		Err((
-			StatusCode::FORBIDDEN,
-			format!("worker does not hold an active lease for repo {repo_id}"),
-		))
+		Err(job_capability::forbidden())
 	}
 }
 
@@ -122,9 +115,9 @@ pub struct SearchQuery {
 /// server-side, so the caller doesn't need to know FTS5 syntax.
 pub async fn search(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>,
-	Path(repo_id): Path<i64>, Query(qp): Query<SearchQuery>,
+	Path(repo_id): Path<i64>, Query(qp): Query<SearchQuery>, headers: HeaderMap,
 ) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
-	authorize_prior_finding_repo(&state, &authed, repo_id)?;
+	authorize_prior_finding_repo(&state, &authed, &headers, repo_id)?;
 	let limit = qp.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
 	let sanitized = findings::sanitize_fts_query(&qp.q);
 	if sanitized.is_empty() {
@@ -147,13 +140,24 @@ pub async fn search(
 
 pub async fn get(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
+	headers: HeaderMap,
 ) -> Result<Json<FindingDetail>, (StatusCode, String)> {
+	let authorized_repo = if authed.is_admin() {
+		None
+	} else {
+		Some(job_capability::authorize(&state, &authed, &headers, now_secs())?.row.repo_id)
+	};
 	let row = state
 		.db
 		.with_conn(|c| Ok(findings::get(c, id)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
 		.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
-	authorize_prior_finding_repo(&state, &authed, row.repo_id)?;
+	if authorized_repo.is_some_and(|repo_id| repo_id != row.repo_id) {
+		// Return the same 404 a nonexistent id yields so a leased
+		// worker cannot use the status code to probe which finding ids
+		// exist in a repository it does not hold a capability for.
+		return Err((StatusCode::NOT_FOUND, format!("no finding with id {id}")));
+	}
 	Ok(Json(row_to_detail(row)))
 }
 

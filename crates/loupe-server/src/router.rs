@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/jobs/lease", post(routes::jobs::lease))
 		.route("/v1/jobs/{id}/heartbeat", post(routes::jobs::heartbeat))
 		.route("/v1/jobs/{id}/findings", post(routes::jobs::submit_findings))
+		.route("/v1/jobs/{id}/llm-findings", post(routes::jobs::submit_llm_finding))
 		.route("/v1/jobs/{id}/verdict", post(routes::jobs::submit_verdict))
 		.route("/v1/jobs/{id}/complete", post(routes::jobs::complete))
 		.route_layer(axum::middleware::from_fn(auth::require_worker));

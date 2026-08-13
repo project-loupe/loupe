@@ -40,7 +40,9 @@ pub struct RepoKey {
 
 impl RepoKey {
 	pub fn new(host: impl Into<String>, owner: impl Into<String>, repo: impl Into<String>) -> Self {
-		Self { host: host.into(), owner: owner.into(), repo: repo.into() }
+		let host = host.into();
+		let host = host.rsplit_once('@').map_or(host.as_str(), |(_, host)| host).to_owned();
+		Self { host, owner: owner.into(), repo: repo.into() }
 	}
 }
 
@@ -581,6 +583,22 @@ mod tests {
 		let cache = RepoCache::new(tmp.path().to_path_buf(), u64::MAX).unwrap();
 		let path = cache.repo_path(&RepoKey::new("github.com", "acme", "widget"));
 		assert_eq!(path, tmp.path().join("github.com").join("acme").join("widget.git"));
+	}
+
+	#[test]
+	fn repo_key_does_not_expose_host_userinfo_credentials() {
+		let tmp = tempfile::tempdir().unwrap();
+		let cache = RepoCache::new(tmp.path().to_path_buf(), u64::MAX).unwrap();
+		let token = "ghp_repo_path_leak_canary";
+		let key = RepoKey::new(format!("x-access-token:{token}@github.com"), "acme", "widget");
+		let path = cache.repo_path(&key);
+
+		assert_eq!(key.host, "github.com", "repo key retained credential-bearing userinfo");
+		assert!(
+			!path.to_string_lossy().contains(token),
+			"cache path leaked credential-bearing host userinfo: {}",
+			path.display(),
+		);
 	}
 
 	#[test]

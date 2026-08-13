@@ -9,8 +9,8 @@
 //!
 //! - [`ClaudeCliBackend`] shells out to Anthropic's `claude` CLI.
 //!   Carries optional MCP context so each invocation can call back
-//!   into `loupe-worker mcp-serve` over stdio JSON-RPC — used by the
-//!   discovery scanner to query prior findings and submit new ones.
+//!   into a credential-free proxy connected to the parent worker's
+//!   host-side MCP broker.
 //! - [`CodexCliBackend`] shells out to OpenAI's `codex` CLI. Carries
 //!   the same optional MCP context via Codex CLI config overrides.
 //!
@@ -32,7 +32,8 @@ use anyhow::Result;
 use clap::ValueEnum;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
-pub use mcp::{McpContext, McpTlsSource};
+use loupe_proto::JobCapability;
+pub use mcp::McpContext;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
@@ -163,10 +164,13 @@ pub struct LlmRequest {
 	pub repo_id: Option<i64>,
 	/// Job id for the scan currently in progress. Required for the
 	/// `submit_finding` MCP tool to POST to
-	/// `/v1/jobs/{job_id}/findings`; without it, that tool is not
+	/// `/v1/jobs/{job_id}/llm-findings`; without it, that tool is not
 	/// advertised. `None` falls back to query-only MCP usage (the
 	/// agent can read prior findings but can't write new ones).
 	pub job_id: Option<i64>,
+	/// Opaque authority for the exact active lease. It remains in the
+	/// trusted host broker and is never passed to the agent process.
+	pub job_capability: Option<JobCapability>,
 	/// Finding id for a verify-kind session. When `Some`, the MCP
 	/// server enters verify mode: `submit_finding` is hidden;
 	/// `submit_verdict`, `submit_patch`, and `validate_patch` are
@@ -207,9 +211,15 @@ pub fn claude_available() -> bool {
 }
 
 /// Return true when the worker has auth material the claude CLI can
-/// use without running an interactive login during a scan.
+/// use non-interactively inside the sandbox.
+///
+/// Only environment credentials count: `ANTHROPIC_API_KEY`, or a
+/// `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Subscription
+/// login state under `~/.claude` is deliberately not mounted, and its
+/// OAuth refresh needs to write — which the read-only sandbox forbids
+/// — so a bare `~/.claude.json` no longer counts as usable auth.
 pub fn claude_auth_available() -> bool {
-	env_present("ANTHROPIC_API_KEY") || home_path(".claude.json").is_some_and(|p| p.exists())
+	env_present("ANTHROPIC_API_KEY") || env_present("CLAUDE_CODE_OAUTH_TOKEN")
 }
 
 /// Probe PATH for `bkb-mcp` (Bitcoin Knowledge Base MCP server).
@@ -262,20 +272,10 @@ pub fn codex_available() -> bool {
 		.unwrap_or(false)
 }
 
-/// Directory codex should read for login-state files when env-based
-/// auth is not used. `CODEX_HOME` mirrors codex's own config-home
-/// override; otherwise we use `~/.codex`.
-pub fn codex_home_dir() -> Option<PathBuf> {
-	if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-		return Some(PathBuf::from(home));
-	}
-	home_path(".codex")
-}
-
 /// Return true when the worker has auth material the codex CLI can use
 /// without running an interactive login during a scan.
 pub fn codex_auth_available() -> bool {
-	codex_api_key_env().is_some() || codex_home_dir().is_some_and(|p| p.join("auth.json").exists())
+	codex_api_key_env().is_some()
 }
 
 pub(crate) fn codex_api_key_env() -> Option<OsString> {
@@ -288,10 +288,6 @@ fn env_present(name: &str) -> bool {
 
 fn env_value(name: &str) -> Option<OsString> {
 	std::env::var_os(name).filter(|v| !v.is_empty())
-}
-
-fn home_path(child: &str) -> Option<PathBuf> {
-	std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(child))
 }
 
 /// Build the scan [`LlmBackend`] according to the configured agent
@@ -430,11 +426,9 @@ fn build_codex_backend(
 #[cfg(test)]
 mod tests {
 	use std::ffi::OsString;
-	use std::sync::Mutex;
 
 	use super::*;
-
-	static ENV_LOCK: Mutex<()> = Mutex::new(());
+	use crate::PROCESS_ENV_LOCK;
 
 	struct EnvGuard {
 		name: &'static str,
@@ -467,7 +461,7 @@ mod tests {
 
 	#[test]
 	fn provider_auth_checks_accept_api_keys() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", "anthropic-key");
 		let _openai = EnvGuard::set("OPENAI_API_KEY", "openai-key");
 		let _codex = EnvGuard::unset("CODEX_API_KEY");
@@ -477,17 +471,37 @@ mod tests {
 	}
 
 	#[test]
+	fn claude_auth_requires_env_token_not_a_stale_config_file() {
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let _anthropic = EnvGuard::unset("ANTHROPIC_API_KEY");
+		let _oauth = EnvGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
+		let home = tempfile::tempdir().unwrap();
+		std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+		let _home = EnvGuard::set("HOME", home.path().as_os_str());
+
+		// A leftover `~/.claude.json` carries no usable credential once
+		// `~/.claude` (with `.credentials.json`) is no longer mounted,
+		// and OAuth refresh cannot write into the read-only sandbox. It
+		// must not make the worker advertise Claude as ready.
+		assert!(
+			!claude_auth_available(),
+			"a stale ~/.claude.json must not masquerade as usable Claude auth"
+		);
+
+		let _token = EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token");
+		assert!(
+			claude_auth_available(),
+			"CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) must satisfy Claude auth"
+		);
+	}
+
+	#[test]
 	fn codex_auth_checks_codex_api_key() {
-		let _guard = ENV_LOCK.lock().unwrap();
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
 		let _openai = EnvGuard::unset("OPENAI_API_KEY");
 		let _codex = EnvGuard::set("CODEX_API_KEY", "codex-key");
-		let dir = tempfile::tempdir().unwrap();
-		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());
 
-		assert!(
-			codex_auth_available(),
-			"CODEX_API_KEY should enable codex auth without OPENAI_API_KEY or auth.json"
-		);
+		assert!(codex_auth_available(), "CODEX_API_KEY should enable codex authentication");
 	}
 
 	#[test]
@@ -503,19 +517,6 @@ mod tests {
 		assert!(summary.contains("proxy refused websocket"), "got: {summary}");
 		assert!(summary.contains(CLI_STREAM_OMISSION), "got: {summary}");
 		assert!(!summary.contains('\n'), "summary must stay single-line: {summary}");
-	}
-
-	#[test]
-	fn codex_auth_checks_codex_home_auth_json() {
-		let _guard = ENV_LOCK.lock().unwrap();
-		let _openai = EnvGuard::unset("OPENAI_API_KEY");
-		let _codex = EnvGuard::unset("CODEX_API_KEY");
-		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
-		let _codex_home = EnvGuard::set("CODEX_HOME", dir.path().as_os_str());
-
-		assert_eq!(codex_home_dir().as_deref(), Some(dir.path()));
-		assert!(codex_auth_available());
 	}
 
 	#[test]

@@ -133,6 +133,8 @@ set -a
 set +a
 
 export ANTHROPIC_API_KEY=...
+# Or use a long-lived headless token from `claude setup-token`:
+# export CLAUDE_CODE_OAUTH_TOKEN=...
 # Optional, enables Codex scan or verifier jobs:
 export CODEX_API_KEY=...
 # Optional, defaults preserve Claude scan + Codex verifier when ready:
@@ -147,28 +149,15 @@ contrib/docker/deploy-worker.sh
 
 The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 `0600`, owned by the container UID `10002`. It contains the worker certificate
-bundle and whichever LLM API keys are set. It also writes
+bundle and whichever LLM credentials are set. It also writes
 `/etc/loupe-container/worker.config.toml` for non-secret worker settings
 (cache, logging, job-agent selection, scanner defaults, BKB API URL, and
 Claude/Codex model/effort), mounts it read-only into the container, and sets
 `LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT` and `LOUPE_VERIFY_AGENT` accept
 `auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
-startup if that CLI is not authenticated. For Codex, prefer `CODEX_API_KEY`;
+startup if that CLI is not authenticated. For Codex, use `CODEX_API_KEY`;
 for compatibility the deploy script also writes `CODEX_API_KEY` from
 `OPENAI_API_KEY` when `CODEX_API_KEY` is absent.
-
-As a temporary alternative to `CODEX_API_KEY`, a worker can use Codex login
-state from an explicit local `auth.json` path:
-
-```bash
-unset CODEX_API_KEY
-unset OPENAI_API_KEY
-export CODEX_AUTH_JSON_PATH="$HOME/.codex/auth.json"
-```
-
-The worker deploy copies that file to
-`/etc/loupe-container/codex/auth.json` on the worker host with mode `0600`
-and mounts it read-only at `/var/lib/loupe-worker/.codex/auth.json`.
 
 ## Secret Handling
 
@@ -178,10 +167,10 @@ protected host-side env file per service so systemd can restart the container
 after a crash or VM reboot without another deploy.
 
 Each secret env file is a single-line `NAME=value` file. TLS PEM material is
-stored in the generated `_B64` env vars; API keys are stored directly. The file
-is bind-mounted read-only into the container at `/run/loupe/secrets.env`, and
-the container entrypoint allowlists and exports those variables before starting
-Loupe.
+stored in the generated `_B64` env vars; API keys and OAuth tokens are stored
+directly. The file is bind-mounted read-only into the container at
+`/run/loupe/secrets.env`, and the container entrypoint allowlists and exports
+those variables before starting Loupe.
 
 The secret file stays outside the container's writable filesystem and survives
 container replacement. Root on the host can inspect it, and root can also

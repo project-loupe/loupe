@@ -15,7 +15,7 @@ use loupe_core::{Finding, Severity};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseRequest, LeaseResponse,
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, PROTOCOL_VERSION,
+	ScanRequest, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::reporters::GithubReporter;
@@ -407,6 +407,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	};
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&FindingsBatch {
 			protocol_version: PROTOCOL_VERSION,
 			findings: vec![confirmed, second_confirmed],
@@ -437,6 +438,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	};
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![validating] })
 		.send()
 		.await
@@ -445,6 +447,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 
 	let resp = worker
 		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,

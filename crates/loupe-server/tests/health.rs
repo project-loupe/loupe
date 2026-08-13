@@ -57,11 +57,15 @@ async fn health_endpoint_returns_protocol_version() {
 	let resp =
 		client.get("https://loupe-server/v1/health").send().await.expect("request to /v1/health");
 	assert!(resp.status().is_success(), "got {}", resp.status());
-	assert_eq!(resp.headers().get("x-loupe-protocol").and_then(|v| v.to_str().ok()), Some("1"));
+	let expected_protocol = PROTOCOL_VERSION.to_string();
+	assert_eq!(
+		resp.headers().get("x-loupe-protocol").and_then(|v| v.to_str().ok()),
+		Some(expected_protocol.as_str())
+	);
 
 	let body: serde_json::Value = resp.json().await.unwrap();
 	assert_eq!(body["status"], "ok");
-	assert_eq!(body["protocol_version"], 1);
+	assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
 
 	handle.shutdown().await;
 }
@@ -76,9 +80,10 @@ async fn server_rejects_unsupported_protocol_header() {
 		.await
 		.expect("request to /v1/health");
 	assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+	let expected_protocol = PROTOCOL_VERSION.to_string();
 	assert_eq!(
 		resp.headers().get(PROTOCOL_VERSION_HEADER).and_then(|v| v.to_str().ok()),
-		Some("1")
+		Some(expected_protocol.as_str())
 	);
 	let body = resp.text().await.unwrap();
 	assert!(body.contains("unsupported"), "got: {body}");
