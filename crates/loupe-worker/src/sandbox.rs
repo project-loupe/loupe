@@ -3,13 +3,15 @@
 //! Every scanner runs inside `bwrap` so a malicious or buggy invocation
 //! can't poison follow-up jobs. Each invocation gets a fresh `/tmp`,
 //! its own `$HOME`, and the worktree mounted read-only at `/workdir`.
+//! `/etc` starts empty and receives only public runtime files required
+//! for dynamic linking, identity lookup, name resolution, and TLS trust.
 //! Network is unshared by default; LLM backends opt in via
 //! [`SandboxBuilder::allow_network`].
 //!
 //! The worker fails closed when `LOUPE_DISABLE_SANDBOX` is enabled.
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -17,6 +19,29 @@ use tokio::process::Command;
 
 /// Path to the bwrap binary. Resolved once and cached.
 const BWRAP_BIN: &str = "bwrap";
+
+/// Public host data needed by dynamically linked agent CLIs and libc
+/// identity lookups. Keep this list to individual files: mounting the
+/// containing `/etc` tree would expose Loupe credentials and arbitrary
+/// service configuration to repository-controlled processes.
+const SANDBOX_SYSTEM_FILES: &[&str] =
+	&["/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf"];
+
+/// Name-resolution inputs needed only by network-enabled agent CLIs.
+const SANDBOX_NETWORK_FILES: &[&str] = &["/etc/hosts", "/etc/resolv.conf"];
+
+/// Public CA locations used by the major Linux distribution families.
+/// These deliberately name certificate-only paths rather than broader
+/// parents such as `/etc/ssl` or `/etc/pki`, which may contain private
+/// keys.
+const SANDBOX_CA_PATHS: &[&str] = &[
+	"/etc/ssl/certs",
+	"/etc/ssl/cert.pem",
+	"/etc/ca-certificates/extracted",
+	"/etc/pki/ca-trust/extracted",
+	"/etc/pki/tls/certs",
+	"/etc/pki/tls/cert.pem",
+];
 
 /// Legacy environment variable. Enabling it is rejected because the
 /// repository-controlled agent must never run with the worker's host
@@ -135,10 +160,10 @@ impl SandboxBuilder {
 
 	/// Locate `name` on the host PATH and bind-mount the install tree
 	/// into the sandbox so the wrapped subprocess can `exec` it. The
-	/// default sandbox only mounts `/usr`, `/etc`, `/lib`, `/lib64`,
-	/// `/bin`, `/sbin` — anything installed in `~/.local/bin` (per-
-	/// user installs, npm-global with non-root prefix, etc.) is
-	/// invisible to the wrapped subprocess unless this method is
+	/// default sandbox only mounts system binaries, libraries, and a
+	/// minimal allowlist of public `/etc` inputs. Anything installed in
+	/// `~/.local/bin` (per-user installs, npm-global with non-root prefix,
+	/// etc.) is invisible to the wrapped subprocess unless this method is
 	/// called.
 	///
 	/// Resolves the entry point on PATH, follows the symlink chain
@@ -210,21 +235,16 @@ impl SandboxBuilder {
 		}
 		cmd.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts"]);
 
-		// Read-only system directories. /lib and /lib64 are platform-
-		// dependent: glibc systems have /lib64, musl typically does not.
-		// We bind whichever exists.
-		for ro in ["/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"] {
+		// Read-only system binaries and libraries. /lib and /lib64 are
+		// platform-dependent, so bind whichever exists. Never bind all
+		// of /etc: supported deployments store the worker identity there.
+		for ro in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
 			if Path::new(ro).exists() {
 				cmd.args(["--ro-bind-try", ro, ro]);
 			}
 		}
 
-		// On systemd-resolved hosts, /etc/resolv.conf often points
-		// outside /etc. Keep the /etc symlink usable without exposing
-		// the whole resolver runtime directory.
-		if self.allow_network {
-			add_resolver_binds(&mut cmd);
-		}
+		add_minimal_system_binds(&mut cmd, self.allow_network);
 
 		cmd.args(["--proc", "/proc", "--dev", "/dev"]);
 
@@ -298,48 +318,28 @@ fn sandbox_path() -> String {
 		.unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into())
 }
 
-fn add_resolver_binds(cmd: &mut Command) {
-	let resolv_conf = Path::new("/etc/resolv.conf");
-	let Ok(link_target) = std::fs::read_link(resolv_conf) else {
-		return;
-	};
-	let Ok(real) = std::fs::canonicalize(resolv_conf) else {
-		return;
-	};
-
-	for dst in resolver_bind_destinations(resolv_conf, &link_target, &real) {
-		cmd.arg("--ro-bind-try").arg(&real).arg(dst);
+fn add_minimal_system_binds(cmd: &mut Command, allow_network: bool) {
+	// Bubblewrap creates parents for nested bind destinations, but the
+	// top-level directory must exist first.
+	cmd.args(["--dir", "/etc"]);
+	for path in SANDBOX_SYSTEM_FILES {
+		add_canonical_ro_bind(cmd, path);
 	}
-}
-
-fn resolver_bind_destinations(symlink: &Path, link_target: &Path, real: &Path) -> Vec<PathBuf> {
-	let visible = normalize_path(&if link_target.is_absolute() {
-		link_target.to_path_buf()
-	} else {
-		symlink.parent().unwrap_or_else(|| Path::new("/")).join(link_target)
-	});
-
-	let mut destinations = vec![visible.clone()];
-	if visible != real {
-		destinations.push(real.to_path_buf());
-	}
-	destinations
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-	let mut out = PathBuf::new();
-	for component in path.components() {
-		match component {
-			Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-			Component::RootDir => out.push(Path::new("/")),
-			Component::CurDir => {},
-			Component::ParentDir => {
-				out.pop();
-			},
-			Component::Normal(part) => out.push(part),
+	if allow_network {
+		for path in SANDBOX_NETWORK_FILES.iter().chain(SANDBOX_CA_PATHS) {
+			add_canonical_ro_bind(cmd, path);
 		}
 	}
-	out
+}
+
+fn add_canonical_ro_bind(cmd: &mut Command, destination: &str) {
+	let Ok(source) = std::fs::canonicalize(destination) else {
+		return;
+	};
+	// Resolve symlinks on the trusted side, then mount only the resolved
+	// file or directory at its conventional sandbox path. This keeps a
+	// systemd-resolved target usable without exposing its /run parent.
+	cmd.arg("--ro-bind").arg(source).arg(destination);
 }
 
 /// If `path` lives inside a `node_modules/` tree, return the outer
@@ -434,34 +434,6 @@ mod tests {
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
-	}
-
-	#[test]
-	fn resolver_bind_destinations_preserve_symlink_visible_alias() {
-		let destinations = resolver_bind_destinations(
-			Path::new("/etc/resolv.conf"),
-			Path::new("/var/run/systemd/resolve/stub-resolv.conf"),
-			Path::new("/run/systemd/resolve/stub-resolv.conf"),
-		);
-
-		assert_eq!(
-			destinations,
-			vec![
-				PathBuf::from("/var/run/systemd/resolve/stub-resolv.conf"),
-				PathBuf::from("/run/systemd/resolve/stub-resolv.conf"),
-			],
-		);
-	}
-
-	#[test]
-	fn resolver_bind_destinations_resolve_relative_symlink_target() {
-		let destinations = resolver_bind_destinations(
-			Path::new("/etc/resolv.conf"),
-			Path::new("../run/systemd/resolve/stub-resolv.conf"),
-			Path::new("/run/systemd/resolve/stub-resolv.conf"),
-		);
-
-		assert_eq!(destinations, vec![PathBuf::from("/run/systemd/resolve/stub-resolv.conf")],);
 	}
 
 	#[test]
@@ -706,6 +678,91 @@ mod tests {
 			args.windows(2).any(|pair| pair == ["--chdir", "/home/scanner"]),
 			"agent must not auto-load instructions from the repository root: {args:?}",
 		);
+	}
+
+	#[test]
+	fn sandbox_does_not_bind_the_host_etc_tree() {
+		let _guard = PROCESS_ENV_LOCK.blocking_lock();
+		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let args: Vec<String> =
+			cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+
+		assert!(
+			!args.windows(3).any(|window| {
+				matches!(window[0].as_str(), "--ro-bind" | "--ro-bind-try")
+					&& window[1..] == ["/etc", "/etc"]
+			}),
+			"the sandbox must expose individual public system files, not the host /etc tree: {args:?}",
+		);
+	}
+
+	#[tokio::test]
+	async fn sandbox_hides_non_allowlisted_etc_files() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
+		if !bwrap_present() || !Path::new("/etc/machine-id").exists() {
+			eprintln!("skipping: bwrap or /etc/machine-id missing");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		let out = SandboxBuilder::new(workdir.path())
+			.build("/bin/sh")
+			.arg("-c")
+			.arg("test ! -e /etc/machine-id")
+			.output()
+			.await
+			.expect("sandbox command should run");
+
+		assert!(
+			out.status.success(),
+			"a non-allowlisted host /etc file remained visible inside the sandbox",
+		);
+	}
+
+	#[tokio::test]
+	async fn minimal_system_files_support_agent_runtime_lookups() {
+		let _guard = PROCESS_ENV_LOCK.lock().await;
+		if !bwrap_present() {
+			eprintln!("skipping: bwrap missing");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		let mut checks = "getent passwd \"$(id -u)\" >/dev/null\n\
+			getent hosts localhost >/dev/null\n"
+			.to_owned();
+		if let Some(ca_path) = SANDBOX_CA_PATHS.iter().find(|path| Path::new(path).exists()) {
+			checks.push_str(&format!("test -r {ca_path}\n"));
+		}
+		let out = SandboxBuilder::new(workdir.path())
+			.allow_network()
+			.build("/bin/sh")
+			.arg("-c")
+			.arg(checks)
+			.output()
+			.await
+			.expect("sandbox command should run");
+
+		assert!(
+			out.status.success(),
+			"minimal system inputs broke identity, name, or CA lookup: {}",
+			String::from_utf8_lossy(&out.stderr),
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn system_file_bind_resolves_symlink_without_its_parent() {
+		use std::os::unix::fs::symlink;
+
+		let scratch = tempfile::tempdir().unwrap();
+		let target = scratch.path().join("target");
+		let link = scratch.path().join("link");
+		std::fs::write(&target, "resolver data").unwrap();
+		symlink(&target, &link).unwrap();
+		let mut cmd = Command::new(BWRAP_BIN);
+		add_canonical_ro_bind(&mut cmd, link.to_str().unwrap());
+		let args: Vec<PathBuf> = cmd.as_std().get_args().map(PathBuf::from).collect();
+
+		assert_eq!(args, [PathBuf::from("--ro-bind"), target, link]);
 	}
 
 	#[tokio::test]

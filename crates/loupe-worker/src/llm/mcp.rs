@@ -268,7 +268,7 @@ mod tests {
 	}
 
 	#[test]
-	fn agent_sandbox_receives_no_loupe_credentials() {
+	fn mcp_bind_adds_no_loupe_credentials() {
 		let dir = tempfile::tempdir().unwrap();
 		let broker = McpBroker { dir, task: None, shutdown: CancellationToken::new() };
 		let ctx = test_context();

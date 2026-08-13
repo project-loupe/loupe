@@ -200,9 +200,9 @@ impl LlmBackend for ClaudeCliBackend {
 		let mut sandbox = sandbox_builder
 			.allow_network()
 			// Make the `claude` install reachable — by default the
-			// sandbox only mounts /usr, /etc, /lib*, /bin, /sbin, so
-			// per-user installs at ~/.local/bin/... are invisible
-			// without this.
+			// sandbox only mounts system binaries, libraries, and public
+			// runtime files, so per-user installs at ~/.local/bin/... are
+			// invisible without this.
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
 			// Forward the environment credential the CLI uses

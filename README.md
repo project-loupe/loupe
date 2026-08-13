@@ -285,6 +285,10 @@ is used for each job kind:
 
 The worker also probes for `bwrap` at startup and exits 1 if it is
 missing. Sandboxing cannot be bypassed for an LLM-enabled worker.
+The sandbox exposes only an allowlist of public runtime files from
+`/etc`; the worker configuration and TLS files under `/etc/loupe` stay
+outside the agent namespace.
+
 Cache size defaults to 40 GB and evicts LRU clones above the cap.
 
 Verifier jobs only get queued when a repo resolves to

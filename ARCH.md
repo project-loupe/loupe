@@ -346,6 +346,12 @@ call it makes is mediated by the broker, which pins the request to one
 repository and one live lease through the job capability issued with
 that lease.
 
+The sandbox does not inherit the host `/etc` tree. It receives only the
+public loader, account lookup, resolver, and CA-certificate inputs needed
+by the agent runtime; Loupe configuration and worker TLS material remain
+outside the namespace even when a bare-metal deployment stores them under
+`/etc/loupe`.
+
 All secrets at rest in the SQLite DB (PATs, finding bodies, repo
 metadata) are sealed by SQLCipher under the operator's master key —
 the same key the server gets at startup via `LOUPE_MASTER_KEY` (or a
