@@ -25,6 +25,13 @@ max_gb = 40
 max_workdir_gb = 5
 disable_sandbox = false
 
+[sandbox]
+# "public" allows public IPv4 while blocking host, private, and special
+# networks. "allowlist" permits only the active agent API, enabled BKB
+# endpoint, and the additional hostnames/IPv4 addresses listed here.
+network = "public"
+allowlist = []
+
 [logging]
 level = "info"
 json = false

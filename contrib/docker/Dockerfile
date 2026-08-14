@@ -51,7 +51,9 @@ ENV NPM_CONFIG_AUDIT=false \
 	NPM_CONFIG_FUND=false \
 	NPM_CONFIG_UPDATE_NOTIFIER=false
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends bubblewrap ca-certificates git tini \
+	&& apt-get install -y --no-install-recommends \
+		bubblewrap ca-certificates git iproute2 nftables slirp4netns tini util-linux \
+	&& nsenter --help | grep -q -- --user-parent \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& if [ "$INSTALL_CLAUDE" = "1" ]; then npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; fi \
 	&& if [ "$INSTALL_CODEX" = "1" ]; then npm install -g "@openai/codex@${CODEX_VERSION}"; fi \

@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod repo_cache;
 pub mod runner;
 pub mod sandbox;
+mod sandbox_network;
 pub mod scanner;
 pub mod scanners;
 pub(crate) mod source_discovery;

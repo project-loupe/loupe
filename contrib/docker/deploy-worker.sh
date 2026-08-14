@@ -104,6 +104,25 @@ toml_string() {
 	printf '"%s"' "$(toml_escape "$1")"
 }
 
+toml_csv_array() {
+	local csv="$1"
+	local first=1
+	local value
+	local values=()
+	printf '['
+	if [ -n "$csv" ]; then
+		IFS=',' read -r -a values <<<"$csv"
+		for value in "${values[@]}"; do
+			if [ "$first" -eq 0 ]; then
+				printf ', '
+			fi
+			toml_string "$value"
+			first=0
+		done
+	fi
+	printf ']'
+}
+
 bool_value() {
 	local value="${1:-}"
 	case "${value,,}" in
@@ -148,6 +167,10 @@ build_worker_config_file() {
 		printf '[runtime]\n'
 		printf 'max_workdir_gb = %s\n' "${LOUPE_MAX_WORKDIR_GB:-5}"
 		printf 'disable_sandbox = %s\n\n' "$(bool_value "${LOUPE_DISABLE_SANDBOX:-}")"
+
+		printf '[sandbox]\n'
+		printf 'network = %s\n' "$(toml_string "${LOUPE_SANDBOX_NETWORK:-public}")"
+		printf 'allowlist = %s\n\n' "$(toml_csv_array "${LOUPE_SANDBOX_ALLOWLIST:-}")"
 
 		printf '[logging]\n'
 		printf 'level = %s\n' "$(toml_string "${LOUPE_LOG_LEVEL:-info}")"

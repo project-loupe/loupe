@@ -7,7 +7,13 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates podman
+apt-get install -y --no-install-recommends ca-certificates kmod podman
+
+install -d -m 0755 /etc/modules-load.d
+printf 'tun\nnf_tables\nnf_conntrack\n' >/etc/modules-load.d/loupe-worker.conf
+for module in tun nf_tables nf_conntrack; do
+	modprobe "$module" 2>/dev/null || true
+done
 
 install -d -m 0755 /etc/loupe-container /usr/local/lib/loupe-container
 install -d -o 10001 -g 10001 -m 0700 /var/lib/loupe-container/server

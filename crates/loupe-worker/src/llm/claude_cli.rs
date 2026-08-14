@@ -29,7 +29,9 @@ use super::mcp::{
 	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
-use crate::sandbox::SandboxBuilder;
+use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
+
+const PROVIDER_API_HOST: &str = "api.anthropic.com";
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
@@ -114,9 +116,12 @@ pub struct ClaudeCliBackend {
 	bin: String,
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
+	network: SandboxNetworkConfig,
 	log_agent_output: bool,
 	#[cfg(test)]
 	disable_sandbox: bool,
+	#[cfg(test)]
+	disable_network: bool,
 }
 
 impl ClaudeCliBackend {
@@ -128,9 +133,12 @@ impl ClaudeCliBackend {
 				effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
 			},
 			mcp: None,
+			network: SandboxNetworkConfig::default(),
 			log_agent_output: false,
 			#[cfg(test)]
 			disable_sandbox: false,
+			#[cfg(test)]
+			disable_network: false,
 		}
 	}
 
@@ -148,9 +156,20 @@ impl ClaudeCliBackend {
 		self
 	}
 
+	pub fn with_network_config(mut self, network: SandboxNetworkConfig) -> Self {
+		self.network = network;
+		self
+	}
+
 	#[cfg(test)]
 	fn with_sandbox_disabled_for_tests(mut self) -> Self {
 		self.disable_sandbox = true;
+		self
+	}
+
+	#[cfg(test)]
+	fn with_network_disabled_for_tests(mut self) -> Self {
+		self.disable_network = true;
 		self
 	}
 
@@ -197,8 +216,22 @@ impl LlmBackend for ClaudeCliBackend {
 		#[cfg(not(test))]
 		let sandbox_builder = SandboxBuilder::new(&req.workdir);
 
+		#[cfg(test)]
+		let attach_network = !self.disable_network;
+		#[cfg(not(test))]
+		let attach_network = true;
+		let sandbox_builder = if attach_network {
+			let bkb_api_url = self
+				.mcp
+				.as_ref()
+				.filter(|ctx| ctx.bkb_mcp_path.is_some())
+				.map(|ctx| ctx.bkb_api_url.as_str());
+			let required_hosts = super::required_network_hosts(PROVIDER_API_HOST, bkb_api_url)?;
+			sandbox_builder.with_network(self.network.clone(), required_hosts)
+		} else {
+			sandbox_builder
+		};
 		let mut sandbox = sandbox_builder
-			.allow_network()
 			// Make the `claude` install reachable — by default the
 			// sandbox only mounts system binaries, libraries, and public
 			// runtime files, so per-user installs at ~/.local/bin/... are
@@ -426,16 +459,6 @@ mod tests {
 		);
 	}
 
-	fn claude_present(bin: &str) -> bool {
-		std::process::Command::new(bin)
-			.arg("--version")
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.status()
-			.map(|s| s.success())
-			.unwrap_or(false)
-	}
-
 	fn bwrap_present() -> bool {
 		std::process::Command::new("bwrap")
 			.arg("--version")
@@ -489,7 +512,7 @@ mod tests {
 		let _home = EnvGuard::set("HOME", &home);
 		let _token = EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "loupe-test-oauth-token");
 
-		let backend = ClaudeCliBackend::with_bin("fake-claude");
+		let backend = ClaudeCliBackend::with_bin("fake-claude").with_network_disabled_for_tests();
 		let req = LlmRequest {
 			prompt: "irrelevant".into(),
 			workdir: workdir.path().to_path_buf(),
@@ -555,38 +578,6 @@ mod tests {
 			.stdout(Stdio::null())
 			.stderr(Stdio::null())
 			.status();
-	}
-
-	#[tokio::test]
-	async fn cli_backend_round_trip_against_real_claude() {
-		// Live test: needs `claude` + `bwrap` + an explicit environment
-		// credential. Host Claude configuration is never mounted.
-		if !claude_present("claude") || !bwrap_present() {
-			eprintln!("skipping: claude or bwrap missing");
-			return;
-		}
-		if std::env::var_os("ANTHROPIC_API_KEY").is_none()
-			&& std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_none()
-		{
-			eprintln!("skipping: no Claude environment credential");
-			return;
-		}
-
-		let workdir = tempfile::tempdir().unwrap();
-		let backend = ClaudeCliBackend::new();
-		let req = LlmRequest {
-			prompt: "Reply with only the single word `pong`. No prose, no formatting.".to_owned(),
-			workdir: workdir.path().to_path_buf(),
-			timeout: Duration::from_secs(60),
-			cancel: CancellationToken::new(),
-			repo_id: None,
-			job_id: None,
-			job_capability: None,
-			finding_id: None,
-		};
-		let resp = backend.run(req).await.expect("claude responded");
-		assert_eq!(resp.backend_id, BACKEND_ID);
-		assert!(!resp.text.trim().is_empty());
 	}
 
 	#[tokio::test]

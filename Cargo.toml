@@ -56,6 +56,7 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "rin
 rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
 rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "pipe", "process"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }

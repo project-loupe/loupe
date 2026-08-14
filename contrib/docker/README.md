@@ -16,13 +16,20 @@ Fresh Debian service and worker hosts need:
 - SSH access
 - non-interactive sudo permission for deploy commands, or an interactive root shell
 
+Worker hosts additionally need a Linux kernel with user/network namespaces,
+TUN, nftables, and conntrack support. `/dev/net/tun` must be a
+character device before the worker container starts. The bootstrap installs
+`kmod`, persists `tun`, `nf_tables`, and `nf_conntrack` module requests, and
+attempts to load them immediately.
+
 The deploy helpers run unattended over SSH, so routine deploys need passwordless
 sudo for the required `podman`, `install`, and `systemctl` commands. For the
 one-time bootstrap, password-prompting sudo is fine, but upload the script first
 so sudo can read the password from a TTY instead of from the script's stdin.
 
 The worker host does not need host Rust, Cargo, Node, npm, Git, `bubblewrap`,
-Claude Code, Codex, or `bkb-mcp`. Those are installed in the worker image.
+`slirp4netns`, `nft`, `ip`, `nsenter`, Claude Code, Codex, or `bkb-mcp`.
+Those are installed in the worker image.
 
 Optional bootstrap:
 
@@ -38,8 +45,8 @@ ssh deploy@worker rm -f /tmp/loupe-bootstrap.sh
 
 The worker unit runs rootful Podman with `--privileged` so the non-root worker
 process inside the container can run nested `bubblewrap`. The worker still
-smoke-tests `bubblewrap` at startup and refuses to lease jobs if the sandbox
-cannot run.
+smoke-tests Bubblewrap, slirp4netns, nftables, namespace entry, and TUN at
+startup and refuses to lease jobs if the sandbox cannot run.
 
 ## Build Images
 
@@ -140,6 +147,10 @@ export CODEX_API_KEY=...
 # Optional, defaults preserve Claude scan + Codex verifier when ready:
 export LOUPE_SCAN_AGENT=auto
 export LOUPE_VERIFY_AGENT=auto
+export LOUPE_SANDBOX_NETWORK=public
+# For provider/BKB plus selected destinations instead:
+# export LOUPE_SANDBOX_NETWORK=allowlist
+# export LOUPE_SANDBOX_ALLOWLIST=github.com,203.0.113.10
 export LOUPE_SERVER_URL=https://loupe.example.com:8443
 
 LOUPE_WORKER_SSH=deploy@worker \
@@ -151,8 +162,8 @@ The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 `0600`, owned by the container UID `10002`. It contains the worker certificate
 bundle and whichever LLM credentials are set. It also writes
 `/etc/loupe-container/worker.config.toml` for non-secret worker settings
-(cache, logging, job-agent selection, scanner defaults, BKB API URL, and
-Claude/Codex model/effort), mounts it read-only into the container, and sets
+(cache, sandbox networking, logging, job-agent selection, scanner defaults,
+BKB API URL, and Claude/Codex model/effort), mounts it read-only into the container, and sets
 `LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT` and `LOUPE_VERIFY_AGENT` accept
 `auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
 startup if that CLI is not authenticated. For Codex, use `CODEX_API_KEY`;
@@ -187,6 +198,7 @@ ssh deploy@worker systemctl status loupe-worker-container.service
 
 ssh deploy@server sudo ls -l /etc/loupe-container/server.secrets.env
 ssh deploy@worker sudo ls -l /etc/loupe-container/worker.secrets.env
+ssh deploy@worker test -c /dev/net/tun
 
 ssh deploy@server sudo systemctl restart loupe-server-container.service
 ssh deploy@worker sudo systemctl restart loupe-worker-container.service

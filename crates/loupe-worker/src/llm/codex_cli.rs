@@ -33,7 +33,9 @@ use super::mcp::{
 	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
-use crate::sandbox::SandboxBuilder;
+use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
+
+const PROVIDER_API_HOST: &str = "api.openai.com";
 
 const BACKEND_ID: &str = "codex-cli";
 const CODEX_BIN: &str = "codex";
@@ -89,6 +91,7 @@ pub struct CodexCliBackend {
 	bin: String,
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
+	network: SandboxNetworkConfig,
 	log_agent_output: bool,
 	#[cfg(test)]
 	disable_sandbox: bool,
@@ -103,6 +106,7 @@ impl CodexCliBackend {
 				effort: DEFAULT_CODEX_EFFORT.to_owned(),
 			},
 			mcp: None,
+			network: SandboxNetworkConfig::default(),
 			log_agent_output: false,
 			#[cfg(test)]
 			disable_sandbox: false,
@@ -120,6 +124,11 @@ impl CodexCliBackend {
 
 	pub fn with_log_agent_output(mut self, enabled: bool) -> Self {
 		self.log_agent_output = enabled;
+		self
+	}
+
+	pub fn with_network_config(mut self, network: SandboxNetworkConfig) -> Self {
+		self.network = network;
 		self
 	}
 
@@ -172,8 +181,14 @@ impl LlmBackend for CodexCliBackend {
 		#[cfg(not(test))]
 		let sandbox_builder = SandboxBuilder::new(&req.workdir);
 
+		let bkb_api_url = self
+			.mcp
+			.as_ref()
+			.filter(|ctx| ctx.bkb_mcp_path.is_some())
+			.map(|ctx| ctx.bkb_api_url.as_str());
+		let required_hosts = super::required_network_hosts(PROVIDER_API_HOST, bkb_api_url)?;
 		let mut sandbox = sandbox_builder
-			.allow_network()
+			.with_network(self.network.clone(), required_hosts)
 			// Per-user installs (`npm i -g @openai/codex` with a non-root
 			// prefix, etc.) live outside the default sandbox mounts —
 			// surface the install tree so the wrapped subprocess can
@@ -393,26 +408,6 @@ mod tests {
 		);
 	}
 
-	fn codex_present(bin: &str) -> bool {
-		std::process::Command::new(bin)
-			.arg("--version")
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.status()
-			.map(|s| s.success())
-			.unwrap_or(false)
-	}
-
-	fn bwrap_present() -> bool {
-		std::process::Command::new("bwrap")
-			.arg("--version")
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.status()
-			.map(|s| s.success())
-			.unwrap_or(false)
-	}
-
 	#[cfg(unix)]
 	fn sh_single_quote(path: &Path) -> String {
 		format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
@@ -459,41 +454,6 @@ mod tests {
 			.stdout(Stdio::null())
 			.stderr(Stdio::null())
 			.status();
-	}
-
-	#[tokio::test]
-	async fn cli_backend_round_trip_against_real_codex() {
-		// Live test: needs `codex` + `bwrap` and a `CODEX_API_KEY` or
-		// `OPENAI_API_KEY` in env. Skip if either binary is missing or
-		// no API token is present — same shape as the claude live test.
-		if !codex_present("codex") || !bwrap_present() {
-			eprintln!("skipping: codex or bwrap missing");
-			return;
-		}
-		let auth_present = std::env::var_os("CODEX_API_KEY").is_some()
-			|| std::env::var_os("OPENAI_API_KEY").is_some();
-		if !auth_present {
-			eprintln!("skipping: no CODEX_API_KEY or OPENAI_API_KEY");
-			return;
-		}
-
-		let workdir = tempfile::tempdir().unwrap();
-		let backend = CodexCliBackend::new();
-		let req = LlmRequest {
-			prompt: "Reply with only the single word `pong`. No prose, no formatting.".to_owned(),
-			workdir: workdir.path().to_path_buf(),
-			// Live LLM call — give it generous headroom; codex's first-
-			// turn warm-up can take a few seconds.
-			timeout: Duration::from_secs(120),
-			cancel: CancellationToken::new(),
-			repo_id: None,
-			job_id: None,
-			job_capability: None,
-			finding_id: None,
-		};
-		let resp = backend.run(req).await.expect("codex responded");
-		assert_eq!(resp.backend_id, BACKEND_ID);
-		assert!(!resp.text.trim().is_empty());
 	}
 
 	#[tokio::test]

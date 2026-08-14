@@ -39,13 +39,15 @@ Before installing, the host needs:
   `fmt` on nightly and `clippy`/`test` on stable.
 - **`git`** on PATH. `loupe-worker` shells out to `git` for repo
   cloning into the local cache.
-- **`bubblewrap`** (`bwrap`) on PATH on every machine running
+- **Sandbox networking tools** on PATH on every machine running
   `loupe-worker` *with the LLM scanner enabled*. The worker
-  hard-fatals at startup if the LLM scanner is on but `bwrap` is
-  missing or if `LOUPE_DISABLE_SANDBOX=1` is set. Debian/Ubuntu:
-  `sudo apt-get install bubblewrap`. Fedora/RHEL: `sudo dnf install
-  bubblewrap`. macOS does not have a port; LLM scanning runs on Linux
-  workers only.
+  needs `bubblewrap`, `slirp4netns`, `nft`, `ip`, and an `nsenter`
+  with `--user-parent`; it hard-fatals at startup if any are
+  missing or if `LOUPE_DISABLE_SANDBOX=1` is set. Debian Trixie:
+  `sudo apt-get install bubblewrap slirp4netns nftables iproute2
+  util-linux`. Other distributions need util-linux 2.41 or newer.
+  The host kernel must expose `/dev/net/tun`. macOS does not have
+  Bubblewrap; LLM scanning runs on Linux workers only.
 - **`claude` CLI** on PATH on every machine running `loupe-worker`
   that uses Claude for scan or verify jobs. The default scan agent is
   Claude when it is authenticated. Claude invocations run inside
@@ -248,10 +250,29 @@ loupe-worker run --config /etc/loupe/worker.config.toml
 ```
 
 The worker config owns non-secret runtime settings: server URL, TLS
-file paths, cache settings, logging, LLM job-agent selection,
-Claude/Codex model + effort, scanner defaults, and BKB API URL. CLI
-flags and matching env vars override the config. API keys and PEM
-contents still belong in env or secret files.
+file paths, cache settings, sandbox networking, logging, LLM job-agent
+selection, Claude/Codex model + effort, scanner defaults, and BKB API
+URL. CLI flags and matching env vars override the config. API keys and
+PEM contents still belong in env or secret files.
+
+Every agent invocation receives a private network namespace. The
+default `[sandbox].network = "public"` policy allows public IPv4 while
+blocking host addresses, connected routes, private/special ranges,
+CGNAT, and IPv6. Set it to `"allowlist"` for default-deny egress;
+`[sandbox].allowlist` then adds hostnames or IPv4 addresses. The active
+agent API (`api.anthropic.com` or `api.openai.com`) is always allowed,
+as is the host from `[bkb].api_url` when `bkb-mcp` is attached, so an
+empty allowlist means provider/BKB-only access. Overrides are
+`--sandbox-network` / `LOUPE_SANDBOX_NETWORK` and
+`--sandbox-allowlist` / `LOUPE_SANDBOX_ALLOWLIST`; the environment
+allowlist is comma-separated.
+
+Hostnames are resolved to IPv4 before each sandbox starts and remain
+fixed for that invocation. Filtering is by destination IP, so it
+cannot distinguish virtual hosts sharing an address. DNS through
+slirp's resolver remains available, operator allowlists may explicitly
+name private IPv4 destinations, and IPv6 allowlist entries are not
+supported.
 
 The worker auto-detects authenticated `claude` and `codex` CLIs at
 startup. `[agents].scan` and `[agents].verify` choose which LLM agent
@@ -283,8 +304,9 @@ is used for each job kind:
 > token usage. Run a small test repository or narrow scanner
 > configuration first if usage limits matter.
 
-The worker also probes for `bwrap` at startup and exits 1 if it is
-missing. Sandboxing cannot be bypassed for an LLM-enabled worker.
+The worker probes the complete Bubblewrap/slirp4netns/nftables setup at
+startup and exits 1 if it cannot create and configure an isolated
+network namespace. Sandboxing cannot be bypassed for an LLM-enabled worker.
 The sandbox exposes only an allowlist of public runtime files from
 `/etc`; the worker configuration and TLS files under `/etc/loupe` stay
 outside the agent namespace.
