@@ -42,7 +42,7 @@ EXPOSE 8443
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/loupe-container-entrypoint"]
 CMD ["loupe-server", "serve"]
 
-FROM node:22-bookworm-slim AS loupe-worker
+FROM node:22-trixie-slim AS loupe-worker
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG INSTALL_CLAUDE=1
