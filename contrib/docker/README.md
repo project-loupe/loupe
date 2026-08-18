@@ -18,9 +18,9 @@ Fresh Debian service and worker hosts need:
 
 Worker hosts additionally need a Linux kernel with user/network namespaces,
 TUN, nftables, and conntrack support. `/dev/net/tun` must be a
-character device before the worker container starts. The bootstrap installs
-`kmod`, persists `tun`, `nf_tables`, and `nf_conntrack` module requests, and
-attempts to load them immediately.
+character device before the worker container starts. The worker-role bootstrap
+installs `kmod`, persists `tun`, `nf_tables`, and `nf_conntrack` module requests,
+and attempts to load them immediately. The server role does none of this.
 
 The deploy helpers run unattended over SSH, so routine deploys need passwordless
 sudo for the required `podman`, `install`, and `systemctl` commands. For the
@@ -31,15 +31,16 @@ The worker host does not need host Rust, Cargo, Node, npm, Git, `bubblewrap`,
 `slirp4netns`, `nft`, `ip`, `nsenter`, Claude Code, Codex, or `bkb-mcp`.
 Those are installed in the worker image.
 
-Optional bootstrap:
+Optional bootstrap. The script takes the host's role and prepares only that
+role, so a host running both needs one run per role:
 
 ```bash
 scp contrib/docker/bootstrap-debian-host.sh deploy@server:/tmp/loupe-bootstrap.sh
-ssh -t deploy@server 'sudo bash /tmp/loupe-bootstrap.sh'
+ssh -t deploy@server 'sudo bash /tmp/loupe-bootstrap.sh server'
 ssh deploy@server rm -f /tmp/loupe-bootstrap.sh
 
 scp contrib/docker/bootstrap-debian-host.sh deploy@worker:/tmp/loupe-bootstrap.sh
-ssh -t deploy@worker 'sudo bash /tmp/loupe-bootstrap.sh'
+ssh -t deploy@worker 'sudo bash /tmp/loupe-bootstrap.sh worker'
 ssh deploy@worker rm -f /tmp/loupe-bootstrap.sh
 ```
 
