@@ -9,6 +9,7 @@ use crate::llm::codex_cli::{DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL};
 use crate::llm::mcp::DEFAULT_BKB_API_URL;
 use crate::llm::{CliModelConfig, JobAgent, DEFAULT_REQUEST_TIMEOUT};
 use crate::runner::DEFAULT_MAX_WORKDIR_BYTES;
+use crate::sandbox::{validate_network_host, SandboxNetworkConfig, SandboxNetworkMode};
 use crate::scanners::LlmScannerConfig;
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/loupe-worker";
@@ -23,6 +24,7 @@ pub struct WorkerConfig {
 	pub tls: TlsConfig,
 	pub cache: CacheConfig,
 	pub runtime: RuntimeConfig,
+	pub sandbox: SandboxNetworkConfig,
 	pub logging: LoggingConfig,
 	pub agents: AgentsConfig,
 	pub scanner_defaults: LlmScannerConfig,
@@ -78,6 +80,8 @@ pub struct WorkerConfigOverrides {
 	pub max_cache_gb: Option<u64>,
 	pub max_workdir_gb: Option<u64>,
 	pub disable_sandbox: Option<bool>,
+	pub sandbox_network: Option<SandboxNetworkMode>,
+	pub sandbox_allowlist: Option<Vec<String>>,
 	pub log_level: Option<String>,
 	pub log_json: Option<bool>,
 	pub log_agent_output: Option<bool>,
@@ -104,6 +108,8 @@ pub struct FileConfig {
 	pub cache: CacheSection,
 	#[serde(default)]
 	pub runtime: RuntimeSection,
+	#[serde(default)]
+	pub sandbox: SandboxSection,
 	#[serde(default)]
 	pub logging: LoggingSection,
 	#[serde(default)]
@@ -148,6 +154,15 @@ pub struct RuntimeSection {
 	pub max_workdir_gb: Option<u64>,
 	#[serde(default)]
 	pub disable_sandbox: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxSection {
+	#[serde(default)]
+	pub network: Option<SandboxNetworkMode>,
+	#[serde(default)]
+	pub allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -239,6 +254,12 @@ impl WorkerConfig {
 		if let Some(v) = file.runtime.disable_sandbox {
 			self.runtime.disable_sandbox = v;
 		}
+		if let Some(v) = file.sandbox.network {
+			self.sandbox.mode = v;
+		}
+		if let Some(v) = file.sandbox.allowlist {
+			self.sandbox.allowlist = v;
+		}
 		if let Some(v) = file.logging.level {
 			self.logging.level = v;
 		}
@@ -305,6 +326,12 @@ impl WorkerConfig {
 		}
 		if let Some(v) = overrides.disable_sandbox {
 			self.runtime.disable_sandbox = v;
+		}
+		if let Some(v) = overrides.sandbox_network {
+			self.sandbox.mode = v;
+		}
+		if let Some(v) = overrides.sandbox_allowlist {
+			self.sandbox.allowlist = v;
 		}
 		if let Some(v) = overrides.log_level {
 			self.logging.level = v;
@@ -375,8 +402,25 @@ impl WorkerConfig {
 			"scanner_defaults.per_request_timeout_seconds",
 			self.scanner_defaults.per_request_timeout.as_secs(),
 		)?;
+		if self.sandbox.mode == SandboxNetworkMode::Public && !self.sandbox.allowlist.is_empty() {
+			anyhow::bail!("sandbox.allowlist requires sandbox.network = \"allowlist\"");
+		}
+		for host in &self.sandbox.allowlist {
+			validate_network_host(host).context("validating sandbox.allowlist")?;
+		}
 		validate_nonempty("bkb.api_url", &self.bkb.api_url)?;
-		self.bkb.api_url.parse::<reqwest::Url>().context("bkb.api_url must be a valid URL")?;
+		let bkb_url =
+			self.bkb.api_url.parse::<reqwest::Url>().context("bkb.api_url must be a valid URL")?;
+		let Some(bkb_host) = bkb_url.host_str() else {
+			anyhow::bail!("bkb.api_url must be an HTTP(S) URL with a host");
+		};
+		if !matches!(bkb_url.scheme(), "http" | "https") {
+			anyhow::bail!("bkb.api_url must be an HTTP(S) URL with a host");
+		}
+		// Each sandbox launch turns this host into a network policy entry, so
+		// reject anything the policy cannot express while the worker is still
+		// starting instead of failing every leased job.
+		validate_network_host(bkb_host).context("validating bkb.api_url host")?;
 		Ok(())
 	}
 }
@@ -395,6 +439,7 @@ impl Default for WorkerConfig {
 				max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 				disable_sandbox: false,
 			},
+			sandbox: SandboxNetworkConfig::default(),
 			logging: LoggingConfig {
 				level: DEFAULT_LOG_LEVEL.to_owned(),
 				json: false,
@@ -482,6 +527,8 @@ mod tests {
 		let cfg = WorkerConfig::load(None, WorkerConfigOverrides::default()).unwrap();
 		assert_eq!(cfg.cache.dir, PathBuf::from(DEFAULT_CACHE_DIR));
 		assert_eq!(cfg.cache.max_gb, 40);
+		assert_eq!(cfg.sandbox.mode, SandboxNetworkMode::Public);
+		assert!(cfg.sandbox.allowlist.is_empty());
 		assert_eq!(cfg.logging.level, "info");
 		assert_eq!(cfg.agents.scan, JobAgent::Auto);
 		assert_eq!(cfg.agents.verify, JobAgent::Auto);
@@ -515,6 +562,10 @@ max_gb = 7
 [runtime]
 max_workdir_gb = 3
 disable_sandbox = true
+
+[sandbox]
+network = "allowlist"
+allowlist = ["example.com", "203.0.113.9"]
 
 [logging]
 level = "debug"
@@ -554,6 +605,8 @@ api_url = "https://bkb.example.test"
 		assert_eq!(cfg.cache.max_gb, 7);
 		assert_eq!(cfg.runtime.max_workdir_bytes, 3 * 1_073_741_824);
 		assert!(cfg.runtime.disable_sandbox);
+		assert_eq!(cfg.sandbox.mode, SandboxNetworkMode::Allowlist);
+		assert_eq!(cfg.sandbox.allowlist, ["example.com", "203.0.113.9"]);
 		assert_eq!(cfg.logging.level, "debug");
 		assert!(cfg.logging.json);
 		assert!(cfg.logging.agent_output);
@@ -579,6 +632,10 @@ api_url = "https://bkb.example.test"
 [agents.codex]
 model = "from-file"
 effort = "low"
+
+[sandbox]
+network = "allowlist"
+allowlist = ["from-file.example"]
 "#,
 		)
 		.unwrap();
@@ -590,6 +647,8 @@ effort = "low"
 				verify_agent: Some(JobAgent::Claude),
 				codex_model: Some("from-env".to_owned()),
 				codex_effort: Some("xhigh".to_owned()),
+				sandbox_network: Some(SandboxNetworkMode::Allowlist),
+				sandbox_allowlist: Some(vec!["from-env.example".to_owned()]),
 				..WorkerConfigOverrides::default()
 			},
 		)
@@ -599,6 +658,50 @@ effort = "low"
 		assert_eq!(cfg.agents.verify, JobAgent::Claude);
 		assert_eq!(cfg.agents.codex.model, "from-env");
 		assert_eq!(cfg.agents.codex.effort, "xhigh");
+		assert_eq!(cfg.sandbox.allowlist, ["from-env.example"]);
+	}
+
+	#[test]
+	fn public_network_rejects_an_operator_allowlist() {
+		let err = WorkerConfig::load(
+			None,
+			WorkerConfigOverrides {
+				sandbox_allowlist: Some(vec!["example.com".to_owned()]),
+				..Default::default()
+			},
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("requires sandbox.network"), "got: {err:#}");
+	}
+
+	#[test]
+	fn bkb_api_url_host_must_survive_sandbox_host_validation() {
+		// Every sandbox launch feeds this host into the network policy, so a
+		// host the policy cannot express has to fail at startup rather than
+		// at the first leased job.
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[bkb]\napi_url = \"https://[2001:db8::1]:8443/api\"\n").unwrap();
+
+		let err = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+
+		assert!(format!("{err:#}").contains("sandbox network"), "got: {err:#}");
+	}
+
+	#[test]
+	fn allowlist_rejects_urls_ports_and_ipv6() {
+		for invalid in ["https://example.com", "example.com:443", "2001:db8::1"] {
+			let err = WorkerConfig::load(
+				None,
+				WorkerConfigOverrides {
+					sandbox_network: Some(SandboxNetworkMode::Allowlist),
+					sandbox_allowlist: Some(vec![invalid.to_owned()]),
+					..Default::default()
+				},
+			)
+			.unwrap_err();
+			assert!(format!("{err:#}").contains("sandbox network"), "got: {err:#}");
+		}
 	}
 
 	#[test]

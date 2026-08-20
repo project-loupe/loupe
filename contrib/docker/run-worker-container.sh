@@ -23,6 +23,10 @@ if [ ! -r "$CONFIG_HOST" ] && [ -z "${LOUPE_SERVER_URL:-}" ]; then
 	echo "error: missing worker config at $CONFIG_HOST and LOUPE_SERVER_URL is unset" >&2
 	exit 78
 fi
+if [ ! -c /dev/net/tun ]; then
+	echo "error: worker host TUN device missing at /dev/net/tun; load the tun kernel module" >&2
+	exit 78
+fi
 
 install -d -o 10002 -g 10002 -m 0700 "$CACHE_DIR"
 
@@ -46,6 +50,8 @@ for name in \
 	LOUPE_PER_REQUEST_TIMEOUT_SECONDS \
 	LOUPE_LOG_AGENT_OUTPUT \
 	LOUPE_DISABLE_SANDBOX \
+	LOUPE_SANDBOX_NETWORK \
+	LOUPE_SANDBOX_ALLOWLIST \
 	LOUPE_SCAN_AGENT \
 	LOUPE_VERIFY_AGENT \
 	LOUPE_CLAUDE_MODEL \

@@ -37,10 +37,18 @@ pub use mcp::McpContext;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::sandbox::SandboxNetworkConfig;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliModelConfig {
 	pub model: String,
 	pub effort: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BackendRuntimeConfig {
+	pub network: SandboxNetworkConfig,
+	pub log_agent_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
@@ -282,6 +290,19 @@ pub(crate) fn codex_api_key_env() -> Option<OsString> {
 	env_value("CODEX_API_KEY").or_else(|| env_value("OPENAI_API_KEY"))
 }
 
+pub(crate) fn required_network_hosts(
+	provider_host: &str, bkb_api_url: Option<&str>,
+) -> Result<Vec<String>> {
+	let mut hosts = vec![provider_host.to_owned()];
+	if let Some(bkb_api_url) = bkb_api_url {
+		let url = reqwest::Url::parse(bkb_api_url)?;
+		let host =
+			url.host_str().ok_or_else(|| anyhow::anyhow!("configured BKB API URL has no host"))?;
+		hosts.push(host.to_owned());
+	}
+	Ok(hosts)
+}
+
 fn env_present(name: &str) -> bool {
 	env_value(name).is_some()
 }
@@ -296,8 +317,9 @@ fn env_value(name: &str) -> Option<OsString> {
 /// unless the operator explicitly selects Codex for scan jobs.
 pub fn build_scan_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+	codex_agent: CliModelConfig, claude_agent: CliModelConfig, runtime: BackendRuntimeConfig,
 ) -> Result<Option<Arc<dyn LlmBackend>>> {
+	let BackendRuntimeConfig { network, log_agent_output } = runtime;
 	match selection {
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
@@ -305,7 +327,7 @@ pub fn build_scan_backend(
 				effort = %claude_agent.effort,
 				"scan backend: claude (auto)"
 			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
+			Ok(Some(build_claude_backend(mcp, claude_agent, network, log_agent_output)))
 		},
 		JobAgent::Auto => {
 			tracing::info!(
@@ -320,7 +342,7 @@ pub fn build_scan_backend(
 				effort = %claude_agent.effort,
 				"scan backend: claude (configured)"
 			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
+			Ok(Some(build_claude_backend(mcp, claude_agent, network, log_agent_output)))
 		},
 		JobAgent::Codex => {
 			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
@@ -329,7 +351,7 @@ pub fn build_scan_backend(
 				effort = %codex_agent.effort,
 				"scan backend: codex (configured)"
 			);
-			Ok(Some(build_codex_backend(mcp, codex_agent, log_agent_output)))
+			Ok(Some(build_codex_backend(mcp, codex_agent, network, log_agent_output)))
 		},
 	}
 }
@@ -350,8 +372,9 @@ pub fn build_scan_backend(
 /// is actually verifying without having to inspect process listings.
 pub fn build_verifier_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+	codex_agent: CliModelConfig, claude_agent: CliModelConfig, runtime: BackendRuntimeConfig,
 ) -> Result<Arc<dyn LlmBackend>> {
+	let BackendRuntimeConfig { network, log_agent_output } = runtime;
 	match selection {
 		JobAgent::Auto if codex_ready => {
 			tracing::info!(
@@ -359,7 +382,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (auto)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output))
 		},
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
@@ -367,7 +390,7 @@ pub fn build_verifier_backend(
 				effort = %claude_agent.effort,
 				"verifier backend: claude (auto, codex unavailable)"
 			);
-			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
+			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output))
 		},
 		JobAgent::Auto => anyhow::bail!("no authenticated verifier backend available"),
 		JobAgent::Claude => {
@@ -377,7 +400,7 @@ pub fn build_verifier_backend(
 				effort = %claude_agent.effort,
 				"verifier backend: claude (configured)"
 			);
-			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
+			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output))
 		},
 		JobAgent::Codex => {
 			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
@@ -386,7 +409,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (configured)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output))
 		},
 	}
 }
@@ -402,10 +425,13 @@ fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<(
 }
 
 fn build_claude_backend(
-	mcp: Option<McpContext>, agent: CliModelConfig, log_agent_output: bool,
+	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
+	log_agent_output: bool,
 ) -> Arc<dyn LlmBackend> {
-	let mut backend =
-		ClaudeCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
+	let mut backend = ClaudeCliBackend::new()
+		.with_agent_config(agent)
+		.with_network_config(network)
+		.with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
@@ -413,10 +439,13 @@ fn build_claude_backend(
 }
 
 fn build_codex_backend(
-	mcp: Option<McpContext>, agent: CliModelConfig, log_agent_output: bool,
+	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
+	log_agent_output: bool,
 ) -> Arc<dyn LlmBackend> {
-	let mut backend =
-		CodexCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
+	let mut backend = CodexCliBackend::new()
+		.with_agent_config(agent)
+		.with_network_config(network)
+		.with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
@@ -520,6 +549,23 @@ mod tests {
 	}
 
 	#[test]
+	fn sandbox_network_always_includes_provider_and_enabled_bkb() {
+		assert_eq!(required_network_hosts("api.openai.com", None).unwrap(), ["api.openai.com"]);
+		assert_eq!(
+			required_network_hosts("api.openai.com", Some(mcp::DEFAULT_BKB_API_URL)).unwrap(),
+			["api.openai.com", "bitcoinknowledge.dev"]
+		);
+		assert_eq!(
+			required_network_hosts(
+				"api.anthropic.com",
+				Some("https://knowledge.example.test:8443/api"),
+			)
+			.unwrap(),
+			["api.anthropic.com", "knowledge.example.test"]
+		);
+	}
+
+	#[test]
 	fn scan_backend_auto_preserves_claude_only_discovery_default() {
 		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
 		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
@@ -531,15 +577,22 @@ mod tests {
 			true,
 			codex.clone(),
 			claude.clone(),
-			false,
+			BackendRuntimeConfig::default(),
 		)
 		.unwrap()
 		.expect("claude-ready auto scan should register");
 		assert_eq!(backend.id(), "claude-cli");
 
-		let backend =
-			build_scan_backend(None, JobAgent::Auto, false, true, codex.clone(), claude, false)
-				.unwrap();
+		let backend = build_scan_backend(
+			None,
+			JobAgent::Auto,
+			false,
+			true,
+			codex.clone(),
+			claude,
+			BackendRuntimeConfig::default(),
+		)
+		.unwrap();
 		assert!(
 			backend.is_none(),
 			"auto scan should not switch to codex unless explicitly configured"
@@ -558,14 +611,21 @@ mod tests {
 			true,
 			codex.clone(),
 			claude.clone(),
-			false,
+			BackendRuntimeConfig::default(),
 		)
 		.unwrap()
 		.expect("explicit codex scan should register when codex is ready");
 		assert_eq!(backend.id(), "codex-cli");
 
-		let err = match build_scan_backend(None, JobAgent::Codex, true, false, codex, claude, false)
-		{
+		let err = match build_scan_backend(
+			None,
+			JobAgent::Codex,
+			true,
+			false,
+			codex,
+			claude,
+			BackendRuntimeConfig::default(),
+		) {
 			Ok(_) => panic!("explicit unavailable codex scan should fail"),
 			Err(e) => e,
 		};
@@ -583,7 +643,7 @@ mod tests {
 			true,
 			codex.clone(),
 			claude.clone(),
-			false,
+			BackendRuntimeConfig::default(),
 		)
 		.unwrap();
 		assert_eq!(backend.id(), "codex-cli");
@@ -595,7 +655,7 @@ mod tests {
 			false,
 			codex.clone(),
 			claude.clone(),
-			false,
+			BackendRuntimeConfig::default(),
 		)
 		.unwrap();
 		assert_eq!(backend.id(), "claude-cli");
@@ -607,7 +667,7 @@ mod tests {
 			false,
 			codex,
 			claude,
-			false,
+			BackendRuntimeConfig::default(),
 		) {
 			Ok(_) => panic!("missing verifier backend should be rejected"),
 			Err(e) => e,
@@ -627,17 +687,23 @@ mod tests {
 			true,
 			codex.clone(),
 			claude.clone(),
-			false,
+			BackendRuntimeConfig::default(),
 		)
 		.unwrap();
 		assert_eq!(backend.id(), "claude-cli");
 
-		let err =
-			match build_verifier_backend(None, JobAgent::Claude, false, true, codex, claude, false)
-			{
-				Ok(_) => panic!("explicit unavailable claude verifier should fail"),
-				Err(e) => e,
-			};
+		let err = match build_verifier_backend(
+			None,
+			JobAgent::Claude,
+			false,
+			true,
+			codex,
+			claude,
+			BackendRuntimeConfig::default(),
+		) {
+			Ok(_) => panic!("explicit unavailable claude verifier should fail"),
+			Err(e) => e,
+		};
 		assert!(err.to_string().contains("verify agent `claude`"), "got: {err}");
 	}
 }

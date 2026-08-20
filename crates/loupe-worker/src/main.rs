@@ -1,6 +1,6 @@
 //! Entry point for the loupe scan/verify worker.
 //!
-//! Two modes via subcommands:
+//! Worker and internal helper modes are selected via subcommands:
 //!
 //! - `run` (default when no subcommand is given): the long-running
 //!   worker loop — leases jobs, runs scanners, submits findings.
@@ -8,6 +8,7 @@
 //!   inside an agent sandbox. The trusted MCP broker stays in the
 //!   parent worker process.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,8 +17,10 @@ use clap::{Parser, Subcommand};
 use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
-	claude_available, codex_auth_available, codex_available, JobAgent, McpContext,
+	claude_available, codex_auth_available, codex_available, BackendRuntimeConfig, JobAgent,
+	McpContext,
 };
+use loupe_worker::sandbox::SandboxNetworkMode;
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
@@ -40,6 +43,9 @@ enum Cmd {
 	/// Bridge MCP stdio to one host-side Unix socket. This subcommand
 	/// receives no server URL, mTLS credentials, job id, or capability.
 	McpProxy(McpProxyArgs),
+	/// Internal supervisor for one isolated sandbox network.
+	#[command(hide = true)]
+	SandboxExec(SandboxExecArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -89,6 +95,12 @@ struct RunArgs {
 	/// Legacy option. Enabling it is rejected; LLM workers require bubblewrap.
 	#[arg(long, env = "LOUPE_DISABLE_SANDBOX", value_parser = clap::builder::BoolishValueParser::new())]
 	disable_sandbox: Option<bool>,
+	/// Agent sandbox network policy: public or allowlist.
+	#[arg(long, env = "LOUPE_SANDBOX_NETWORK", value_enum)]
+	sandbox_network: Option<SandboxNetworkMode>,
+	/// Comma-separated hostnames or IPv4 addresses added in allowlist mode.
+	#[arg(long, env = "LOUPE_SANDBOX_ALLOWLIST", value_delimiter = ',')]
+	sandbox_allowlist: Option<Vec<String>>,
 	/// Logging level: trace, debug, info, warn, or error.
 	#[arg(long, env = "LOUPE_LOG_LEVEL")]
 	log_level: Option<String>,
@@ -136,6 +148,18 @@ struct McpProxyArgs {
 	socket: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+struct SandboxExecArgs {
+	#[arg(long, value_enum)]
+	network: SandboxNetworkMode,
+	#[arg(long)]
+	required_host: Vec<String>,
+	#[arg(long)]
+	allow_host: Vec<String>,
+	#[arg(last = true, required = true, allow_hyphen_values = true)]
+	command: Vec<OsString>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 	let cli = Cli::parse();
@@ -148,6 +172,15 @@ async fn main() -> Result<()> {
 		Some(Cmd::McpProxy(args)) => {
 			init_tracing_from_env();
 			run_mcp_proxy(args).await
+		},
+		Some(Cmd::SandboxExec(args)) => {
+			let status = sandbox::run_networked_sandbox(
+				args.network,
+				args.required_host,
+				args.allow_host,
+				args.command,
+			)?;
+			std::process::exit(status.code().unwrap_or(1));
 		},
 		// Default subcommand for backwards compatibility with the
 		// existing `loupe-worker --server-url ...` invocation pattern.
@@ -228,8 +261,13 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// bwrap is the security boundary for every agent subprocess; a
 	// missing binary or attempted bypass is a startup error.
 	sandbox::probe_at_startup().context("LLM scanner requires bubblewrap")?;
-	sandbox::smoketest(&cache_dir).context("bubblewrap sandbox smoketest failed")?;
-	tracing::info!("bubblewrap available; LLM scanners sandboxed");
+	sandbox::smoketest(&cache_dir, cfg.sandbox.clone())
+		.context("bubblewrap sandbox smoketest failed")?;
+	tracing::info!(
+		network = %cfg.sandbox.mode,
+		allowlist_hosts = cfg.sandbox.allowlist.len(),
+		"bubblewrap and isolated sandbox networking available"
+	);
 
 	// Optional bkb-mcp auto-attach. When the operator has installed
 	// `bkb-mcp` (cargo install bkb-mcp), the discovery agent gets the
@@ -269,7 +307,10 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		codex,
 		cfg.agents.codex.clone(),
 		cfg.agents.claude.clone(),
-		cfg.logging.agent_output,
+		BackendRuntimeConfig {
+			network: cfg.sandbox.clone(),
+			log_agent_output: cfg.logging.agent_output,
+		},
 	)? {
 		scanners.push(Arc::new(
 			LlmCodeReviewScanner::new(backend)
@@ -290,7 +331,10 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		codex,
 		cfg.agents.codex.clone(),
 		cfg.agents.claude.clone(),
-		cfg.logging.agent_output,
+		BackendRuntimeConfig {
+			network: cfg.sandbox.clone(),
+			log_agent_output: cfg.logging.agent_output,
+		},
 	)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
@@ -345,6 +389,8 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 			max_cache_gb: args.max_cache_gb,
 			max_workdir_gb: args.max_workdir_gb,
 			disable_sandbox: args.disable_sandbox,
+			sandbox_network: args.sandbox_network,
+			sandbox_allowlist: args.sandbox_allowlist.clone(),
 			log_level: args.log_level.clone(),
 			log_json: args.log_json,
 			log_agent_output: args.log_agent_output,
@@ -531,5 +577,20 @@ mod tests {
 			};
 
 		assert!(err.to_string().contains("LOUPE_WORKER_CERT_PEM"));
+	}
+
+	#[test]
+	fn cli_parses_sandbox_network_and_comma_separated_allowlist() {
+		let cli = Cli::try_parse_from([
+			"loupe-worker",
+			"--sandbox-network",
+			"allowlist",
+			"--sandbox-allowlist",
+			"example.com,203.0.113.9",
+		])
+		.unwrap();
+
+		assert_eq!(cli.run.sandbox_network, Some(SandboxNetworkMode::Allowlist));
+		assert_eq!(cli.run.sandbox_allowlist.unwrap(), ["example.com", "203.0.113.9"]);
 	}
 }

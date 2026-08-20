@@ -25,6 +25,7 @@ loupe-proto = { path = "../loupe-proto" }
 loupe-tls = { path = "../loupe-tls" }
 regex = { workspace = true }
 reqwest = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

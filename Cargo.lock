@@ -1008,6 +1008,7 @@ dependencies = [
  "loupe-tls",
  "regex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
