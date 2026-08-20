@@ -20,7 +20,7 @@ FROM rust:${RUST_VERSION}-bookworm AS bkb-mcp-builder
 ARG BKB_MCP_VERSION=0.2.0
 RUN cargo install bkb-mcp --version "${BKB_MCP_VERSION}" --locked
 
-FROM debian:bookworm-slim AS loupe-server
+FROM debian:trixie-slim AS loupe-server
 # No `ca-certificates` here: loupe-server's only outbound TLS is the
 # GitHub reporter, which uses reqwest + rustls with webpki-roots
 # compiled into the binary (see workspace Cargo.toml). Sendmail is
