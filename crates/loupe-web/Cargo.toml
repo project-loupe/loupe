@@ -1,12 +1,15 @@
 [package]
 name = "loupe-web"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "loupe-web — local operator dashboard served over the loupectl admin RPCs."
-publish = false
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "loupe-web"
@@ -18,7 +21,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
-loupe-proto = { path = "../loupe-proto" }
+loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
 rand_core = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -28,9 +31,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-loupe-server = { path = "../loupe-server" }
-loupe-storage = { path = "../loupe-storage" }
-loupe-tls = { path = "../loupe-tls" }
+loupe-server = { version = "0.1.0", path = "../loupe-server" }
+loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
+loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 tempfile = { workspace = true }
 
 [lints]

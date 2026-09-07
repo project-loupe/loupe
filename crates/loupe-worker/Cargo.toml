@@ -1,12 +1,15 @@
 [package]
 name = "loupe-worker"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "loupe scan/verify worker — leases jobs, clones repos, runs scanners, reports findings."
-publish = false
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "loupe-worker"
@@ -20,9 +23,9 @@ base64 = { workspace = true }
 clap = { workspace = true }
 git2 = { workspace = true }
 glob = { workspace = true }
-loupe-core = { path = "../loupe-core" }
-loupe-proto = { path = "../loupe-proto" }
-loupe-tls = { path = "../loupe-tls" }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
+loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 regex = { workspace = true }
 reqwest = { workspace = true }
 rustix = { workspace = true }
@@ -38,8 +41,10 @@ tracing-subscriber = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+# Keep this test dependency path-only: Cargo omits it on publication,
+# avoiding a server/worker cycle in the registry dependency graph.
 loupe-server = { path = "../loupe-server" }
-loupe-storage = { path = "../loupe-storage" }
+loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
 tempfile = { workspace = true }
 
 [lints]

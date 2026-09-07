@@ -1,12 +1,15 @@
 [package]
 name = "loupe-server"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "loupe job-queue daemon: registers repos, schedules scans, dispatches reports."
-publish = false
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "loupe-server"
@@ -22,10 +25,10 @@ clap = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }
-loupe-core = { path = "../loupe-core" }
-loupe-proto = { path = "../loupe-proto" }
-loupe-storage = { path = "../loupe-storage" }
-loupe-tls = { path = "../loupe-tls" }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
+loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
+loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
@@ -42,7 +45,9 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 git2 = { workspace = true }
-loupe-tls = { path = "../loupe-tls" }
+loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
+# Keep this test dependency path-only: Cargo omits it on publication,
+# avoiding a server/worker cycle in the registry dependency graph.
 loupe-worker = { path = "../loupe-worker" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 tempfile = { workspace = true }

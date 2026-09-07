@@ -1,12 +1,15 @@
 [package]
 name = "loupe-tls"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "rustls helpers for loupe: in-memory CA, mTLS server/client config builders, cert fingerprinting."
-publish = false
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
