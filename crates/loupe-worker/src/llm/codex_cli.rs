@@ -290,12 +290,13 @@ impl LlmBackend for CodexCliBackend {
 		// cannot race an agent or proxy that is still exiting. If
 		// termination itself fails, abort the broker rather than preserving
 		// authority for that process.
-		if !matches!(&run_outcome, Ok(Ok(_))) {
-			if let Err(error) = child.kill().await {
-				drop(mcp_broker.take());
-				return Err(anyhow::Error::from(error)
-					.context("terminating codex CLI before broker shutdown"));
-			}
+		if !matches!(&run_outcome, Ok(Ok(_)))
+			&& let Err(error) = child.kill().await
+		{
+			drop(mcp_broker.take());
+			return Err(
+				anyhow::Error::from(error).context("terminating codex CLI before broker shutdown")
+			);
 		}
 
 		// The agent process is gone by now, so drain the broker before

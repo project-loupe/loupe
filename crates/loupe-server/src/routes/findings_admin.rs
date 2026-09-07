@@ -188,10 +188,10 @@ pub async fn retry_verify(
 			format!("unsupported protocol_version {}", req.protocol_version),
 		));
 	}
-	if let Some(limit) = req.limit {
-		if limit <= 0 {
-			return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
-		}
+	if let Some(limit) = req.limit
+		&& limit <= 0
+	{
+		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
 	}
 	let now = now_secs();
 	let mut response = state

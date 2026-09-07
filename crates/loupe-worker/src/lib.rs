@@ -1,7 +1,7 @@
 //! `loupe-worker` library surface.
 
 #[cfg(test)]
-pub(crate) static PROCESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+mod test_env;
 
 pub mod client;
 pub mod config;

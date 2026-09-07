@@ -317,12 +317,13 @@ impl LlmBackend for ClaudeCliBackend {
 		// cannot race an agent or proxy that is still exiting. If
 		// termination itself fails, abort the broker rather than preserving
 		// authority for that process.
-		if !matches!(&run_outcome, Ok(Ok(_))) {
-			if let Err(error) = child.kill().await {
-				drop(mcp_broker.take());
-				return Err(anyhow::Error::from(error)
-					.context("terminating claude CLI before broker shutdown"));
-			}
+		if !matches!(&run_outcome, Ok(Ok(_)))
+			&& let Err(error) = child.kill().await
+		{
+			drop(mcp_broker.take());
+			return Err(
+				anyhow::Error::from(error).context("terminating claude CLI before broker shutdown")
+			);
 		}
 
 		// The agent process is gone by now, so drain the broker before
@@ -419,37 +420,13 @@ fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsString;
 	use std::path::Path;
 	use std::time::Duration;
 
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
-	use crate::PROCESS_ENV_LOCK;
-
-	struct EnvGuard {
-		name: &'static str,
-		old: Option<OsString>,
-	}
-
-	impl EnvGuard {
-		fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-			let old = std::env::var_os(name);
-			std::env::set_var(name, value);
-			Self { name, old }
-		}
-	}
-
-	impl Drop for EnvGuard {
-		fn drop(&mut self) {
-			if let Some(old) = &self.old {
-				std::env::set_var(self.name, old);
-			} else {
-				std::env::remove_var(self.name);
-			}
-		}
-	}
+	use crate::test_env::in_env;
 
 	#[test]
 	fn agent_uses_only_per_job_mcp_config() {
@@ -479,7 +456,6 @@ mod tests {
 			return;
 		}
 
-		let _lock = PROCESS_ENV_LOCK.lock().await;
 		let workdir = tempfile::tempdir().unwrap();
 		let scratch = tempfile::tempdir().unwrap();
 		let home = scratch.path().join("home");
@@ -508,9 +484,17 @@ mod tests {
 			path_entries.extend(std::env::split_paths(&path));
 		}
 		let path = std::env::join_paths(path_entries).unwrap();
-		let _path = EnvGuard::set("PATH", &path);
-		let _home = EnvGuard::set("HOME", &home);
-		let _token = EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "loupe-test-oauth-token");
+		if !in_env(
+			"llm::claude_cli::tests::sandbox_uses_headless_token_without_host_login_state",
+			"oauth-token",
+			&[
+				("PATH", Some(path.as_os_str())),
+				("HOME", Some(home.as_os_str())),
+				("CLAUDE_CODE_OAUTH_TOKEN", Some("loupe-test-oauth-token".as_ref())),
+			],
+		) {
+			return;
+		}
 
 		let backend = ClaudeCliBackend::with_bin("fake-claude").with_network_disabled_for_tests();
 		let req = LlmRequest {

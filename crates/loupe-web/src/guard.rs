@@ -71,43 +71,39 @@ fn forbidden(reason: &str) -> Response {
 /// Applies the Host allowlist and, for mutating requests, the CSRF pair.
 /// Mounted on every route including the document, so DNS rebinding cannot
 /// even fetch the page.
-pub async fn browser_guard(
-	State(state): State<WebState>, req: Request, next: Next,
-) -> Result<Response, Response> {
+pub async fn browser_guard(State(state): State<WebState>, req: Request, next: Next) -> Response {
 	if !host_is_allowed(req.headers(), &state) {
-		return Err(forbidden(
+		return forbidden(
 			"unexpected Host header; loupe-web only answers on its own loopback address",
-		));
+		);
 	}
 	if is_mutating(req.method()) {
 		if !same_origin(req.headers(), &state) {
-			return Err(forbidden("cross-origin request refused"));
+			return forbidden("cross-origin request refused");
 		}
 		if req.headers().get(REQUEST_HEADER).is_none() {
-			return Err(forbidden(concat!(
+			return forbidden(concat!(
 				"missing ",
 				"X-Loupe-Dashboard",
 				" header; mutating requests must come from the dashboard itself"
-			)));
+			));
 		}
 	}
-	Ok(next.run(req).await)
+	next.run(req).await
 }
 
 /// Requires a valid origin-scoped capability header. Mounted on `/api`
 /// only so the document and assets can load before the page recovers the
 /// token from its URL fragment.
-pub async fn require_token(
-	State(state): State<WebState>, req: Request, next: Next,
-) -> Result<Response, Response> {
+pub async fn require_token(State(state): State<WebState>, req: Request, next: Next) -> Response {
 	let presented = req.headers().get(token::HEADER_NAME).and_then(|h| h.to_str().ok());
 	match presented {
-		Some(candidate) if state.token.matches(candidate) => Ok(next.run(req).await),
-		_ => Err((
+		Some(candidate) if state.token.matches(candidate) => next.run(req).await,
+		_ => (
 			StatusCode::UNAUTHORIZED,
 			"missing or invalid dashboard capability; reopen the URL printed at startup\n",
 		)
-			.into_response()),
+			.into_response(),
 	}
 }
 

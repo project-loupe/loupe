@@ -630,14 +630,14 @@ pub async fn submit_verdict(
 		})?
 		.ok_or_else(job_capability::forbidden)?;
 
-	if matches!(new_state, Some(FindingState::Confirmed)) {
-		if let Err(e) = dispatch_finding(&state, target_finding_id, now).await {
-			tracing::warn!(
-				finding_id = target_finding_id,
-				error = %format_error_chain(&e),
-				"dispatch on verdict-confirm failed"
-			);
-		}
+	if matches!(new_state, Some(FindingState::Confirmed))
+		&& let Err(e) = dispatch_finding(&state, target_finding_id, now).await
+	{
+		tracing::warn!(
+			finding_id = target_finding_id,
+			error = %format_error_chain(&e),
+			"dispatch on verdict-confirm failed"
+		);
 	}
 	Ok(StatusCode::NO_CONTENT)
 }
