@@ -454,46 +454,22 @@ fn build_codex_backend(
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsString;
-
 	use super::*;
-	use crate::PROCESS_ENV_LOCK;
-
-	struct EnvGuard {
-		name: &'static str,
-		old: Option<OsString>,
-	}
-
-	impl EnvGuard {
-		fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-			let old = std::env::var_os(name);
-			std::env::set_var(name, value);
-			Self { name, old }
-		}
-
-		fn unset(name: &'static str) -> Self {
-			let old = std::env::var_os(name);
-			std::env::remove_var(name);
-			Self { name, old }
-		}
-	}
-
-	impl Drop for EnvGuard {
-		fn drop(&mut self) {
-			if let Some(old) = &self.old {
-				std::env::set_var(self.name, old);
-			} else {
-				std::env::remove_var(self.name);
-			}
-		}
-	}
+	use crate::test_env::in_env;
 
 	#[test]
 	fn provider_auth_checks_accept_api_keys() {
-		let _guard = PROCESS_ENV_LOCK.blocking_lock();
-		let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", "anthropic-key");
-		let _openai = EnvGuard::set("OPENAI_API_KEY", "openai-key");
-		let _codex = EnvGuard::unset("CODEX_API_KEY");
+		if !in_env(
+			"llm::tests::provider_auth_checks_accept_api_keys",
+			"api-keys",
+			&[
+				("ANTHROPIC_API_KEY", Some("anthropic-key".as_ref())),
+				("OPENAI_API_KEY", Some("openai-key".as_ref())),
+				("CODEX_API_KEY", None),
+			],
+		) {
+			return;
+		}
 
 		assert!(claude_auth_available());
 		assert!(codex_auth_available());
@@ -501,34 +477,41 @@ mod tests {
 
 	#[test]
 	fn claude_auth_requires_env_token_not_a_stale_config_file() {
-		let _guard = PROCESS_ENV_LOCK.blocking_lock();
-		let _anthropic = EnvGuard::unset("ANTHROPIC_API_KEY");
-		let _oauth = EnvGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
 		let home = tempfile::tempdir().unwrap();
 		std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
-		let _home = EnvGuard::set("HOME", home.path().as_os_str());
 
 		// A leftover `~/.claude.json` carries no usable credential once
 		// `~/.claude` (with `.credentials.json`) is no longer mounted,
 		// and OAuth refresh cannot write into the read-only sandbox. It
 		// must not make the worker advertise Claude as ready.
-		assert!(
-			!claude_auth_available(),
-			"a stale ~/.claude.json must not masquerade as usable Claude auth"
-		);
-
-		let _token = EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token");
-		assert!(
-			claude_auth_available(),
-			"CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) must satisfy Claude auth"
-		);
+		for (case, token) in [("stale-config", None), ("oauth-token", Some("oauth-token"))] {
+			if in_env(
+				"llm::tests::claude_auth_requires_env_token_not_a_stale_config_file",
+				case,
+				&[
+					("ANTHROPIC_API_KEY", None),
+					("CLAUDE_CODE_OAUTH_TOKEN", token.map(AsRef::as_ref)),
+					("HOME", Some(home.path().as_os_str())),
+				],
+			) {
+				assert_eq!(
+					claude_auth_available(),
+					token.is_some(),
+					"only an explicit token, not a stale ~/.claude.json, must satisfy Claude auth"
+				);
+			}
+		}
 	}
 
 	#[test]
 	fn codex_auth_checks_codex_api_key() {
-		let _guard = PROCESS_ENV_LOCK.blocking_lock();
-		let _openai = EnvGuard::unset("OPENAI_API_KEY");
-		let _codex = EnvGuard::set("CODEX_API_KEY", "codex-key");
+		if !in_env(
+			"llm::tests::codex_auth_checks_codex_api_key",
+			"codex-key",
+			&[("OPENAI_API_KEY", None), ("CODEX_API_KEY", Some("codex-key".as_ref()))],
+		) {
+			return;
+		}
 
 		assert!(codex_auth_available(), "CODEX_API_KEY should enable codex authentication");
 	}

@@ -1,16 +1,19 @@
 [package]
 name = "loupe-storage"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "SQLite storage layer for loupe — schema, migrations, and DAOs."
-publish = false
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-loupe-core = { path = "../loupe-core" }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
 rand_core = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }

@@ -69,12 +69,12 @@ pub struct PinGuard {
 
 impl Drop for PinGuard {
 	fn drop(&mut self) {
-		if let Ok(mut refs) = self.cache.refcounts.lock() {
-			if let Some(n) = refs.get_mut(&self.key) {
-				*n = n.saturating_sub(1);
-				if *n == 0 {
-					refs.remove(&self.key);
-				}
+		if let Ok(mut refs) = self.cache.refcounts.lock()
+			&& let Some(n) = refs.get_mut(&self.key)
+		{
+			*n = n.saturating_sub(1);
+			if *n == 0 {
+				refs.remove(&self.key);
 			}
 		}
 	}
@@ -239,11 +239,11 @@ impl RepoCache {
 		let lock = self.repo_lock(key);
 		let _guard = lock.lock().await;
 
-		if let Err(e) = std::fs::remove_dir_all(&path) {
-			if path.exists() {
-				return Err(e)
-					.with_context(|| format!("failed to remove cached repo {}", path.display()));
-			}
+		if let Err(e) = std::fs::remove_dir_all(&path)
+			&& path.exists()
+		{
+			return Err(e)
+				.with_context(|| format!("failed to remove cached repo {}", path.display()));
 		}
 		self.evict_if_needed()?;
 		if let Some(parent) = path.parent() {

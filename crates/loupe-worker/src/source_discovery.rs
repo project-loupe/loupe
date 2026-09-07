@@ -409,10 +409,10 @@ fn matches_exclude(path: &Path, pattern: &str) -> bool {
 	if let Some(component) = pattern.strip_prefix("dotnet-output:") {
 		return is_dotnet_output_path(path, component);
 	}
-	if let Some(component) = pattern.strip_prefix('/') {
-		if !component.contains('/') {
-			return has_component(path, component);
-		}
+	if let Some(component) = pattern.strip_prefix('/')
+		&& !component.contains('/')
+	{
+		return has_component(path, component);
 	}
 	path.to_string_lossy().contains(pattern)
 }

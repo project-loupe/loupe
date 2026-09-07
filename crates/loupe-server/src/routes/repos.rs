@@ -314,10 +314,10 @@ pub async fn set_github_reporting(
 			if !repos::update_reporting(&tx, id, &new_reporting)? {
 				return Ok(false);
 			}
-			if let Some(old_secret_id) = old_secret_id {
-				if repos::count_github_pat_references(&tx, old_secret_id)? == 0 {
-					secrets::delete(&tx, old_secret_id)?;
-				}
+			if let Some(old_secret_id) = old_secret_id
+				&& repos::count_github_pat_references(&tx, old_secret_id)? == 0
+			{
+				secrets::delete(&tx, old_secret_id)?;
 			}
 			tx.commit()?;
 			Ok(true)

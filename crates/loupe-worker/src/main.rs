@@ -198,9 +198,6 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		.clone()
 		.context("--server-url / LOUPE_SERVER_URL / [server].url in worker config is required")?;
 	let cache_dir = cfg.cache.dir.clone();
-	if cfg.runtime.disable_sandbox {
-		std::env::set_var(sandbox::DISABLE_SANDBOX_ENV, "1");
-	}
 	let tls = read_worker_tls(
 		args.ca_cert_pem,
 		args.ca_cert_pem_b64,
@@ -260,7 +257,8 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	}
 	// bwrap is the security boundary for every agent subprocess; a
 	// missing binary or attempted bypass is a startup error.
-	sandbox::probe_at_startup().context("LLM scanner requires bubblewrap")?;
+	sandbox::probe_at_startup(cfg.runtime.disable_sandbox)
+		.context("LLM scanner requires bubblewrap")?;
 	sandbox::smoketest(&cache_dir, cfg.sandbox.clone())
 		.context("bubblewrap sandbox smoketest failed")?;
 	tracing::info!(

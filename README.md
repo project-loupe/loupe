@@ -34,7 +34,7 @@ Join the Project Loupe Discord: https://discord.gg/d4Z58kTZF4
 
 Before installing, the host needs:
 
-- **Rust** (stable toolchain). Nightly is only required if you intend to
+- **Rust 1.88 or newer**. Nightly is only required if you intend to
   run `cargo fmt` — `rustfmt.toml` uses nightly-only options. CI runs
   `fmt` on nightly and `clippy`/`test` on stable.
 - **`git`** on PATH. `loupe-worker` shells out to `git` for repo
@@ -121,6 +121,9 @@ The binaries land in `target/release/`:
 test suites; the LLM-backend live test skips automatically when
 `claude` is not on PATH, and the bubblewrap integration tests skip
 when `bwrap` is missing.
+
+For release validation and crates.io publication, see
+[the release guide](contrib/releasing.md).
 
 ## Quickstart
 

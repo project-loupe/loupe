@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/loupe-cli",
     "crates/loupe-core",
@@ -12,10 +12,15 @@ members = [
 ]
 
 [workspace.package]
-edition = "2021"
+version = "0.1.0"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tnull/loupe"
-rust-version = "1.75"
+repository = "https://github.com/project-loupe/loupe"
+rust-version = "1.88"
+readme = "README.md"
+keywords = ["security", "code-review", "scanner"]
+categories = ["development-tools"]
+publish = ["crates-io"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
