@@ -6,6 +6,8 @@
 - Deny provider-side `mcp_servers` connections at the model broker ([#60]).
 - Add guarded schema v3 for the v2 review harness, preserving legacy data and queued work; require an offline server upgrade with no leased jobs (see the [upgrade runbook](contrib/upgrading-schema-v3.md)) ([#61]).
 - Reject unknown persisted job kinds at startup and explain incompatible schema versions ([#61]).
+- Add typed, transactional review-harness storage with bounded text, semantic identities, replay records, and project-scoped proof metadata; keep unsupported job kinds readable but inert.
+- Log the database schema version and runtime image revision at server startup.
 
 ## v0.1 — 2026-09-07
 

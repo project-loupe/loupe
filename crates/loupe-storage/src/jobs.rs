@@ -11,7 +11,9 @@ use loupe_core::{
 	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
 };
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{
+	params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 /// Lease lifetime in seconds. Worker must heartbeat or complete before
 /// `lease_expires_at` or the reaper will reclaim the job.
@@ -477,9 +479,9 @@ pub fn get_active_by_capability_hash(
 /// no longer active and the mutation was not run.
 pub fn with_active_lease_transaction<T>(
 	conn: &mut Connection, lease: ActiveLease<'_>,
-	mutate: impl FnOnce(&Connection, &JobRow) -> rusqlite::Result<T>,
-) -> rusqlite::Result<Option<T>> {
-	let tx = conn.transaction()?;
+	mutate: impl FnOnce(&Transaction<'_>, &JobRow) -> crate::Result<T>,
+) -> crate::Result<Option<T>> {
+	let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 	let Some(row) = get_active_by_capability_hash(
 		&tx,
 		lease.identity.worker_id,
@@ -1433,7 +1435,7 @@ mod tests {
 		let mutation_ran = Cell::new(false);
 		let result = db
 			.with_conn(|c| {
-				Ok(with_active_lease_transaction(
+				with_active_lease_transaction(
 					c,
 					ActiveLease {
 						identity: LeaseIdentity {
@@ -1447,7 +1449,7 @@ mod tests {
 						mutation_ran.set(true);
 						Ok(())
 					},
-				)?)
+				)
 			})
 			.unwrap();
 

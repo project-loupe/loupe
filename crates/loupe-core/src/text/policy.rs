@@ -18,6 +18,8 @@ texts! {
 	Reason, "reason", 1000, false;
 	Argument, "argument", 4000, true;
 	Symbol, "symbol", 256, false;
+	MediaType, "media_type", 100, false;
+	OriginalName, "original_name", 512, false;
 	AnchorText, "identity_anchor", 300, false;
 	InstanceKey, "identity_instance_key", 200, false;
 }

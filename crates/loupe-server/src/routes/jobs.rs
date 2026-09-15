@@ -469,7 +469,7 @@ pub async fn submit_findings(
 	let submitted = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::with_active_lease_transaction(
+			jobs::with_active_lease_transaction(
 				c,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
@@ -485,13 +485,51 @@ pub async fn submit_findings(
 					}
 					Ok(())
 				},
-			)?)
+			)
 		})
-		.map_err(|e: loupe_storage::Error| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit findings: {e}"))
-		})?;
+		.map_err(|e| storage_write_error("submit findings", e))?;
 	submitted.ok_or_else(job_capability::forbidden)?;
 	Ok(StatusCode::NO_CONTENT)
+}
+
+fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCode, String) {
+	use loupe_storage::Error;
+	let status = match &error {
+		Error::Validation(_) | Error::UnknownPaths(_) => StatusCode::BAD_REQUEST,
+		Error::Conflict(_) => StatusCode::CONFLICT,
+		Error::Ownership(_) => StatusCode::FORBIDDEN,
+		Error::NotFound(_, _) => StatusCode::NOT_FOUND,
+		Error::Sqlite(_) | Error::UnknownJobKinds(_) => StatusCode::INTERNAL_SERVER_ERROR,
+	};
+	(status, format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod storage_error_tests {
+	use super::*;
+	#[test]
+	fn domain_errors_keep_their_http_meaning() {
+		use loupe_storage::{Conflict, Entity, Error, Ownership};
+		for (error, status) in [
+			(Error::Conflict(Conflict::Checkpoint), StatusCode::CONFLICT),
+			(Error::Ownership(Ownership::LeadJob), StatusCode::FORBIDDEN),
+			(Error::NotFound(Entity::Job, 1), StatusCode::NOT_FOUND),
+			(
+				Error::Validation(loupe_core::text::Error::new(
+					"title",
+					loupe_core::text::Rule::Empty,
+				)),
+				StatusCode::BAD_REQUEST,
+			),
+			(Error::UnknownJobKinds(vec![]), StatusCode::INTERNAL_SERVER_ERROR),
+		] {
+			assert_eq!(
+				storage_write_error("submit", error).0,
+				status,
+				"preserve typed storage failure status"
+			);
+		}
+	}
 }
 
 /// `POST /v1/jobs/:id/llm-findings` — strict host-side MCP broker path.
@@ -529,24 +567,22 @@ pub async fn submit_llm_finding(
 	let submitted = state
 		.db
 		.with_conn(|conn| {
-			Ok(jobs::with_active_lease_transaction(
+			jobs::with_active_lease_transaction(
 				conn,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
-					findings::insert_or_ignore(
+					Ok(findings::insert_or_ignore(
 						tx,
 						active.repo_id,
 						active.id,
 						&finding,
 						repo.verification_enabled,
 						now,
-					)
+					)?)
 				},
-			)?)
+			)
 		})
-		.map_err(|error| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit LLM finding: {error}"))
-		})?;
+		.map_err(|error| storage_write_error("submit LLM finding", error))?;
 	submitted.ok_or_else(job_capability::forbidden)?;
 	Ok(StatusCode::NO_CONTENT)
 }
@@ -603,7 +639,7 @@ pub async fn submit_verdict(
 	let new_state: Option<FindingState> = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::with_active_lease_transaction(
+			jobs::with_active_lease_transaction(
 				c,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
@@ -630,19 +666,17 @@ pub async fn submit_verdict(
 							now,
 						)?;
 					}
-					loupe_storage::findings::roll_up_verdicts_for_finding(
+					Ok(loupe_storage::findings::roll_up_verdicts_for_finding(
 						tx,
 						target_finding_id,
 						terminal_inconclusive,
 						require_approval,
 						now,
-					)
+					)?)
 				},
-			)?)
+			)
 		})
-		.map_err(|e: loupe_storage::Error| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit verdict: {e}"))
-		})?
+		.map_err(|e| storage_write_error("submit verdict", e))?
 		.ok_or_else(job_capability::forbidden)?;
 
 	if matches!(new_state, Some(FindingState::Confirmed))

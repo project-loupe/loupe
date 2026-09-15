@@ -39,6 +39,8 @@ pub enum Conflict {
 	Checkpoint,
 	TerminalReceipt,
 	FindingIdentity(i64),
+	FindingDetails,
+	AttemptDetails,
 	ArtifactIdentity,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,9 +102,11 @@ where
 		.transpose()
 }
 
+/// A duplicate on a UNIQUE index or on a rowid-alias primary key; SQLite
+/// reports the latter with the same message but a different extended code.
 pub(crate) fn is_unique(error: &rusqlite::Error, columns: &str) -> bool {
 	matches!(error, rusqlite::Error::SqliteFailure(code, Some(message))
-		if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+		if matches!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
 		&& message == &format!("UNIQUE constraint failed: {columns}"))
 }
 pub(crate) fn classify(error: rusqlite::Error, columns: &str, conflict: Conflict) -> crate::Error {
