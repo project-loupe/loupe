@@ -102,11 +102,13 @@ pub enum RetryOutcome {
 }
 
 /// Insert a `queued` job, returning the new id.
-pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i64> {
+pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> {
 	// NewJob is also the public legacy input, so enforce this at runtime.
 	// Match the enum, not its text: Unknown("scan") is still unknown.
 	if !RUNTIME_KINDS.contains(&new.kind) {
-		return Err(rusqlite::Error::InvalidParameterName("unsupported job kind".into()));
+		return Err(
+			loupe_core::text::Error::new("job_kind", loupe_core::text::Rule::Identifier).into()
+		);
 	}
 	let initial_state =
 		initial_job_state(JobTransition::Enqueue).map_err(sql_state_transition_error)?;
@@ -749,7 +751,7 @@ mod tests {
 
 	fn enqueue_job(db: &Db, repo_id: i64, kind: JobKind, at: i64) -> i64 {
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -760,7 +762,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				at,
-			)?)
+			)
 		})
 		.unwrap()
 	}
@@ -806,7 +808,11 @@ mod tests {
 					parent_job_id: None,
 					target_finding_id: None,
 				};
-				assert!(enqueue(c, &new, 0).is_err());
+				let result = enqueue(c, &new, 0);
+				assert!(
+					matches!(result, Err(crate::Error::Validation(_))),
+					"unsupported kinds are validation errors"
+				);
 			}
 			assert!(list(c, &JobFilter::default())?.is_empty());
 			Ok(())
@@ -1117,7 +1123,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1128,7 +1134,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					100,
-				)?)
+				)
 			})
 			.unwrap();
 
@@ -1147,7 +1153,7 @@ mod tests {
 	fn lease_is_atomic_across_concurrent_callers() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1158,7 +1164,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				100,
-			)?)
+			)
 		})
 		.unwrap();
 
@@ -1177,7 +1183,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		// One scan job and one verify job, scan first.
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1188,11 +1194,11 @@ mod tests {
 					target_finding_id: None,
 				},
 				100,
-			)?)
+			)
 		})
 		.unwrap();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1203,7 +1209,7 @@ mod tests {
 					target_finding_id: Some(42),
 				},
 				101,
-			)?)
+			)
 		})
 		.unwrap();
 
@@ -1224,7 +1230,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let scan_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1235,12 +1241,12 @@ mod tests {
 						target_finding_id: None,
 					},
 					100,
-				)?)
+				)
 			})
 			.unwrap();
 		let verify_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1251,7 +1257,7 @@ mod tests {
 						target_finding_id: Some(42),
 					},
 					200,
-				)?)
+				)
 			})
 			.unwrap();
 
@@ -1277,7 +1283,7 @@ mod tests {
 	fn heartbeat_extends_lease() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1288,7 +1294,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =
@@ -1301,7 +1307,7 @@ mod tests {
 	fn heartbeat_cannot_revive_an_expired_lease() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1312,7 +1318,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =
@@ -1333,7 +1339,7 @@ mod tests {
 	fn heartbeat_from_wrong_worker_is_rejected() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1344,7 +1350,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =
@@ -1361,7 +1367,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1372,7 +1378,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					100,
-				)?)
+				)
 			})
 			.unwrap();
 		let leased = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?)).unwrap();
@@ -1402,7 +1408,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1413,7 +1419,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					100,
-				)?)
+				)
 			})
 			.unwrap();
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?))
@@ -1453,7 +1459,7 @@ mod tests {
 	fn complete_succeeded_terminates_job() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1464,7 +1470,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =
@@ -1485,7 +1491,7 @@ mod tests {
 	fn complete_rejects_an_expired_lease() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1496,7 +1502,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =
@@ -1520,7 +1526,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1531,7 +1537,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					100,
-				)?)
+				)
 			})
 			.unwrap();
 
@@ -1553,7 +1559,7 @@ mod tests {
 	fn cancel_leased_scan_discards_pending_findings() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1564,7 +1570,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				100,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =
@@ -1614,7 +1620,7 @@ mod tests {
 	fn reap_requeues_under_max_attempts() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1625,7 +1631,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ should requeue.
@@ -1642,7 +1648,7 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				Ok(enqueue(
+				enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -1653,7 +1659,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					0,
-				)?)
+				)
 			})
 			.unwrap();
 
@@ -1689,7 +1695,7 @@ mod tests {
 	fn reap_fails_after_max_attempts() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1700,7 +1706,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		// Drive the attempts column to MAX_ATTEMPTS by leasing+reaping
@@ -1722,7 +1728,7 @@ mod tests {
 	fn reap_failed_scan_discards_pending_findings() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			Ok(enqueue(
+			enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -1733,7 +1739,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		let leased =

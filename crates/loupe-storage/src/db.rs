@@ -13,6 +13,16 @@ pub enum Error {
 	Sqlite(#[from] rusqlite::Error),
 	#[error("database contains unknown job kinds {0:?}; refusing startup")]
 	UnknownJobKinds(Vec<String>),
+	#[error(transparent)]
+	Validation(#[from] loupe_core::text::Error),
+	#[error("conflict: {0:?}")]
+	Conflict(crate::Conflict),
+	#[error("ownership mismatch: {0:?}")]
+	Ownership(crate::Ownership),
+	#[error("{0:?} {1} not found")]
+	NotFound(crate::Entity, i64),
+	#[error(transparent)]
+	UnknownPaths(crate::inventory::UnknownPaths),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -149,7 +149,7 @@ pub async fn enqueue_scan(
 	let job_id = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::enqueue(
+			jobs::enqueue(
 				c,
 				&NewJob {
 					repo_id: repo.id,
@@ -160,7 +160,7 @@ pub async fn enqueue_scan(
 					target_finding_id: None,
 				},
 				now,
-			)?)
+			)
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue: {e}")))?;
 
