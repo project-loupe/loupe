@@ -13,16 +13,23 @@ pub mod generations;
 pub mod identity;
 pub mod inventory;
 pub mod jobs;
+pub mod lead_observations;
+pub mod leads;
 pub mod migrations;
 pub mod ownership;
 pub mod repos;
 mod review;
+pub mod review_unit_results;
+pub mod review_units;
 pub mod secrets;
+pub mod source_refs;
 pub mod transaction;
 pub mod workers;
 
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod scope_tests;
 
 pub use db::{Db, Error, Result};
 pub use loupe_core::canonical;
