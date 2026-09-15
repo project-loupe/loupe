@@ -317,6 +317,27 @@ pub fn retry_failed(
 				)));
 			},
 		}
+		// Schema v3 enforces one active verify job per finding with a partial
+		// unique index, and legacy data may already hold a queued sibling.
+		// Answer with the endpoint's usual conflict instead of letting the
+		// requeue surface the index violation as an internal error.
+		let active_verify: Option<i64> = tx
+			.query_row(
+				"SELECT id FROM jobs
+				  WHERE kind = 'verify'
+				    AND target_finding_id = ?1
+				    AND state IN ('queued','leased')
+				    AND id <> ?2
+				  ORDER BY id LIMIT 1",
+				params![finding_id, job_id],
+				|r| r.get(0),
+			)
+			.optional()?;
+		if let Some(active_verify) = active_verify {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} target finding {finding_id} already has active verify job {active_verify}"
+			)));
+		}
 		if !crate::findings::retry_verification(&tx, finding_id, validating_deadline)? {
 			return Ok(RetryOutcome::Conflict(format!(
 				"verify job {job_id} target finding {finding_id} changed before retry"

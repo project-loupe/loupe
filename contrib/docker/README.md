@@ -7,6 +7,11 @@ The production path is rootful Podman managed by systemd. The images are
 Docker-compatible, but the production helpers install systemd units and keep
 runtime secrets in one protected env file per host.
 
+When upgrading an existing database to schema v3, complete the
+[offline upgrade runbook](../upgrading-schema-v3.md) before using the deploy
+helpers. B1 requires a server redeploy and stopping all workers for migration;
+it does not itself require a worker rebuild or protocol upgrade.
+
 ## Host Prerequisites
 
 Fresh Debian service and worker hosts need:

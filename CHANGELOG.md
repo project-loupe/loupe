@@ -4,6 +4,8 @@
 
 - Keep model credentials outside agent sandboxes by routing Claude and Codex through a host-side model broker ([#59]).
 - Deny provider-side `mcp_servers` connections at the model broker ([#60]).
+- Add guarded schema v3 for the v2 review harness, preserving legacy data and queued work; require an offline server upgrade with no leased jobs (see the [upgrade runbook](contrib/upgrading-schema-v3.md)).
+- Reject unknown persisted job kinds at startup and explain incompatible schema versions.
 
 ## v0.1 — 2026-09-07
 

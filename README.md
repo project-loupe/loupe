@@ -346,6 +346,11 @@ See `contrib/docker/README.md` for fresh Debian host prerequisites,
 image builds, two-host deployment, restart behaviour, and the exact
 secret-handling model.
 
+For existing installations moving to schema v3, follow the
+[offline upgrade runbook](contrib/upgrading-schema-v3.md) before deploying the
+new server. Back up first and stop the old server and all workers; queued
+legacy work may remain, but leased jobs block the migration.
+
 ### 6. Register a repo and trigger a scan
 
 The `--pat` value here is the GitHub PAT you minted in the
