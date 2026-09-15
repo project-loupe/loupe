@@ -52,8 +52,9 @@ Before installing, the host needs:
   that uses Claude for scan or verify jobs. The default scan agent is
   Claude when it is authenticated. Claude invocations run inside
   bubblewrap, with the worker's mount keeping each invocation's `/tmp`
-  and `$HOME` fresh. See https://github.com/anthropics/claude-code for
-  install instructions.
+  and `$HOME` fresh. The worker keeps the provider credential on the
+  trusted host and gives the sandbox only a per-job model-broker socket.
+  See https://github.com/anthropics/claude-code for install instructions.
 - **`codex` CLI** on PATH on every machine running `loupe-worker` that
   uses Codex for scan or verify jobs. The default verifier prefers
   Codex so the second opinion comes from a different model family than
@@ -61,7 +62,8 @@ Before installing, the host needs:
   Codex invocations shell out to `codex exec
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
   For API-key auth, set `CODEX_API_KEY`; `OPENAI_API_KEY` remains a
-  compatibility alias in the Docker deploy helper.
+  compatibility alias. The key is consumed by the worker-host broker and
+  is never passed to the Codex sandbox.
   See https://github.com/openai/codex for install instructions.
 - **`bkb-mcp`** (optional) on PATH on workers scanning bitcoin /
   lightning / cashu codebases. When the binary is present at startup,
@@ -254,18 +256,20 @@ loupe-worker run --config /etc/loupe/worker.config.toml
 
 The worker config owns non-secret runtime settings: server URL, TLS
 file paths, cache settings, sandbox networking, logging, LLM job-agent
-selection, Claude/Codex model + effort, scanner defaults, and BKB API
-URL. CLI flags and matching env vars override the config. API keys and
-PEM contents still belong in env or secret files.
+selection, Claude/Codex model + effort, model-broker ceilings, scanner
+defaults, and BKB API URL. CLI flags and matching env vars override the
+config. API keys and PEM contents still belong in env or secret files.
 
 Every agent invocation receives a private network namespace. The
 default `[sandbox].network = "public"` policy allows public IPv4 while
 blocking host addresses, connected routes, private/special ranges,
 CGNAT, and IPv6. Set it to `"allowlist"` for default-deny egress;
-`[sandbox].allowlist` then adds hostnames or IPv4 addresses. The active
-agent API (`api.anthropic.com` or `api.openai.com`) is always allowed,
-as is the host from `[bkb].api_url` when `bkb-mcp` is attached, so an
-empty allowlist means provider/BKB-only access. Overrides are
+`[sandbox].allowlist` then adds hostnames or IPv4 addresses. Provider API
+hosts are not added: the agent reaches a loopback adapter backed by its
+job-scoped Unix socket, while the trusted worker broker owns the fixed
+upstream, model, effort, and credential. The host from `[bkb].api_url` is
+allowed when `bkb-mcp` is attached, so an empty allowlist means no external
+agent egress unless BKB is enabled. Overrides are
 `--sandbox-network` / `LOUPE_SANDBOX_NETWORK` and
 `--sandbox-allowlist` / `LOUPE_SANDBOX_ALLOWLIST`; the environment
 allowlist is comma-separated.
@@ -276,6 +280,15 @@ cannot distinguish virtual hosts sharing an address. DNS through
 slirp's resolver remains available, operator allowlists may explicitly
 name private IPv4 destinations, and IPv6 allowlist entries are not
 supported.
+
+`[broker].request_ceiling` (default `1000`) and
+`[broker].output_ceiling_bytes` (default `33554432`) bound each job's model
+session. `[broker].token_ceiling` is optional and defaults to no reported
+token cutoff. The matching environment overrides are
+`LOUPE_BROKER_REQUEST_CEILING`, `LOUPE_BROKER_OUTPUT_CEILING_BYTES`, and
+`LOUPE_BROKER_TOKEN_CEILING`. These limits, provider authentication, model
+pinning, and provider-side fetch-tool filtering are enforced by the trusted
+worker broker rather than by repository-controlled agent settings.
 
 The worker auto-detects authenticated `claude` and `codex` CLIs at
 startup. `[agents].scan` and `[agents].verify` choose which LLM agent
@@ -676,9 +689,9 @@ crates/
   loupe-tls       internal CA + cert minting + fingerprint helpers
   loupe-storage   SQLCipher DAO surface, FTS5 index, schema-versioned migrations
   loupe-server    daemon binary + mTLS routes + reporters + scheduler/reaper
-  loupe-worker    worker binary (`run` + credential-free `mcp-proxy`) +
-                  scanner trait + LLM backend + versioned MCP tool surface +
-                  bwrap sandbox
+  loupe-worker    worker binary (`run` + credential-free `mcp-proxy` and
+                  `model-proxy`) + scanner trait + LLM backend + versioned
+                  MCP tool surface + bwrap sandbox
   loupe-cli       loupectl admin CLI
   loupe-web       loupe-web local operator dashboard (loopback HTTP,
                   proxies the same admin RPCs as loupectl)

@@ -189,6 +189,14 @@ build_worker_config_file() {
 		printf 'model = %s\n' "$(toml_string "${LOUPE_CODEX_MODEL:-gpt-5.5}")"
 		printf 'effort = %s\n\n' "$(toml_string "${LOUPE_CODEX_EFFORT:-xhigh}")"
 
+		printf '[broker]\n'
+		printf 'request_ceiling = %s\n' "${LOUPE_BROKER_REQUEST_CEILING:-1000}"
+		printf 'output_ceiling_bytes = %s\n' "${LOUPE_BROKER_OUTPUT_CEILING_BYTES:-33554432}"
+		if [ -n "${LOUPE_BROKER_TOKEN_CEILING:-}" ]; then
+			printf 'token_ceiling = %s\n' "$LOUPE_BROKER_TOKEN_CEILING"
+		fi
+		printf '\n'
+
 		printf '[scanner_defaults]\n'
 		printf 'max_concurrent_files = %s\n' "${LOUPE_MAX_CONCURRENT_FILES:-8}"
 		printf 'max_file_bytes = %s\n' "${LOUPE_MAX_FILE_BYTES:-2097152}"

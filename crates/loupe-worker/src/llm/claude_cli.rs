@@ -7,8 +7,8 @@
 //! because the sandbox is the security boundary, not the CLI's
 //! permission system.
 //!
-//! Network is allowed through the sandbox so the CLI can reach
-//! api.anthropic.com.
+//! Model traffic reaches a loopback adapter in the private sandbox network;
+//! the host-side broker alone connects to the provider API.
 //!
 //! When constructed with [`McpContext`], each invocation writes a
 //! per-call MCP config and passes `--mcp-config` to claude. The
@@ -28,16 +28,19 @@ use tokio::time::timeout;
 use super::mcp::{
 	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
+use super::model_broker::{
+	bind_model_into_sandbox, ModelBrokerBackend, ModelBrokerContext, SANDBOX_MODEL_SOCKET,
+};
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
-
-const PROVIDER_API_HOST: &str = "api.anthropic.com";
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_CLAUDE_EFFORT: &str = "max";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
+const MODEL_PROXY_LISTEN: &str = "127.0.0.1:0";
+const SANDBOX_MODEL_PORT_FILE: &str = "/tmp/loupe-model.port";
 
 fn claude_mcp_args() -> [&'static str; 3] {
 	["--mcp-config", SANDBOX_MCP_CONFIG, "--strict-mcp-config"]
@@ -116,6 +119,7 @@ pub struct ClaudeCliBackend {
 	bin: String,
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
+	model_broker: Option<ModelBrokerContext>,
 	network: SandboxNetworkConfig,
 	log_agent_output: bool,
 	#[cfg(test)]
@@ -133,6 +137,7 @@ impl ClaudeCliBackend {
 				effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
 			},
 			mcp: None,
+			model_broker: None,
 			network: SandboxNetworkConfig::default(),
 			log_agent_output: false,
 			#[cfg(test)]
@@ -181,6 +186,11 @@ impl ClaudeCliBackend {
 		self.mcp = Some(mcp);
 		self
 	}
+
+	pub fn with_model_broker_context(mut self, model_broker: ModelBrokerContext) -> Self {
+		self.model_broker = Some(model_broker);
+		self
+	}
 }
 
 impl Default for ClaudeCliBackend {
@@ -206,6 +216,19 @@ impl LlmBackend for ClaudeCliBackend {
 			"claude-cli: invoking",
 		);
 		let started = std::time::Instant::now();
+		let model_context = self
+			.model_broker
+			.as_ref()
+			.context("claude backend requires a host-side model broker context")?;
+		let mut model_broker = Some(
+			model_context
+				.start_session(ModelBrokerBackend::Claude {
+					model: self.agent.model.clone(),
+					effort: self.agent.effort.clone(),
+				})
+				.await
+				.context("starting host-side Claude model broker")?,
+		);
 
 		#[cfg(test)]
 		let sandbox_builder = if self.disable_sandbox {
@@ -226,8 +249,14 @@ impl LlmBackend for ClaudeCliBackend {
 				.as_ref()
 				.filter(|ctx| ctx.bkb_mcp_path.is_some())
 				.map(|ctx| ctx.bkb_api_url.as_str());
-			let required_hosts = super::required_network_hosts(PROVIDER_API_HOST, bkb_api_url)?;
-			sandbox_builder.with_network(self.network.clone(), required_hosts)
+			let required_hosts = super::required_network_hosts(bkb_api_url)?;
+			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
+				sandbox_builder
+					.with_network(self.network.clone(), required_hosts)
+					.with_network_supervisor(model_context.worker_binary())
+			} else {
+				sandbox_builder
+			}
 		} else {
 			sandbox_builder
 		};
@@ -238,11 +267,16 @@ impl LlmBackend for ClaudeCliBackend {
 			// invisible without this.
 			.allow_binary(&self.bin)
 			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
-			// Forward the environment credential the CLI uses
-			// non-interactively: an API key, or a headless OAuth token
-			// from `claude setup-token`. Both are set only when present.
-			.forward_env("ANTHROPIC_API_KEY")
-			.forward_env("CLAUDE_CODE_OAUTH_TOKEN");
+			// Claude requires a value before attempting an API call. This
+			// fixed sentinel is not authority; the host broker strips it.
+			.set_env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered")
+			.set_env("DISABLE_AUTOUPDATER", "1")
+			.set_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+			.set_env("DISABLE_TELEMETRY", "1")
+			.set_env("DISABLE_ERROR_REPORTING", "1")
+			.set_env("DISABLE_BUG_COMMAND", "1");
+		let model_session = model_broker.as_ref().expect("model broker was just started");
+		sandbox = bind_model_into_sandbox(sandbox, model_context, model_session);
 
 		// Optional MCP attachment. Held in a local so its `TempDir`
 		// lives until after the subprocess returns — dropping it
@@ -270,13 +304,21 @@ impl LlmBackend for ClaudeCliBackend {
 			_ => None,
 		};
 
-		let mut cmd = sandbox.build(&self.bin);
-		for arg in claude_invocation_args(&self.agent, &req.prompt) {
-			cmd.arg(arg);
-		}
+		let mut agent_args = claude_invocation_args(&self.agent, &req.prompt);
 		if _mcp_scratch.is_some() {
-			cmd.args(claude_mcp_args());
+			agent_args.extend(claude_mcp_args().into_iter().map(str::to_owned));
 		}
+		#[cfg(test)]
+		let mut cmd = if self.disable_sandbox {
+			let mut cmd =
+				sandbox.set_env("ANTHROPIC_BASE_URL", "http://127.0.0.1:1").build(&self.bin);
+			cmd.args(&agent_args);
+			cmd
+		} else {
+			build_model_proxied_command(&sandbox, &self.bin, &agent_args)
+		};
+		#[cfg(not(test))]
+		let mut cmd = build_model_proxied_command(&sandbox, &self.bin, &agent_args);
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		cmd.kill_on_drop(true);
 
@@ -321,6 +363,7 @@ impl LlmBackend for ClaudeCliBackend {
 			&& let Err(error) = child.kill().await
 		{
 			drop(mcp_broker.take());
+			drop(model_broker.take());
 			return Err(
 				anyhow::Error::from(error).context("terminating claude CLI before broker shutdown")
 			);
@@ -332,6 +375,21 @@ impl LlmBackend for ClaudeCliBackend {
 		// paths would discard a verdict the agent had already produced.
 		let broker_outcome = match mcp_broker.take() {
 			Some(broker) => broker.finish().await.context("finishing host-side MCP broker"),
+			None => Ok(()),
+		};
+		let model_broker_outcome = match model_broker.take() {
+			Some(broker) => broker
+				.finish()
+				.await
+				.map(|usage| {
+					tracing::debug!(
+						requests = usage.requests,
+						output_bytes = usage.output_bytes,
+						tokens = usage.tokens,
+						"claude-cli: model broker usage"
+					);
+				})
+				.context("finishing host-side Claude model broker"),
 			None => Ok(()),
 		};
 
@@ -368,6 +426,7 @@ impl LlmBackend for ClaudeCliBackend {
 		// Reported last: a CLI failure explains a broker failure, so the
 		// CLI diagnostic is the more useful error to surface.
 		broker_outcome?;
+		model_broker_outcome?;
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
@@ -406,6 +465,25 @@ impl LlmBackend for ClaudeCliBackend {
 	}
 }
 
+fn build_model_proxied_command(
+	sandbox: &SandboxBuilder, agent_bin: &str, agent_args: &[String],
+) -> tokio::process::Command {
+	let mut cmd = sandbox.build(SANDBOX_LOUPE_BIN);
+	cmd.args([
+		"model-proxy",
+		"--socket",
+		SANDBOX_MODEL_SOCKET,
+		"--listen",
+		MODEL_PROXY_LISTEN,
+		"--port-file",
+		SANDBOX_MODEL_PORT_FILE,
+		"--",
+		agent_bin,
+	]);
+	cmd.args(agent_args);
+	cmd
+}
+
 fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 	vec![
 		"--dangerously-skip-permissions".to_owned(),
@@ -413,6 +491,7 @@ fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 		agent.model.clone(),
 		"--effort".to_owned(),
 		agent.effort.clone(),
+		"--no-session-persistence".to_owned(),
 		"-p".to_owned(),
 		prompt.to_owned(),
 	]
@@ -446,9 +525,18 @@ mod tests {
 			.unwrap_or(false)
 	}
 
+	fn test_model_broker(worker_binary: impl Into<PathBuf>) -> ModelBrokerContext {
+		ModelBrokerContext::new(
+			worker_binary.into(),
+			"http://127.0.0.1:9".parse().unwrap(),
+			super::super::model_broker::ModelCredential::anthropic_api_key("host-test-secret"),
+			super::super::model_broker::ModelBrokerLimits::default(),
+		)
+	}
+
 	#[cfg(unix)]
 	#[tokio::test(flavor = "current_thread")]
-	async fn sandbox_uses_headless_token_without_host_login_state() {
+	async fn sandbox_receives_only_the_broker_sentinel_and_loopback_url() {
 		use std::os::unix::fs::PermissionsExt;
 
 		if !bwrap_present() {
@@ -468,16 +556,33 @@ mod tests {
 		std::fs::write(
 			&bin_path,
 			"#!/bin/sh\n\
-			if [ -e /home/scanner/.claude.json ]; then\n\
+			if [ -n \"${ANTHROPIC_API_KEY-}\" ] || [ -n \"${CLAUDE_CODE_OAUTH_TOKEN-}\" ]; then\n\
 			  echo LEAKED\n\
-			elif [ \"${CLAUDE_CODE_OAUTH_TOKEN-}\" = \"loupe-test-oauth-token\" ]; then\n\
-			  echo SAFE\n\
+			elif [ \"${ANTHROPIC_AUTH_TOKEN-}\" != \"loupe-brokered\" ]; then\n\
+			  echo MISSING_SENTINEL\n\
+			elif [ \"${ANTHROPIC_BASE_URL-}\" != \"http://127.0.0.1:18080\" ]; then\n\
+			  echo BAD_BASE_URL\n\
+			elif [ \"${DISABLE_AUTOUPDATER-}\" != \"1\" ] || [ \"${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-}\" != \"1\" ]; then\n\
+			  echo NONESSENTIAL_TRAFFIC_ENABLED\n\
+			elif [ -e /home/scanner/.claude.json ]; then\n\
+			  echo LEAKED_LOGIN_STATE\n\
 			else\n\
-			  echo MISSING_TOKEN\n\
+			  echo SAFE\n\
 			fi\n",
 		)
 		.unwrap();
 		std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+		let proxy_path = bin_dir.join("fake-loupe-worker");
+		std::fs::write(
+			&proxy_path,
+			"#!/bin/sh\n\
+			while [ \"$1\" != \"--\" ]; do shift; done\n\
+			shift\n\
+			export ANTHROPIC_BASE_URL=http://127.0.0.1:18080\n\
+			exec \"$@\"\n",
+		)
+		.unwrap();
+		std::fs::set_permissions(&proxy_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
 		let mut path_entries = vec![bin_dir];
 		if let Some(path) = std::env::var_os("PATH") {
@@ -485,18 +590,26 @@ mod tests {
 		}
 		let path = std::env::join_paths(path_entries).unwrap();
 		if !in_env(
-			"llm::claude_cli::tests::sandbox_uses_headless_token_without_host_login_state",
+			"llm::claude_cli::tests::sandbox_receives_only_the_broker_sentinel_and_loopback_url",
 			"oauth-token",
 			&[
 				("PATH", Some(path.as_os_str())),
 				("HOME", Some(home.as_os_str())),
-				("CLAUDE_CODE_OAUTH_TOKEN", Some("loupe-test-oauth-token".as_ref())),
+				("CLAUDE_CODE_OAUTH_TOKEN", Some("host-oauth-secret".as_ref())),
 			],
 		) {
 			return;
 		}
 
-		let backend = ClaudeCliBackend::with_bin("fake-claude").with_network_disabled_for_tests();
+		let model_broker = super::super::model_broker::ModelBrokerContext::new(
+			proxy_path,
+			"http://127.0.0.1:9".parse().unwrap(),
+			super::super::model_broker::ModelCredential::anthropic_oauth_token("host-oauth-secret"),
+			super::super::model_broker::ModelBrokerLimits::default(),
+		);
+		let backend = ClaudeCliBackend::with_bin("fake-claude")
+			.with_network_disabled_for_tests()
+			.with_model_broker_context(model_broker);
 		let req = LlmRequest {
 			prompt: "irrelevant".into(),
 			workdir: workdir.path().to_path_buf(),
@@ -512,7 +625,7 @@ mod tests {
 		assert_eq!(
 			response.text.trim(),
 			"SAFE",
-			"the agent must receive only explicit headless auth, not host Claude login state"
+			"the sandbox must receive only local broker configuration, not host auth"
 		);
 	}
 
@@ -568,7 +681,8 @@ mod tests {
 	async fn missing_binary_errors_clearly() {
 		// `loupe-worker-no-such-bin` definitely does not exist on PATH.
 		let workdir = tempfile::tempdir().unwrap();
-		let backend = ClaudeCliBackend::with_bin("loupe-worker-no-such-bin");
+		let backend = ClaudeCliBackend::with_bin("loupe-worker-no-such-bin")
+			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
 			prompt: "irrelevant".into(),
 			workdir: workdir.path().to_path_buf(),
@@ -605,7 +719,8 @@ mod tests {
 		write_fake_cli(&bin_path, &pid_path, &survived_path);
 
 		let backend = ClaudeCliBackend::with_bin(bin_path.to_string_lossy())
-			.with_sandbox_disabled_for_tests();
+			.with_sandbox_disabled_for_tests()
+			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
 			prompt: "irrelevant".into(),
 			workdir: workdir.path().to_path_buf(),
@@ -646,6 +761,7 @@ mod tests {
 
 		assert!(args.windows(2).any(|w| w == ["--model", "claude-test"]));
 		assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
+		assert!(args.iter().any(|arg| arg == "--no-session-persistence"));
 		assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
 	}
 }

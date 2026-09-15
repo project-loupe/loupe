@@ -20,9 +20,14 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
+futures-util = { workspace = true }
 git2 = { workspace = true }
 glob = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 loupe-core = { version = "0.1.0", path = "../loupe-core" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
@@ -41,6 +46,7 @@ tracing-subscriber = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 # Keep this test dependency path-only: Cargo omits it on publication,
 # avoiding a server/worker cycle in the registry dependency graph.
 loupe-server = { path = "../loupe-server" }

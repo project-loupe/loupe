@@ -40,8 +40,11 @@ async-trait = { version = "0.1", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio", "tracing"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
+bytes = { version = "1", default-features = false, features = ["std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
-hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+futures-util = { version = "0.3", default-features = false, features = ["async-await", "std"] }
+http-body-util = { version = "0.1", default-features = false }
+hyper = { version = "1", default-features = false, features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service", "server"] }
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 # `rustls-tls-webpki-roots` gives reqwest a compiled-in Mozilla root
@@ -53,7 +56,7 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 # does not chain to a public root. Crypto provider is `ring`, pulled
 # in explicitly via the `rustls` workspace dep below; `aws-lc-rs` is
 # excluded.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
 glob = { version = "0.3", default-features = false }

@@ -31,6 +31,25 @@ The worker host does not need host Rust, Cargo, Node, npm, Git, `bubblewrap`,
 `slirp4netns`, `nft`, `ip`, `nsenter`, Claude Code, Codex, or `bkb-mcp`.
 Those are installed in the worker image.
 
+Worker image builds default to the npm `latest` releases of Claude Code and
+Codex. `build-images.sh` refreshes their install layer on every build while
+retaining the Rust and system-package caches. Rebuild and deploy the worker
+image to pick up new CLI releases; restarting or redeploying an existing
+image keeps its installed versions. Running agents do not auto-update.
+
+For manual builds, pass a fresh `--build-arg AGENT_CLI_REFRESH="$(date +%s)-$$"`
+to avoid reusing a cached CLI install. The `CLAUDE_CODE_VERSION` and
+`CODEX_VERSION` build arguments still accept explicit versions for rollback
+or diagnosis. Retain a known-good image for rollback when tracking `latest`.
+
+Set `LOUPE_TEST_CLAUDE_BIN` and `LOUPE_TEST_CODEX_BIN` to the candidate
+executables when running `cargo test -p loupe-worker --test model_broker`.
+The opt-in tests log the selected versions and check real CLI request routing
+inside the no-egress sandbox, without requiring a hard-coded version. They
+do not establish a complete successful model conversation; smoke-test new
+images before deployment. Broker credential and endpoint restrictions remain
+enforced if a newer CLI is incompatible.
+
 Optional bootstrap. The script takes the host's role and prepares only that
 role, so a host running both needs one run per role:
 
@@ -149,7 +168,11 @@ export CODEX_API_KEY=...
 export LOUPE_SCAN_AGENT=auto
 export LOUPE_VERIFY_AGENT=auto
 export LOUPE_SANDBOX_NETWORK=public
-# For provider/BKB plus selected destinations instead:
+# Optional per-job model-broker limits:
+# export LOUPE_BROKER_REQUEST_CEILING=1000
+# export LOUPE_BROKER_OUTPUT_CEILING_BYTES=33554432
+# export LOUPE_BROKER_TOKEN_CEILING=100000
+# For BKB plus selected destinations instead (model traffic is brokered):
 # export LOUPE_SANDBOX_NETWORK=allowlist
 # export LOUPE_SANDBOX_ALLOWLIST=github.com,203.0.113.10
 export LOUPE_SERVER_URL=https://loupe.example.com:8443
@@ -164,12 +187,18 @@ The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 bundle and whichever LLM credentials are set. It also writes
 `/etc/loupe-container/worker.config.toml` for non-secret worker settings
 (cache, sandbox networking, logging, job-agent selection, scanner defaults,
-BKB API URL, and Claude/Codex model/effort), mounts it read-only into the container, and sets
+BKB API URL, broker ceilings, and Claude/Codex model/effort), mounts it
+read-only into the container, and sets
 `LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT` and `LOUPE_VERIFY_AGENT` accept
 `auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
 startup if that CLI is not authenticated. For Codex, use `CODEX_API_KEY`;
 for compatibility the deploy script also writes `CODEX_API_KEY` from
 `OPENAI_API_KEY` when `CODEX_API_KEY` is absent.
+
+Provider credentials remain in the trusted worker process. Each agent
+sandbox receives a fresh job-scoped model socket, a loopback adapter, and a
+fixed non-secret client sentinel; it receives neither the provider key nor
+the worker's saved CLI login state.
 
 ## Secret Handling
 

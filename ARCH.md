@@ -15,17 +15,19 @@ crates/
                   migrations, secrets table
   loupe-server    daemon binary + mTLS routes + reporters + scheduler/reaper
   loupe-worker    worker binary + scanner trait + LLM backend + sandbox
-                  + host-side MCP broker (mcp-proxy subcommand)
+                  + host-side model/MCP brokers (model-proxy and mcp-proxy)
   loupe-cli       loupectl admin CLI
   loupe-web       loupe-web local operator dashboard (loopback HTTP,
                   proxies the same admin RPCs as loupectl)
 ```
 
 Four deployable binaries: `loupe-server`, `loupe-worker`, `loupectl`, and
-`loupe-web`. The MCP server runs *in the worker process*, on the trusted
-side of the sandbox boundary; the agent reaches it through a
-credential-free bridge (`loupe-worker mcp-proxy`) that forwards stdio to
-a per-invocation Unix socket. `loupe-web` is an optional operator
+`loupe-web`. The model and MCP brokers run *in the worker process*, on the
+trusted side of the sandbox boundary. The agent reaches them through
+credential-free bridges (`loupe-worker model-proxy` and `mcp-proxy`) backed
+by distinct per-invocation Unix sockets. Provider credentials, the fixed
+model/effort policy, and server/job authority stay in those host brokers.
+`loupe-web` is an optional operator
 convenience: it
 holds the same admin certificate `loupectl` uses and proxies the same
 routes, so it adds no new authority to the system and no new trust root.
@@ -41,17 +43,16 @@ It binds loopback only, for the reasons in README §9.
                                     │ admin mTLS
                                     │ /v1/repos, /v1/findings, …
                                     ▼
-                       ┌────────────────────────┐         ┌──────────────────┐
-                       │      loupe-server      │ ──HTTPS─► api.github.com   │
-                       │                        │  (PAT)  │  (GitHub Issues) │
-                       │                        │ ─sendmail→ local MTA       │
-                       │  ┌──────────────────┐  │         └──────────────────┘
-                       │  │   SQLCipher DB   │  │
+                       ┌────────────────────────┐           ┌────────────────────┐
+                       │      loupe-server      │ ─HTTPS──► │ api.github.com     │
+                       │                        │  (PAT)    │ (GitHub Issues)    │
+                       │  ┌──────────────────┐  │           └────────────────────┘
+                       │  │ SQLCipher DB     │  │ ─sendmail─► local MTA
                        │  │ • repos          │  │
                        │  │ • jobs           │  │
                        │  │ • findings       │  │
-                       │  │ • finding_fts    │  │  (FTS5 over title +
-                       │  │ • secrets (PATs) │  │   description + path)
+                       │  │ • finding_fts    │  │ FTS5 over title +
+                       │  │ • secrets (PATs) │  │ description + path
                        │  │ • workers        │  │
                        │  └──────────────────┘  │
                        │  ┌──────────────────┐  │
@@ -59,95 +60,56 @@ It binds loopback only, for the reasons in README §9.
                        │  └──────────────────┘  │
                        └─────────┬─────┬────────┘
                                  │     │
-                worker mTLS      │     │   worker mTLS (long-poll)
-            (lease, heartbeat,   │     │     POST /v1/jobs/lease
-             submit_findings,    │     │
-             complete,           │     │
-             submit_verdict,     │     │
-             search_findings)    │     │
+        worker mTLS              │     │ worker mTLS (long-poll)
+    (lease, heartbeat,           │     │ POST /v1/jobs/lease
+     submit_findings, complete,  │     │
+     submit_verdict,             │     │
+     search_findings)            │     │
                                  ▼     ▼
                        ┌────────────────────────┐
                        │      loupe-worker      │
                        │  ┌──────────────────┐  │
-                       │  │   repo cache     │  │   `git clone --bare`
-                       │  │   (LRU bare      │  │    via shell-out
-                       │  │    clones)       │  │
+                       │  │ repo cache       │  │   repo clone/fetch
+                       │  │ (LRU bare clones)│  │
                        │  └──────────────────┘  │
                        │  ┌──────────────────┐  │
                        │  │ scanners:        │  │
-                       │  │  • regex-secrets │  │
-                       │  │  • llm-code-     │  │
-                       │  │     review       │  │
-                       │  │  • llm-verifier  │  │
-                       │  └─────┬────────────┘  │
-                       └───────┬┴───────────────┘
-                               │ spawns inside bwrap sandbox
-                               ▼
-                       ┌────────────────────────┐
-                       │      bwrap sandbox     │
-                       │  (worktree mounted ro  │
-                       │   at /workdir, fresh   │
-                       │   /tmp + /home/scanner)│
-                       │                        │
-                       │  ┌──────────────────┐  │ HTTPS  ┌────────────────┐
-                       │  │ configured agent │ ─┼───────►│ provider API   │
-                       │  │  + MCP config    │  │        │                │
-                       │  └─┬─────────┬──────┘  │        └────────────────┘
-                       │    │         │
-                       │    │         │ stdio JSON-RPC (MCP)
-                       │    │         ▼
-                       │    │     ┌──────────────────┐  HTTP   ┌────────────────┐
-                       │    │     │ bkb-mcp (opt.)   │ ───────►│  bkb HTTP API  │
-                       │    │     │                  │         │  (BKB_API_URL) │
-                       │    │     │ tools:           │         └────────────────┘
-                       │    │     │ • bkb_search     │
-                       │    │     │ • bkb_lookup_bip │
-                       │    │     │ • bkb_lookup_bolt│
-                       │    │     │ • bkb_lookup_lud │
-                       │    │     │ • bkb_lookup_nut │
-                       │    │     │ • bkb_lookup_blip│
-                       │    │     │ • bkb_find_commit│
-                       │    │     │ • bkb_get_doc    │
-                       │    │     │ • bkb_get_refs   │
-                       │    │     │ • bkb_timeline   │
-                       │    │     └──────────────────┘
-                       │    │ stdio JSON-RPC (MCP)
-                       │    ▼
-                       │  ┌──────────────────┐  │
-                       │  │ loupe-worker     │  │  no credentials,
-                       │  │   mcp-proxy      │  │  no server URL,
-                       │  │ (stdio ⇄ socket) │  │  no job id
+                       │  │ • regex-secrets  │  │
+                       │  │ • llm-code-review│  │
+                       │  │ • llm-verifier   │  │
                        │  └────────┬─────────┘  │
-                       └───────────┼────────────┘
-                          sandbox  │  Unix socket bind-mounted
-                        ───────────┼───────────────────────────
-                          trusted  │  worker process
+                       └───────────┬────────────┘
+                                   │ spawns inside bwrap
                                    ▼
-                          ┌──────────────────┐   mTLS (worker cert)
-                          │ host-side MCP    │ ──────────► loupe-server
-                          │ broker           │   + X-Loupe-Job-Capability
-                          │                  │
-                          │ holds: client,   │   GET  /v1/repos/:id/
-                          │ job capability,  │          findings/search
-                          │ repo id, job id  │   GET  /v1/findings/:id
-                          │                  │   POST /v1/jobs/:id/
-                          │ tools:           │          llm-findings
-                          │ • query_prior_   │
-                          │   findings       │
-                          │ • get_finding_   │
-                          │   by_id          │
-                          │ • submit_finding │
-                          │ • validate_poc   │
-                          └──────────────────┘
+              ┌──────────────────────────────────────────────────────────────┐
+              │                        agent sandbox                         │
+              │ read-only /workdir; fresh /tmp and $HOME                     │
+              │                                                              │
+              │ agent ──HTTP loopback──► model-proxy                         │
+              │   ├────stdio MCP───────► mcp-proxy                           │
+              │   └────stdio MCP───────► bkb-mcp (optional)                  ├──HTTP──► BKB API
+              └───────────────┬─────────────────────────────┬────────────────┘
+                              │ Unix socket                 │ Unix socket
+              ────────────────┼─────────────────────────────┼───────────────── trust boundary
+                              ▼                             ▼
+                  ┌───────────────────────┐     ┌───────────────────────┐
+                  │ host-side model broker│     │ host-side MCP broker  │
+                  │                       │     │                       │
+                  │ provider/model/effort │     │ worker client +       │
+                  │ limits + credential   │     │ repo/job capability   │
+                  └───────────┬───────────┘     └───────────┬───────────┘
+                              │ HTTPS                       │ mTLS
+                              ▼                             ▼
+                        provider API                  loupe-server
 ```
 
-The `bkb-mcp` block is dashed because it's optional: the worker
-attaches it to the per-call MCP configuration only when `bkb-mcp` is
+The `bkb-mcp` branch is optional: the worker attaches it to the per-call
+MCP configuration only when `bkb-mcp` is
 on PATH at startup. Workers that don't have it installed run without
 that branch and the agent's prompt makes no mention of bkb tools.
 
-The broker tool list shown above is the
-**discovery-mode** catalogue. A verify-mode session (spawned for a
+The host-side MCP broker exposes a phase-specific tool catalogue. Its
+**discovery mode** is used for scan jobs. A verify-mode session (spawned for a
 `kind=verify` job) exposes a different surface: `query_prior_findings`
 and `get_finding_by_id` carry over, while `submit_finding` /
 `validate_poc` are replaced with `submit_verdict`, `submit_patch`,
@@ -312,32 +274,32 @@ instance. There are three client cert "roles":
   whose row is `revoked_at != NULL`) gets a 401.
 
 ```
-                       ┌─────────────────┐
-                       │  loupe-server   │  CA (host of trust)
-                       │  ┌───────────┐  │     │
-                       │  │  server   │  │     ├── server.pem (leaf)
-                       │  │   cert    │  │     ├── admin.pem  (leaf, kind=admin)
-                       │  └───────────┘  │     └── worker-N.pem (leaf, kind=worker)
-                       └────────┬────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              │                 │                 │
-              ▼                 ▼                 ▼
-     ┌─────────────┐   ┌────────────────┐   ┌────────────────┐
-     │   admin     │   │   worker A     │   │  worker B      │
-     │ (loupectl)  │   │  + scanners    │   │  + verifier    │
-     └─────────────┘   └────────┬───────┘   └────────────────┘
-                                │
-                                │ (the worker cert never
-                                │  crosses into bwrap; only
-                                │  a Unix socket is bound in)
-                                ▼
-                       ┌────────────────┐
-                       │ loupe-worker   │   in the bwrap sandbox,
-                       │   mcp-proxy    │   forwards stdio to the
-                       │ (no cert, no   │   broker in the trusted
-                       │  URL, no id)   │   parent process
-                       └────────────────┘
+                       ┌───────────────────┐
+                       │   loupe-server    │    CA (host of trust)
+                       │   ┌───────────┐   │    │
+                       │   │ server    │   │    ├── server.pem (leaf)
+                       │   │ cert      │   │    ├── admin.pem (leaf, kind=admin)
+                       │   └───────────┘   │    └── worker-N.pem (leaf, kind=worker)
+                       └─────────┬─────────┘
+                                 │
+           ┌─────────────────────┼─────────────────────┐
+           │                     │                     │
+           ▼                     ▼                     ▼
+  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+  │ admin           │   │ worker A        │   │ worker B        │
+  │ (loupectl)      │   │ + scanners      │   │ + verifier      │
+  └─────────────────┘   └────────┬────────┘   └─────────────────┘
+                                 │
+                                 │ (the worker cert never
+                                 │  crosses into bwrap; only
+                                 │  a Unix socket is bound in)
+                                 ▼
+                        ┌─────────────────┐
+                        │ loupe-worker    │    in the bwrap sandbox,
+                        │ mcp-proxy       │    forwards stdio to the
+                        │ (no cert, no    │    broker in the trusted
+                        │ URL, no id)     │    parent process
+                        └─────────────────┘
 ```
 
 A compromised agent therefore cannot reach `loupe-server` at all: it

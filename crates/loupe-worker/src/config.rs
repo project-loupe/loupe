@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::llm::claude_cli::{DEFAULT_CLAUDE_EFFORT, DEFAULT_CLAUDE_MODEL};
 use crate::llm::codex_cli::{DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL};
 use crate::llm::mcp::DEFAULT_BKB_API_URL;
+use crate::llm::model_broker::ModelBrokerLimits;
 use crate::llm::{CliModelConfig, JobAgent, DEFAULT_REQUEST_TIMEOUT};
 use crate::runner::DEFAULT_MAX_WORKDIR_BYTES;
 use crate::sandbox::{validate_network_host, SandboxNetworkConfig, SandboxNetworkMode};
@@ -29,6 +30,7 @@ pub struct WorkerConfig {
 	pub agents: AgentsConfig,
 	pub scanner_defaults: LlmScannerConfig,
 	pub bkb: BkbConfig,
+	pub broker: ModelBrokerLimits,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +97,9 @@ pub struct WorkerConfigOverrides {
 	pub max_file_bytes: Option<u64>,
 	pub per_request_timeout_seconds: Option<u64>,
 	pub bkb_api_url: Option<String>,
+	pub broker_request_ceiling: Option<u64>,
+	pub broker_output_ceiling_bytes: Option<u64>,
+	pub broker_token_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -118,6 +123,8 @@ pub struct FileConfig {
 	pub scanner_defaults: ScannerDefaultsSection,
 	#[serde(default)]
 	pub bkb: BkbSection,
+	#[serde(default)]
+	pub broker: BrokerSection,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -216,6 +223,17 @@ pub struct BkbSection {
 	pub api_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerSection {
+	#[serde(default)]
+	pub request_ceiling: Option<u64>,
+	#[serde(default)]
+	pub output_ceiling_bytes: Option<u64>,
+	#[serde(default)]
+	pub token_ceiling: Option<u64>,
+}
+
 impl WorkerConfig {
 	pub fn load(path: Option<&Path>, overrides: WorkerConfigOverrides) -> Result<Self> {
 		let mut cfg = WorkerConfig::default();
@@ -299,6 +317,15 @@ impl WorkerConfig {
 		if let Some(v) = file.bkb.api_url {
 			self.bkb.api_url = v;
 		}
+		if let Some(v) = file.broker.request_ceiling {
+			self.broker.request_ceiling = v;
+		}
+		if let Some(v) = file.broker.output_ceiling_bytes {
+			self.broker.output_ceiling_bytes = v;
+		}
+		if let Some(v) = file.broker.token_ceiling {
+			self.broker.token_ceiling = Some(v);
+		}
 		Ok(())
 	}
 
@@ -372,6 +399,15 @@ impl WorkerConfig {
 		if let Some(v) = overrides.bkb_api_url {
 			self.bkb.api_url = v;
 		}
+		if let Some(v) = overrides.broker_request_ceiling {
+			self.broker.request_ceiling = v;
+		}
+		if let Some(v) = overrides.broker_output_ceiling_bytes {
+			self.broker.output_ceiling_bytes = v;
+		}
+		if let Some(v) = overrides.broker_token_ceiling {
+			self.broker.token_ceiling = Some(v);
+		}
 	}
 
 	fn validate(&self) -> Result<()> {
@@ -421,6 +457,7 @@ impl WorkerConfig {
 		// reject anything the policy cannot express while the worker is still
 		// starting instead of failing every leased job.
 		validate_network_host(bkb_host).context("validating bkb.api_url host")?;
+		self.broker.validate()?;
 		Ok(())
 	}
 }
@@ -465,6 +502,7 @@ impl Default for WorkerConfig {
 				exclude_path_substrings: scanner_defaults.exclude_path_substrings,
 			},
 			bkb: BkbConfig { api_url: DEFAULT_BKB_API_URL.to_owned() },
+			broker: ModelBrokerLimits::default(),
 		}
 	}
 }
@@ -538,6 +576,9 @@ mod tests {
 		assert_eq!(cfg.agents.codex.effort, "xhigh");
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 2 * 1024 * 1024);
 		assert_eq!(cfg.bkb.api_url, "https://bitcoinknowledge.dev");
+		assert_eq!(cfg.broker.request_ceiling, 1_000);
+		assert_eq!(cfg.broker.output_ceiling_bytes, 32 * 1024 * 1024);
+		assert_eq!(cfg.broker.token_ceiling, None);
 	}
 
 	#[test]
@@ -591,6 +632,11 @@ per_request_timeout_seconds = 99
 
 [bkb]
 api_url = "https://bkb.example.test"
+
+[broker]
+request_ceiling = 23
+output_ceiling_bytes = 4567
+token_ceiling = 890
 "#,
 		)
 		.unwrap();
@@ -620,6 +666,9 @@ api_url = "https://bkb.example.test"
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 1234);
 		assert_eq!(cfg.scanner_defaults.per_request_timeout, Duration::from_secs(99));
 		assert_eq!(cfg.bkb.api_url, "https://bkb.example.test");
+		assert_eq!(cfg.broker.request_ceiling, 23);
+		assert_eq!(cfg.broker.output_ceiling_bytes, 4567);
+		assert_eq!(cfg.broker.token_ceiling, Some(890));
 	}
 
 	#[test]
@@ -647,6 +696,9 @@ allowlist = ["from-file.example"]
 				verify_agent: Some(JobAgent::Claude),
 				codex_model: Some("from-env".to_owned()),
 				codex_effort: Some("xhigh".to_owned()),
+				broker_request_ceiling: Some(42),
+				broker_output_ceiling_bytes: Some(8192),
+				broker_token_ceiling: Some(9000),
 				sandbox_network: Some(SandboxNetworkMode::Allowlist),
 				sandbox_allowlist: Some(vec!["from-env.example".to_owned()]),
 				..WorkerConfigOverrides::default()
@@ -659,6 +711,21 @@ allowlist = ["from-file.example"]
 		assert_eq!(cfg.agents.codex.model, "from-env");
 		assert_eq!(cfg.agents.codex.effort, "xhigh");
 		assert_eq!(cfg.sandbox.allowlist, ["from-env.example"]);
+		assert_eq!(cfg.broker.request_ceiling, 42);
+		assert_eq!(cfg.broker.output_ceiling_bytes, 8192);
+		assert_eq!(cfg.broker.token_ceiling, Some(9000));
+	}
+
+	#[test]
+	fn broker_ceilings_must_be_positive() {
+		for overrides in [
+			WorkerConfigOverrides { broker_request_ceiling: Some(0), ..Default::default() },
+			WorkerConfigOverrides { broker_output_ceiling_bytes: Some(0), ..Default::default() },
+			WorkerConfigOverrides { broker_token_ceiling: Some(0), ..Default::default() },
+		] {
+			let error = WorkerConfig::load(None, overrides).unwrap_err();
+			assert!(error.to_string().contains("broker"), "unexpected error: {error:#}");
+		}
 	}
 
 	#[test]

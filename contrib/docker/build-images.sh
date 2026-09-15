@@ -26,7 +26,10 @@ if [ -n "$RUST_VERSION" ]; then
 fi
 
 "$ENGINE" build "${build_args[@]}" -f "$DOCKERFILE" --target loupe-server -t "$SERVER_IMAGE" "$ROOT" >&2
-"$ENGINE" build "${build_args[@]}" -f "$DOCKERFILE" --target loupe-worker -t "$WORKER_IMAGE" "$ROOT" >&2
+# A mutable npm tag alone does not invalidate the image build cache.
+# Refresh only the CLI install layer, including rebuilds of the same commit.
+"$ENGINE" build "${build_args[@]}" --build-arg "AGENT_CLI_REFRESH=$(date +%s)-$$" \
+	-f "$DOCKERFILE" --target loupe-worker -t "$WORKER_IMAGE" "$ROOT" >&2
 
 printf 'export LOUPE_SERVER_IMAGE=%q\n' "$SERVER_IMAGE"
 printf 'export LOUPE_WORKER_IMAGE=%q\n' "$WORKER_IMAGE"

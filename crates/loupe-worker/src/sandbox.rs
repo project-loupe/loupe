@@ -153,6 +153,7 @@ pub fn run_networked_sandbox(
 pub struct SandboxBuilder {
 	workdir: PathBuf,
 	network: Option<SandboxNetworkLaunch>,
+	network_supervisor: Option<PathBuf>,
 	disabled: bool,
 	/// Caller-supplied read-only bind mounts (host path, sandbox
 	/// path). Populated by [`bind_ro`] and [`allow_binary`].
@@ -175,6 +176,7 @@ impl SandboxBuilder {
 		Self {
 			workdir: workdir.into(),
 			network: None,
+			network_supervisor: None,
 			disabled: false,
 			extra_ro_binds: Vec::new(),
 			forward_env: Vec::new(),
@@ -187,6 +189,7 @@ impl SandboxBuilder {
 		Self {
 			workdir: workdir.into(),
 			network: None,
+			network_supervisor: None,
 			disabled: true,
 			extra_ro_binds: Vec::new(),
 			forward_env: Vec::new(),
@@ -204,6 +207,15 @@ impl SandboxBuilder {
 		self
 	}
 
+	/// Select the trusted worker binary that supervises a networked
+	/// sandbox. Production normally defaults to the current executable;
+	/// callers that already pin a worker binary for a broker mount should
+	/// use the same path here.
+	pub fn with_network_supervisor(mut self, worker_binary: impl Into<PathBuf>) -> Self {
+		self.network_supervisor = Some(worker_binary.into());
+		self
+	}
+
 	/// Bind-mount `src` (a path on the host) read-only at `dst` (a path
 	/// inside the sandbox). The two can be equal — that's the common
 	/// case when surfacing a host install directly.
@@ -212,10 +224,9 @@ impl SandboxBuilder {
 		self
 	}
 
-	/// Forward an env var into the sandbox. The value is looked up
-	/// from the worker's own environment at `build()` time. Use for
-	/// things like `ANTHROPIC_API_KEY` that the agent reads to
-	/// authenticate.
+	/// Forward a non-secret env var into the sandbox. The value is looked up
+	/// from the worker's own environment at `build()` time. Provider credentials
+	/// must remain in a host-side broker and must never use this path.
 	pub fn forward_env(mut self, name: &'static str) -> Self {
 		self.forward_env.push(name);
 		self
@@ -293,8 +304,9 @@ impl SandboxBuilder {
 		}
 
 		let mut cmd = if let Some(network) = &self.network {
-			let launcher =
-				std::env::current_exe().unwrap_or_else(|_| PathBuf::from("loupe-worker"));
+			let launcher = self.network_supervisor.clone().unwrap_or_else(|| {
+				std::env::current_exe().unwrap_or_else(|_| PathBuf::from("loupe-worker"))
+			});
 			let mut cmd = Command::new(launcher);
 			cmd.arg("sandbox-exec");
 			cmd.arg("--network").arg(network.config.mode.as_str());
@@ -502,7 +514,21 @@ fn locate_on_path(name: &str) -> Option<PathBuf> {
 /// invocation fail; calling this once at startup surfaces that early
 /// rather than mid-job.
 pub fn smoketest(workdir: &Path, network: SandboxNetworkConfig) -> Result<()> {
-	let builder = SandboxBuilder::new(workdir).with_network(network, Vec::new());
+	smoketest_with_builder(SandboxBuilder::new(workdir).with_network(network, Vec::new()))
+}
+
+#[doc(hidden)]
+pub fn smoketest_with_supervisor(
+	workdir: &Path, network: SandboxNetworkConfig, worker_binary: impl Into<PathBuf>,
+) -> Result<()> {
+	smoketest_with_builder(
+		SandboxBuilder::new(workdir)
+			.with_network(network, Vec::new())
+			.with_network_supervisor(worker_binary),
+	)
+}
+
+fn smoketest_with_builder(builder: SandboxBuilder) -> Result<()> {
 	let mut cmd = builder.build("/bin/true");
 	cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
 	let output = cmd.as_std_mut().output().context("running bwrap smoketest")?;

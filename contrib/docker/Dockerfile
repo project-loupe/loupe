@@ -43,10 +43,6 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/loupe-container-entrypoint"]
 CMD ["loupe-server", "serve"]
 
 FROM node:22-trixie-slim AS loupe-worker
-ARG CLAUDE_CODE_VERSION=latest
-ARG CODEX_VERSION=latest
-ARG INSTALL_CLAUDE=1
-ARG INSTALL_CODEX=1
 ENV NPM_CONFIG_AUDIT=false \
 	NPM_CONFIG_FUND=false \
 	NPM_CONFIG_UPDATE_NOTIFIER=false
@@ -55,9 +51,18 @@ RUN apt-get update \
 		bubblewrap ca-certificates git iproute2 nftables slirp4netns tini util-linux \
 	&& nsenter --help | grep -q -- --user-parent \
 	&& rm -rf /var/lib/apt/lists/* \
-	&& if [ "$INSTALL_CLAUDE" = "1" ]; then npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; fi \
-	&& if [ "$INSTALL_CODEX" = "1" ]; then npm install -g "@openai/codex@${CODEX_VERSION}"; fi \
 	&& useradd --uid 10002 --user-group --home-dir /var/lib/loupe-worker --create-home --shell /usr/sbin/nologin loupe-worker
+# Resolve current releases when building an image, never inside a running
+# worker. Explicit versions remain available for rollback or diagnosis.
+ARG CLAUDE_CODE_VERSION=latest
+ARG CODEX_VERSION=latest
+ARG INSTALL_CLAUDE=1
+ARG INSTALL_CODEX=1
+# build-images.sh changes this argument for each worker build so the CLI
+# install layer is refreshed without rebuilding Rust or system packages.
+ARG AGENT_CLI_REFRESH
+RUN if [ "$INSTALL_CLAUDE" = "1" ]; then npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; fi \
+	&& if [ "$INSTALL_CODEX" = "1" ]; then npm install -g "@openai/codex@${CODEX_VERSION}"; fi
 COPY --from=app-builder /src/target/release/loupe-worker /usr/local/bin/loupe-worker
 COPY --from=bkb-mcp-builder /usr/local/cargo/bin/bkb-mcp /usr/local/bin/bkb-mcp
 COPY contrib/docker/loupe-container-entrypoint.sh /usr/local/bin/loupe-container-entrypoint

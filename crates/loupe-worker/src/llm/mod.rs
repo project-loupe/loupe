@@ -20,6 +20,8 @@
 pub mod claude_cli;
 pub mod codex_cli;
 pub mod mcp;
+pub mod model_broker;
+pub mod model_proxy;
 pub mod prompts;
 
 use std::ffi::OsString;
@@ -34,10 +36,14 @@ pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
 use loupe_proto::JobCapability;
 pub use mcp::McpContext;
+use model_broker::{ModelBrokerContext, ModelBrokerLimits, ModelCredential};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::SandboxNetworkConfig;
+use crate::sandbox::{SandboxNetworkConfig, SandboxNetworkMode};
+
+const ANTHROPIC_UPSTREAM_URL: &str = "https://api.anthropic.com";
+const OPENAI_UPSTREAM_URL: &str = "https://api.openai.com";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliModelConfig {
@@ -49,6 +55,13 @@ pub struct CliModelConfig {
 pub struct BackendRuntimeConfig {
 	pub network: SandboxNetworkConfig,
 	pub log_agent_output: bool,
+	pub model_broker: Option<ModelBrokerRuntimeConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelBrokerRuntimeConfig {
+	pub worker_binary: PathBuf,
+	pub limits: ModelBrokerLimits,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
@@ -230,6 +243,22 @@ pub fn claude_auth_available() -> bool {
 	env_present("ANTHROPIC_API_KEY") || env_present("CLAUDE_CODE_OAUTH_TOKEN")
 }
 
+fn claude_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<ModelBrokerContext> {
+	let credential = if let Some(secret) = utf8_env_value("ANTHROPIC_API_KEY")? {
+		ModelCredential::anthropic_api_key(secret)
+	} else if let Some(secret) = utf8_env_value("CLAUDE_CODE_OAUTH_TOKEN")? {
+		ModelCredential::anthropic_oauth_token(secret)
+	} else {
+		anyhow::bail!("Claude model broker requires ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN");
+	};
+	Ok(ModelBrokerContext::new(
+		runtime.worker_binary,
+		ANTHROPIC_UPSTREAM_URL.parse().expect("static Anthropic upstream URL is valid"),
+		credential,
+		runtime.limits,
+	))
+}
+
 /// Probe PATH for `bkb-mcp` (Bitcoin Knowledge Base MCP server).
 /// Returns the resolved binary path (via `which`-style lookup) when
 /// available, `None` otherwise.
@@ -290,10 +319,24 @@ pub(crate) fn codex_api_key_env() -> Option<OsString> {
 	env_value("CODEX_API_KEY").or_else(|| env_value("OPENAI_API_KEY"))
 }
 
-pub(crate) fn required_network_hosts(
-	provider_host: &str, bkb_api_url: Option<&str>,
-) -> Result<Vec<String>> {
-	let mut hosts = vec![provider_host.to_owned()];
+fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<ModelBrokerContext> {
+	let secret = if let Some(secret) = utf8_env_value("CODEX_API_KEY")? {
+		secret
+	} else if let Some(secret) = utf8_env_value("OPENAI_API_KEY")? {
+		secret
+	} else {
+		anyhow::bail!("Codex model broker requires CODEX_API_KEY or OPENAI_API_KEY");
+	};
+	Ok(ModelBrokerContext::new(
+		runtime.worker_binary,
+		OPENAI_UPSTREAM_URL.parse().expect("static OpenAI upstream URL is valid"),
+		ModelCredential::openai_api_key(secret),
+		runtime.limits,
+	))
+}
+
+pub(crate) fn required_network_hosts(bkb_api_url: Option<&str>) -> Result<Vec<String>> {
+	let mut hosts = Vec::new();
 	if let Some(bkb_api_url) = bkb_api_url {
 		let url = reqwest::Url::parse(bkb_api_url)?;
 		let host =
@@ -301,6 +344,14 @@ pub(crate) fn required_network_hosts(
 		hosts.push(host.to_owned());
 	}
 	Ok(hosts)
+}
+
+pub(crate) fn sandbox_requires_egress_setup(
+	network: &SandboxNetworkConfig, required_hosts: &[String],
+) -> bool {
+	network.mode == SandboxNetworkMode::Public
+		|| !network.allowlist.is_empty()
+		|| !required_hosts.is_empty()
 }
 
 fn env_present(name: &str) -> bool {
@@ -311,6 +362,16 @@ fn env_value(name: &str) -> Option<OsString> {
 	std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
+fn utf8_env_value(name: &str) -> Result<Option<String>> {
+	env_value(name)
+		.map(|value| {
+			value.into_string().map_err(|_| {
+				anyhow::anyhow!("{name} must contain valid UTF-8 for HTTP authentication")
+			})
+		})
+		.transpose()
+}
+
 /// Build the scan [`LlmBackend`] according to the configured agent
 /// selection. `auto` preserves the historical behaviour: Claude owns
 /// LLM discovery when ready; Codex-only workers advertise verify-only
@@ -319,7 +380,7 @@ pub fn build_scan_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
 	codex_agent: CliModelConfig, claude_agent: CliModelConfig, runtime: BackendRuntimeConfig,
 ) -> Result<Option<Arc<dyn LlmBackend>>> {
-	let BackendRuntimeConfig { network, log_agent_output } = runtime;
+	let BackendRuntimeConfig { network, log_agent_output, model_broker } = runtime;
 	match selection {
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
@@ -327,7 +388,13 @@ pub fn build_scan_backend(
 				effort = %claude_agent.effort,
 				"scan backend: claude (auto)"
 			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, network, log_agent_output)))
+			Ok(Some(build_claude_backend(
+				mcp,
+				claude_agent,
+				network,
+				log_agent_output,
+				model_broker,
+			)?))
 		},
 		JobAgent::Auto => {
 			tracing::info!(
@@ -342,7 +409,13 @@ pub fn build_scan_backend(
 				effort = %claude_agent.effort,
 				"scan backend: claude (configured)"
 			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, network, log_agent_output)))
+			Ok(Some(build_claude_backend(
+				mcp,
+				claude_agent,
+				network,
+				log_agent_output,
+				model_broker,
+			)?))
 		},
 		JobAgent::Codex => {
 			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
@@ -351,7 +424,13 @@ pub fn build_scan_backend(
 				effort = %codex_agent.effort,
 				"scan backend: codex (configured)"
 			);
-			Ok(Some(build_codex_backend(mcp, codex_agent, network, log_agent_output)))
+			Ok(Some(build_codex_backend(
+				mcp,
+				codex_agent,
+				network,
+				log_agent_output,
+				model_broker,
+			)?))
 		},
 	}
 }
@@ -374,7 +453,7 @@ pub fn build_verifier_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
 	codex_agent: CliModelConfig, claude_agent: CliModelConfig, runtime: BackendRuntimeConfig,
 ) -> Result<Arc<dyn LlmBackend>> {
-	let BackendRuntimeConfig { network, log_agent_output } = runtime;
+	let BackendRuntimeConfig { network, log_agent_output, model_broker } = runtime;
 	match selection {
 		JobAgent::Auto if codex_ready => {
 			tracing::info!(
@@ -382,7 +461,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (auto)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
 		},
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
@@ -390,7 +469,7 @@ pub fn build_verifier_backend(
 				effort = %claude_agent.effort,
 				"verifier backend: claude (auto, codex unavailable)"
 			);
-			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output))
+			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker)?)
 		},
 		JobAgent::Auto => anyhow::bail!("no authenticated verifier backend available"),
 		JobAgent::Claude => {
@@ -400,7 +479,7 @@ pub fn build_verifier_backend(
 				effort = %claude_agent.effort,
 				"verifier backend: claude (configured)"
 			);
-			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output))
+			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker)?)
 		},
 		JobAgent::Codex => {
 			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
@@ -409,7 +488,7 @@ pub fn build_verifier_backend(
 				effort = %codex_agent.effort,
 				"verifier backend: codex (configured)"
 			);
-			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output))
+			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
 		},
 	}
 }
@@ -426,8 +505,8 @@ fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<(
 
 fn build_claude_backend(
 	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
-	log_agent_output: bool,
-) -> Arc<dyn LlmBackend> {
+	log_agent_output: bool, model_broker: Option<ModelBrokerRuntimeConfig>,
+) -> Result<Arc<dyn LlmBackend>> {
 	let mut backend = ClaudeCliBackend::new()
 		.with_agent_config(agent)
 		.with_network_config(network)
@@ -435,13 +514,16 @@ fn build_claude_backend(
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
-	Arc::new(backend)
+	if let Some(runtime) = model_broker {
+		backend = backend.with_model_broker_context(claude_model_broker_context(runtime)?);
+	}
+	Ok(Arc::new(backend))
 }
 
 fn build_codex_backend(
 	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
-	log_agent_output: bool,
-) -> Arc<dyn LlmBackend> {
+	log_agent_output: bool, model_broker: Option<ModelBrokerRuntimeConfig>,
+) -> Result<Arc<dyn LlmBackend>> {
 	let mut backend = CodexCliBackend::new()
 		.with_agent_config(agent)
 		.with_network_config(network)
@@ -449,7 +531,10 @@ fn build_codex_backend(
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
-	Arc::new(backend)
+	if let Some(runtime) = model_broker {
+		backend = backend.with_model_broker_context(codex_model_broker_context(runtime)?);
+	}
+	Ok(Arc::new(backend))
 }
 
 #[cfg(test)]
@@ -532,20 +617,32 @@ mod tests {
 	}
 
 	#[test]
-	fn sandbox_network_always_includes_provider_and_enabled_bkb() {
-		assert_eq!(required_network_hosts("api.openai.com", None).unwrap(), ["api.openai.com"]);
+	fn sandbox_network_only_includes_enabled_bkb() {
+		assert_eq!(required_network_hosts(None).unwrap(), Vec::<String>::new());
 		assert_eq!(
-			required_network_hosts("api.openai.com", Some(mcp::DEFAULT_BKB_API_URL)).unwrap(),
-			["api.openai.com", "bitcoinknowledge.dev"]
+			required_network_hosts(Some(mcp::DEFAULT_BKB_API_URL)).unwrap(),
+			["bitcoinknowledge.dev"]
 		);
 		assert_eq!(
-			required_network_hosts(
-				"api.anthropic.com",
-				Some("https://knowledge.example.test:8443/api"),
-			)
-			.unwrap(),
-			["api.anthropic.com", "knowledge.example.test"]
+			required_network_hosts(Some("https://knowledge.example.test:8443/api")).unwrap(),
+			["knowledge.example.test"]
 		);
+	}
+
+	#[test]
+	fn empty_allowlist_uses_the_private_loopback_namespace() {
+		let model_only =
+			SandboxNetworkConfig { mode: SandboxNetworkMode::Allowlist, allowlist: Vec::new() };
+		assert!(!sandbox_requires_egress_setup(&model_only, &[]));
+		assert!(sandbox_requires_egress_setup(&model_only, &["bkb.example".into()]));
+		assert!(sandbox_requires_egress_setup(
+			&SandboxNetworkConfig {
+				mode: SandboxNetworkMode::Allowlist,
+				allowlist: vec!["docs.example".into()],
+			},
+			&[],
+		));
+		assert!(sandbox_requires_egress_setup(&SandboxNetworkConfig::default(), &[]));
 	}
 
 	#[test]

@@ -1,9 +1,9 @@
 //! Backend that shells out to the `codex` CLI (OpenAI Codex).
 //!
 //! Mirrors [`ClaudeCliBackend`]'s shape: runs the agent inside the
-//! bubblewrap sandbox the worker builds and forwards only the selected
-//! API token as `CODEX_API_KEY`. User-level Codex configuration and
-//! login state are not mounted into the sandbox.
+//! bubblewrap sandbox the worker builds. User-level Codex configuration,
+//! login state, and provider credentials are not mounted into the sandbox;
+//! model traffic goes through a job-scoped, credential-free broker.
 //!
 //! Wire shape: `codex exec --dangerously-bypass-approvals-and-sandbox
 //! --skip-git-repo-check "$prompt"`. The bypass flag is the codex
@@ -32,27 +32,20 @@ use tokio::time::timeout;
 use super::mcp::{
 	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
+use super::model_broker::{
+	bind_model_into_sandbox, ModelBrokerBackend, ModelBrokerContext, SANDBOX_MODEL_SOCKET,
+};
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
-
-const PROVIDER_API_HOST: &str = "api.openai.com";
 
 const BACKEND_ID: &str = "codex-cli";
 const CODEX_BIN: &str = "codex";
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_CODEX_EFFORT: &str = "xhigh";
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
-
-fn codex_agent_env(
-	codex_api_key: Option<std::ffi::OsString>, openai_api_key: Option<std::ffi::OsString>,
-) -> Vec<(&'static str, std::ffi::OsString)> {
-	codex_api_key
-		.filter(|value| !value.is_empty())
-		.or_else(|| openai_api_key.filter(|value| !value.is_empty()))
-		.into_iter()
-		.map(|api_key| ("CODEX_API_KEY", api_key))
-		.collect()
-}
+const MODEL_PROXY_LISTEN: &str = "127.0.0.1:0";
+const SANDBOX_MODEL_PORT_FILE: &str = "/tmp/loupe-model.port";
+const MODEL_RESPONSES_BASE_URL: &str = "@LOUPE_MODEL_BASE_URL@/v1";
 
 /// Render a Rust string as a TOML basic-string literal: wraps in
 /// double quotes, escapes the few characters TOML cares about (`\`,
@@ -91,10 +84,13 @@ pub struct CodexCliBackend {
 	bin: String,
 	agent: CliModelConfig,
 	mcp: Option<McpContext>,
+	model_broker: Option<ModelBrokerContext>,
 	network: SandboxNetworkConfig,
 	log_agent_output: bool,
 	#[cfg(test)]
 	disable_sandbox: bool,
+	#[cfg(test)]
+	disable_network: bool,
 }
 
 impl CodexCliBackend {
@@ -106,10 +102,13 @@ impl CodexCliBackend {
 				effort: DEFAULT_CODEX_EFFORT.to_owned(),
 			},
 			mcp: None,
+			model_broker: None,
 			network: SandboxNetworkConfig::default(),
 			log_agent_output: false,
 			#[cfg(test)]
 			disable_sandbox: false,
+			#[cfg(test)]
+			disable_network: false,
 		}
 	}
 
@@ -138,12 +137,23 @@ impl CodexCliBackend {
 		self
 	}
 
+	#[cfg(test)]
+	fn with_network_disabled_for_tests(mut self) -> Self {
+		self.disable_network = true;
+		self
+	}
+
 	/// Attach an MCP server to every invocation. When set, each call
 	/// emits `-c mcp_servers.loupe.command/args/env=...` overrides
 	/// (and the same for `bkb` when bkb-mcp is on the host) so the
 	/// agent sees the loupe tool surface for the duration of the call.
 	pub fn with_mcp_context(mut self, mcp: McpContext) -> Self {
 		self.mcp = Some(mcp);
+		self
+	}
+
+	pub fn with_model_broker_context(mut self, model_broker: ModelBrokerContext) -> Self {
+		self.model_broker = Some(model_broker);
 		self
 	}
 }
@@ -171,6 +181,19 @@ impl LlmBackend for CodexCliBackend {
 			"codex-cli: invoking",
 		);
 		let started = std::time::Instant::now();
+		let model_context = self
+			.model_broker
+			.as_ref()
+			.context("Codex backend requires a host-side model broker context")?;
+		let mut model_broker = Some(
+			model_context
+				.start_session(ModelBrokerBackend::Codex {
+					model: self.agent.model.clone(),
+					effort: self.agent.effort.clone(),
+				})
+				.await
+				.context("starting host-side Codex model broker")?,
+		);
 
 		#[cfg(test)]
 		let sandbox_builder = if self.disable_sandbox {
@@ -181,25 +204,39 @@ impl LlmBackend for CodexCliBackend {
 		#[cfg(not(test))]
 		let sandbox_builder = SandboxBuilder::new(&req.workdir);
 
-		let bkb_api_url = self
-			.mcp
-			.as_ref()
-			.filter(|ctx| ctx.bkb_mcp_path.is_some())
-			.map(|ctx| ctx.bkb_api_url.as_str());
-		let required_hosts = super::required_network_hosts(PROVIDER_API_HOST, bkb_api_url)?;
+		#[cfg(test)]
+		let attach_network = !self.disable_network;
+		#[cfg(not(test))]
+		let attach_network = true;
+		let sandbox_builder = if attach_network {
+			let bkb_api_url = self
+				.mcp
+				.as_ref()
+				.filter(|ctx| ctx.bkb_mcp_path.is_some())
+				.map(|ctx| ctx.bkb_api_url.as_str());
+			let required_hosts = super::required_network_hosts(bkb_api_url)?;
+			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
+				sandbox_builder
+					.with_network(self.network.clone(), required_hosts)
+					.with_network_supervisor(model_context.worker_binary())
+			} else {
+				sandbox_builder
+			}
+		} else {
+			sandbox_builder
+		};
 		let mut sandbox = sandbox_builder
-			.with_network(self.network.clone(), required_hosts)
 			// Per-user installs (`npm i -g @openai/codex` with a non-root
 			// prefix, etc.) live outside the default sandbox mounts —
 			// surface the install tree so the wrapped subprocess can
 			// `exec` it.
 			.allow_binary(&self.bin)
-			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?;
-		for (name, value) in
-			codex_agent_env(std::env::var_os("CODEX_API_KEY"), std::env::var_os("OPENAI_API_KEY"))
-		{
-			sandbox = sandbox.set_env(name, value);
-		}
+			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
+			// Codex requires its configured env key to be present. This
+			// fixed value carries no authority and is stripped by the broker.
+			.set_env("CODEX_API_KEY", "loupe-brokered");
+		let model_session = model_broker.as_ref().expect("model broker was just started");
+		sandbox = bind_model_into_sandbox(sandbox, model_context, model_session);
 		// Optional MCP attachment. Codex doesn't take a "config-file"
 		// flag like claude's `--mcp-config`; instead it accepts
 		// `-c <key>=<toml-literal>` overrides on the command line.
@@ -246,10 +283,17 @@ impl LlmBackend for CodexCliBackend {
 			_ => Vec::new(),
 		};
 
-		let mut cmd = sandbox.build(&self.bin);
-		for arg in codex_invocation_args(&self.agent, &mcp_overrides, &req.prompt) {
-			cmd.arg(arg);
-		}
+		let agent_args = codex_invocation_args(&self.agent, &mcp_overrides, &req.prompt);
+		#[cfg(test)]
+		let mut cmd = if self.disable_sandbox {
+			let mut cmd = sandbox.build(&self.bin);
+			cmd.args(&agent_args);
+			cmd
+		} else {
+			build_model_proxied_command(&sandbox, &self.bin, &agent_args)
+		};
+		#[cfg(not(test))]
+		let mut cmd = build_model_proxied_command(&sandbox, &self.bin, &agent_args);
 		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		cmd.kill_on_drop(true);
 
@@ -294,6 +338,7 @@ impl LlmBackend for CodexCliBackend {
 			&& let Err(error) = child.kill().await
 		{
 			drop(mcp_broker.take());
+			drop(model_broker.take());
 			return Err(
 				anyhow::Error::from(error).context("terminating codex CLI before broker shutdown")
 			);
@@ -305,6 +350,21 @@ impl LlmBackend for CodexCliBackend {
 		// paths would discard a verdict the agent had already produced.
 		let broker_outcome = match mcp_broker.take() {
 			Some(broker) => broker.finish().await.context("finishing host-side MCP broker"),
+			None => Ok(()),
+		};
+		let model_broker_outcome = match model_broker.take() {
+			Some(broker) => broker
+				.finish()
+				.await
+				.map(|usage| {
+					tracing::debug!(
+						requests = usage.requests,
+						output_bytes = usage.output_bytes,
+						tokens = usage.tokens,
+						"codex-cli: model broker usage"
+					);
+				})
+				.context("finishing host-side Codex model broker"),
 			None => Ok(()),
 		};
 
@@ -336,6 +396,7 @@ impl LlmBackend for CodexCliBackend {
 		// Reported last: a CLI failure explains a broker failure, so the
 		// CLI diagnostic is the more useful error to surface.
 		broker_outcome?;
+		model_broker_outcome?;
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("codex CLI stdout was not UTF-8: {e}"))?;
@@ -365,6 +426,37 @@ impl LlmBackend for CodexCliBackend {
 	}
 }
 
+fn build_model_proxied_command(
+	sandbox: &SandboxBuilder, agent_bin: &str, agent_args: &[String],
+) -> tokio::process::Command {
+	let mut cmd = sandbox.build(SANDBOX_LOUPE_BIN);
+	cmd.args([
+		"model-proxy",
+		"--socket",
+		SANDBOX_MODEL_SOCKET,
+		"--listen",
+		MODEL_PROXY_LISTEN,
+		"--port-file",
+		SANDBOX_MODEL_PORT_FILE,
+		"--provider",
+		"codex",
+		"--",
+		agent_bin,
+	]);
+	cmd.args(agent_args);
+	cmd
+}
+
+fn codex_model_provider_overrides() -> [String; 5] {
+	[
+		format!("model_provider={}", toml_string_literal("loupe")),
+		format!("model_providers.loupe.name={}", toml_string_literal("Loupe broker")),
+		format!("model_providers.loupe.base_url={}", toml_string_literal(MODEL_RESPONSES_BASE_URL)),
+		format!("model_providers.loupe.env_key={}", toml_string_literal("CODEX_API_KEY")),
+		format!("model_providers.loupe.wire_api={}", toml_string_literal("responses")),
+	]
+}
+
 fn codex_invocation_args(
 	agent: &CliModelConfig, mcp_overrides: &[String], prompt: &str,
 ) -> Vec<String> {
@@ -372,11 +464,17 @@ fn codex_invocation_args(
 		"exec".to_owned(),
 		"--dangerously-bypass-approvals-and-sandbox".to_owned(),
 		"--skip-git-repo-check".to_owned(),
+		"--ephemeral".to_owned(),
+		"--ignore-user-config".to_owned(),
 		"--model".to_owned(),
 		agent.model.clone(),
 		"-c".to_owned(),
 		format!("model_reasoning_effort={}", toml_string_literal(&agent.effort)),
 	];
+	for ov in codex_model_provider_overrides() {
+		args.push("-c".to_owned());
+		args.push(ov);
+	}
 	for ov in mcp_overrides {
 		args.push("-c".to_owned());
 		args.push(ov.clone());
@@ -387,26 +485,108 @@ fn codex_invocation_args(
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsString;
-	use std::path::Path;
+	use std::path::{Path, PathBuf};
 	use std::time::Duration;
 
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
+	use crate::test_env::in_env;
 
-	#[test]
-	fn agent_receives_only_the_selected_codex_api_key() {
-		let env = codex_agent_env(
-			Some(OsString::from("selected-codex-key")),
-			Some(OsString::from("unrelated-openai-key")),
-		);
+	fn bwrap_present() -> bool {
+		std::process::Command::new("bwrap")
+			.arg("--version")
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status()
+			.map(|status| status.success())
+			.unwrap_or(false)
+	}
 
-		assert_eq!(
-			env,
-			vec![("CODEX_API_KEY", OsString::from("selected-codex-key"))],
-			"the Codex sandbox must not receive an unrelated OPENAI_API_KEY",
-		);
+	fn test_model_broker(
+		worker_binary: impl Into<PathBuf>,
+	) -> super::super::model_broker::ModelBrokerContext {
+		super::super::model_broker::ModelBrokerContext::new(
+			worker_binary.into(),
+			"http://127.0.0.1:9".parse().unwrap(),
+			super::super::model_broker::ModelCredential::openai_api_key("host-test-secret"),
+			super::super::model_broker::ModelBrokerLimits::default(),
+		)
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn sandbox_receives_only_the_codex_broker_sentinel() {
+		use std::os::unix::fs::PermissionsExt;
+
+		if !bwrap_present() {
+			eprintln!("skipping: bwrap missing");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		let scratch = tempfile::tempdir().unwrap();
+		let bin_dir = scratch.path().join("bin");
+		std::fs::create_dir_all(&bin_dir).unwrap();
+		let bin_path = bin_dir.join("fake-codex");
+		std::fs::write(
+			&bin_path,
+			"#!/bin/sh\n\
+			if [ \"${CODEX_API_KEY-}\" != \"loupe-brokered\" ] || [ -n \"${OPENAI_API_KEY-}\" ]; then\n\
+			  echo LEAKED\n\
+			elif [ -e /home/scanner/.codex/auth.json ]; then\n\
+			  echo LEAKED_LOGIN_STATE\n\
+			else\n\
+			  echo SAFE\n\
+			fi\n",
+		)
+		.unwrap();
+		std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+		let proxy_path = bin_dir.join("fake-loupe-worker");
+		std::fs::write(
+			&proxy_path,
+			"#!/bin/sh\n\
+			while [ \"$1\" != \"--\" ]; do shift; done\n\
+			shift\n\
+			export CODEX_API_KEY=loupe-brokered\n\
+			unset OPENAI_API_KEY\n\
+			exec \"$@\"\n",
+		)
+		.unwrap();
+		std::fs::set_permissions(&proxy_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let mut path_entries = vec![bin_dir];
+		if let Some(path) = std::env::var_os("PATH") {
+			path_entries.extend(std::env::split_paths(&path));
+		}
+		let path = std::env::join_paths(path_entries).unwrap();
+		if !in_env(
+			"llm::codex_cli::tests::sandbox_receives_only_the_codex_broker_sentinel",
+			"api-keys",
+			&[
+				("PATH", Some(path.as_os_str())),
+				("CODEX_API_KEY", Some("host-codex-secret".as_ref())),
+				("OPENAI_API_KEY", Some("unrelated-host-secret".as_ref())),
+			],
+		) {
+			return;
+		}
+
+		let backend = CodexCliBackend::with_bin("fake-codex")
+			.with_network_disabled_for_tests()
+			.with_model_broker_context(test_model_broker(proxy_path));
+		let response = backend
+			.run(LlmRequest {
+				prompt: "irrelevant".into(),
+				workdir: workdir.path().to_path_buf(),
+				timeout: Duration::from_secs(5),
+				cancel: CancellationToken::new(),
+				repo_id: None,
+				job_id: None,
+				job_capability: None,
+				finding_id: None,
+			})
+			.await
+			.expect("fake Codex CLI should run through the credential-free adapter");
+		assert_eq!(response.text.trim(), "SAFE");
 	}
 
 	#[cfg(unix)]
@@ -461,7 +641,8 @@ mod tests {
 	async fn missing_binary_errors_clearly() {
 		// `loupe-worker-no-such-bin` definitely does not exist on PATH.
 		let workdir = tempfile::tempdir().unwrap();
-		let backend = CodexCliBackend::with_bin("loupe-worker-no-such-bin");
+		let backend = CodexCliBackend::with_bin("loupe-worker-no-such-bin")
+			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
 			prompt: "irrelevant".into(),
 			workdir: workdir.path().to_path_buf(),
@@ -495,8 +676,9 @@ mod tests {
 		let survived_path = scratch.path().join("survived");
 		write_fake_cli(&bin_path, &pid_path, &survived_path);
 
-		let backend =
-			CodexCliBackend::with_bin(bin_path.to_string_lossy()).with_sandbox_disabled_for_tests();
+		let backend = CodexCliBackend::with_bin(bin_path.to_string_lossy())
+			.with_sandbox_disabled_for_tests()
+			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
 			prompt: "irrelevant".into(),
 			workdir: workdir.path().to_path_buf(),
@@ -573,7 +755,16 @@ mod tests {
 		);
 
 		assert!(args.windows(2).any(|w| w == ["--model", "gpt-test"]));
+		assert!(args.iter().any(|arg| arg == "--ephemeral"));
+		assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
 		assert!(args.windows(2).any(|w| w == ["-c", r#"model_reasoning_effort="xhigh""#]));
+		assert!(args.windows(2).any(|w| w == ["-c", r#"model_provider="loupe""#]));
+		assert!(args.windows(2).any(|w| {
+			w == ["-c", r#"model_providers.loupe.base_url="@LOUPE_MODEL_BASE_URL@/v1""#]
+		}));
+		assert!(args
+			.windows(2)
+			.any(|w| w == ["-c", r#"model_providers.loupe.wire_api="responses""#]));
 		assert!(args.windows(2).any(|w| w == ["-c", "mcp_servers.loupe.env={}"]));
 		assert_eq!(args.last().map(String::as_str), Some("hello"));
 	}

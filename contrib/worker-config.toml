@@ -27,8 +27,9 @@ disable_sandbox = false
 
 [sandbox]
 # "public" allows public IPv4 while blocking host, private, and special
-# networks. "allowlist" permits only the active agent API, enabled BKB
-# endpoint, and the additional hostnames/IPv4 addresses listed here.
+# networks. "allowlist" permits only the enabled BKB endpoint and the
+# additional hostnames/IPv4 addresses listed here. Model API traffic uses
+# the worker-host broker and does not require sandbox access to a provider.
 network = "public"
 allowlist = []
 
@@ -48,6 +49,13 @@ effort = "max"
 [agents.codex]
 model = "gpt-5.5"
 effort = "xhigh"
+
+[broker]
+# Per-job ceilings enforced by the worker-host model broker.
+request_ceiling = 1000
+output_ceiling_bytes = 33554432
+# Optional; omit to leave reported model-token usage uncapped.
+# token_ceiling = 100000
 
 [scanner_defaults]
 max_concurrent_files = 8

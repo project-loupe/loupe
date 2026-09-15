@@ -7,18 +7,22 @@
 //! - `mcp-proxy`: a credential-free stdio/Unix-socket bridge spawned
 //!   inside an agent sandbox. The trusted MCP broker stays in the
 //!   parent worker process.
+//! - `model-proxy`: a credential-free loopback/Unix-socket bridge that
+//!   supervises one sandboxed agent while provider authority stays in
+//!   the parent worker's per-job model broker.
 
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
 	claude_available, codex_auth_available, codex_available, BackendRuntimeConfig, JobAgent,
-	McpContext,
+	McpContext, ModelBrokerRuntimeConfig,
 };
 use loupe_worker::sandbox::SandboxNetworkMode;
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
@@ -43,6 +47,9 @@ enum Cmd {
 	/// Bridge MCP stdio to one host-side Unix socket. This subcommand
 	/// receives no server URL, mTLS credentials, job id, or capability.
 	McpProxy(McpProxyArgs),
+	/// Relay bounded sandbox-local model API connections to its job broker,
+	/// then supervise the agent command in the same network namespace.
+	ModelProxy(ModelProxyArgs),
 	/// Internal supervisor for one isolated sandbox network.
 	#[command(hide = true)]
 	SandboxExec(SandboxExecArgs),
@@ -140,6 +147,15 @@ struct RunArgs {
 	/// BKB HTTP API URL for the optional bkb-mcp child.
 	#[arg(long, env = "LOUPE_BKB_API_URL")]
 	bkb_api_url: Option<String>,
+	/// Maximum model API requests allowed in one broker session.
+	#[arg(long, env = "LOUPE_BROKER_REQUEST_CEILING")]
+	broker_request_ceiling: Option<u64>,
+	/// Maximum model response bytes allowed in one broker session.
+	#[arg(long, env = "LOUPE_BROKER_OUTPUT_CEILING_BYTES")]
+	broker_output_ceiling_bytes: Option<u64>,
+	/// Optional maximum reported model tokens allowed in one broker session.
+	#[arg(long, env = "LOUPE_BROKER_TOKEN_CEILING")]
+	broker_token_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Parser)]
@@ -147,6 +163,28 @@ struct McpProxyArgs {
 	#[arg(long)]
 	socket: PathBuf,
 }
+
+#[derive(Debug, Parser)]
+struct ModelProxyArgs {
+	#[arg(long)]
+	socket: PathBuf,
+	#[arg(long, default_value = "127.0.0.1:0")]
+	listen: SocketAddr,
+	#[arg(long)]
+	port_file: PathBuf,
+	#[arg(long, value_enum, default_value = "claude")]
+	provider: ModelProxyProvider,
+	#[arg(last = true, required = true, allow_hyphen_values = true)]
+	command: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModelProxyProvider {
+	Claude,
+	Codex,
+}
+
+const MODEL_BASE_URL_PLACEHOLDER: &str = "@LOUPE_MODEL_BASE_URL@";
 
 #[derive(Debug, Parser)]
 struct SandboxExecArgs {
@@ -172,6 +210,11 @@ async fn main() -> Result<()> {
 		Some(Cmd::McpProxy(args)) => {
 			init_tracing_from_env();
 			run_mcp_proxy(args).await
+		},
+		Some(Cmd::ModelProxy(args)) => {
+			init_tracing_from_env();
+			let status = run_model_proxy(args).await?;
+			std::process::exit(status.code().unwrap_or(1));
 		},
 		Some(Cmd::SandboxExec(args)) => {
 			let status = sandbox::run_networked_sandbox(
@@ -292,7 +335,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	let worker_binary = std::env::current_exe()
 		.context("resolving the loupe-worker binary path for MCP bind-mount")?;
 	let mcp_ctx = McpContext {
-		worker_binary,
+		worker_binary: worker_binary.clone(),
 		client: client.clone(),
 		bkb_mcp_path: bkb_mcp_path.clone(),
 		bkb_api_url: cfg.bkb.api_url.clone(),
@@ -308,6 +351,10 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		BackendRuntimeConfig {
 			network: cfg.sandbox.clone(),
 			log_agent_output: cfg.logging.agent_output,
+			model_broker: Some(ModelBrokerRuntimeConfig {
+				worker_binary: worker_binary.clone(),
+				limits: cfg.broker,
+			}),
 		},
 	)? {
 		scanners.push(Arc::new(
@@ -332,6 +379,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		BackendRuntimeConfig {
 			network: cfg.sandbox.clone(),
 			log_agent_output: cfg.logging.agent_output,
+			model_broker: Some(ModelBrokerRuntimeConfig { worker_binary, limits: cfg.broker }),
 		},
 	)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
@@ -375,6 +423,69 @@ async fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
 	Ok(())
 }
 
+async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatus> {
+	use loupe_worker::llm::model_proxy::ModelProxy;
+
+	let proxy = ModelProxy::bind(args.socket, args.listen, &args.port_file).await?;
+	let base_url = proxy.base_url();
+	let mut relay = tokio::spawn(proxy.relay());
+	let (program, command_args) = args.command.split_first().expect("clap requires a command");
+	let mut child = tokio::process::Command::new(program);
+	child.args(
+		command_args.iter().cloned().map(|argument| replace_model_base_url(argument, &base_url)),
+	);
+	// Fail closed even if this internal mode is invoked outside the
+	// normal Bubblewrap path: the supervised process sees only a fixed,
+	// non-secret gateway sentinel, never a host provider credential.
+	child.env_clear();
+	for name in ["PATH", "HOME", "TMPDIR"] {
+		if let Some(value) = std::env::var_os(name) {
+			child.env(name, value);
+		}
+	}
+	match args.provider {
+		ModelProxyProvider::Claude => {
+			child.env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered");
+			child.env("ANTHROPIC_BASE_URL", base_url);
+			child.env("DISABLE_AUTOUPDATER", "1");
+			child.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+			child.env("DISABLE_TELEMETRY", "1");
+			child.env("DISABLE_ERROR_REPORTING", "1");
+			child.env("DISABLE_BUG_COMMAND", "1");
+		},
+		ModelProxyProvider::Codex => {
+			child.env("CODEX_API_KEY", "loupe-brokered");
+		},
+	}
+	child.kill_on_drop(true);
+	let mut child = child.spawn().context("spawning model-proxied agent command")?;
+
+	tokio::select! {
+		biased;
+		status = child.wait() => {
+			relay.abort();
+			let _ = relay.await;
+			status.context("waiting for model-proxied agent command")
+		},
+		result = &mut relay => {
+			match result.context("model proxy relay task panicked")? {
+				Ok(()) => child.wait().await.context("waiting for model-proxied agent command"),
+				Err(error) => {
+					let _ = child.kill().await;
+					Err(error)
+				},
+			}
+		},
+	}
+}
+
+fn replace_model_base_url(argument: OsString, base_url: &str) -> OsString {
+	match argument.into_string() {
+		Ok(argument) => OsString::from(argument.replace(MODEL_BASE_URL_PLACEHOLDER, base_url)),
+		Err(argument) => argument,
+	}
+}
+
 fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 	WorkerConfig::load(
 		args.config.as_deref(),
@@ -402,6 +513,9 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 			max_file_bytes: args.max_file_bytes,
 			per_request_timeout_seconds: args.per_request_timeout_seconds,
 			bkb_api_url: args.bkb_api_url.clone(),
+			broker_request_ceiling: args.broker_request_ceiling,
+			broker_output_ceiling_bytes: args.broker_output_ceiling_bytes,
+			broker_token_ceiling: args.broker_token_ceiling,
 		},
 	)
 }
@@ -590,5 +704,44 @@ mod tests {
 
 		assert_eq!(cli.run.sandbox_network, Some(SandboxNetworkMode::Allowlist));
 		assert_eq!(cli.run.sandbox_allowlist.unwrap(), ["example.com", "203.0.113.9"]);
+	}
+
+	#[test]
+	fn model_proxy_cli_carries_only_local_routing_data() {
+		let cli = Cli::try_parse_from([
+			"loupe-worker",
+			"model-proxy",
+			"--socket",
+			"/loupe/model/session.sock",
+			"--listen",
+			"127.0.0.1:0",
+			"--port-file",
+			"/tmp/model.port",
+			"--",
+			"/bin/true",
+		])
+		.unwrap();
+
+		let Some(Cmd::ModelProxy(args)) = cli.cmd else {
+			panic!("model-proxy subcommand was not parsed");
+		};
+		assert_eq!(args.socket, PathBuf::from("/loupe/model/session.sock"));
+		assert_eq!(args.listen, "127.0.0.1:0".parse().unwrap());
+		assert_eq!(args.port_file, PathBuf::from("/tmp/model.port"));
+		assert_eq!(args.command, [OsString::from("/bin/true")]);
+	}
+
+	#[test]
+	fn model_proxy_replaces_only_the_fixed_base_url_placeholder() {
+		let argument =
+			OsString::from("model_providers.loupe.base_url=\"@LOUPE_MODEL_BASE_URL@/v1\"");
+		assert_eq!(
+			replace_model_base_url(argument, "http://127.0.0.1:3210"),
+			OsString::from("model_providers.loupe.base_url=\"http://127.0.0.1:3210/v1\""),
+		);
+		assert_eq!(
+			replace_model_base_url(OsString::from("unrelated"), "http://127.0.0.1:3210"),
+			OsString::from("unrelated"),
+		);
 	}
 }
