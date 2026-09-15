@@ -15,3 +15,4 @@ pub mod secrets;
 pub mod workers;
 
 pub use db::{Db, Error, Result};
+pub use loupe_core::canonical;
