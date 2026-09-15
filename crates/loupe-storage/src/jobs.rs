@@ -5,6 +5,8 @@
 //! `JobKind::as_str` exactly so callers can shuttle them through SQL
 //! without having to define their own constants.
 
+use std::sync::LazyLock;
+
 use loupe_core::{
 	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
 };
@@ -21,6 +23,20 @@ pub const MAX_ATTEMPTS: u32 = 3;
 
 pub const JOB_CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by admin";
 pub const LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR: &str = "lease expired after max attempts";
+
+/// Widen only when the runtime can authorize and finish the added kinds.
+pub const RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
+
+fn runtime_kinds_sql() -> &'static str {
+	static SQL: LazyLock<String> = LazyLock::new(|| {
+		RUNTIME_KINDS
+			.iter()
+			.map(|kind| format!("'{}'", kind.as_str()))
+			.collect::<Vec<_>>()
+			.join(",")
+	});
+	&SQL
+}
 
 const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha, head_sha,
         parent_job_id, target_finding_id, worker_id, lease_expires_at,
@@ -71,9 +87,10 @@ pub struct NewJob {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelOutcome {
-	Cancelled(JobRow),
+	Cancelled(Box<JobRow>),
 	NotFound,
 	NotCancellable(JobState),
+	UnsupportedKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,10 +98,16 @@ pub enum RetryOutcome {
 	Retried(JobRow),
 	NotFound,
 	Conflict(String),
+	UnsupportedKind,
 }
 
 /// Insert a `queued` job, returning the new id.
 pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i64> {
+	// NewJob is also the public legacy input, so enforce this at runtime.
+	// Match the enum, not its text: Unknown("scan") is still unknown.
+	if !RUNTIME_KINDS.contains(&new.kind) {
+		return Err(rusqlite::Error::InvalidParameterName("unsupported job kind".into()));
+	}
 	let initial_state =
 		initial_job_state(JobTransition::Enqueue).map_err(sql_state_transition_error)?;
 	conn.execute(
@@ -135,6 +158,7 @@ pub fn lease_next(
 		 WHERE id = (
 		     SELECT id FROM jobs
 		     WHERE state = 'queued'
+		       AND kind IN ({runtime})
 		       AND (kind = 'scan' OR (kind = 'verify' AND ?5 = 1))
 		     ORDER BY
 		       CASE WHEN kind = 'verify' AND ?5 = 1 THEN 0 ELSE 1 END,
@@ -142,6 +166,7 @@ pub fn lease_next(
 		     LIMIT 1
 		 )
 		 RETURNING {JOB_COLUMNS}",
+		runtime = runtime_kinds_sql(),
 	))?;
 	let mut iter = stmt.query_map(
 		params![
@@ -171,11 +196,15 @@ pub fn heartbeat(
 	let leased_state =
 		JobState::Leased.apply(JobTransition::Heartbeat).map_err(sql_state_transition_error)?;
 	let n = conn.execute(
-		"UPDATE jobs
+		&format!(
+			"UPDATE jobs
 		   SET lease_expires_at = ?1
 		 WHERE id = ?2 AND state = ?3 AND worker_id = ?4
 		   AND job_capability_hash = ?5
-		   AND lease_expires_at >= ?6",
+		   AND lease_expires_at >= ?6
+		   AND kind IN ({})",
+			runtime_kinds_sql()
+		),
 		params![lease_until, job_id, leased_state.as_str(), worker_id, job_capability_hash, now],
 	)?;
 	Ok(if n > 0 { Some(lease_until) } else { None })
@@ -199,7 +228,8 @@ pub fn complete(
 	};
 	let target_state = JobState::Leased.apply(transition).map_err(sql_state_transition_error)?;
 	let n = conn.execute(
-		"UPDATE jobs
+		&format!(
+			"UPDATE jobs
 		   SET state = ?1,
 		       head_sha = COALESCE(?2, head_sha),
 		       error = ?3,
@@ -208,7 +238,10 @@ pub fn complete(
 		       job_capability_hash = NULL
 		 WHERE id = ?5 AND state = ?6 AND worker_id = ?7
 		   AND job_capability_hash = ?8
-		   AND lease_expires_at >= ?9",
+		   AND lease_expires_at >= ?9
+		   AND kind IN ({})",
+			runtime_kinds_sql()
+		),
 		params![
 			target_state.as_str(),
 			head_sha,
@@ -230,20 +263,26 @@ pub fn complete(
 pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<CancelOutcome> {
 	let tx = conn.transaction()?;
 	let Some(row) = get(&tx, job_id)? else { return Ok(CancelOutcome::NotFound) };
+	if !RUNTIME_KINDS.contains(&row.kind) {
+		return Ok(CancelOutcome::UnsupportedKind);
+	}
 	let target_state = match row.state.apply(JobTransition::Cancel) {
 		Ok(state) => state,
 		Err(_) => return Ok(CancelOutcome::NotCancellable(row.state)),
 	};
 
 	let updated = tx.execute(
-		"UPDATE jobs
+		&format!(
+			"UPDATE jobs
 		   SET state = ?2,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
 		       job_capability_hash = NULL,
 		       finished_at = ?3,
 		       error = ?4
-		 WHERE id = ?1 AND state IN ('queued','leased')",
+		 WHERE id = ?1 AND state IN ('queued','leased') AND kind IN ({})",
+			runtime_kinds_sql()
+		),
 		(job_id, target_state.as_str(), now, JOB_CANCELLED_BY_ADMIN_ERROR),
 	)?;
 	if updated == 0 {
@@ -255,7 +294,7 @@ pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<
 	}
 	let row = get(&tx, job_id)?.expect("cancelled job row still exists");
 	tx.commit()?;
-	Ok(CancelOutcome::Cancelled(row))
+	Ok(CancelOutcome::Cancelled(Box::new(row)))
 }
 
 pub fn enqueue_verify_jobs_for_scan(
@@ -269,7 +308,8 @@ pub fn enqueue_verify_jobs_for_scan(
 		    target_finding_id, enqueued_at)
 		 SELECT ?1, ?2, ?3, 0, ?4, id, ?5
 		 FROM findings
-		 WHERE job_id = ?4 AND state = ?6",
+		 WHERE job_id = ?4 AND state = ?6
+		   AND EXISTS (SELECT 1 FROM jobs WHERE id = ?4 AND repo_id = ?1 AND kind = 'scan')",
 		params![
 			repo_id,
 			JobKind::Verify.as_str(),
@@ -286,6 +326,9 @@ pub fn retry_failed(
 ) -> rusqlite::Result<RetryOutcome> {
 	let tx = conn.transaction()?;
 	let Some(row) = get(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
+	if !RUNTIME_KINDS.contains(&row.kind) {
+		return Ok(RetryOutcome::UnsupportedKind);
+	}
 	if row.state != JobState::Failed {
 		return Ok(RetryOutcome::Conflict(format!("job {job_id} is {:?}, not failed", row.state)));
 	}
@@ -358,7 +401,8 @@ pub fn requeue_failed(
 	let target_state =
 		JobState::Failed.apply(JobTransition::Retry).map_err(sql_state_transition_error)?;
 	let updated = conn.execute(
-		"UPDATE jobs
+		&format!(
+			"UPDATE jobs
 		   SET state = ?1,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
@@ -369,7 +413,10 @@ pub fn requeue_failed(
 		       error = NULL,
 		       head_sha = NULL,
 		       enqueued_at = ?2
-		 WHERE id = ?3 AND state = ?4",
+		 WHERE id = ?3 AND state = ?4
+		   AND kind IN ({})",
+			runtime_kinds_sql()
+		),
 		(target_state.as_str(), now, job_id, JobState::Failed.as_str()),
 	)?;
 	if updated == 0 {
@@ -413,7 +460,9 @@ pub fn get_active_by_capability_hash(
 			   AND job_capability_hash = ?2
 			   AND state = 'leased'
 			   AND lease_expires_at IS NOT NULL
-			   AND lease_expires_at >= ?3"
+			   AND lease_expires_at >= ?3
+			   AND kind IN ({runtime})",
+			runtime = runtime_kinds_sql(),
 		),
 		params![worker_id, job_capability_hash, now],
 		row_to_job,
@@ -455,7 +504,7 @@ pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRo
 		clauses.push(format!("state IN ({placeholders})"));
 		args.extend(filter.states.iter().map(|s| Value::Text(s.as_str().to_owned())));
 	}
-	if let Some(kind) = filter.kind {
+	if let Some(kind) = &filter.kind {
 		clauses.push("kind = ?".to_owned());
 		args.push(Value::Text(kind.as_str().to_owned()));
 	}
@@ -506,14 +555,18 @@ pub fn worker_has_active_lease_for_repo(
 	conn: &Connection, worker_id: i64, repo_id: i64, now: i64,
 ) -> rusqlite::Result<bool> {
 	let found: i64 = conn.query_row(
-		"SELECT EXISTS(
+		&format!(
+			"SELECT EXISTS(
 		     SELECT 1 FROM jobs
 		     WHERE repo_id = ?1
 		       AND worker_id = ?2
 		       AND state = 'leased'
 		       AND lease_expires_at IS NOT NULL
 		       AND lease_expires_at >= ?3
+		       AND kind IN ({})
 		 )",
+			runtime_kinds_sql()
+		),
 		params![repo_id, worker_id, now],
 		|r| r.get(0),
 	)?;
@@ -540,7 +593,8 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		rows.collect::<rusqlite::Result<Vec<_>>>()?
 	};
 	let requeued = conn.execute(
-		"UPDATE jobs
+		&format!(
+			"UPDATE jobs
 		   SET state = ?2,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
@@ -548,11 +602,15 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		       started_at = NULL
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
-		   AND attempts < ?3",
+		   AND attempts < ?3
+		   AND kind IN ({})",
+			runtime_kinds_sql()
+		),
 		params![now, requeued_state.as_str(), MAX_ATTEMPTS],
 	)?;
 	let failed = conn.execute(
-		"UPDATE jobs
+		&format!(
+			"UPDATE jobs
 		   SET state = ?3,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
@@ -561,7 +619,10 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		       error = COALESCE(error, ?4)
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
-		   AND attempts >= ?2",
+		   AND attempts >= ?2
+		   AND kind IN ({})",
+			runtime_kinds_sql()
+		),
 		params![now, MAX_ATTEMPTS, failed_state.as_str(), LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR],
 	)?;
 	for job_id in failing_scan_jobs {
@@ -577,9 +638,7 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 	let kind_str: String = row.get(2)?;
 	let state_str: String = row.get(3)?;
-	let kind = kind_str.parse::<JobKind>().map_err(|e| {
-		rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
-	})?;
+	let kind = kind_str.parse::<JobKind>().expect("infallible kind parser");
 	let state = state_str.parse::<JobState>().map_err(|e| {
 		rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into())
 	})?;
@@ -712,6 +771,266 @@ mod tests {
 			.into_iter()
 			.map(|r| (r.id, r.state, r.kind))
 			.collect()
+	}
+
+	#[test]
+	fn future_kind_is_readable_without_breaking_other_jobs() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		enqueue_job(&db, repo_id, JobKind::Scan, 1);
+		db.with_conn(|c| {
+			c.execute("INSERT INTO job_kinds VALUES ('future', 0)", [])?;
+			c.execute("INSERT INTO jobs (repo_id, kind, state, enqueued_at) VALUES (?1, 'future', 'queued', 2)", [repo_id])?;
+			let rows = list(c, &JobFilter::default());
+			assert!(rows.is_ok(), "one future kind must not break listing: {rows:?}");
+			let rows = rows.unwrap();
+			assert_eq!(rows.len(), 2);
+			assert_eq!(rows[0].kind.as_str(), "future");
+			assert_eq!(get(c, rows[0].id)?.unwrap(), rows[0]);
+			assert_eq!(rows[1].kind, JobKind::Scan);
+			assert_eq!(super::lease_next(c, worker_id, true, 10, 100, &[1; 32])?.unwrap().kind, JobKind::Scan);
+			assert!(super::lease_next(c, worker_id, true, 10, 100, &[2; 32])?.is_none());
+			Ok(())
+		}).unwrap();
+	}
+
+	#[test]
+	fn enqueue_rejects_unknown_even_when_it_wraps_a_known_spelling() {
+		let (db, repo_id, _) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			for raw in ["future", "scan", "verify", "survey", "drilldown"] {
+				let new = NewJob {
+					repo_id,
+					kind: JobKind::Unknown(raw.into()),
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				};
+				assert!(enqueue(c, &new, 0).is_err());
+			}
+			assert!(list(c, &JobFilter::default())?.is_empty());
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	fn future_leased_fixture() -> (Db, i64, i64, i64) {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let id = db.with_conn(|c| {
+			c.execute("INSERT INTO job_kinds VALUES ('future', 0)", [])?;
+			c.execute("INSERT INTO jobs (repo_id, kind, state, worker_id, job_capability_hash, lease_expires_at, attempts, enqueued_at)
+			VALUES (?1, 'future', 'leased', ?2, zeroblob(32), 100, 1, 0)", params![repo_id, worker_id])?;
+			Ok(c.last_insert_rowid())
+		}).unwrap();
+		(db, repo_id, worker_id, id)
+	}
+
+	#[test]
+	fn unsupported_phase_kinds_do_not_authorize_or_cancel() {
+		for kind in ["survey", "drilldown"] {
+			let (db, repo, worker, id) = future_leased_fixture();
+			db.with_conn(|c| {
+				c.execute("UPDATE jobs SET kind = ?1 WHERE id = ?2", params![kind, id])?;
+				assert!(
+					get_active_by_capability_hash(c, worker, &[0; 32], 10)?.is_none(),
+					"unsupported phase must not authorize a persisted capability"
+				);
+				assert!(!worker_has_active_lease_for_repo(c, worker, repo, 10)?);
+				assert!(
+					!matches!(cancel(c, id, 10)?, CancelOutcome::Cancelled(_)),
+					"unsupported phase must not be cancelled with legacy semantics"
+				);
+				assert_eq!(get(c, id)?.unwrap().state, JobState::Leased);
+				c.execute("UPDATE jobs SET state = 'failed' WHERE id = ?1", [id])?;
+				assert!(matches!(retry_failed(c, id, 10, 100)?, RetryOutcome::UnsupportedKind));
+				assert_eq!(get(c, id)?.unwrap().state, JobState::Failed);
+				Ok(())
+			})
+			.unwrap();
+		}
+	}
+
+	#[test]
+	fn unsupported_phase_kinds_cannot_be_enqueued() {
+		let (db, repo_id, _) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			for kind in [JobKind::Survey, JobKind::Drilldown] {
+				let new = NewJob {
+					repo_id,
+					kind,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				};
+				assert!(
+					enqueue(c, &new, 0).is_err(),
+					"known but unsupported kinds must not enter the legacy runtime"
+				);
+			}
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn unsupported_parent_cannot_fan_out_verification_work() {
+		let (db, repo, _, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			c.execute("INSERT INTO findings (repo_id, job_id, scanner_id, severity, title, description, fingerprint, state, created_at)
+			VALUES (?1, ?2, 'llm', 'high', 'title', 'description', 'fingerprint', 'validating', 0)", params![repo, id])?;
+			assert_eq!(enqueue_verify_jobs_for_scan(c, repo, id, 10)?, 0, "unsupported parent must not spawn verify jobs");
+			Ok(())
+		}).unwrap();
+	}
+
+	#[test]
+	fn future_kind_heartbeat_cannot_extend_a_persisted_lease() {
+		let (db, _, worker, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			assert_eq!(
+				super::heartbeat(c, id, worker, 10, 200, &[0; 32])?,
+				None,
+				"future-kind leases must not be heartbeated"
+			);
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn future_kind_cannot_authorize_a_capability_or_callback() {
+		let (db, repo, worker, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			let resolved = get_active_by_capability_hash(c, worker, &[0; 32], 10);
+			assert!(
+				matches!(resolved, Ok(None)),
+				"future capability must fail closed without a decode error: {resolved:?}"
+			);
+			let ran = std::cell::Cell::new(false);
+			let outcome = with_active_lease_transaction(
+				c,
+				ActiveLease {
+					identity: LeaseIdentity {
+						job_id: id,
+						worker_id: worker,
+						capability_hash: &[0; 32],
+					},
+					now: 10,
+				},
+				|_, _| {
+					ran.set(true);
+					Ok(())
+				},
+			)?;
+			assert!(outcome.is_none());
+			assert!(!ran.get());
+			assert!(!worker_has_active_lease_for_repo(c, worker, repo, 10)?);
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn future_kind_admin_operations_are_conflicts_without_mutation() {
+		let (db, _, _, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			for state in ["queued", "leased", "failed", "succeeded", "cancelled"] {
+				c.execute("UPDATE jobs SET state = ?1 WHERE id = ?2", params![state, id])?;
+				let cancelled = cancel(c, id, 10);
+				assert!(
+					cancelled.is_ok(),
+					"unknown cancellation must be a classified outcome, not a decode error"
+				);
+				assert!(!matches!(cancelled.unwrap(), CancelOutcome::Cancelled(_)));
+				assert!(matches!(retry_failed(c, id, 10, 100)?, RetryOutcome::UnsupportedKind));
+				let after: String =
+					c.query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| r.get(0))?;
+				assert_eq!(after, state);
+			}
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn future_kind_completion_cannot_transition_a_persisted_lease() {
+		let (db, _, worker, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			assert!(
+				!super::complete(
+					c,
+					LeaseIdentity { job_id: id, worker_id: worker, capability_hash: &[0; 32] },
+					JobState::Succeeded,
+					None,
+					None,
+					10
+				)?,
+				"future-kind leases must not be completed"
+			);
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn future_kind_reaper_leaves_both_expiry_outcomes_untouched() {
+		let (db, repo, _, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			c.execute(
+				"INSERT INTO jobs (repo_id, kind, state, lease_expires_at, attempts, enqueued_at)
+			VALUES (?1, 'future', 'leased', 100, ?2, 0)",
+				params![repo, MAX_ATTEMPTS],
+			)?;
+			for kind in ["scan", "verify"] {
+				for attempts in [1, MAX_ATTEMPTS] {
+					c.execute("INSERT INTO jobs (repo_id, kind, state, lease_expires_at, attempts, enqueued_at)
+					VALUES (?1, ?2, 'leased', 100, ?3, 0)", params![repo, kind, attempts])?;
+				}
+			}
+			assert_eq!(reap_stale_leases(c, 101)?, 4, "only scan/verify leases may be reaped");
+			let state: String =
+				c.query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| r.get(0))?;
+			assert_eq!(state, "leased");
+			assert_eq!(
+				c.query_row(
+					"SELECT COUNT(*) FROM jobs WHERE kind = 'future' AND state = 'leased'",
+					[],
+					|r| r.get::<_, i64>(0)
+				)?,
+				2
+			);
+			for state in ["queued", "failed"] {
+				assert_eq!(
+					c.query_row(
+						"SELECT COUNT(*) FROM jobs WHERE kind IN ('scan','verify') AND state = ?1",
+						[state],
+						|r| r.get::<_, i64>(0)
+					)?,
+					2
+				);
+			}
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn future_kind_requeue_cannot_mutate_before_decoding() {
+		let (db, _, _, id) = future_leased_fixture();
+		db.with_conn(|c| {
+			c.execute("UPDATE jobs SET state = 'failed' WHERE id = ?1", [id])?;
+			let outcome = requeue_failed(c, id, 10);
+			let state: String =
+				c.query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| r.get(0))?;
+			assert_eq!(
+				state, "failed",
+				"unknown jobs must remain untouched even when a returned row cannot decode"
+			);
+			assert!(outcome?.is_none());
+			Ok(())
+		})
+		.unwrap();
 	}
 
 	#[test]
@@ -891,13 +1210,13 @@ mod tests {
 		// Worker that does NOT accept verify: leases scan, then sees
 		// the queue as empty (verify is gated).
 		let first = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?)).unwrap();
-		assert!(matches!(first.as_ref().map(|r| r.kind), Some(JobKind::Scan)));
+		assert!(matches!(first.as_ref().map(|r| &r.kind), Some(JobKind::Scan)));
 		let second = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 201, 60)?)).unwrap();
 		assert!(second.is_none(), "verify job must be invisible to non-verify workers");
 
 		// A verify-capable worker DOES pick it up.
 		let third = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 202, 60)?)).unwrap();
-		assert!(matches!(third.as_ref().map(|r| r.kind), Some(JobKind::Verify)));
+		assert!(matches!(third.as_ref().map(|r| &r.kind), Some(JobKind::Verify)));
 	}
 
 	#[test]
@@ -938,11 +1257,11 @@ mod tests {
 
 		let first = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 300, 60)?)).unwrap();
 		assert_eq!(first.as_ref().map(|r| r.id), Some(verify_id));
-		assert!(matches!(first.as_ref().map(|r| r.kind), Some(JobKind::Verify)));
+		assert!(matches!(first.as_ref().map(|r| &r.kind), Some(JobKind::Verify)));
 
 		let second = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 301, 60)?)).unwrap();
 		assert_eq!(second.as_ref().map(|r| r.id), Some(scan_id));
-		assert!(matches!(second.as_ref().map(|r| r.kind), Some(JobKind::Scan)));
+		assert!(matches!(second.as_ref().map(|r| &r.kind), Some(JobKind::Scan)));
 	}
 
 	#[test]
