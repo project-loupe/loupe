@@ -7,22 +7,25 @@
 
 use rusqlite::{params, Connection};
 
+mod v3;
+
 #[cfg(test)]
 mod framework_tests;
+
+#[cfg(test)]
+mod failure_tests;
+#[cfg(test)]
+mod fixtures;
+#[cfg(test)]
+mod ownership_tests;
+#[cfg(test)]
+mod v3_tests;
 
 /// One migration step. Versions are dense (1, 2, 3, ...) and applied in
 /// ascending order.
 enum Migration {
-	Sql {
-		version: u32,
-		sql: &'static str,
-	},
-	// The first production structural migration lands with schema v3.
-	#[cfg_attr(not(test), expect(dead_code))]
-	Structural {
-		version: u32,
-		run: fn(&mut Connection) -> rusqlite::Result<()>,
-	},
+	Sql { version: u32, sql: &'static str },
+	Structural { version: u32, run: fn(&mut Connection) -> rusqlite::Result<()> },
 }
 
 impl Migration {
@@ -37,6 +40,7 @@ impl Migration {
 const MIGRATIONS: &[Migration] = &[
 	Migration::Sql { version: 1, sql: V1_INITIAL },
 	Migration::Sql { version: 2, sql: V2_JOB_CAPABILITIES },
+	Migration::Structural { version: 3, run: v3::run },
 ];
 
 /// The highest version this build knows about.

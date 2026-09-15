@@ -47,7 +47,16 @@ impl Db {
 		Self::bootstrap(conn, key)
 	}
 
-	fn bootstrap(mut conn: Connection, key: &MasterKey) -> Result<Self> {
+	fn bootstrap(conn: Connection, key: &MasterKey) -> Result<Self> {
+		Self::bootstrap_with_migration(conn, key, apply_pending)
+	}
+
+	// Keep configuration and connection disposal on the real startup path
+	// when migration tests inject failures at transactional boundaries.
+	pub(crate) fn bootstrap_with_migration(
+		mut conn: Connection, key: &MasterKey,
+		migrate: impl FnOnce(&mut Connection) -> rusqlite::Result<()>,
+	) -> Result<Self> {
 		// PRAGMA key MUST run before any other statement that touches
 		// pages: SQLCipher decrypts pages on read, so an unkeyed read
 		// against an encrypted file returns "file is not a database".
@@ -55,7 +64,7 @@ impl Db {
 		conn.pragma_update(None, "journal_mode", "WAL")?;
 		conn.pragma_update(None, "foreign_keys", "ON")?;
 		conn.pragma_update(None, "synchronous", "NORMAL")?;
-		apply_pending(&mut conn)?;
+		migrate(&mut conn)?;
 		Ok(Self { conn: Mutex::new(conn) })
 	}
 
