@@ -29,6 +29,11 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends tini \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& useradd --uid 10001 --user-group --home-dir /var/lib/loupe --create-home --shell /usr/sbin/nologin loupe
+# The revision changes on every commit; keep it below the package layers so
+# they stay cached, and above the binaries it describes.
+ARG LOUPE_BUILD_REVISION=unknown
+ENV LOUPE_BUILD_REVISION=$LOUPE_BUILD_REVISION
+LABEL org.opencontainers.image.revision=$LOUPE_BUILD_REVISION
 COPY --from=app-builder /src/target/release/loupe-server /usr/local/bin/loupe-server
 COPY --from=app-builder /src/target/release/loupectl /usr/local/bin/loupectl
 COPY contrib/docker/loupe-container-entrypoint.sh /usr/local/bin/loupe-container-entrypoint
@@ -63,6 +68,10 @@ ARG INSTALL_CODEX=1
 ARG AGENT_CLI_REFRESH
 RUN if [ "$INSTALL_CLAUDE" = "1" ]; then npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; fi \
 	&& if [ "$INSTALL_CODEX" = "1" ]; then npm install -g "@openai/codex@${CODEX_VERSION}"; fi
+# See the server stage: revision metadata sits below every package layer.
+ARG LOUPE_BUILD_REVISION=unknown
+ENV LOUPE_BUILD_REVISION=$LOUPE_BUILD_REVISION
+LABEL org.opencontainers.image.revision=$LOUPE_BUILD_REVISION
 COPY --from=app-builder /src/target/release/loupe-worker /usr/local/bin/loupe-worker
 COPY --from=bkb-mcp-builder /usr/local/cargo/bin/bkb-mcp /usr/local/bin/bkb-mcp
 COPY contrib/docker/loupe-container-entrypoint.sh /usr/local/bin/loupe-container-entrypoint

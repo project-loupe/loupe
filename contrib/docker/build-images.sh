@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 ENGINE="${CONTAINER_ENGINE:-}"
 if [ -z "$ENGINE" ]; then
 	if command -v podman >/dev/null 2>&1; then
@@ -14,13 +14,22 @@ if [ -z "$ENGINE" ]; then
 	fi
 fi
 
-TAG="${LOUPE_IMAGE_TAG:-$(git -C "$ROOT" rev-parse --short HEAD)}"
+# Only trust git metadata that belongs to this checkout. `git -C` walks up
+# to any enclosing repository, so a source export unpacked inside an
+# unrelated checkout would otherwise be stamped with that project's revision.
+if [ "$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)" = "$ROOT" ]; then
+	BUILD_REVISION="${LOUPE_BUILD_REVISION:-$(git -C "$ROOT" describe --always --dirty)}"
+	TAG="${LOUPE_IMAGE_TAG:-$(git -C "$ROOT" rev-parse --short HEAD)}"
+else
+	BUILD_REVISION="${LOUPE_BUILD_REVISION:-unknown}"
+	TAG="${LOUPE_IMAGE_TAG:-$BUILD_REVISION}"
+fi
 SERVER_IMAGE="${LOUPE_SERVER_IMAGE:-localhost/loupe-server:$TAG}"
 WORKER_IMAGE="${LOUPE_WORKER_IMAGE:-localhost/loupe-worker:$TAG}"
 DOCKERFILE="${LOUPE_DOCKERFILE:-$ROOT/contrib/docker/Dockerfile}"
 RUST_VERSION="${LOUPE_RUST_VERSION:-}"
 
-build_args=()
+build_args=(--build-arg "LOUPE_BUILD_REVISION=$BUILD_REVISION")
 if [ -n "$RUST_VERSION" ]; then
 	build_args+=(--build-arg "RUST_VERSION=$RUST_VERSION")
 fi
