@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Keep model credentials outside agent sandboxes by routing Claude and Codex through a host-side model broker ([#59]).
+- Deny provider-side `mcp_servers` connections at the model broker ([#60]).
+
 ## v0.1 — 2026-09-07
 
 First release of Loupe, a security-scanning harness for source repositories.
@@ -78,3 +83,5 @@ deduplication and verification; and GitHub, email, or manual reporting.
 [#55]: https://github.com/project-loupe/loupe/pull/55
 [#56]: https://github.com/project-loupe/loupe/pull/56
 [#57]: https://github.com/project-loupe/loupe/pull/57
+[#59]: https://github.com/project-loupe/loupe/pull/59
+[#60]: https://github.com/project-loupe/loupe/pull/60
