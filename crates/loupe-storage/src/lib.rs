@@ -8,6 +8,7 @@
 
 mod db;
 pub mod findings;
+pub mod identity;
 pub mod jobs;
 pub mod migrations;
 pub mod repos;
