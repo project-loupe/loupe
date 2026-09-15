@@ -13,9 +13,12 @@ publish.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+unicode-general-category = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [lints]
 workspace = true

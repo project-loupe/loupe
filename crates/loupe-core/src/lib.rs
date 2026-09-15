@@ -12,6 +12,7 @@ mod job;
 mod repo;
 mod severity;
 mod state_machine;
+pub mod text;
 mod verdict;
 
 pub use error::{Error, Result};
