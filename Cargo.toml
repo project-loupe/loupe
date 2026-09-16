@@ -78,3 +78,5 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json", "tracing-log"] }
 walkdir = { version = "2", default-features = false }
+unicode-general-category = { version = "1.1", default-features = false }
+unicode-normalization = { version = "0.1.25", default-features = false, features = ["std"] }

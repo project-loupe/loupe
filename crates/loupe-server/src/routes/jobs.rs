@@ -52,7 +52,7 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 	JobInfo {
 		job_id: row.id,
 		repo_id: row.repo_id,
-		kind: row.kind,
+		kind: row.kind.clone(),
 		state: row.state,
 		incremental: row.incremental,
 		since_sha: row.since_sha.clone(),
@@ -119,9 +119,15 @@ fn parse_states(raw: Option<&str>) -> Result<Vec<JobState>, (StatusCode, String)
 
 fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind>, (StatusCode, String)> {
 	raw.map(|k| {
-		k.parse::<JobKind>().map_err(|_| {
-			(StatusCode::BAD_REQUEST, format!("unknown job kind {k:?}; expected scan or verify"))
-		})
+		let kind: JobKind = k.parse().expect("infallible kind parser");
+		if kind.is_known() {
+			Ok(kind)
+		} else {
+			Err((
+				StatusCode::BAD_REQUEST,
+				format!("unknown job kind {k:?}; expected scan, verify, survey or drilldown"),
+			))
+		}
 	})
 	.transpose()
 }
@@ -143,7 +149,7 @@ pub async fn enqueue_scan(
 	let job_id = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::enqueue(
+			jobs::enqueue(
 				c,
 				&NewJob {
 					repo_id: repo.id,
@@ -154,7 +160,7 @@ pub async fn enqueue_scan(
 					target_finding_id: None,
 				},
 				now,
-			)?)
+			)
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue: {e}")))?;
 
@@ -219,6 +225,9 @@ pub async fn retry(
 			Err((StatusCode::NOT_FOUND, format!("no job with id {id}")))
 		},
 		jobs::RetryOutcome::Conflict(msg) => Err((StatusCode::CONFLICT, msg)),
+		jobs::RetryOutcome::UnsupportedKind => {
+			Err((StatusCode::CONFLICT, "unsupported job kind".into()))
+		},
 	}
 }
 
@@ -238,6 +247,9 @@ pub async fn cancel(
 		},
 		jobs::CancelOutcome::NotCancellable(state) => {
 			Err((StatusCode::CONFLICT, format!("job {id} is {state:?}, not queued or leased")))
+		},
+		jobs::CancelOutcome::UnsupportedKind => {
+			Err((StatusCode::CONFLICT, "unsupported job kind".into()))
 		},
 	}
 }
@@ -368,6 +380,9 @@ fn build_lease_envelope(
 			let finding = finding_row.into_finding();
 			LeasePayload::Verify { finding_id: target_id, finding: Box::new(finding), reviewed_sha }
 		},
+		JobKind::Survey | JobKind::Drilldown | JobKind::Unknown(_) => {
+			anyhow::bail!("unsupported job kind in legacy lease envelope");
+		},
 	};
 
 	Ok(LeaseEnvelope {
@@ -454,7 +469,7 @@ pub async fn submit_findings(
 	let submitted = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::with_active_lease_transaction(
+			jobs::with_active_lease_transaction(
 				c,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
@@ -470,13 +485,51 @@ pub async fn submit_findings(
 					}
 					Ok(())
 				},
-			)?)
+			)
 		})
-		.map_err(|e: loupe_storage::Error| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit findings: {e}"))
-		})?;
+		.map_err(|e| storage_write_error("submit findings", e))?;
 	submitted.ok_or_else(job_capability::forbidden)?;
 	Ok(StatusCode::NO_CONTENT)
+}
+
+fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCode, String) {
+	use loupe_storage::Error;
+	let status = match &error {
+		Error::Validation(_) | Error::UnknownPaths(_) => StatusCode::BAD_REQUEST,
+		Error::Conflict(_) => StatusCode::CONFLICT,
+		Error::Ownership(_) => StatusCode::FORBIDDEN,
+		Error::NotFound(_, _) => StatusCode::NOT_FOUND,
+		Error::Sqlite(_) | Error::UnknownJobKinds(_) => StatusCode::INTERNAL_SERVER_ERROR,
+	};
+	(status, format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod storage_error_tests {
+	use super::*;
+	#[test]
+	fn domain_errors_keep_their_http_meaning() {
+		use loupe_storage::{Conflict, Entity, Error, Ownership};
+		for (error, status) in [
+			(Error::Conflict(Conflict::Checkpoint), StatusCode::CONFLICT),
+			(Error::Ownership(Ownership::LeadJob), StatusCode::FORBIDDEN),
+			(Error::NotFound(Entity::Job, 1), StatusCode::NOT_FOUND),
+			(
+				Error::Validation(loupe_core::text::Error::new(
+					"title",
+					loupe_core::text::Rule::Empty,
+				)),
+				StatusCode::BAD_REQUEST,
+			),
+			(Error::UnknownJobKinds(vec![]), StatusCode::INTERNAL_SERVER_ERROR),
+		] {
+			assert_eq!(
+				storage_write_error("submit", error).0,
+				status,
+				"preserve typed storage failure status"
+			);
+		}
+	}
 }
 
 /// `POST /v1/jobs/:id/llm-findings` — strict host-side MCP broker path.
@@ -514,24 +567,22 @@ pub async fn submit_llm_finding(
 	let submitted = state
 		.db
 		.with_conn(|conn| {
-			Ok(jobs::with_active_lease_transaction(
+			jobs::with_active_lease_transaction(
 				conn,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
-					findings::insert_or_ignore(
+					Ok(findings::insert_or_ignore(
 						tx,
 						active.repo_id,
 						active.id,
 						&finding,
 						repo.verification_enabled,
 						now,
-					)
+					)?)
 				},
-			)?)
+			)
 		})
-		.map_err(|error| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit LLM finding: {error}"))
-		})?;
+		.map_err(|error| storage_write_error("submit LLM finding", error))?;
 	submitted.ok_or_else(job_capability::forbidden)?;
 	Ok(StatusCode::NO_CONTENT)
 }
@@ -588,7 +639,7 @@ pub async fn submit_verdict(
 	let new_state: Option<FindingState> = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::with_active_lease_transaction(
+			jobs::with_active_lease_transaction(
 				c,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
@@ -615,19 +666,17 @@ pub async fn submit_verdict(
 							now,
 						)?;
 					}
-					loupe_storage::findings::roll_up_verdicts_for_finding(
+					Ok(loupe_storage::findings::roll_up_verdicts_for_finding(
 						tx,
 						target_finding_id,
 						terminal_inconclusive,
 						require_approval,
 						now,
-					)
+					)?)
 				},
-			)?)
+			)
 		})
-		.map_err(|e: loupe_storage::Error| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit verdict: {e}"))
-		})?
+		.map_err(|e| storage_write_error("submit verdict", e))?
 		.ok_or_else(job_capability::forbidden)?;
 
 	if matches!(new_state, Some(FindingState::Confirmed))
@@ -658,6 +707,10 @@ pub async fn complete(
 
 	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
 	let job = &authorized.row;
+	// Same set the storage guards use; the two must never drift apart.
+	if !jobs::RUNTIME_KINDS.contains(&job.kind) {
+		return Err((StatusCode::BAD_REQUEST, "unsupported job kind".into()));
+	}
 	if matches!(new_state, JobState::Succeeded) {
 		match job.kind {
 			JobKind::Scan => {
@@ -689,6 +742,9 @@ pub async fn complete(
 						"successful verify completion requires a submitted verdict".into(),
 					));
 				}
+			},
+			JobKind::Survey | JobKind::Drilldown | JobKind::Unknown(_) => {
+				return Err((StatusCode::BAD_REQUEST, "unsupported job kind".into()));
 			},
 		}
 	}

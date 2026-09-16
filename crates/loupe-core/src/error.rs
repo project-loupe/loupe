@@ -10,9 +10,6 @@ pub enum Error {
 	#[error("unknown job state: {0:?}")]
 	UnknownJobState(String),
 
-	#[error("unknown job kind: {0:?}")]
-	UnknownJobKind(String),
-
 	#[error("unknown finding state: {0:?}")]
 	UnknownFindingState(String),
 }

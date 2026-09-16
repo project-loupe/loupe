@@ -4,6 +4,7 @@
 //! and `loupe-cli`. They deliberately know nothing about storage layout or
 //! wire framing — those concerns live in `loupe-storage` and `loupe-proto`.
 
+pub mod canonical;
 mod error;
 mod finding;
 mod finding_state;
@@ -11,6 +12,7 @@ mod job;
 mod repo;
 mod severity;
 mod state_machine;
+pub mod text;
 mod verdict;
 
 pub use error::{Error, Result};

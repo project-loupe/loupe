@@ -572,7 +572,7 @@ mod tests {
 			.unwrap();
 		let job_id = db
 			.with_conn(|c| {
-				Ok(jobs::enqueue(
+				jobs::enqueue(
 					c,
 					&NewJob {
 						repo_id,
@@ -583,7 +583,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					0,
-				)?)
+				)
 			})
 			.unwrap();
 		(db, repo_id, job_id)
@@ -777,7 +777,7 @@ mod tests {
 			.unwrap();
 		let job_id_b = db
 			.with_conn(|c| {
-				Ok(jobs::enqueue(
+				jobs::enqueue(
 					c,
 					&jobs::NewJob {
 						repo_id: repo_id_b,
@@ -788,7 +788,7 @@ mod tests {
 						target_finding_id: None,
 					},
 					0,
-				)?)
+				)
 			})
 			.unwrap();
 

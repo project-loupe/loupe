@@ -320,6 +320,105 @@ the same key the server gets at startup via `LOUPE_MASTER_KEY` (or a
 file). See README's "Bootstrap the data directory" + "Run the
 server" sections for the master-key sourcing rules.
 
+## Storage layout for the review harness
+
+Schema v3 has a typed storage API ahead of the v2 scheduler and endpoints.
+It adds no phase routes, worker behavior, or migration. Only `scan` and
+`verify` are runtime-enabled: known but unsupported phase kinds and future
+kinds remain readable, but cannot be leased, mutated, or authorized by the
+legacy runtime. The startup guard still rejects kinds absent from the
+database's `job_kinds` table.
+
+| Modules | Responsibility |
+| --- | --- |
+| `campaigns`, `generations`, `inventory` | Lifecycle, terminal snapshots, pinned paths, coverage preconditions |
+| `review_units`, `review_unit_results` | Review scopes, assignment epochs, append-only evidence |
+| `leads`, `lead_observations`, `identity` | Semantic identity, collision outcomes, preserved observations |
+| `checkpoints`, `terminal_receipt` | Operation-qualified replay and capability-bound terminal replay |
+| `finding_details`, `proofs` | Canonical review metadata and project-scoped proof rows |
+| `ownership`, `transaction` | In-transaction scope checks and standalone transaction boundaries |
+
+Every new mutation accepts a caller-owned `rusqlite::Transaction` and
+returns `storage::Result`. It never begins a nested transaction or commits.
+Each module's `standalone` wrappers open an IMMEDIATE transaction and
+commit only on success. Multi-step callers must propagate an operation's
+error and roll back the whole transaction; a failed batch may have executed
+earlier statements. In particular, domain writes and their checkpoints or
+terminal receipt must commit together. The lease-transaction helper passes
+the same transaction and preserves typed errors.
+Checkpoint handlers use `checkpoints::run`, which owns the whole sequence:
+a hit returns the original response without running the domain body; a
+miss runs the body and records its response under the key. Everything
+happens in the caller's transaction, so retries cannot append duplicate
+observations and a failing body records nothing. `lookup` and
+`record_or_replay` remain available for callers that need the pieces, but
+the three-step convention is no longer something a handler has to remember.
+
+Ownership is checked before mutation, including relations where a foreign
+key proves existence but not repository or generation scope. An explicit
+job generation cannot be overridden by a same-repository campaign link;
+the campaign fallback applies only to jobs without a generation. Unit
+carry-forward requires explicitly remapped dependency IDs. Assignment
+claims compare and bump the epoch and exclude active competing assignments.
+Lead identity collisions append the submitted observation even for closed
+leads; only stale-closed identities can create a successor.
+
+### Text and digest boundaries
+
+`loupe-core::text` provides private, policy-bound values. Agent-authored
+strings enter the new DAOs only through these validated types; commit SHAs,
+IDs, times, capability hashes, and captured binary content are host inputs.
+Proof-command `argv` and `env_names` are agent-authored requests: they pass
+the payload policy *before* the host executes them, so the recorded command
+is byte-for-byte the executed one (an argument with a control character or
+trailing whitespace is refused, not normalized after the fact). `limits` is
+host-authored but shares the bounded JSON shape.
+Semantic text is NFC-normalized and rejects invisible/control characters,
+unsafe whitespace, and oversized values. Validation errors report field,
+rule, and offending code point without echoing the payload.
+
+| Policy | Character / byte cap | Fields |
+| --- | --- | --- |
+| `ClientKey`, `Family`, `Label`, `JsonKey` | 128, 64, 64, 64 ASCII bytes | Replay/unit keys, identity family, artifact label, JSON object keys |
+| `Title`, `Objective` | 200 / 400; 2000 / 4000 | Unit title/objective, receipt title |
+| `Reason`, `Argument` | 1000 / 2000; 4000 / 8000 | Lifecycle explanations; evidence and closure arguments |
+| `Symbol`, `AnchorText`, `InstanceKey` | 256 / 512; 300 / 600; 200 / 400 | Source symbols and normalized semantic identity |
+| `JsonLeaf`, `Payload` | 4000 / 8000 per string; 64 KiB, depth 16, 4096 nodes per document | Bounded canonical JSON, rejecting duplicate keys |
+| `RepoPath` | 512 bytes, exact spelling | Relative source paths, without dot components or normalization |
+| `SourceRefs<32/64>` | 32 unit / 64 inspected refs, 64 KiB | Canonical structured arrays preserving path bytes, unlike generic JSON leaves |
+| `proofs::MediaType`, `OriginalName` | 100 / 200; 512 / 1024 | Single-line artifact metadata; names are display-only |
+
+Proof working directories use an explicit `Root` variant (stored as
+`.`) or a validated `RepoPath`; this does not relax source-path rules.
+Inventory ingestion preserves both composed and decomposed Git names.
+Unrepresentable names become excluded percent-encoded display entries,
+never referenceable paths; real names take precedence within a bulk batch.
+Reference checks require byte-exact membership once an inventory exists.
+
+`loupe-core::canonical` is the single JSON renderer: sorted object keys,
+compact UTF-8, serde_json number rendering, array order preserved.
+BLAKE3-256 of these bytes compares retransmissions and attests payloads;
+it is not a deduplication identity. Semantic identities instead hash the
+versioned, NUL-delimited family/anchor/instance tuple. Storage supplies the
+repository or generation uniqueness scope. Proof blobs separately use
+SHA-256 derived from their captured content, deduplicated only within one
+repository; artifact length and hash are copied from that blob.
+
+Text validation does not prevent prompt injection expressed as ordinary
+prose. Newtypes have redacted `Debug`; rendering requires explicit
+`.expose()`. Future sinks must label untrusted content and use a structured
+boundary or a per-render random boundary of at least 128 bits verified
+absent from that content. A fixed sentinel is not collision-safe. Logs use
+redacted values, UI isolates bidirectional text, reports escape Markdown,
+and CLI rendering escapes controls. Searching for formatting sites is an
+audit aid, not proof of these guarantees.
+
+The future phase endpoints must enforce HTTP body caps before
+deserialization, validate payload field semantics and job-specific
+budgets, and validate the lease before first finalization. Proof capture,
+finalization, garbage collection, and sink wiring are not implemented by
+this storage layer.
+
 ## Cross-references
 
 - Finding state machine details (verdict rollup policy, approval

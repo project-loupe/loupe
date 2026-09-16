@@ -280,6 +280,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	};
 	let db = Db::open(&db_path, &master_key)
 		.with_context(|| format!("opening db at {}", db_path.display()))?;
+	tracing::info!(
+		schema_version = db.schema_version()?,
+		build = %std::env::var("LOUPE_BUILD_REVISION").unwrap_or_else(|_| "unknown".into()),
+		"loupe-server: database ready"
+	);
 	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
 	let state = AppState::new(Arc::new(db), Arc::new(ca), github)
 		.with_require_approval_default(require_approval_default)

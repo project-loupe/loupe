@@ -43,7 +43,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 			continue;
 		}
 		db.with_conn(|c| {
-			Ok(jobs::enqueue(
+			jobs::enqueue(
 				c,
 				&NewJob {
 					repo_id: repo.id,
@@ -54,7 +54,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 					target_finding_id: None,
 				},
 				now,
-			)?)
+			)
 		})?;
 		enqueued += 1;
 		tracing::info!(repo = %repo.clone_url, "scheduler enqueued periodic scan");
@@ -185,7 +185,7 @@ mod tests {
 	fn reaper_reclaims_stale_leases() {
 		let (db, repo_id, worker_id) = fixture();
 		db.with_conn(|c| {
-			Ok(jobs::enqueue(
+			jobs::enqueue(
 				c,
 				&NewJob {
 					repo_id,
@@ -196,7 +196,7 @@ mod tests {
 					target_finding_id: None,
 				},
 				0,
-			)?)
+			)
 		})
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ requeue.
