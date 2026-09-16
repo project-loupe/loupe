@@ -4,7 +4,8 @@ use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 use loupe_storage::scheduler::{self, Band, CampaignPolicy, NewPhaseJob};
 use loupe_storage::{
-	campaigns, generations, jobs, review_units, Conflict, Entity, Error, Ownership, Result,
+	campaigns, generations, jobs, review_units, transaction, Conflict, Db, Entity, Error,
+	Ownership, Result,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -244,28 +245,41 @@ pub fn activate_generation(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> 
 	generations::activate(tx, id, now)
 }
 
+enum Replenished {
+	Queued(i64),
+	NotNeeded,
+	BudgetExhausted,
+}
+
 pub fn replenish(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Option<i64>> {
+	Ok(match replenish_inner(tx, campaign_id, now)? {
+		Replenished::Queued(id) => Some(id),
+		Replenished::NotNeeded | Replenished::BudgetExhausted => None,
+	})
+}
+
+fn replenish_inner(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Replenished> {
 	let campaign = get(tx, campaign_id)?;
 	if campaign.state != campaigns::State::Active
 		|| campaign.deadline_at.is_some_and(|at| at <= now)
 	{
-		return Ok(None);
+		return Ok(Replenished::NotNeeded);
 	}
 	let Some(generation_id) = campaign.generation_id else {
-		return Ok(None);
+		return Ok(Replenished::NotNeeded);
 	};
 	let generation = generations::get(tx, generation_id)?
 		.ok_or(Error::NotFound(Entity::Generation, generation_id))?;
 	if generation.state != generations::State::Active {
-		return Ok(None);
+		return Ok(Replenished::NotNeeded);
 	}
 	let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE campaign_id=?1 AND kind='survey' AND state='queued')",[campaign_id],|r|r.get(0))?;
 	if queued {
-		return Ok(None);
+		return Ok(Replenished::NotNeeded);
 	}
 	let band:Option<String>=tx.query_row(&format!("SELECT u.priority_band FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END LIMIT 1",*review_units::UNIT_NEEDS_WORK),[generation_id],|r|r.get(0)).optional()?;
 	let Some(band) = band else {
-		return Ok(None);
+		return Ok(Replenished::NotNeeded);
 	};
 	let band: Band = band.parse()?;
 	let parent:Option<i64>=tx.query_row("SELECT id FROM jobs WHERE campaign_id=?1 AND kind='survey' AND state IN ('succeeded','failed','cancelled') ORDER BY finished_at DESC,id DESC LIMIT 1",[campaign_id],|r|r.get(0)).optional()?;
@@ -290,8 +304,8 @@ pub fn replenish(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Opt
 		},
 		now,
 	) {
-		Ok(id) => Ok(Some(id)),
-		Err(Error::Conflict(Conflict::CampaignBudget)) => Ok(None),
+		Ok(id) => Ok(Replenished::Queued(id)),
+		Err(Error::Conflict(Conflict::CampaignBudget)) => Ok(Replenished::BudgetExhausted),
 		Err(error) => Err(error),
 	}
 }
@@ -301,4 +315,112 @@ pub fn cancel(
 ) -> Result<()> {
 	scheduler::cancel_queued_children(tx, campaign_id, now, reason)?;
 	campaigns::cancel(tx, campaign_id, reason, now)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+	Completed,
+	DeadlineReached,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickReport {
+	pub enqueued: usize,
+	pub completed: usize,
+	pub deadline_reached: usize,
+	pub budget_exhausted: usize,
+	/// A failed campaign transaction is rolled back; other campaigns proceed.
+	pub failed: usize,
+}
+
+#[derive(Default)]
+struct Progress {
+	enqueued: bool,
+	finish: Option<Finish>,
+	budget_exhausted: bool,
+}
+
+pub fn try_finish(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Option<Finish>> {
+	Ok(advance(tx, campaign_id, now)?.finish)
+}
+
+fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress> {
+	let campaign = get(tx, campaign_id)?;
+	let mut progress = Progress::default();
+	if campaign.state != campaigns::State::Active {
+		return Ok(progress);
+	}
+	let expired = campaign.deadline_at.is_some_and(|at| at <= now);
+	if expired {
+		scheduler::cancel_queued_children(
+			tx,
+			campaign_id,
+			now,
+			&BoundedText::new("campaign deadline")?,
+		)?;
+	}
+	let busy: bool = tx.query_row(
+		"SELECT EXISTS(SELECT 1 FROM jobs WHERE campaign_id=?1 AND state IN ('queued','leased'))",
+		[campaign_id],
+		|r| r.get(0),
+	)?;
+	if busy {
+		return Ok(progress);
+	}
+	if !expired {
+		match replenish_inner(tx, campaign_id, now)? {
+			Replenished::Queued(_) => {
+				progress.enqueued = true;
+				return Ok(progress);
+			},
+			Replenished::BudgetExhausted => progress.budget_exhausted = true,
+			Replenished::NotNeeded => {},
+		}
+	}
+	let (finish, reason) = if expired {
+		(Finish::DeadlineReached, "deadline")
+	} else {
+		(Finish::Completed, "completed")
+	};
+	let summary = campaigns::summarize(tx, campaign_id)?;
+	campaigns::finish(tx, campaign_id, &summary, &BoundedText::new(reason)?, now)?;
+	progress.finish = Some(finish);
+	Ok(progress)
+}
+
+/// No active campaigns means no write transaction. Each campaign otherwise
+/// advances independently, so a malformed row cannot stall another repository.
+pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
+	let active: Vec<i64> = db.with_conn(|c| {
+		Ok(c.prepare(
+			"SELECT campaign_id FROM review_campaigns WHERE state='active' ORDER BY campaign_id",
+		)?
+		.query_map([], |r| r.get(0))?
+		.collect::<rusqlite::Result<_>>()?)
+	})?;
+	let mut report = TickReport::default();
+	for campaign_id in active {
+		let progress =
+			db.with_conn(|c| transaction::immediate(c, |tx| advance(tx, campaign_id, now)));
+		let progress = match progress {
+			Ok(progress) => progress,
+			Err(error) => {
+				report.failed += 1;
+				tracing::warn!(campaign_id, %error, "campaign tick rolled back");
+				continue;
+			},
+		};
+		report.enqueued += usize::from(progress.enqueued);
+		match progress.finish {
+			Some(Finish::Completed) => report.completed += 1,
+			Some(Finish::DeadlineReached) => report.deadline_reached += 1,
+			None => {},
+		}
+		if progress.budget_exhausted {
+			report.budget_exhausted += 1;
+			// The finish committed above; subsequent ticks cannot log this again.
+			tracing::info!(campaign_id, "campaign survey budget exhausted with uncovered units");
+		}
+	}
+	Ok(report)
 }

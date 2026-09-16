@@ -8,6 +8,7 @@
 - Reject unknown persisted job kinds at startup and explain incompatible schema versions ([#61]).
 - Add typed, transactional review-harness storage with bounded text, semantic identities, replay records, and project-scoped proof metadata; keep unsupported job kinds readable but inert ([#62]).
 - Log the database schema version and runtime image revision at server startup ([#62]).
+- Add campaign-aware review scheduling with frozen budgets, resumable survey batches, bounded fair claims, and deadline handling; preserve legacy leasing and keep survey/drilldown runtime-gated.
 
 ## v0.1 — 2026-09-07
 

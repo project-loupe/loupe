@@ -52,6 +52,34 @@ fn bootstrap_to_coverage_preserves_the_profile_and_activation() {
 		let after=generations::get(tx,generation)?.unwrap();
 		assert_eq!(after.profile_version,1);
 		assert_eq!(after.activated_at,Some(3));
+		assert_eq!(campaign::try_finish(tx,campaign_id,5).unwrap(),Some(campaign::Finish::Completed));
+		let row=crate::campaigns::get(tx,campaign_id)?.unwrap();
+		assert_eq!(row.state,crate::campaigns::State::Finished);
+		assert!(row.terminal_counts.is_some());
+
+		// The activated baseline survives campaign boundaries. The next
+		// incremental survey reuses it, including profile and activation time.
+		let opened=campaign::open(tx,&campaign::OpenCampaign{repo_id:1,trigger:"manual".parse().unwrap(),requested_ref:campaign::RequestedRef::Pinned(SHA),base_sha:Some(SHA),kind_hint:campaign::KindHint::Incremental},&ReviewPolicy::default(),6).unwrap();
+		let campaign::Opened::Created{campaign_id:second,job_id:initial}=opened else {panic!("second campaign")};
+		let row=crate::campaigns::get(tx,second)?.unwrap();
+		assert_eq!(row.recipe,crate::campaigns::Recipe::Incremental);
+		assert_eq!(row.generation_id,Some(generation));
+		request.now=7;
+		request.capability_hash=&[6;32];
+		let incremental=claim_kinds(tx,&request,&kinds)?.unwrap();
+		assert_eq!(incremental.job.id,initial);
+		assert!(incremental.assigned_units.is_empty());
+		let recipe=review_tests::payload();
+		let queued=enqueue_phase(tx,&NewPhaseJob{repo_id:1,kind:JobKind::Survey,campaign_id:second,generation_id:Some(generation),assigned_lead_id:None,target_finding_id:None,continuation_of_job_id:None,band:Band::Normal,effective_priority:0,eligible_at:7,token_budget:None,recipe:&recipe,handoff:false},7)?;
+		let deadline=row.deadline_at.unwrap();
+		assert_eq!(campaign::try_finish(tx,second,deadline).unwrap(),None);
+		assert_eq!(jobs::get(tx,queued)?.unwrap().state,JobState::Cancelled);
+		assert_eq!(jobs::get(tx,initial)?.unwrap().state,JobState::Leased);
+		tx.execute("UPDATE jobs SET state='succeeded',finished_at=?2 WHERE id=?1",params![initial,deadline+1])?;
+		assert_eq!(campaign::try_finish(tx,second,deadline+1).unwrap(),Some(campaign::Finish::DeadlineReached));
+		let after=generations::get(tx,generation)?.unwrap();
+		assert_eq!(after.profile_version,1);
+		assert_eq!(after.activated_at,Some(3));
 		Ok(())
 	})).unwrap();
 }
