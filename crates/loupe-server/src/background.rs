@@ -65,7 +65,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 /// Reaper tick: reclaim leases past their TTL. Re-queue if attempts <
 /// MAX, fail otherwise. Wraps `loupe-storage::jobs::reap_stale_leases`.
 pub fn reap_once(db: &Db, now: i64) -> anyhow::Result<usize> {
-	let n = db.with_conn(|c| Ok(jobs::reap_stale_leases(c, now)?))?;
+	let n = db.with_conn(|c| jobs::reap_stale_leases(c, now))?;
 	if n > 0 {
 		tracing::info!(reclaimed = n, "reaper transitioned stale leases");
 	}

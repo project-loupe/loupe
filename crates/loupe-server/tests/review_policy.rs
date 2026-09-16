@@ -28,6 +28,29 @@ fn snapshots_freeze_only_campaign_owned_limits() {
 }
 
 #[test]
+fn server_snapshots_round_trip_through_storage_policy() {
+	let policy = ReviewPolicy {
+		campaign_max_jobs: 19,
+		campaign_handoff_reserve: 3,
+		survey_units_per_job: 7,
+		max_attempts: 5,
+		survey_token_budget: Some(1000),
+		..ReviewPolicy::default()
+	};
+	let snapshot = policy.snapshot().unwrap();
+	let decoded = loupe_storage::scheduler::CampaignPolicy::from_snapshot(&snapshot).unwrap();
+	assert_eq!(decoded.campaign_max_jobs, 19);
+	assert_eq!(decoded.campaign_handoff_reserve, 3);
+	assert_eq!(decoded.survey_units_per_job, 7);
+	assert_eq!(decoded.max_attempts, 5);
+	assert_eq!(decoded.survey_token_budget, Some(1000));
+	assert_eq!(
+		snapshot,
+		loupe_core::text::BoundedJson::new(&serde_json::to_string(&decoded).unwrap()).unwrap()
+	);
+}
+
+#[test]
 fn policy_reports_all_invalid_fields() {
 	let policy = ReviewPolicy {
 		active_jobs_per_repo: 0,
