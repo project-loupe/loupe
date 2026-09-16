@@ -351,6 +351,7 @@ fn reaper_never_requeues_children_of_inactive_campaigns() {
 	})
 	.unwrap();
 }
+mod claim;
 
 #[test]
 fn an_unreadable_campaign_snapshot_never_blocks_legacy_reaping() {

@@ -1,4 +1,6 @@
 //! Review scopes and optimistic assignment claims.
+use std::sync::LazyLock;
+
 use loupe_core::text::policy::{Argument, ClientKey, Objective, Payload, Reason, Title};
 use loupe_core::text::{BoundedJson, BoundedText, Identifier};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
@@ -6,6 +8,13 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use crate::review::{changed, classify, optional, parsed, standalone, string_enum};
 use crate::source_refs::UnitRefs;
 use crate::{inventory, ownership, Conflict, Entity, Error, Ownership, Result};
+
+/// Current ordinary conclusive evidence. Assignment state is not coverage.
+pub const UNIT_COVERED: &str = "EXISTS(SELECT 1 FROM review_unit_results r WHERE r.review_unit_id=u.review_unit_id AND r.invalidated=0 AND r.commit_sha=g.generation_commit_sha AND r.profile_version=g.profile_version AND r.disposition IN ('lead_created','no_lead_found','not_applicable') AND r.corroborates_review_unit_result_id IS NULL AND r.corroborates_inventory_exclusion_id IS NULL)";
+/// Ordinary scheduling eligibility, composed from the same evidence predicate.
+pub static UNIT_NEEDS_WORK: LazyLock<String> = LazyLock::new(|| {
+	format!("u.status='open' AND u.stale=0 AND NOT EXISTS(SELECT 1 FROM job_assigned_review_units a JOIN jobs j ON j.id=a.job_id WHERE a.review_unit_id=u.review_unit_id AND j.state IN ('queued','leased')) AND NOT ({UNIT_COVERED})")
+});
 string_enum!(Status { Open=>"open", Deferred=>"deferred", Retired=>"retired" });
 string_enum!(Priority { Urgent=>"urgent", High=>"high", Normal=>"normal", Background=>"background" });
 pub struct NewUnit<'a> {

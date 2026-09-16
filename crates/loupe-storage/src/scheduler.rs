@@ -1,5 +1,9 @@
 //! Phase-aware queue policy. Campaign-owned limits are separate from live caps.
+mod claim;
 mod policy;
+#[cfg(test)]
+use claim::claim_kinds;
+pub use claim::{claim, ClaimRequest, Claimed};
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
@@ -143,6 +147,11 @@ pub fn cancel_queued_children(
 #[cfg(test)]
 mod tests;
 pub use crate::review_units::Priority as Band;
+
+/// Campaign job kinds this binary can lease *and finish through the phase
+/// endpoints*. Empty until B4 lands those endpoints; widen it together with
+/// `jobs::RUNTIME_KINDS` and the handlers, never ahead of them.
+pub const PHASE_RUNTIME_KINDS: &[JobKind] = &[];
 
 pub const PRIORITY_MAX: u32 = 1000;
 
