@@ -24,6 +24,9 @@ pub struct Claimed {
 
 pub(super) const BAND_RANK: &str = "CASE WHEN j.campaign_id IS NULL THEN 2 ELSE CASE j.scheduling_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END END";
 pub(super) const SCORE: &str = "CASE WHEN j.campaign_id IS NULL THEN CASE j.kind WHEN 'verify' THEN 1 ELSE 0 END ELSE COALESCE(j.effective_priority,0) + MIN(MAX(:now-j.enqueued_at,0)/:aging_interval,:aging_cap) END";
+const PROMOTED: &str =
+	"j.campaign_id IS NOT NULL AND j.kind='survey' AND COALESCE(s.burst,0)>=:burst_length";
+const ANTI_AFFINITY: &str = "CASE WHEN j.kind='verify' AND j.campaign_id IS NOT NULL AND EXISTS(SELECT 1 FROM finding_review_details d JOIN jobs p ON p.assigned_lead_id=d.origin_lead_id AND p.kind='drilldown' WHERE d.finding_id=j.target_finding_id AND p.worker_id=:worker) THEN 1 ELSE 0 END";
 
 /// Runtime gating is mandatory, even when callers request unsupported kinds.
 /// Legacy rows follow `RUNTIME_KINDS`; campaign rows additionally need a
@@ -74,21 +77,54 @@ fn claim_filtered(
 		|| req.policy.priority_aging_cap < 0
 		|| req.policy.lease_seconds < 1
 		|| req.policy.lease_report_grace_seconds < 1
+		|| req.policy.active_jobs_per_repo < 1
+		|| req.policy.active_jobs_total.is_some_and(|n| n < 1)
+		|| req.policy.active_surveys_per_repo < 1
+		|| req.policy.active_drilldowns_per_repo < 1
+		|| req.policy.active_verifications_per_repo < 1
+		|| req.policy.verify_reserved_slots < 0
+		|| req.policy.urgency_burst_length < 1
 	{
 		return Err(invalid("claim_policy"));
 	}
 	let lease =
 		req.now.checked_add(req.legacy_lease_seconds).ok_or_else(|| invalid("lease_expires_at"))?;
-	let sql = format!("UPDATE jobs SET state='leased',worker_id=:worker,lease_expires_at=:lease,attempts=attempts+1,started_at=COALESCE(started_at,:now),job_capability_hash=:hash
+	let sql = format!("WITH active AS (
+		SELECT repo_id,COUNT(*) AS total,SUM(kind='survey') AS surveys,
+		SUM(kind='drilldown') AS drilldowns,SUM(kind='verify') AS verifies
+		FROM jobs WHERE state='leased' AND campaign_id IS NOT NULL GROUP BY repo_id)
+		UPDATE jobs SET state='leased',worker_id=:worker,lease_expires_at=:lease,attempts=attempts+1,started_at=COALESCE(started_at,:now),job_capability_hash=:hash
 		WHERE id=(SELECT j.id FROM jobs j
+		LEFT JOIN active a ON a.repo_id=j.repo_id
+		LEFT JOIN scheduler_repo_state s ON s.repo_id=j.repo_id
 		WHERE j.state='queued' AND j.kind IN ({kinds}) AND (
 		 j.campaign_id IS NULL OR ({campaign_kind_clause} AND (j.eligible_at IS NULL OR j.eligible_at<=:now)
-		 AND EXISTS(SELECT 1 FROM review_campaigns c WHERE c.campaign_id=j.campaign_id AND c.state='active' AND (c.deadline_at IS NULL OR c.deadline_at>:now))))
-		ORDER BY {BAND_RANK}, {SCORE} DESC, j.enqueued_at, j.id LIMIT 1)
+		 AND EXISTS(SELECT 1 FROM review_campaigns c WHERE c.campaign_id=j.campaign_id AND c.state='active' AND (c.deadline_at IS NULL OR c.deadline_at>:now))
+		 AND COALESCE(a.total,0)<:repo_cap
+		 AND CASE j.kind WHEN 'survey' THEN COALESCE(a.surveys,0)<:survey_cap
+		     WHEN 'drilldown' THEN COALESCE(a.drilldowns,0)<:drilldown_cap
+		     WHEN 'verify' THEN COALESCE(a.verifies,0)<:verify_cap ELSE 0 END
+		 AND (:global_cap IS NULL OR COALESCE((SELECT SUM(total) FROM active),0)<:global_cap)
+		 AND (j.kind='verify' OR NOT EXISTS (
+		     SELECT 1 FROM jobs q JOIN review_campaigns qc ON qc.campaign_id=q.campaign_id
+		     WHERE q.repo_id=j.repo_id AND q.kind='verify' AND q.state='queued'
+		       AND (q.eligible_at IS NULL OR q.eligible_at<=:now)
+		       AND qc.state='active' AND (qc.deadline_at IS NULL OR qc.deadline_at>:now))
+		     OR COALESCE(a.total,0)<:repo_cap-MAX(0,:reserved-COALESCE(a.verifies,0)))))
+		ORDER BY CASE WHEN {PROMOTED} THEN 0 ELSE 1 END,
+		 CASE WHEN {PROMOTED} THEN j.enqueued_at ELSE 0 END,
+		 {BAND_RANK}, {ANTI_AFFINITY},
+		 CASE WHEN j.campaign_id IS NULL THEN 0 ELSE COALESCE(a.total,0) END,
+		 CASE WHEN j.campaign_id IS NULL THEN 0 ELSE COALESCE(s.last_claim_seq,0) END,
+		 {SCORE} DESC, j.enqueued_at, j.id LIMIT 1)
 		RETURNING {JOB_COLUMNS}", kinds=kinds.join(","));
 	let selected = tx.query_row(&sql, named_params!{
 		":worker":req.worker_id, ":lease":lease, ":now":req.now, ":hash":req.capability_hash,
 		":aging_interval":req.policy.priority_aging_interval_seconds, ":aging_cap":req.policy.priority_aging_cap,
+		":repo_cap":req.policy.active_jobs_per_repo, ":global_cap":req.policy.active_jobs_total,
+		":survey_cap":req.policy.active_surveys_per_repo, ":drilldown_cap":req.policy.active_drilldowns_per_repo,
+		":verify_cap":req.policy.active_verifications_per_repo, ":reserved":req.policy.verify_reserved_slots,
+		":burst_length":req.policy.urgency_burst_length,
 	}, jobs::row_to_job).optional()?;
 	let Some(mut job) = selected else {
 		return Ok(None);
@@ -96,6 +132,14 @@ fn claim_filtered(
 	let mut assigned_units = Vec::new();
 	let mut resumed = false;
 	if let Some(campaign_id) = job.campaign_id {
+		let seq: i64 = tx.query_row(
+			"UPDATE scheduler_clock SET seq=seq+1 WHERE singleton=1 RETURNING seq",
+			[],
+			|r| r.get(0),
+		)?;
+		tx.execute("INSERT INTO scheduler_repo_state(repo_id,last_claim_seq,burst) VALUES(?1,?2,CASE WHEN ?3='survey' THEN 0 ELSE 1 END)
+		 ON CONFLICT(repo_id) DO UPDATE SET last_claim_seq=excluded.last_claim_seq,
+		 burst=CASE WHEN ?3='survey' OR scheduler_repo_state.burst>=?4 THEN 0 ELSE scheduler_repo_state.burst+1 END",params![job.repo_id,seq,job.kind.as_str(),req.policy.urgency_burst_length])?;
 		let campaign = campaigns::get(tx, campaign_id)?
 			.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
 		let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
