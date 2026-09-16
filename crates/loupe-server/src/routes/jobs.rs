@@ -324,17 +324,25 @@ fn try_lease(
 ) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
 	let now = now_secs();
 	let (job_capability, job_capability_hash) = job_capability::issue();
+	let kinds =
+		if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
 	let row = state
 		.db
 		.with_conn(|c| {
-			Ok(jobs::lease_next(
-				c,
-				worker_id,
-				accepts_verify,
-				now,
-				DEFAULT_LEASE_SECONDS,
-				&job_capability_hash,
-			)?)
+			loupe_storage::transaction::immediate(c, |tx| {
+				loupe_storage::scheduler::claim(
+					tx,
+					&loupe_storage::scheduler::ClaimRequest {
+						worker_id,
+						kinds: &kinds,
+						now,
+						legacy_lease_seconds: DEFAULT_LEASE_SECONDS,
+						capability_hash: &job_capability_hash,
+						policy: &state.review_policy.claim_policy(),
+					},
+				)
+			})
+			.map(|claimed| claimed.map(|c| c.job))
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
 	let Some(row) = row else { return Ok(None) };
