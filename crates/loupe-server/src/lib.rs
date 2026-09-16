@@ -9,6 +9,7 @@ pub mod config;
 pub mod init;
 mod job_capability;
 pub mod reporters;
+pub mod review;
 pub mod router;
 pub mod routes;
 pub mod state;
