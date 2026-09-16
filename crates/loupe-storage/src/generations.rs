@@ -110,6 +110,12 @@ pub fn activate(tx: &Transaction<'_>, id: i64, now: i64) -> Result<()> {
 pub fn retire(tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>, now: i64) -> Result<()> {
 	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason=?2,retired_at=?3 WHERE generation_id=?1 AND state='active'",params![id,reason.expose(),now])?,Conflict::GenerationState)
 }
+/// Discard rebuildable state from a bootstrap that never became a baseline.
+pub fn abandon(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>, now: i64,
+) -> Result<()> {
+	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason=?2,retired_at=?3 WHERE generation_id=?1 AND state='building'",params![id,reason.expose(),now])?,Conflict::GenerationState)
+}
 pub fn set_profile(
 	tx: &Transaction<'_>, id: i64, version: i64, profile: &BoundedJson<Payload>,
 ) -> Result<()> {
@@ -142,6 +148,7 @@ standalone! {
 	create(new: &NewGeneration<'_>, now: i64) -> i64;
 	activate(id: i64, now: i64) -> ();
 	retire(id: i64, reason: &BoundedText<Reason>, now: i64) -> ();
+	abandon(id: i64, reason: &BoundedText<Reason>, now: i64) -> ();
 	set_profile(id: i64, version: i64, profile: &BoundedJson<Payload>) -> ();
 	set_corroboration(id: i64, state: Corroboration) -> ();
 	set_coverage(id: i64, coverage: Coverage) -> ();

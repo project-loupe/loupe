@@ -353,6 +353,7 @@ fn reaper_never_requeues_children_of_inactive_campaigns() {
 }
 mod claim;
 mod fairness;
+mod lifecycle;
 
 #[test]
 fn scheduler_state_is_connection_local_and_ensure_is_idempotent() {
