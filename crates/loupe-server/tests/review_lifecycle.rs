@@ -1,12 +1,13 @@
 //! Server orchestration with explicit worker-state fixtures. Storage tests
-//! exercise actual bootstrap/coverage claims without a reverse dependency.
+//! exercise actual bootstrap/coverage/incremental claims without a reverse dependency.
 use loupe_core::text::policy::Payload;
 use loupe_core::text::BoundedJson;
-use loupe_core::JobKind;
+use loupe_core::{JobKind, JobState};
 use loupe_server::review::campaign;
 use loupe_server::review::policy::ReviewPolicy;
+use loupe_storage::scheduler::{self, Band, NewPhaseJob};
 use loupe_storage::source_refs::InspectedRefs;
-use loupe_storage::{generations, jobs, review_unit_results, transaction};
+use loupe_storage::{campaigns, generations, jobs, review_unit_results, transaction};
 use rusqlite::{params, Transaction};
 
 // Pinning only accepts complete object ids.
@@ -70,6 +71,37 @@ fn bootstrap_to_coverage_preserves_the_profile_and_activation() {
 		assert!(generations::coverage_rollup(tx,generation)?.complete());
 		let after=generations::get(tx,generation)?.unwrap();
 		assert_eq!(after.profile_version,1);
+		assert_eq!(after.activated_at,Some(3));
+		assert_eq!(campaign::try_finish(tx,campaign_id,5).unwrap(),Some(campaign::Finish::Completed));
+		let row=campaigns::get(tx,campaign_id)?.unwrap();
+		assert_eq!(row.state,campaigns::State::Finished);
+		assert!(row.terminal_counts.is_some());
+
+		// The activated baseline survives campaign boundaries. The next
+		// incremental survey reuses it, including profile and activation time.
+		let opened=campaign::open(tx,&campaign::OpenCampaign{repo_id:1,trigger:"manual".parse().unwrap(),requested_ref:campaign::RequestedRef::Pinned(SHA),base_sha:Some(SHA),kind_hint:campaign::KindHint::Incremental},&ReviewPolicy::default(),6).unwrap();
+		let campaign::Opened::Created{campaign_id:second,job_id:initial}=opened else {panic!("second campaign")};
+		let row=campaigns::get(tx,second)?.unwrap();
+		assert_eq!(row.recipe,campaigns::Recipe::Incremental);
+		assert_eq!(row.generation_id,Some(generation));
+		let incremental=lease_fixture(tx,initial,worker)?;
+		assert_eq!(incremental.kind,JobKind::Survey);
+		assert_eq!(incremental.generation_id,Some(generation));
+		let recipe:serde_json::Value=serde_json::from_str(incremental.recipe.as_ref().unwrap().expose()).unwrap();
+		assert_eq!(recipe["recipe"],"incremental");
+		// Storage's companion claim test checks that this baseline yields
+		// an empty incremental batch after all units have been completed.
+		let recipe=BoundedJson::<Payload>::new(r#"{"version":1,"phase":"survey","recipe":"incremental","assignment_key":"ordinary"}"#)?;
+		let queued=scheduler::enqueue_phase(tx,&NewPhaseJob{repo_id:1,kind:JobKind::Survey,campaign_id:second,generation_id:Some(generation),assigned_lead_id:None,target_finding_id:None,continuation_of_job_id:None,band:Band::Normal,effective_priority:0,eligible_at:7,token_budget:None,recipe:&recipe,handoff:false},7)?;
+		let deadline=row.deadline_at.unwrap();
+		assert_eq!(campaign::try_finish(tx,second,deadline).unwrap(),None);
+		assert_eq!(jobs::get(tx,queued)?.unwrap().state,JobState::Cancelled);
+		assert_eq!(jobs::get(tx,initial)?.unwrap().state,JobState::Leased);
+		tx.execute("UPDATE jobs SET state='succeeded',finished_at=?2 WHERE id=?1",params![initial,deadline+1])?;
+		assert_eq!(campaign::try_finish(tx,second,deadline+1).unwrap(),Some(campaign::Finish::DeadlineReached));
+		let after=generations::get(tx,generation)?.unwrap();
+		assert_eq!(after.profile_version,1);
+		assert_eq!(after.generated_profile.as_ref(),Some(&payload));
 		assert_eq!(after.activated_at,Some(3));
 		Ok(())
 	})).unwrap();

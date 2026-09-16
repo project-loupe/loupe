@@ -94,10 +94,16 @@ pub fn spawn_scheduler(
 			tokio::select! {
 				_ = cancel.cancelled() => return,
 				_ = interval.tick() => {
-					match schedule_due(&db, now_secs()) {
+					let now = now_secs();
+					match schedule_due(&db, now) {
 						Ok(0) => {},
 						Ok(_) => job_arrived.notify_waiters(),
 						Err(e) => tracing::warn!(error = %e, "scheduler tick failed"),
+					}
+					match crate::review::campaign::tick(&db, now) {
+						Ok(report) if report.enqueued > 0 => job_arrived.notify_waiters(),
+						Ok(_) => {},
+						Err(e) => tracing::warn!(error = %e, "campaign scheduler tick failed"),
 					}
 				}
 			}

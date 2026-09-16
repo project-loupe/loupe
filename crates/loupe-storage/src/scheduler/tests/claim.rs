@@ -206,7 +206,7 @@ fn bootstrap_and_unpinned_surveys_skip_batches() {
 }
 
 #[test]
-fn coverage_claim_after_bootstrap_skips_completed_units() {
+fn bootstrap_coverage_and_incremental_claims_preserve_completed_work() {
 	use crate::review_unit_results::{self, Disposition, NewResult};
 	use crate::source_refs::InspectedRefs;
 
@@ -262,6 +262,22 @@ fn coverage_claim_after_bootstrap_skips_completed_units() {
 		serde_json::from_str(batch.job.recipe.as_ref().unwrap().expose()).unwrap();
 	assert_eq!(value["recipe"], "coverage");
 	finish(coverage, &batch.assigned_units, 103);
+	let incremental = queue(&db, Band::Normal, 0, 104);
+	db.with_conn(|conn| {
+		conn.execute(
+			"UPDATE jobs SET recipe=?2 WHERE id=?1",
+			params![
+				incremental,
+				r#"{"version":1,"phase":"survey","recipe":"incremental","assignment_key":"ordinary"}"#
+			],
+		)?;
+		Ok(())
+	})
+	.unwrap();
+	let next = take(&db, 104, &ClaimPolicy::default()).unwrap();
+	assert_eq!(next.job.id, incremental);
+	assert!(next.assigned_units.is_empty());
+	assert!(!next.resumed);
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			assert!(generations::coverage_rollup(tx, 11)?.complete());
