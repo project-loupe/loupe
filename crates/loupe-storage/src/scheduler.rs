@@ -8,13 +8,26 @@ use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 pub use policy::{CampaignPolicy, PhasePolicy};
-use rusqlite::{params, Transaction};
+use rusqlite::{params, Connection, Transaction};
 
 use crate::review::{changed, is_unique};
 use crate::{campaigns, jobs, ownership, Conflict, Entity, Error, Ownership, Result};
 
 fn invalid(field: &'static str) -> Error {
 	loupe_core::text::Error::new(field, loupe_core::text::Rule::Identifier).into()
+}
+
+/// Connection-local, transactional scheduling history. It resets on restart.
+pub fn ensure_state(conn: &Connection) -> Result<()> {
+	conn.execute_batch(
+		"CREATE TEMP TABLE IF NOT EXISTS scheduler_repo_state (
+		repo_id INTEGER PRIMARY KEY, last_claim_seq INTEGER NOT NULL DEFAULT 0,
+		burst INTEGER NOT NULL DEFAULT 0);
+	CREATE TEMP TABLE IF NOT EXISTS scheduler_clock (
+		singleton INTEGER PRIMARY KEY CHECK(singleton=1), seq INTEGER NOT NULL);
+	INSERT OR IGNORE INTO scheduler_clock(singleton,seq) VALUES(1,0);",
+	)?;
+	Ok(())
 }
 
 pub struct NewPhaseJob<'a> {
