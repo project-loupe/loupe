@@ -961,6 +961,7 @@ dependencies = [
  "loupe-core",
  "rand_core 0.6.4",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

@@ -40,9 +40,12 @@ fn runtime_kinds_sql() -> &'static str {
 	&SQL
 }
 
-const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha, head_sha,
+pub(crate) const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha, head_sha,
         parent_job_id, target_finding_id, worker_id, lease_expires_at,
-        attempts, enqueued_at, started_at, finished_at, error";
+        attempts, enqueued_at, started_at, finished_at, error,
+        campaign_id, generation_id, assigned_lead_id, continuation_of_job_id,
+        scheduling_band, effective_priority, eligible_at, soft_deadline_at,
+        hard_deadline_at, submit_by, token_budget, recipe, workflow_contract_version";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
@@ -62,6 +65,19 @@ pub struct JobRow {
 	pub started_at: Option<i64>,
 	pub finished_at: Option<i64>,
 	pub error: Option<String>,
+	pub campaign_id: Option<i64>,
+	pub generation_id: Option<i64>,
+	pub assigned_lead_id: Option<i64>,
+	pub continuation_of_job_id: Option<i64>,
+	pub scheduling_band: Option<crate::scheduler::Band>,
+	pub effective_priority: Option<i64>,
+	pub eligible_at: Option<i64>,
+	pub soft_deadline_at: Option<i64>,
+	pub hard_deadline_at: Option<i64>,
+	pub submit_by: Option<i64>,
+	pub token_budget: Option<u64>,
+	pub recipe: Option<loupe_core::text::BoundedJson<loupe_core::text::policy::Payload>>,
+	pub workflow_contract_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +113,7 @@ pub enum CancelOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryOutcome {
-	Retried(JobRow),
+	Retried(Box<JobRow>),
 	NotFound,
 	Conflict(String),
 	UnsupportedKind,
@@ -396,7 +412,7 @@ pub fn retry_failed(
 		return Ok(RetryOutcome::Conflict(format!("job {job_id} changed before retry")));
 	};
 	tx.commit()?;
-	Ok(RetryOutcome::Retried(row))
+	Ok(RetryOutcome::Retried(Box::new(row)))
 }
 
 pub fn requeue_failed(
@@ -580,7 +596,47 @@ pub fn worker_has_active_lease_for_repo(
 /// Reap leases that have expired. For each, transitions back to
 /// `queued` if `attempts < MAX_ATTEMPTS`, else `failed` with an error
 /// message. Returns the number of rows affected.
-pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+pub fn reap_stale_leases(conn: &mut Connection, now: i64) -> crate::Result<usize> {
+	// Legacy rows first, in their own transaction: their liveness must never
+	// depend on the health of any campaign row.
+	let legacy = crate::transaction::immediate(conn, |tx| reap_legacy(tx, now))?;
+	let campaign_jobs = conn
+		.prepare(
+			"SELECT id FROM jobs
+			 WHERE campaign_id IS NOT NULL AND state = 'leased' AND lease_expires_at < ?1
+			   AND kind IN ('survey','drilldown','verify')",
+		)?
+		.query_map([now], |r| r.get::<_, i64>(0))?
+		.collect::<rusqlite::Result<Vec<_>>>()?;
+	let error = loupe_core::text::BoundedText::new(LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR)?;
+	let mut reaped = legacy;
+	for id in campaign_jobs {
+		// One transaction per job so a single undecidable row (for example a
+		// policy snapshot this binary cannot read) cannot stall the others.
+		let outcome = crate::transaction::immediate(conn, |tx| {
+			crate::scheduler::retry_or_fail(tx, id, now, &error)
+		});
+		match outcome {
+			Ok(_) => reaped += 1,
+			Err(cause) => {
+				let message = format!("reaper could not decide a retry: {cause}");
+				let failed = crate::transaction::immediate(conn, |tx| {
+					Ok(tx.execute(
+						"UPDATE jobs
+						   SET state = 'failed', error = ?2, finished_at = ?3, worker_id = NULL,
+						       lease_expires_at = NULL, job_capability_hash = NULL
+						 WHERE id = ?1 AND state = 'leased'",
+						params![id, message, now],
+					)?)
+				})?;
+				reaped += failed;
+			},
+		}
+	}
+	Ok(reaped)
+}
+
+fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 	let requeued_state =
 		JobState::Leased.apply(JobTransition::ReapToQueued).map_err(sql_state_transition_error)?;
 	let failed_state =
@@ -589,6 +645,7 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		let mut stmt = conn.prepare(
 			"SELECT id FROM jobs
 			 WHERE kind = 'scan'
+			   AND campaign_id IS NULL
 			   AND state = 'leased'
 			   AND lease_expires_at < ?1
 			   AND attempts >= ?2",
@@ -607,6 +664,7 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
 		   AND attempts < ?3
+		   AND campaign_id IS NULL
 		   AND kind IN ({})",
 			runtime_kinds_sql()
 		),
@@ -624,6 +682,7 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
 		   AND attempts >= ?2
+		   AND campaign_id IS NULL
 		   AND kind IN ({})",
 			runtime_kinds_sql()
 		),
@@ -639,7 +698,7 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 	rusqlite::Error::InvalidParameterName(error.to_string())
 }
 
-fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
+pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 	let kind_str: String = row.get(2)?;
 	let state_str: String = row.get(3)?;
 	let kind = kind_str.parse::<JobKind>().expect("infallible kind parser");
@@ -663,6 +722,19 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		started_at: row.get(13)?,
 		finished_at: row.get(14)?,
 		error: row.get(15)?,
+		campaign_id: row.get(16)?,
+		generation_id: row.get(17)?,
+		assigned_lead_id: row.get(18)?,
+		continuation_of_job_id: row.get(19)?,
+		scheduling_band: crate::review::optional(row, 20)?,
+		effective_priority: row.get(21)?,
+		eligible_at: row.get(22)?,
+		soft_deadline_at: row.get(23)?,
+		hard_deadline_at: row.get(24)?,
+		submit_by: row.get(25)?,
+		token_budget: row.get(26)?,
+		recipe: crate::review::optional(row, 27)?,
+		workflow_contract_version: row.get(28)?,
 	})
 }
 
@@ -1638,7 +1710,7 @@ mod tests {
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ should requeue.
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 10)?)).unwrap();
-		let n = db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
+		let n = db.with_conn(|c| reap_stale_leases(c, 200)).unwrap();
 		assert_eq!(n, 1);
 		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Queued);
@@ -1671,7 +1743,7 @@ mod tests {
 			.expect("first attempt leases");
 		assert_eq!(first.started_at, Some(100));
 
-		db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
+		db.with_conn(|c| reap_stale_leases(c, 200)).unwrap();
 		let queued = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
 		assert_eq!(
 			queued.started_at, None,
@@ -1716,12 +1788,12 @@ mod tests {
 		// next reap should send it to `failed`.
 		for t in 0..MAX_ATTEMPTS as i64 {
 			db.with_conn(|c| Ok(lease_next(c, worker_id, false, t * 100, 10)?)).unwrap();
-			db.with_conn(|c| Ok(reap_stale_leases(c, t * 100 + 50)?)).unwrap();
+			db.with_conn(|c| reap_stale_leases(c, t * 100 + 50)).unwrap();
 		}
 		// Now attempts == MAX_ATTEMPTS. One more lease and reap drops it
 		// to failed.
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 999, 10)?)).unwrap();
-		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
+		db.with_conn(|c| reap_stale_leases(c, 9_999)).unwrap();
 		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
 	}
@@ -1780,7 +1852,7 @@ mod tests {
 		})
 		.unwrap();
 
-		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
+		db.with_conn(|c| reap_stale_leases(c, 9_999)).unwrap();
 		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
 		let pending_findings: i64 = db
