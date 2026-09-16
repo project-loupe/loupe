@@ -355,6 +355,51 @@ mod claim;
 mod fairness;
 
 #[test]
+fn scheduler_state_is_connection_local_and_ensure_is_idempotent() {
+	let key = crate::secrets::MasterKey::for_tests();
+	let memory = crate::Db::open_in_memory(&key).unwrap();
+	memory.with_conn(|c| {
+		assert_eq!(c.query_row("SELECT COUNT(*) FROM sqlite_temp_master WHERE type='table' AND name IN ('scheduler_clock','scheduler_repo_state')",[],|r|r.get::<_,i64>(0))?,2);
+		Ok(())
+	}).unwrap();
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("scheduler.db");
+	let db = crate::Db::open(&path, &key).unwrap();
+	db.with_conn(|c| {
+		c.execute("UPDATE scheduler_clock SET seq=7", [])?;
+		c.execute("INSERT INTO scheduler_repo_state VALUES(1,7,3)", [])?;
+		ensure_state(c)?;
+		assert_eq!(c.query_row("SELECT seq FROM scheduler_clock", [], |r| r.get::<_, i64>(0))?, 7);
+		assert_eq!(
+			c.query_row(
+				"SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'scheduler_%'",
+				[],
+				|r| r.get::<_, i64>(0)
+			)?,
+			0
+		);
+		Ok(())
+	})
+	.unwrap();
+	drop(db);
+	crate::Db::open(&path, &key)
+		.unwrap()
+		.with_conn(|c| {
+			assert_eq!(
+				c.query_row("SELECT seq FROM scheduler_clock", [], |r| r.get::<_, i64>(0))?,
+				0
+			);
+			assert_eq!(
+				c.query_row("SELECT COUNT(*) FROM scheduler_repo_state", [], |r| r
+					.get::<_, i64>(0))?,
+				0
+			);
+			Ok(())
+		})
+		.unwrap();
+}
+
+#[test]
 fn an_unreadable_campaign_snapshot_never_blocks_legacy_reaping() {
 	let db = fixture();
 	db.with_conn(|conn| {
