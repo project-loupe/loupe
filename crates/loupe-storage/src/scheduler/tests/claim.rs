@@ -206,6 +206,84 @@ fn bootstrap_and_unpinned_surveys_skip_batches() {
 }
 
 #[test]
+fn coverage_claim_after_bootstrap_skips_completed_units() {
+	use crate::review_unit_results::{self, Disposition, NewResult};
+	use crate::source_refs::InspectedRefs;
+
+	let db = claim_fixture();
+	units(&db);
+	let bootstrap = queue(&db, Band::Normal, 0, 0);
+	db.with_conn(|conn| {
+		transaction::immediate(conn, |tx| {
+			generations::set_profile(tx, 11, 1, &review_tests::payload())?;
+			tx.execute("UPDATE review_generations SET activated_at=3 WHERE generation_id=11", [])?;
+			tx.execute(
+				"UPDATE jobs SET recipe=?2 WHERE id=?1",
+				params![
+					bootstrap,
+					r#"{"version":1,"phase":"survey","recipe":"bootstrap","assignment_key":"ordinary"}"#
+				],
+			)?;
+			Ok(())
+		})
+	})
+	.unwrap();
+	let initial = take(&db, 100, &ClaimPolicy::default()).unwrap();
+	assert_eq!(initial.job.id, bootstrap);
+	assert!(initial.assigned_units.is_empty());
+	assert!(!initial.resumed);
+
+	let finish = |job: i64, completed: &[i64], now: i64| {
+		db.with_conn(|conn| {
+			transaction::immediate(conn, |tx| {
+				let refs = InspectedRefs::new(vec![])?;
+				let payload = review_tests::payload();
+				for unit in completed {
+					review_unit_results::insert(tx, &NewResult {
+						generation_id: 11, unit_id: *unit, produced_by_job: Some(job),
+						commit_sha: "base", profile_version: 1,
+						disposition: Disposition::NoLeadFound, inspected_refs: &refs,
+						counterevidence: None, proof_gaps: None, payload: &payload,
+						corroborates_result: None, corroborates_exclusion: None,
+					}, now)?;
+				}
+				assert_eq!(tx.execute("UPDATE jobs SET state='succeeded',finished_at=?2 WHERE id=?1 AND state='leased'", params![job, now])?, 1);
+				Ok(())
+			})
+		}).unwrap();
+	};
+	finish(bootstrap, &[1, 2], 101);
+	let coverage = queue(&db, Band::Normal, 0, 102);
+	let batch = take(&db, 102, &ClaimPolicy::default()).unwrap();
+	assert_eq!(batch.job.id, coverage);
+	assert_eq!(batch.assigned_units, [3, 6, 4, 5]);
+	assert!(!batch.resumed);
+	let value: serde_json::Value =
+		serde_json::from_str(batch.job.recipe.as_ref().unwrap().expose()).unwrap();
+	assert_eq!(value["recipe"], "coverage");
+	finish(coverage, &batch.assigned_units, 103);
+	db.with_conn(|conn| {
+		transaction::immediate(conn, |tx| {
+			assert!(generations::coverage_rollup(tx, 11)?.complete());
+			let generation = generations::get(tx, 11)?.unwrap();
+			assert_eq!(generation.profile_version, 1);
+			assert_eq!(generation.generated_profile, Some(review_tests::payload()));
+			assert_eq!(generation.activated_at, Some(3));
+			assert_eq!(
+				tx.query_row(
+					"SELECT SUM(assignment_epoch) FROM review_units WHERE generation_id=11",
+					[],
+					|r| r.get::<_, i64>(0)
+				)?,
+				4
+			);
+			Ok(())
+		})
+	})
+	.unwrap();
+}
+
+#[test]
 fn a_retry_resumes_only_remaining_assignments_without_bumping_epochs() {
 	let db = claim_fixture();
 	units(&db);

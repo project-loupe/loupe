@@ -938,6 +938,7 @@ dependencies = [
  "loupe-worker",
  "rand_core 0.6.4",
  "reqwest",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
