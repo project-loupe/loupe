@@ -326,25 +326,15 @@ fn try_lease(
 	let (job_capability, job_capability_hash) = job_capability::issue();
 	let kinds =
 		if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
-	let row = state
-		.db
-		.with_conn(|c| {
-			loupe_storage::transaction::immediate(c, |tx| {
-				loupe_storage::scheduler::claim(
-					tx,
-					&loupe_storage::scheduler::ClaimRequest {
-						worker_id,
-						kinds: &kinds,
-						now,
-						legacy_lease_seconds: DEFAULT_LEASE_SECONDS,
-						capability_hash: &job_capability_hash,
-						policy: &state.review_policy.claim_policy(),
-					},
-				)
-			})
-			.map(|claimed| claimed.map(|c| c.job))
-		})
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
+	let row = crate::review::scheduler::claim_for_worker(
+		state,
+		worker_id,
+		&kinds,
+		now,
+		&job_capability_hash,
+	)
+	.map(|claimed| claimed.map(|c| c.job))
+	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
 	let Some(row) = row else { return Ok(None) };
 	let env = build_lease_envelope(state, &row, job_capability)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")))?;
