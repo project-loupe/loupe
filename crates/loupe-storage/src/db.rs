@@ -92,6 +92,7 @@ impl Db {
 		if !unknown.is_empty() {
 			return Err(Error::UnknownJobKinds(unknown));
 		}
+		crate::scheduler::ensure_state(&conn)?;
 		Ok(Self { conn: Mutex::new(conn) })
 	}
 

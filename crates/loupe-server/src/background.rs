@@ -65,7 +65,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 /// Reaper tick: reclaim leases past their TTL. Re-queue if attempts <
 /// MAX, fail otherwise. Wraps `loupe-storage::jobs::reap_stale_leases`.
 pub fn reap_once(db: &Db, now: i64) -> anyhow::Result<usize> {
-	let n = db.with_conn(|c| Ok(jobs::reap_stale_leases(c, now)?))?;
+	let n = db.with_conn(|c| jobs::reap_stale_leases(c, now))?;
 	if n > 0 {
 		tracing::info!(reclaimed = n, "reaper transitioned stale leases");
 	}
@@ -94,10 +94,16 @@ pub fn spawn_scheduler(
 			tokio::select! {
 				_ = cancel.cancelled() => return,
 				_ = interval.tick() => {
-					match schedule_due(&db, now_secs()) {
+					let now = now_secs();
+					match schedule_due(&db, now) {
 						Ok(0) => {},
 						Ok(_) => job_arrived.notify_waiters(),
 						Err(e) => tracing::warn!(error = %e, "scheduler tick failed"),
+					}
+					match crate::review::campaign::tick(&db, now) {
+						Ok(report) if report.enqueued > 0 => job_arrived.notify_waiters(),
+						Ok(_) => {},
+						Err(e) => tracing::warn!(error = %e, "campaign scheduler tick failed"),
 					}
 				}
 			}
@@ -200,7 +206,22 @@ mod tests {
 		})
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ requeue.
-		db.with_conn(|c| Ok(jobs::lease_next(c, worker_id, false, 100, 10, &[1; 32])?)).unwrap();
+		db.with_conn(|c| {
+			loupe_storage::transaction::immediate(c, |tx| {
+				loupe_storage::scheduler::claim(
+					tx,
+					&loupe_storage::scheduler::ClaimRequest {
+						worker_id,
+						kinds: &[JobKind::Scan],
+						now: 100,
+						legacy_lease_seconds: 10,
+						capability_hash: &[1; 32],
+						policy: &loupe_storage::scheduler::ClaimPolicy::default(),
+					},
+				)
+			})
+		})
+		.unwrap();
 		let n = reap_once(&db, 200).unwrap();
 		assert_eq!(n, 1);
 	}

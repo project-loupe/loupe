@@ -24,6 +24,7 @@ pub struct AppState {
 	pub github_reporter: Arc<GithubReporter>,
 	pub email_reporter: Arc<EmailReporter>,
 	pub job_arrived: Arc<Notify>,
+	pub review_policy: Arc<crate::review::policy::ReviewPolicy>,
 	/// Server-wide default for the human-in-the-loop approval gate.
 	/// Used when a repo has `require_approval = NULL` (the wire-side
 	/// default — i.e. the operator didn't pin a per-repo override).
@@ -44,6 +45,7 @@ impl AppState {
 			github_reporter,
 			email_reporter: Arc::new(EmailReporter::new()),
 			job_arrived: Arc::new(Notify::new()),
+			review_policy: Arc::new(crate::review::policy::ReviewPolicy::default()),
 			require_approval_default: false,
 			verification_default: false,
 		}
@@ -52,6 +54,14 @@ impl AppState {
 	pub fn with_email_reporter(mut self, reporter: EmailReporter) -> Self {
 		self.email_reporter = Arc::new(reporter);
 		self
+	}
+
+	pub fn with_review_policy(
+		mut self, policy: crate::review::policy::ReviewPolicy,
+	) -> Result<Self, crate::review::policy::PolicyError> {
+		policy.validate()?;
+		self.review_policy = Arc::new(policy);
+		Ok(self)
 	}
 
 	pub fn with_require_approval_default(mut self, on: bool) -> Self {

@@ -16,11 +16,15 @@ anyhow = { workspace = true }
 loupe-core = { version = "0.1.0", path = "../loupe-core" }
 rand_core = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Path-only: exercise server orchestration with the private phase claim path
+# without exposing an ungated scheduler API or a registry dependency cycle.
+loupe-server = { path = "../loupe-server" }
 tempfile = { workspace = true }
 
 [lints]

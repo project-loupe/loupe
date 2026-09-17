@@ -324,19 +324,17 @@ fn try_lease(
 ) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
 	let now = now_secs();
 	let (job_capability, job_capability_hash) = job_capability::issue();
-	let row = state
-		.db
-		.with_conn(|c| {
-			Ok(jobs::lease_next(
-				c,
-				worker_id,
-				accepts_verify,
-				now,
-				DEFAULT_LEASE_SECONDS,
-				&job_capability_hash,
-			)?)
-		})
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
+	let kinds =
+		if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
+	let row = crate::review::scheduler::claim_for_worker(
+		state,
+		worker_id,
+		&kinds,
+		now,
+		&job_capability_hash,
+	)
+	.map(|claimed| claimed.map(|c| c.job))
+	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
 	let Some(row) = row else { return Ok(None) };
 	let env = build_lease_envelope(state, &row, job_capability)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")))?;

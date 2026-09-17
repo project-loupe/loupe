@@ -53,3 +53,45 @@ require_approval_default = false
 # This sample enables it because production deployments should usually
 # report only after the verifier confirms a finding.
 verification_default = true
+
+[review]
+# Limits for the review harness (campaign scheduling). Every key is
+# optional; the built-in defaults below apply when a key is omitted.
+# Environment and CLI overrides for this section arrive with the
+# harness cutover, so until then this file is the only override point.
+# The server validates the section at startup and refuses to start on
+# an inconsistent combination (for example a submit margin at or above
+# its phase deadline, or a lease longer than any phase deadline).
+#
+# Live deployment knobs — a restart applies them to running campaigns:
+# active_jobs_per_repo = 3
+# active_jobs_total = 8            # unset = bounded by worker count
+# active_surveys_per_repo = 1
+# active_drilldowns_per_repo = 2
+# active_verifications_per_repo = 2
+# verify_reserved_slots = 1
+# lease_seconds = 600
+# lease_report_grace_seconds = 60
+# urgency_burst_length = 4
+# priority_aging_interval_seconds = 3600
+# priority_aging_cap = 8
+#
+# Campaign-owned limits — frozen into each campaign when it opens, so a
+# change here affects new campaigns only:
+# campaign_max_jobs = 64
+# campaign_handoff_reserve = 2
+# campaign_deadline_seconds = 21600
+# survey_units_per_job = 4
+# survey_deadline_seconds = 1800
+# survey_submit_margin_seconds = 300
+# drilldown_deadline_seconds = 2700
+# drilldown_submit_margin_seconds = 420
+# verify_deadline_seconds = 3600
+# verify_submit_margin_seconds = 600
+# max_attempts = 3
+# retry_backoff_base_seconds = 60
+# retry_backoff_cap_seconds = 3600
+# Token budgets are unlimited unless set; 0 is rejected.
+# survey_token_budget = 2000000
+# drilldown_token_budget = 3000000
+# verify_token_budget = 4000000
