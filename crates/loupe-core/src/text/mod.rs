@@ -94,7 +94,8 @@ fn characters(field: &'static str, text: &str, multiline: bool) -> Result<(), Er
 		if matches!(
 			get_general_category(c),
 			G::Control
-				| G::Format | G::Unassigned
+				| G::Format
+				| G::Unassigned
 				| G::PrivateUse
 				| G::LineSeparator
 				| G::ParagraphSeparator

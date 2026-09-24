@@ -682,8 +682,8 @@ async fn scan_success_without_head_sha_is_rejected_without_mutating_job() {
 		Option<i64>,
 		Option<i64>,
 		i64,
-	) = f.db
-		.with_conn(|c| {
+	) =
+		f.db.with_conn(|c| {
 			let (state, finished_at, lease_expires_at) = c.query_row(
 				"SELECT state, finished_at, lease_expires_at FROM jobs WHERE id = ?1",
 				[env.job_id],
@@ -1792,8 +1792,8 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 		String,
 		String,
 		i64,
-	) = f.db
-		.with_conn(|c| {
+	) =
+		f.db.with_conn(|c| {
 			let inconclusive_queued = c.query_row(
 				"SELECT COUNT(*) FROM jobs
 				  WHERE kind = 'verify'
@@ -1982,8 +1982,8 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 		String,
 		Option<i64>,
 		i64,
-	) = f.db
-		.with_conn(|c| {
+	) =
+		f.db.with_conn(|c| {
 			let (stranded_state, stranded_deadline) = c.query_row(
 				"SELECT state, validating_deadline FROM findings WHERE id = ?1",
 				[stranded_id],
