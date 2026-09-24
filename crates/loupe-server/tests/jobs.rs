@@ -22,6 +22,34 @@ use loupe_tls::Ca;
 mod common;
 use common::{pem_to_certificate, pem_to_identity};
 
+#[tokio::test]
+async fn review_scheduler_preserves_legacy_verify_first_through_http() {
+	let f = bring_up_with_repo_and_worker().await;
+	let first = enqueue_scan(&f, f.repo_id).await;
+	let second = enqueue_scan(&f, f.repo_id).await;
+	let verify = f.db.with_conn(|c| {
+		c.execute("UPDATE jobs SET enqueued_at=1 WHERE id=?1",[first.job_id])?;
+		c.execute("UPDATE jobs SET enqueued_at=2 WHERE id=?1",[second.job_id])?;
+		c.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,created_at) VALUES(?1,?2,'test','high','t','d','scheduler-parity','validating',0)",(f.repo_id,first.job_id))?;
+		let finding=c.last_insert_rowid();
+		loupe_storage::jobs::enqueue(c,&loupe_storage::jobs::NewJob{repo_id:f.repo_id,kind:loupe_core::JobKind::Verify,incremental:false,since_sha:None,parent_job_id:Some(first.job_id),target_finding_id:Some(finding)},3)
+	}).unwrap();
+	assert_eq!(lease_verify_job(&f.worker).await.job_id, verify);
+	assert_eq!(lease_job(&f.worker).await.job_id, first.job_id);
+	assert_eq!(lease_job(&f.worker).await.job_id, second.job_id);
+	f.db.with_conn(|c| {
+		assert_eq!(
+			c.query_row("SELECT COUNT(*) FROM scheduler_repo_state", [], |r| r.get::<_, i64>(0))?,
+			0,
+			"legacy jobs must not alter campaign fairness"
+		);
+		assert_eq!(c.query_row("SELECT seq FROM scheduler_clock", [], |r| r.get::<_, i64>(0))?, 0);
+		Ok(())
+	})
+	.unwrap();
+	f.handle.shutdown().await;
+}
+
 fn client(ca_cert_pem: &str, cert_pem: &str, key_pem: &str, addr: SocketAddr) -> reqwest::Client {
 	reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(ca_cert_pem))
@@ -682,8 +710,8 @@ async fn scan_success_without_head_sha_is_rejected_without_mutating_job() {
 		Option<i64>,
 		Option<i64>,
 		i64,
-	) = f.db
-		.with_conn(|c| {
+	) =
+		f.db.with_conn(|c| {
 			let (state, finished_at, lease_expires_at) = c.query_row(
 				"SELECT state, finished_at, lease_expires_at FROM jobs WHERE id = ?1",
 				[env.job_id],
@@ -1792,8 +1820,8 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 		String,
 		String,
 		i64,
-	) = f.db
-		.with_conn(|c| {
+	) =
+		f.db.with_conn(|c| {
 			let inconclusive_queued = c.query_row(
 				"SELECT COUNT(*) FROM jobs
 				  WHERE kind = 'verify'
@@ -1982,8 +2010,8 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 		String,
 		Option<i64>,
 		i64,
-	) = f.db
-		.with_conn(|c| {
+	) =
+		f.db.with_conn(|c| {
 			let (stranded_state, stranded_deadline) = c.query_row(
 				"SELECT state, validating_deadline FROM findings WHERE id = ?1",
 				[stranded_id],

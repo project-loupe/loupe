@@ -70,9 +70,13 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 			)?,
 			0
 		);
-		let scan = jobs::lease_next(conn, 1, false, 100, 600, &[0xa1; 32])?.unwrap();
+		let scan = crate::transaction::immediate(conn, |tx| crate::scheduler::claim(tx, &crate::scheduler::ClaimRequest {
+			worker_id:1,kinds:&[loupe_core::JobKind::Scan],now:100,legacy_lease_seconds:600,capability_hash:&[0xa1;32],policy:&crate::scheduler::ClaimPolicy::default(),
+		}))?.unwrap().job;
 		assert_eq!(scan.id, 7);
-		let verify = jobs::lease_next(conn, 1, true, 100, 600, &[0xa2; 32])?.unwrap();
+		let verify = crate::transaction::immediate(conn, |tx| crate::scheduler::claim(tx, &crate::scheduler::ClaimRequest {
+			worker_id:1,kinds:&[loupe_core::JobKind::Scan,loupe_core::JobKind::Verify],now:100,legacy_lease_seconds:600,capability_hash:&[0xa2;32],policy:&crate::scheduler::ClaimPolicy::default(),
+		}))?.unwrap().job;
 		assert_eq!(verify.id, 8);
 		Ok(())
 	})

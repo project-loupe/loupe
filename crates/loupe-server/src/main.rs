@@ -206,6 +206,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		Some(path) => FileConfig::load(path)?,
 		None => FileConfig::default(),
 	};
+	let review_policy = file_cfg.review.resolve()?;
 
 	let bind_addr = args
 		.bind
@@ -289,6 +290,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	let state = AppState::new(Arc::new(db), Arc::new(ca), github)
 		.with_require_approval_default(require_approval_default)
 		.with_verification_default(verification_default);
+	let state = state.with_review_policy(review_policy)?;
 	if require_approval_default {
 		tracing::info!(
 			"loupe-server: require_approval_default = true (per-repo overrides may opt out)"

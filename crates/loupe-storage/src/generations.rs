@@ -110,6 +110,12 @@ pub fn activate(tx: &Transaction<'_>, id: i64, now: i64) -> Result<()> {
 pub fn retire(tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>, now: i64) -> Result<()> {
 	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason=?2,retired_at=?3 WHERE generation_id=?1 AND state='active'",params![id,reason.expose(),now])?,Conflict::GenerationState)
 }
+/// Discard rebuildable state from a bootstrap that never became a baseline.
+pub fn abandon(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>, now: i64,
+) -> Result<()> {
+	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason=?2,retired_at=?3 WHERE generation_id=?1 AND state='building'",params![id,reason.expose(),now])?,Conflict::GenerationState)
+}
 pub fn set_profile(
 	tx: &Transaction<'_>, id: i64, version: i64, profile: &BoundedJson<Payload>,
 ) -> Result<()> {
@@ -125,9 +131,11 @@ pub fn set_coverage(tx: &Transaction<'_>, id: i64, coverage: Coverage) -> Result
 	changed(tx.execute("UPDATE review_generations SET coverage=?2 WHERE generation_id=?1 AND state IN ('building','active') AND (?2<>'complete' OR corroboration_state='satisfied')",params![id,coverage.as_str()])?,Conflict::Coverage)
 }
 pub fn coverage_rollup(tx: &Transaction<'_>, id: i64) -> Result<CoverageRollup> {
-	let generation = get(tx, id)?.ok_or(Error::NotFound(Entity::Generation, id))?;
-	let missing_results = tx.query_row("SELECT COUNT(*) FROM review_units u WHERE u.generation_id=?1 AND u.status='open' AND NOT EXISTS (SELECT 1 FROM review_unit_results r WHERE r.review_unit_id=u.review_unit_id AND r.invalidated=0 AND r.commit_sha=?2)",params![id,generation.commit_sha],|r|r.get(0))?;
-	let needs_follow_up = tx.query_row("SELECT COUNT(*) FROM review_unit_results r JOIN review_units u ON u.review_unit_id=r.review_unit_id WHERE u.generation_id=?1 AND r.invalidated=0 AND r.disposition='needs_follow_up'",[id],|r|r.get(0))?;
+	get(tx, id)?.ok_or(Error::NotFound(Entity::Generation, id))?;
+	let uncovered = format!("FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND u.status='open' AND NOT ({})", crate::review_units::UNIT_COVERED);
+	let missing_results =
+		tx.query_row(&format!("SELECT COUNT(*) {uncovered}"), [id], |r| r.get(0))?;
+	let needs_follow_up = tx.query_row(&format!("SELECT COUNT(*) {uncovered} AND (SELECT r.disposition FROM review_unit_results r WHERE r.review_unit_id=u.review_unit_id AND r.invalidated=0 AND r.commit_sha=g.generation_commit_sha AND r.profile_version=g.profile_version ORDER BY r.review_unit_result_id DESC LIMIT 1)='needs_follow_up'"),[id],|r|r.get(0))?;
 	let unresolved_inventory = tx.query_row("SELECT COUNT(*) FROM generation_inventory WHERE generation_id=?1 AND disposition='unresolved'",[id],|r|r.get(0))?;
 	Ok(CoverageRollup { missing_results, needs_follow_up, unresolved_inventory })
 }
@@ -140,6 +148,7 @@ standalone! {
 	create(new: &NewGeneration<'_>, now: i64) -> i64;
 	activate(id: i64, now: i64) -> ();
 	retire(id: i64, reason: &BoundedText<Reason>, now: i64) -> ();
+	abandon(id: i64, reason: &BoundedText<Reason>, now: i64) -> ();
 	set_profile(id: i64, version: i64, profile: &BoundedJson<Payload>) -> ();
 	set_corroboration(id: i64, state: Corroboration) -> ();
 	set_coverage(id: i64, coverage: Coverage) -> ();

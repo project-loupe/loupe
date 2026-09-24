@@ -116,7 +116,8 @@ fn every_unicode_scalar_obeys_the_category_policy() {
 		let forbidden = matches!(
 			get_general_category(ch),
 			G::Control
-				| G::Format | G::Unassigned
+				| G::Format
+				| G::Unassigned
 				| G::PrivateUse
 				| G::LineSeparator
 				| G::ParagraphSeparator

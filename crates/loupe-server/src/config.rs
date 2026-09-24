@@ -36,6 +36,41 @@ pub struct FileConfig {
 	pub paths: PathsSection,
 	#[serde(default)]
 	pub policy: PolicySection,
+	#[serde(default)]
+	pub review: ReviewSection,
+}
+
+/// Review-harness overrides. Environment and CLI overrides arrive at cutover.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSection {
+	pub active_jobs_per_repo: Option<i64>,
+	pub active_jobs_total: Option<i64>,
+	pub active_surveys_per_repo: Option<i64>,
+	pub active_drilldowns_per_repo: Option<i64>,
+	pub active_verifications_per_repo: Option<i64>,
+	pub verify_reserved_slots: Option<i64>,
+	pub survey_units_per_job: Option<i64>,
+	pub survey_deadline_seconds: Option<i64>,
+	pub survey_submit_margin_seconds: Option<i64>,
+	pub drilldown_deadline_seconds: Option<i64>,
+	pub drilldown_submit_margin_seconds: Option<i64>,
+	pub verify_deadline_seconds: Option<i64>,
+	pub verify_submit_margin_seconds: Option<i64>,
+	pub lease_seconds: Option<i64>,
+	pub lease_report_grace_seconds: Option<i64>,
+	pub max_attempts: Option<u32>,
+	pub retry_backoff_base_seconds: Option<i64>,
+	pub retry_backoff_cap_seconds: Option<i64>,
+	pub urgency_burst_length: Option<i64>,
+	pub campaign_handoff_reserve: Option<i64>,
+	pub campaign_deadline_seconds: Option<i64>,
+	pub campaign_max_jobs: Option<i64>,
+	pub priority_aging_interval_seconds: Option<i64>,
+	pub priority_aging_cap: Option<i64>,
+	pub survey_token_budget: Option<u64>,
+	pub drilldown_token_budget: Option<u64>,
+	pub verify_token_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
