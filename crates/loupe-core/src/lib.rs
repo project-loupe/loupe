@@ -12,6 +12,7 @@ mod finding;
 mod finding_state;
 mod job;
 mod repo;
+pub mod report_limits;
 mod severity;
 mod state_machine;
 pub mod text;

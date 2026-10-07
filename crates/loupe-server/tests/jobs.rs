@@ -2357,6 +2357,146 @@ async fn llm_findings_cannot_bypass_strict_submission_validation() {
 }
 
 #[tokio::test]
+async fn oversized_llm_report_can_be_shortened_and_retried() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	let mut submission = serde_json::json!({
+		"protocol_version": PROTOCOL_VERSION,
+		"severity": "high",
+		"title": "Unchecked index can terminate the service",
+		"description": "An attacker-controlled index reaches the slice operation without any bounds check and can reliably terminate the service process.",
+		"file_path": "src/lib.rs", "line_start": 1, "line_end": 1,
+		"poc_unified": format!("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n old\n+{}\n", "x".repeat(60_000)),
+		"fingerprint": "b".repeat(64)
+	});
+	let rejected = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/llm-findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+		.json(&submission)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(rejected.status(), 400, "oversized report must be rejected before storage");
+	let error = rejected.text().await.unwrap();
+	assert!(error.contains("60000") && error.contains("retry"), "actionable size error: {error}");
+	let count: i64 =
+		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
+			.unwrap();
+	assert_eq!(count, 0, "rejection must leave no dedup row");
+	submission["poc_unified"] = serde_json::json!(
+		"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n old\n+#[test] fn triggers_bug() {}\n"
+	);
+	let accepted = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/llm-findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+		.json(&submission)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(accepted.status(), 204, "shorter retry with same fingerprint must succeed");
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn github_findings_batch_checks_the_rendered_body() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	// Content fits on its own; a huge CWE makes the rendered body too long.
+	let mut finding = finding("Large metadata", "oversized-metadata");
+	finding.cwe = Some("x".repeat(65_536));
+	let rejected = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/findings", env.job_id))
+		.header(JOB_CAPABILITY_HEADER, env.job_capability.expose_secret())
+		.json(&FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(rejected.status(), 400, "rendered metadata must be included in validation");
+	let error = rejected.text().await.unwrap();
+	assert!(error.contains("65536"), "rendered body error: {error}");
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_verifier_patch_is_rejected_without_locking_the_verdict() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		c.execute(
+			"UPDATE registered_repos SET verification_enabled=1, require_approval=1 WHERE id=?1",
+			[f.repo_id],
+		)?;
+		Ok(())
+	})
+	.unwrap();
+	enqueue_scan(&f, f.repo_id).await;
+	let scan = lease_job(&f.worker).await;
+	let mut report = finding("Large PoC", "patch-budget");
+	report.description = "d".repeat(15_000);
+	report.poc_unified = Some("p".repeat(30_000));
+	submit_finding(&f.worker, &scan, report).await;
+	let complete = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan.job_id))
+		.header(JOB_CAPABILITY_HEADER, scan.job_capability.expose_secret())
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("a".repeat(40)),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(complete.status(), 204);
+	let verify = lease_verify_job(&f.worker).await;
+	let mut verdict = VerdictSubmission {
+		protocol_version: PROTOCOL_VERSION,
+		verdict: Verdict::Confirmed {
+			notes: Some("real bug".into()),
+			patch: Some(loupe_core::VerdictPatch {
+				patch_unified: "x".repeat(21_000),
+				notes: "fix".into(),
+			}),
+		},
+	};
+	let rejected = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/verdict", verify.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify.job_capability.expose_secret())
+		.json(&verdict)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(rejected.status(), 400, "patch must fit alongside the original report");
+	let error = rejected.text().await.unwrap();
+	assert!(error.contains("60000") && error.contains("retry"), "patch size error: {error}");
+	let count: i64 =
+		f.db.with_conn(|c| {
+			Ok(c.query_row("SELECT COUNT(*) FROM finding_verifications", [], |r| r.get(0))?)
+		})
+		.unwrap();
+	assert_eq!(count, 0, "rejection must not record a verdict");
+	if let Verdict::Confirmed { patch: Some(patch), .. } = &mut verdict.verdict {
+		patch.patch_unified = "small fix".into();
+	}
+	let accepted = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/verdict", verify.job_id))
+		.header(JOB_CAPABILITY_HEADER, verify.job_capability.expose_secret())
+		.json(&verdict)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(accepted.status(), 204, "shorter patch retry must succeed");
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn strict_llm_endpoint_rejects_placeholders_and_sets_scanner_identity() {
 	let f = bring_up_with_repo_and_worker().await;
 	enqueue_scan(&f, f.repo_id).await;

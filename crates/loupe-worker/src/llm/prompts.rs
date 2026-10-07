@@ -82,6 +82,14 @@ Constraints:
 - One `submit_finding` call per distinct vulnerability — don't bundle
   multiple bugs into one report, and don't double-submit the same bug
   under different titles.
+- Keep description + poc_unified under 60000 characters combined,
+  preferably well below that budget so a verifier can add a fix.
+  GitHub permits at most 65536 characters for the complete issue body;
+  Loupe reserves room for metadata and Markdown. Use a concise report
+  and a minimal PoC diff; avoid copying entire files or large logs.
+  If `submit_finding` returns a size error, shorten the report or diff,
+  re-run `validate_poc` for a changed diff, and retry the same finding
+  until accepted. A rejected submission does not emit a finding.
 - Do not call `submit_finding` for hardening notes, style issues, or
   bugs you can't write a regression test for. Quality over volume.
 - Keep claims conservative and non-sensationalist. When rating
@@ -251,6 +259,13 @@ If you do propose a patch, it must:
     `applies=true` before calling `submit_patch`.
   - Come with a 1–2 sentence `notes` rationale: what the fix does
     and why this is the minimal correct change.
+  - Fit within 60000 characters for the original description + PoC +
+    proposed patch combined. The complete GitHub issue body is limited
+    to 65536 characters including metadata and Markdown. Keep the diff
+    small. If `submit_patch` returns a size error, shorten the patch,
+    re-run `validate_patch`, and retry. A rejected patch does not lock
+    the patch slot. If no correct patch fits, skip it; the confirmed
+    verdict still stands.
 
 Scope of knowledge — read carefully:
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use loupe_core::report_limits::GITHUB_ISSUE_BODY_MAX_CHARS;
 use loupe_core::{format_finding_id, Finding, ReportingDestination, Severity};
 use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
@@ -164,6 +165,16 @@ impl Reporter for GithubReporter {
 		if findings.is_empty() {
 			return Ok(DispatchReceipt { kind: self.kind(), external_id: None });
 		}
+		// Reject oversize before any GitHub call, including app-token
+		// lookup and minting. Reuse the validated bodies when posting.
+		let bodies = findings
+			.iter()
+			.map(|report_finding| {
+				let body = render_body(repo, report_finding);
+				validate_body(&body).map_err(anyhow::Error::msg)?;
+				Ok(body)
+			})
+			.collect::<Result<Vec<_>>>()?;
 		// One bearer per dispatch: labels and issues share it, and an
 		// app-mode dispatch mints at most one installation token up front
 		// (plus one more if GitHub rejects it mid-way; see
@@ -172,12 +183,11 @@ impl Reporter for GithubReporter {
 		let mut session = DispatchSession { credential, target_owner, target_repo, bearer };
 
 		let mut external_ids = Vec::new();
-		for report_finding in findings {
+		for (report_finding, body) in findings.iter().zip(bodies) {
 			let finding = &report_finding.finding;
 			let severity = severity_label(finding.severity);
 			self.ensure_label(&mut session, severity).await?;
 			let title = render_title(finding);
-			let body = render_body(repo, report_finding);
 			let labels = vec!["loupe".to_owned(), severity.name.to_owned()];
 
 			let url = self
@@ -294,6 +304,24 @@ fn compact_title(raw: &str) -> String {
 	}
 	truncated.push_str("...");
 	truncated
+}
+
+pub(crate) fn validate_finding_body(
+	repo: &RepoRow, report_finding: &ReportFinding,
+) -> Result<(), String> {
+	validate_body(&render_body(repo, report_finding))
+}
+
+fn validate_body(body: &str) -> Result<(), String> {
+	let chars = body.chars().count();
+	if chars > GITHUB_ISSUE_BODY_MAX_CHARS {
+		return Err(format!(
+			"GitHub issue body is too long: {chars} characters; maximum is \
+			 {GITHUB_ISSUE_BODY_MAX_CHARS} including metadata and Markdown. \
+			 Shorten the report or diffs and retry; no issue was submitted."
+		));
+	}
+	Ok(())
 }
 
 fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
@@ -414,6 +442,57 @@ mod tests {
 		assert_eq!(severity_label(Severity::Medium).color, "fbca04");
 		assert_eq!(severity_label(Severity::High).color, "d93f0b");
 		assert_eq!(severity_label(Severity::Critical).color, "b60205");
+	}
+
+	#[tokio::test]
+	async fn oversized_issue_is_rejected_before_any_github_request() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		use std::sync::Arc;
+		let requests = Arc::new(AtomicUsize::new(0));
+		let count = requests.clone();
+		let app = axum::Router::new().fallback(move || {
+			let count = count.clone();
+			async move {
+				count.fetch_add(1, Ordering::SeqCst);
+				axum::Json(serde_json::json!({"number": 7}))
+			}
+		});
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let reporter =
+			GithubReporter::with_base(&format!("http://{}", listener.local_addr().unwrap()))
+				.unwrap();
+		let stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		let mut report =
+			ReportFinding { id: 1234, finding: finding(), reviewed_revision: Some("a".repeat(40)) };
+		report.finding.description.clear();
+		let overhead = render_body(&repo(), &report).chars().count();
+		report.finding.description = "é".repeat(65_536 - overhead);
+		assert!(
+			render_body(&repo(), &report).len() > 65_536,
+			"Unicode bytes must not set the limit"
+		);
+		reporter
+			.dispatch(&repo(), &[report.clone()], &ReporterCredential::GithubPat("pat".into()))
+			.await
+			.expect("exact character limit is accepted");
+		assert_eq!(requests.load(Ordering::SeqCst), 2);
+		report.finding.description.push('é');
+		let error = reporter
+			.dispatch(&repo(), &[report.clone()], &ReporterCredential::GithubPat("pat".into()))
+			.await
+			.unwrap_err();
+		assert!(error.to_string().contains("65536"), "local size rejection: {error:#}");
+		assert!(error.to_string().contains("retry"), "actionable error: {error:#}");
+		assert_eq!(requests.load(Ordering::SeqCst), 2, "oversize must cause no GitHub requests");
+		let credential = app_credential();
+		let error = reporter.dispatch(&repo(), &[report], &credential).await.unwrap_err();
+		assert!(error.to_string().contains("65536"), "app-mode local size rejection: {error:#}");
+		assert_eq!(
+			requests.load(Ordering::SeqCst),
+			2,
+			"oversize must not request an installation token"
+		);
+		stub.abort();
 	}
 
 	#[test]

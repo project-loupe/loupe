@@ -52,6 +52,11 @@ pub const LLM_FINDING_POC_MAX_BYTES: usize = 256 * 1024;
 /// checked-out repository. The trusted broker additionally verifies
 /// file existence, line bounds, and `git apply --check`.
 pub fn validate_llm_finding_submission(finding: &LlmFindingSubmission) -> Result<(), String> {
+	loupe_core::report_limits::validate_report_content(
+		&finding.description,
+		Some(&finding.poc_unified),
+		None,
+	)?;
 	let title_len = finding.title.trim().chars().count();
 	if !(LLM_FINDING_TITLE_MIN_CHARS..=LLM_FINDING_TITLE_MAX_CHARS).contains(&title_len) {
 		return Err(format!(
@@ -219,6 +224,19 @@ mod tests {
 		finding = valid_llm_submission();
 		finding.poc_unified = "--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n x\n+\n".into();
 		assert!(validate_llm_finding_submission(&finding).is_err());
+	}
+
+	#[test]
+	fn strict_llm_submission_rejects_oversized_combined_report() {
+		let mut finding = valid_llm_submission();
+		let overhead = finding.description.chars().count() + finding.poc_unified.chars().count();
+		finding.poc_unified.push_str(&"é".repeat(60_000 - overhead));
+		validate_llm_finding_submission(&finding).expect("exact content budget is allowed");
+		finding.poc_unified.push('é');
+		let error = validate_llm_finding_submission(&finding)
+			.expect_err("oversized combined report must be rejected");
+		assert!(error.contains("60001"), "actual character count: {error}");
+		assert!(error.contains("60000") && error.contains("retry"), "actionable error: {error}");
 	}
 
 	#[test]
