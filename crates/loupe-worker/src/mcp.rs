@@ -483,7 +483,10 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 				 **match the surrounding coding style** of the project (indentation, naming, \
 				 error-handling patterns, idioms — read the neighbouring code if unsure). Pre- \
 				 flight with `validate_patch` first; the server-side check rejects diffs that \
-				 don't apply against the worktree.",
+				 don't apply against the worktree. Original description + PoC + proposed patch \
+				 must fit within 60000 characters combined, leaving room in GitHub's 65536-character \
+				 body limit for metadata. On a size error, shorten the patch, validate it, and retry; \
+				 a rejection does not lock the patch slot.",
 			"inputSchema": {
 				"type": "object",
 				"required": ["patch_unified", "notes"],
@@ -541,7 +544,11 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 				 cross-checked against `query_prior_findings` to avoid duplicating an existing \
 				 report. The PoC must be a unified diff that adds a regression test demonstrating \
 				 the bug — failing on HEAD, would pass once the bug is fixed. Submitting a finding \
-				 you're not confident about is worse than not submitting one.",
+				 you're not confident about is worse than not submitting one. Keep description + \
+				 poc_unified under 60000 characters combined, preferably well below to leave room \
+				 for a fix. GitHub's complete issue body limit is 65536 characters. On a size \
+				 error, shorten the report or diff, validate the changed PoC, and retry the same \
+				 finding; rejected submissions are not stored.",
 			"inputSchema": {
 				"type": "object",
 				"required": [
@@ -710,7 +717,7 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 			Response::ok(
 				id,
 				json!({
-					"content": [{ "type": "text", "text": format!("Error: {e}") }],
+					"content": [{ "type": "text", "text": format!("Error: {e:#}") }],
 					"isError": true,
 					"_meta": loupe_mcp_meta(),
 				}),
@@ -1046,6 +1053,15 @@ async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<Strin
 	if inner.patch.is_some() {
 		anyhow::bail!("patch already submitted for this session; one patch per verify session");
 	}
+	// Check the whole report before taking the patch slot. A rejected
+	// patch must remain retryable within the same agent session.
+	let finding = session.client.get_finding(verify.finding_id, &session.job_capability).await?;
+	loupe_core::report_limits::validate_report_content(
+		&finding.description,
+		finding.poc_unified.as_deref(),
+		Some(&patch_unified),
+	)
+	.map_err(anyhow::Error::msg)?;
 
 	// Now the expensive check. The server-side
 	// `attach_proposed_patch` won't catch a bad diff because storage
@@ -1437,6 +1453,92 @@ mod tests {
 		assert!(error.to_string().contains("does not apply"));
 	}
 
+	#[tokio::test]
+	async fn mcp_error_preserves_the_servers_report_size_rejection() {
+		let app = axum::Router::new().route(
+			"/v1/jobs/42/llm-findings",
+			axum::routing::post(|| async {
+				(axum::http::StatusCode::BAD_REQUEST,
+				 "GitHub issue body exceeds 65536 characters including metadata; shorten and retry")
+			}),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let base = format!("http://{}", listener.local_addr().unwrap());
+		let stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		let (workdir, submission) = valid_local_submission();
+		let session = Arc::new(Session {
+			client: Arc::new(ServerClient::from_parts(
+				reqwest::Client::new(),
+				base.parse().unwrap(),
+			)),
+			job_capability: JobCapability::from_secret("test-capability"),
+			repo_id: 1,
+			job_id: Some(42),
+			workdir: workdir.path().to_owned(),
+			verify: None,
+		});
+		let mut args = serde_json::to_value(&submission).unwrap();
+		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
+		args["file"] = json!(submission.file_path);
+		let response = handle_tool_call(
+			&session,
+			&Request {
+				jsonrpc: "2.0".into(),
+				id: Some(json!(1)),
+				method: "tools/call".into(),
+				params: Some(json!({"name": "submit_finding", "arguments": args})),
+			},
+			json!(1),
+		)
+		.await;
+		let result = response.result.unwrap();
+		assert_eq!(result["isError"], true);
+		let error = result["content"][0]["text"].as_str().unwrap();
+		assert!(
+			error.contains("65536") && error.contains("retry"),
+			"server size error must reach the agent: {error}"
+		);
+		stub.abort();
+	}
+
+	#[tokio::test]
+	async fn oversized_report_is_rejected_by_the_mcp_broker() {
+		let (workdir, submission) = valid_local_submission();
+		let session = Arc::new(Session {
+			client: Arc::new(ServerClient::from_parts(
+				reqwest::Client::new(),
+				"http://127.0.0.1:1".parse().unwrap(),
+			)),
+			job_capability: JobCapability::from_secret("test-capability"),
+			repo_id: 1,
+			job_id: Some(42),
+			workdir: workdir.path().to_owned(),
+			verify: None,
+		});
+		let mut args = serde_json::to_value(&submission).unwrap();
+		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
+		args["file"] = json!(submission.file_path);
+		args["poc_unified"] = json!(format!("{}{}", submission.poc_unified, "x".repeat(60_000)));
+		let response = handle_tool_call(
+			&session,
+			&Request {
+				jsonrpc: "2.0".into(),
+				id: Some(json!(1)),
+				method: "tools/call".into(),
+				params: Some(json!({"name": "submit_finding", "arguments": args})),
+			},
+			json!(1),
+		)
+		.await;
+		let result = response.result.unwrap();
+		assert_eq!(result["isError"], true);
+		let error = result["content"][0]["text"].as_str().unwrap();
+		assert!(
+			error.contains("60000") && error.contains("retry"),
+			"size error before HTTP: {error}"
+		);
+	}
+
 	#[test]
 	fn git_apply_check_neutralizes_inherited_git_config() {
 		use std::ffi::OsStr;
@@ -1532,10 +1634,9 @@ mod tests {
 	}
 
 	fn fake_session_for_verify(finding_id: i64) -> Arc<Session> {
-		// `submit_verdict` / `submit_patch` only buffer locally; they
-		// don't hit the network until `flush_verify_session` runs at
-		// session end. So a no-op ServerClient (default reqwest +
-		// any URL) is fine for the locking tests below.
+		// Locking checks precede the patch budget lookup, so a no-op
+		// ServerClient is enough for verdict ordering tests. Tests that
+		// reach patch validation replace this client with a real stub.
 		let client = Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),
 			"http://invalid.example/".parse().unwrap(),
@@ -1572,6 +1673,51 @@ mod tests {
 			err.to_string().contains("already locked"),
 			"second call must mention the lock; got: {err}"
 		);
+	}
+
+	#[tokio::test]
+	async fn oversized_patch_can_be_shortened_and_retried() {
+		let detail = json!({
+			"protocol_version": PROTOCOL_VERSION, "id": 7, "repo_id": 1, "job_id": 1,
+			"scanner_id": "llm-code-review", "severity": "high", "title": "Large report",
+			"description": "d".repeat(15_000), "poc_unified": "p".repeat(30_000),
+			"fingerprint": "a".repeat(64), "state": "validating",
+			"verification_required": true, "created_at": 0
+		});
+		let app = axum::Router::new().route(
+			"/v1/findings/{id}",
+			axum::routing::get(move || {
+				let detail = detail.clone();
+				async move {
+					(
+						[(loupe_proto::PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())],
+						axum::Json(detail),
+					)
+				}
+			}),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let base = format!("http://{}", listener.local_addr().unwrap());
+		let stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		let mut session = fake_session_for_verify(7);
+		Arc::get_mut(&mut session).unwrap().client =
+			Arc::new(ServerClient::from_parts(reqwest::Client::new(), base.parse().unwrap()));
+		std::fs::write(session.workdir.join("x"), "old\n").unwrap();
+		tool_submit_verdict(&session, &json!({"verdict": "confirmed", "notes": "real bug"}))
+			.await
+			.unwrap();
+		let mut args = json!({"patch_unified": format!("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+{}\n", "x".repeat(21_000)), "notes": "fix"});
+		let error =
+			tool_submit_patch(&session, &args).await.expect_err("oversized patch must be rejected");
+		assert!(
+			error.to_string().contains("60000") && error.to_string().contains("retry"),
+			"patch budget error: {error:#}"
+		);
+		assert!(session.verify.as_ref().unwrap().inner.lock().await.patch.is_none());
+		args["patch_unified"] = json!("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n");
+		tool_submit_patch(&session, &args).await.expect("shorter retry must remain available");
+		assert!(session.verify.as_ref().unwrap().inner.lock().await.patch.is_some());
+		stub.abort();
 	}
 
 	#[tokio::test]

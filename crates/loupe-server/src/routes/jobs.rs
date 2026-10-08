@@ -463,6 +463,9 @@ pub async fn submit_findings(
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
 		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".to_owned()))?;
 	let verification_required = repo.verification_enabled;
+	for finding in &batch.findings {
+		validate_report_size(&repo, finding, row.head_sha.as_deref())?;
+	}
 
 	let submitted = state
 		.db
@@ -500,6 +503,31 @@ fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCod
 		Error::Sqlite(_) | Error::UnknownJobKinds(_) => StatusCode::INTERNAL_SERVER_ERROR,
 	};
 	(status, format!("{context}: {error}"))
+}
+
+fn validate_report_size(
+	repo: &repos::RepoRow, finding: &loupe_core::Finding, reviewed_revision: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+	if matches!(repo.reporting, loupe_core::ReportingDestination::GithubIssue { .. }) {
+		loupe_core::report_limits::validate_report_content(
+			&finding.description,
+			finding.poc_unified.as_deref(),
+			finding.patch_unified.as_deref(),
+		)
+		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+		reporters::github::validate_finding_body(
+			repo,
+			&reporters::ReportFinding {
+				// The finding may not have an ID yet. Reserve the full
+				// width of a stored ID for its public report reference.
+				id: i64::MAX,
+				finding: finding.clone(),
+				reviewed_revision: reviewed_revision.map(str::to_owned),
+			},
+		)
+		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -562,6 +590,7 @@ pub async fn submit_llm_finding(
 		poc_unified: Some(submission.poc_unified),
 		fingerprint: submission.fingerprint,
 	};
+	validate_report_size(&repo, &finding, row.head_sha.as_deref())?;
 	let submitted = state
 		.db
 		.with_conn(|conn| {
@@ -624,12 +653,23 @@ pub async fn submit_verdict(
 	// `confirmed` (immediate dispatch) or `awaiting_approval` (parked
 	// for human sign-off).
 	let server_default = state.require_approval_default;
-	let require_approval = state
+	let repo = state
 		.db
 		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
-		.map(|r| r.effective_require_approval(server_default))
-		.unwrap_or(false);
+		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".into()))?;
+	let require_approval = repo.effective_require_approval(server_default);
+	if let Some((patch_unified, _)) = patch_to_attach {
+		let finding_row = state
+			.db
+			.with_conn(|c| Ok(findings::get(c, target_finding_id)?))
+			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
+			.ok_or((StatusCode::NOT_FOUND, "target finding missing".into()))?;
+		let mut report = report_finding_from_row(&state, finding_row)
+			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get report: {e}")))?;
+		report.finding.patch_unified = Some(patch_unified.to_owned());
+		validate_report_size(&repo, &report.finding, report.reviewed_revision.as_deref())?;
+	}
 	// Insert the verdict + apply the rollup policy in a single
 	// transaction so a concurrent verdict from a second verifier
 	// can't catch us mid-state-flip and observe "confirmed AND
