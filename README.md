@@ -236,6 +236,43 @@ env vars override anything the file supplies, so a typical deploy
 keeps stable settings in `config.toml` and uses the env to flip
 per-environment knobs.
 
+Authenticated worker requests share per-worker token buckets across job
+routes, identity, finding search and finding detail. The defaults allow
+bursts of 600 requests, 16 MiB of body bytes and 60 lease attempts, with
+refill of 10 requests, 256 KiB and one lease attempt per whole monotonic
+second. Total admitted traffic can include the burst plus earned refill.
+
+Authentication and charging precede protocol checks and long polling.
+Body accounting uses actual chunks, including input rejected later as
+malformed; received bytes stay charged if a later chunk fails. Exhaustion
+returns 429. Worker bodies above 2 MiB return 413, and broken body streams
+return 400. Public health and operator requests have no worker budget.
+Exhaustion logs contain only a fixed event/category and the worker ID.
+
+These positive settings can be overridden in the server TOML file:
+
+```toml
+[worker_budgets]
+max_workers = 4096
+idle_seconds = 120
+
+[worker_budgets.requests]
+capacity = 600
+refill_per_second = 10
+
+[worker_budgets.bytes]
+capacity = 16777216
+refill_per_second = 262144
+
+[worker_budgets.leases]
+capacity = 60
+refill_per_second = 1
+```
+
+At most `max_workers` identities are retained; a new identity receives
+429 if that map is full. Idle entries are reclaimed only after all three
+buckets have naturally refilled, so eviction cannot reset spent credit.
+
 ### 3. Point `loupectl` at the server
 
 ```

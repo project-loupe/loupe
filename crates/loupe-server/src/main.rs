@@ -207,6 +207,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		None => FileConfig::default(),
 	};
 	let review_policy = file_cfg.review.resolve()?;
+	file_cfg.worker_budgets.validate()?;
 
 	let bind_addr = args
 		.bind
@@ -298,6 +299,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		.with_verification_default(verification_default)
 		.with_github_app_allowed_owners(file_cfg.github_app.allowed_target_owners);
 	let state = state.with_review_policy(review_policy)?;
+	let state = state.with_worker_budgets(file_cfg.worker_budgets)?;
 	if require_approval_default {
 		tracing::info!(
 			"loupe-server: require_approval_default = true (per-repo overrides may opt out)"

@@ -73,24 +73,17 @@ pub fn router(state: AppState) -> Router {
 		// lease for the requested repo before returning finding data.
 		.route("/v1/repos/{id}/findings/search", get(routes::findings_admin::search))
 		.route("/v1/findings/{id}", get(routes::findings_admin::get))
+		// Authentication charges worker budgets before rejecting protocol input.
+		.route_layer(axum::middleware::from_fn(check_request_protocol))
 		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
 
 	Router::new()
 		.route("/v1/health", get(routes::health::get))
+		.route_layer(axum::middleware::from_fn(check_request_protocol))
 		.merge(authed)
 		.with_state(state)
 		.layer(axum::middleware::from_fn(
 			|req: axum::extract::Request, next: axum::middleware::Next| async move {
-				if let Some(msg) =
-					request_protocol_error(req.headers().get(PROTOCOL_VERSION_HEADER))
-				{
-					let mut resp = (StatusCode::BAD_REQUEST, msg).into_response();
-					resp.headers_mut().insert(
-						PROTOCOL_VERSION_HEADER,
-						PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
-					);
-					return resp;
-				}
 				let mut resp = next.run(req).await;
 				resp.headers_mut().insert(
 					PROTOCOL_VERSION_HEADER,
@@ -99,6 +92,15 @@ pub fn router(state: AppState) -> Router {
 				resp
 			},
 		))
+}
+
+async fn check_request_protocol(
+	req: axum::extract::Request, next: axum::middleware::Next,
+) -> axum::response::Response {
+	if let Some(msg) = request_protocol_error(req.headers().get(PROTOCOL_VERSION_HEADER)) {
+		return (StatusCode::BAD_REQUEST, msg).into_response();
+	}
+	next.run(req).await
 }
 
 pub fn request_protocol_error(value: Option<&HeaderValue>) -> Option<String> {

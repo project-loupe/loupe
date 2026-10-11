@@ -9,6 +9,7 @@ pub mod config;
 pub mod init;
 pub mod job_capability;
 pub mod reporters;
+pub mod request_budget;
 pub mod review;
 pub mod router;
 pub mod routes;
@@ -18,3 +19,7 @@ pub mod tls;
 pub use config::{Config, FileConfig};
 pub use router::{router, serve, PeerCert, ServeHandle};
 pub use state::AppState;
+
+#[cfg(kani)]
+#[path = "../kani/mod.rs"]
+mod kani;

@@ -51,10 +51,15 @@ pub fn do_test(data: &[u8]) {
 		}
 		let Some(table) = raw.as_table() else { panic!("non-table configuration accepted") };
 		assert!(
-			table
-				.keys()
-				.all(|key| ["server", "paths", "policy", "review", "github_app"]
-					.contains(&key.as_str())),
+			table.keys().all(|key| [
+				"server",
+				"paths",
+				"policy",
+				"review",
+				"github_app",
+				"worker_budgets"
+			]
+			.contains(&key.as_str())),
 			"unknown root config key accepted"
 		);
 	}
@@ -71,4 +76,41 @@ pub fn server_config_test<Out: test_logger::Output>(data: &[u8], _out: Out) {
 pub unsafe extern "C" fn server_config_run(data: *const u8, datalen: usize) {
 	// SAFETY: the caller guarantees a valid readable input buffer.
 	do_test(unsafe { std::slice::from_raw_parts(data, datalen) });
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn assert_loader(data: &[u8], accepted: bool) {
+		let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("config fixture: {error}"));
+		let file = dir.path().join("config.toml");
+		std::fs::write(&file, data).unwrap_or_else(|error| panic!("config fixture: {error}"));
+		let result = FileConfig::load(&file);
+		assert_eq!(result.is_ok(), accepted, "actual loader admission must match the control");
+		if let Ok(config) = result {
+			assert_eq!(config.worker_budgets.max_workers, 4096);
+			assert_eq!(config.worker_budgets.idle_seconds, 120);
+		}
+	}
+
+	#[test]
+	fn worker_budget_section_is_a_known_root() {
+		let data = include_bytes!("../test_cases/server_config/worker-budgets-empty");
+		assert_loader(data, true);
+		do_test(data);
+	}
+
+	#[test]
+	fn empty_config_keeps_its_defaults() {
+		assert_loader(b"", true);
+		do_test(b"");
+	}
+
+	#[test]
+	fn unrelated_root_sections_remain_rejected() {
+		let data = b"[not_a_config_section]\n";
+		assert_loader(data, false);
+		do_test(data);
+	}
 }

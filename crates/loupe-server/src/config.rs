@@ -40,6 +40,8 @@ pub struct FileConfig {
 	pub review: ReviewSection,
 	#[serde(default)]
 	pub github_app: GithubAppSection,
+	#[serde(default)]
+	pub worker_budgets: crate::request_budget::WorkerBudgetConfig,
 }
 
 /// Limits on reporting through the server-wide GitHub App. The app's
@@ -154,6 +156,7 @@ impl FileConfig {
 		cfg.github_app
 			.validate()
 			.with_context(|| format!("validating config file {}", path.display()))?;
+		cfg.worker_budgets.validate()?;
 		Ok(cfg)
 	}
 }

@@ -1089,3 +1089,23 @@ mod storage_error_tests {
 		}
 	}
 }
+
+#[cfg(test)]
+mod route_kind_tests {
+	use super::*;
+
+	#[test]
+	fn submission_routes_accept_only_their_runtime_kind() {
+		for kind in [
+			JobKind::Scan,
+			JobKind::Verify,
+			JobKind::Survey,
+			JobKind::Drilldown,
+			JobKind::Unknown("verify".into()),
+		] {
+			assert_eq!(route_admits_kind(Route::Findings, &kind), kind == JobKind::Scan);
+			assert_eq!(route_admits_kind(Route::LlmFinding, &kind), kind == JobKind::Scan);
+			assert_eq!(route_admits_kind(Route::Verdict, &kind), kind == JobKind::Verify);
+		}
+	}
+}

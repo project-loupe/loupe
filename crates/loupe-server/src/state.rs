@@ -25,6 +25,7 @@ pub struct AppState {
 	pub email_reporter: Arc<EmailReporter>,
 	pub job_arrived: Arc<Notify>,
 	pub review_policy: Arc<crate::review::policy::ReviewPolicy>,
+	pub worker_budgets: Arc<crate::request_budget::WorkerBudgets>,
 	/// Server-wide default for the human-in-the-loop approval gate.
 	/// Used when a repo has `require_approval = NULL` (the wire-side
 	/// default — i.e. the operator didn't pin a per-repo override).
@@ -75,6 +76,12 @@ impl AppState {
 			email_reporter: Arc::new(EmailReporter::new()),
 			job_arrived: Arc::new(Notify::new()),
 			review_policy: Arc::new(crate::review::policy::ReviewPolicy::default()),
+			worker_budgets: Arc::new(
+				crate::request_budget::WorkerBudgets::new(
+					crate::request_budget::WorkerBudgetConfig::default(),
+				)
+				.expect("default worker budgets are valid"),
+			),
 			require_approval_default: false,
 			verification_default: false,
 			github_app_allowed_owners: None,
@@ -89,6 +96,13 @@ impl AppState {
 	pub fn with_email_reporter(mut self, reporter: EmailReporter) -> Self {
 		self.email_reporter = Arc::new(reporter);
 		self
+	}
+
+	pub fn with_worker_budgets(
+		mut self, config: crate::request_budget::WorkerBudgetConfig,
+	) -> anyhow::Result<Self> {
+		self.worker_budgets = Arc::new(crate::request_budget::WorkerBudgets::new(config)?);
+		Ok(self)
 	}
 
 	pub fn with_review_policy(

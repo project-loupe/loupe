@@ -53,6 +53,9 @@ pub async fn mtls_auth(
 		.with_conn(|c| Ok(workers::find_active_by_fingerprint(c, &fp)?))
 		.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 		.ok_or(StatusCode::UNAUTHORIZED)?;
+	if row.kind == WorkerKind::Worker {
+		state.worker_budgets.enforce(row.id, &mut req).await?;
+	}
 
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 	let id = row.id;

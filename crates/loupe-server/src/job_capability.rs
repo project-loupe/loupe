@@ -130,3 +130,71 @@ mod tests {
 		assert_eq!(token.expose_secret().len(), JOB_CAPABILITY_TOKEN_CHARS);
 	}
 }
+
+#[cfg(test)]
+mod decision_tests {
+	use axum::http::HeaderValue;
+
+	use super::*;
+
+	#[test]
+	fn capability_facts_require_every_lease_condition() {
+		let mut facts = LeaseFacts {
+			worker_id: Some(7),
+			capability_hash: [9; 32],
+			lease_expires_at: Some(10),
+			state: JobState::Leased,
+		};
+		assert!(capability_admits(&facts, 7, &[9; 32], 10));
+		assert!(capability_admits(&facts, 7, &[9; 32], 9));
+		assert!(!capability_admits(&facts, 7, &[9; 32], 11));
+		assert!(!capability_admits(&facts, 8, &[9; 32], 10));
+		for index in 0..32 {
+			let mut wrong = [9; 32];
+			wrong[index] ^= 1;
+			assert!(!capability_admits(&facts, 7, &wrong, 10));
+		}
+		facts.worker_id = None;
+		assert!(!capability_admits(&facts, 7, &[9; 32], 10));
+		facts.worker_id = Some(7);
+		facts.lease_expires_at = None;
+		assert!(!capability_admits(&facts, 7, &[9; 32], 10));
+		facts.lease_expires_at = Some(10);
+		for state in [JobState::Queued, JobState::Succeeded, JobState::Failed, JobState::Cancelled]
+		{
+			facts.state = state;
+			assert!(!capability_admits(&facts, 7, &[9; 32], 10));
+		}
+	}
+
+	#[test]
+	fn capability_header_requires_text_of_exact_length_and_hashes_all_bytes() {
+		assert!(parse_capability(&HeaderMap::new()).is_none());
+		for len in [0, 42, 43, 44] {
+			for byte in [b'a', b' ', b'\t', 0x80] {
+				let bytes = vec![byte; len];
+				let mut headers = HeaderMap::new();
+				headers.insert(JOB_CAPABILITY_HEADER, HeaderValue::from_bytes(&bytes).unwrap());
+				let expected = if len == 43 && byte != 0x80 {
+					Some(*blake3::hash(&bytes).as_bytes())
+				} else {
+					None
+				};
+				assert_eq!(parse_capability(&headers), expected, "length {len}, byte {byte}");
+			}
+		}
+	}
+
+	#[test]
+	fn legacy_authority_rejects_every_phase_or_unknown_kind() {
+		for (kind, expected) in [
+			(JobKind::Scan, true),
+			(JobKind::Verify, true),
+			(JobKind::Survey, false),
+			(JobKind::Drilldown, false),
+			(JobKind::Unknown("scan".into()), false),
+		] {
+			assert_eq!(legacy_kind(&kind), expected);
+		}
+	}
+}

@@ -939,6 +939,7 @@ dependencies = [
  "base64",
  "blake3",
  "clap",
+ "futures-util",
  "git2",
  "hyper",
  "hyper-util",
