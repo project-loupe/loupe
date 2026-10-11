@@ -47,3 +47,7 @@ pub const JOB_CAPABILITY_TOKEN_CHARS: usize = 43;
 /// submissions and refuses it on the batch endpoint, so the two must
 /// agree; a silent drift would reopen the batch path to LLM findings.
 pub const LLM_CODE_REVIEW_SCANNER_ID: &str = "llm-code-review";
+
+#[cfg(kani)]
+#[path = "../kani/mod.rs"]
+mod kani;

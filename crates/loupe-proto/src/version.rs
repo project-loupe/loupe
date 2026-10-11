@@ -65,6 +65,33 @@ mod tests {
 	}
 
 	#[test]
+	fn mismatch_display_names_all_three_versions() {
+		for (client, server_min, server_max, message) in [
+			(
+				0,
+				1,
+				65535,
+				"loupe protocol version mismatch: client sent 0, server supports [1, 65535]",
+			),
+			(
+				65535,
+				42,
+				4096,
+				"loupe protocol version mismatch: client sent 65535, server supports [42, 4096]",
+			),
+			(
+				9,
+				1200,
+				3,
+				"loupe protocol version mismatch: client sent 9, server supports [1200, 3]",
+			),
+		] {
+			let error = ProtocolMismatch { client, server_min, server_max };
+			assert_eq!(error.to_string(), message);
+		}
+	}
+
+	#[test]
 	fn protocol_mismatch_round_trips_through_json() {
 		let m = ProtocolMismatch { client: 9, server_min: 1, server_max: 3 };
 		let s = serde_json::to_string(&m).unwrap();

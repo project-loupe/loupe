@@ -29,6 +29,7 @@ fixture() {
 	CASE=$TEST_ROOT/$1
 	mkdir -p "$CASE/repo" "$CASE/bin" "$CASE/state" "$CASE/local" "$CASE/locks"
 	cp -a "$SOURCE" "$CASE/repo/ci"
+	printf '# No no-verdict harnesses in this fixture.\n' > "$CASE/repo/ci/kani-no-verdict.txt"
 	mkdir -p "$CASE/repo/crates/loupe-worker/src"
 	mkdir -p "$CASE/repo/fuzz/src/bin" "$CASE/repo/fuzz/runners" "$CASE/repo/fuzz/test_cases/alpha"
 	printf 'GEN_TEST alpha\nGEN_TEST beta\n' > "$CASE/repo/fuzz/src/bin/gen_target.sh"

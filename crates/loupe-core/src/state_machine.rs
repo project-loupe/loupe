@@ -239,6 +239,49 @@ mod tests {
 	];
 
 	#[test]
+	fn transition_names_and_rejection_messages_are_exact() {
+		let jobs = [
+			(JobTransition::Enqueue, "enqueue"),
+			(JobTransition::Lease, "lease"),
+			(JobTransition::Heartbeat, "heartbeat"),
+			(JobTransition::CompleteSucceeded, "complete_succeeded"),
+			(JobTransition::CompleteFailed, "complete_failed"),
+			(JobTransition::Cancel, "cancel"),
+			(JobTransition::Retry, "retry"),
+			(JobTransition::ReapToQueued, "reap_to_queued"),
+			(JobTransition::ReapToFailed, "reap_to_failed"),
+		];
+		for (transition, label) in jobs {
+			assert_eq!(transition.as_str(), label);
+			assert_eq!(
+				JobState::Succeeded.apply(transition).unwrap_err().to_string(),
+				format!("invalid job transition {label} from succeeded")
+			);
+		}
+		let findings = [
+			(FindingTransition::ScanAccepted, "scan_accepted"),
+			(FindingTransition::ScanAutoConfirm, "scan_auto_confirm"),
+			(FindingTransition::ScanAwaitApproval, "scan_await_approval"),
+			(FindingTransition::ScanRequireVerification, "scan_require_verification"),
+			(FindingTransition::VerdictConfirm, "verdict_confirm"),
+			(FindingTransition::VerdictAwaitApproval, "verdict_await_approval"),
+			(FindingTransition::VerdictDismiss, "verdict_dismiss"),
+			(FindingTransition::DeadlineExpire, "deadline_expire"),
+			(FindingTransition::Approve, "approve"),
+			(FindingTransition::Reject, "reject"),
+			(FindingTransition::RetryVerification, "retry_verification"),
+			(FindingTransition::MarkReported, "mark_reported"),
+		];
+		for (transition, label) in findings {
+			assert_eq!(transition.as_str(), label);
+			assert_eq!(
+				FindingState::Reported.apply(transition).unwrap_err().to_string(),
+				format!("invalid finding transition {label} from reported")
+			);
+		}
+	}
+
+	#[test]
 	fn initial_job_state_is_only_enqueue() {
 		assert_eq!(initial_job_state(JobTransition::Enqueue).unwrap(), JobState::Queued);
 		for transition in JOB_TRANSITIONS {

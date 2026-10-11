@@ -8,3 +8,5 @@
 # verify.
 #
 # <crate> <harness>
+loupe-core canonical_object_keys_are_sorted
+loupe-proto protocol_error_names_exact_versions
