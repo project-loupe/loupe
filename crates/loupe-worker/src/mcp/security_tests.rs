@@ -86,6 +86,7 @@ async fn unknown_method_bytes_never_reach_logs() {
 	run_stream_server(context(workdir.path()), input.as_bytes(), &mut output).await.unwrap();
 	let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
 	assert!(!logs.contains(marker), "unknown method leaked into MCP logs");
+	assert!(logs.contains("received request"), "capture must observe the request log: {logs:?}");
 	assert!(String::from_utf8(output).unwrap().contains(marker), "sender keeps its protocol error");
 }
 
@@ -142,6 +143,7 @@ async fn reflected_response_bytes_never_reach_logs() {
 	write_response(&mut output, &Response::err(json!(1), -32601, marker)).await.unwrap();
 	let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
 	assert!(!logs.contains(marker), "reflected response leaked into MCP logs");
+	assert!(logs.contains("sending response"), "capture must observe the response log: {logs:?}");
 	assert!(String::from_utf8(output).unwrap().contains(marker));
 }
 
