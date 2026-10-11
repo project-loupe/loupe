@@ -1086,6 +1086,20 @@ mod tests {
 	}
 
 	#[test]
+	fn wrapped_command_unshares_every_namespace_explicitly() {
+		let command = SandboxBuilder::new("/tmp").build("/bin/true");
+		let namespaces: Vec<_> = command
+			.as_std()
+			.get_args()
+			.filter(|argument| argument.as_encoded_bytes().starts_with(b"--unshare-"))
+			.collect();
+		assert_eq!(
+			namespaces,
+			["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",]
+		);
+	}
+
+	#[test]
 	fn forward_env_explicitly_passes_allowlisted_values() {
 		if !in_env(
 			"sandbox::tests::forward_env_explicitly_passes_allowlisted_values",

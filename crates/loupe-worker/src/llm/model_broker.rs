@@ -1230,6 +1230,106 @@ mod tests {
 		session.finish().await.unwrap();
 	}
 
+	#[test]
+	fn forwarding_header_matrix_strips_authority_and_connection_tokens() {
+		let mut headers = HeaderMap::new();
+		let denied = [
+			"authorization",
+			"cookie",
+			"host",
+			"content-length",
+			"keep-alive",
+			"proxy-authenticate",
+			"proxy-authorization",
+			"te",
+			"trailer",
+			"transfer-encoding",
+			"upgrade",
+			"proxy-custom",
+			"x-nominated",
+			"x-second",
+		];
+		for name in denied {
+			headers.insert(HeaderName::from_static(name), HeaderValue::from_static("client"));
+		}
+		headers.insert(CONNECTION, HeaderValue::from_static("x-nominated, X-Second"));
+		headers.insert("x-api-key", HeaderValue::from_static("client-secret"));
+		headers.insert("x-retained", HeaderValue::from_static("ordinary"));
+		let sanitized =
+			sanitize_request_headers(&headers, &ModelCredential::anthropic_api_key("host-secret"))
+				.unwrap();
+		for name in denied {
+			assert!(!sanitized.contains_key(name), "forwarded denied header {name}");
+		}
+		assert!(!sanitized.contains_key(CONNECTION));
+		assert_eq!(sanitized.get("x-retained").unwrap(), "ordinary");
+		assert_eq!(sanitized.get("x-api-key").unwrap(), "host-secret");
+		assert_eq!(sanitized.len(), 2);
+	}
+
+	#[test]
+	fn response_headers_drop_hop_state_and_keep_end_to_end_values() {
+		let denied = [
+			"content-length",
+			"connection",
+			"keep-alive",
+			"proxy-authenticate",
+			"proxy-authorization",
+			"te",
+			"trailer",
+			"transfer-encoding",
+			"upgrade",
+			"x-nominated",
+		];
+		let mut headers = HeaderMap::new();
+		for name in denied {
+			headers.insert(HeaderName::from_static(name), HeaderValue::from_static("value"));
+		}
+		headers.insert(CONNECTION, HeaderValue::from_static("X-Nominated"));
+		headers.insert("content-type", HeaderValue::from_static("application/json"));
+		headers.insert("x-retained", HeaderValue::from_static("ordinary"));
+		let sanitized = sanitize_response_headers(&headers);
+		for name in denied {
+			assert!(!sanitized.contains_key(name), "forwarded response hop header {name}");
+		}
+		assert_eq!(sanitized.get("content-type").unwrap(), "application/json");
+		assert_eq!(sanitized.get("x-retained").unwrap(), "ordinary");
+		assert_eq!(sanitized.len(), 2);
+	}
+
+	#[test]
+	fn request_policy_repairs_each_partial_configuration() {
+		for (backend, field) in
+			[(claude_backend(), "output_config"), (codex_backend(), "reasoning")]
+		{
+			for model in [backend.model(), "other-model"] {
+				for effort in [
+					serde_json::json!({"effort": backend.effort(), "retained": true}),
+					serde_json::json!({"effort": "other-effort", "retained": true}),
+					serde_json::Value::Null,
+					serde_json::json!("not-an-object"),
+				] {
+					let mut input =
+						serde_json::json!({"model": model, "preserved": {"nested": true}});
+					input[field] = effort.clone();
+					let body = Bytes::from(serde_json::to_vec(&input).unwrap());
+					let output = enforce_request_policy(&body, &backend)
+						.unwrap_or_else(|_| panic!("ordinary policy input was denied"));
+					let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+					assert_eq!(output["model"], backend.model());
+					assert_eq!(output[field]["effort"], backend.effort());
+					assert_eq!(output["preserved"], input["preserved"]);
+					if effort.is_object() {
+						assert_eq!(
+							output[field]["retained"], true,
+							"preserve other effort settings"
+						);
+					}
+				}
+			}
+		}
+	}
+
 	#[tokio::test]
 	async fn claude_oauth_uses_host_bearer_authentication() {
 		let upstream = FakeUpstream::start("{}").await;

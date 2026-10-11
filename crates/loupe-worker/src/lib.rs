@@ -20,3 +20,7 @@ pub use client::ServerClient;
 pub use repo_cache::{RepoCache, RepoKey};
 pub use runner::Runner;
 pub use scanner::{ScanContext, Scanner, VerifyContext, VerifyOutcome};
+
+#[cfg(any(kani, test))]
+#[path = "../kani/mod.rs"]
+mod kani;
