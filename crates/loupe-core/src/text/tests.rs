@@ -227,3 +227,109 @@ fn json_bounds_validation_and_digests_are_one_boundary() {
 	}
 	assert_eq!(serde_json::from_str::<BoundedJson<Payload>>(json.expose()).unwrap(), json);
 }
+
+struct TwoByteText;
+impl TextPolicy for TwoByteText {
+	const FIELD: &'static str = "two_byte_text";
+	const MAX_CHARS: usize = 2;
+	const MAX_BYTES: usize = 2;
+	const MULTILINE: bool = false;
+}
+
+#[test]
+fn text_caps_include_the_exact_byte_boundary() {
+	for raw in ["a", "ab", "é"] {
+		assert_eq!(BoundedText::<TwoByteText>::new(raw).unwrap().expose(), raw);
+	}
+	for raw in ["aé", "😀"] {
+		assert_eq!(BoundedText::<TwoByteText>::new(raw).unwrap_err().rule, Rule::Bytes);
+	}
+	assert_eq!(BoundedText::<TwoByteText>::new("abc").unwrap_err().rule, Rule::Chars);
+}
+
+#[test]
+fn raw_text_admission_precedes_character_validation() {
+	for length in [7, 8] {
+		assert_eq!(oversized("fixture", &"x".repeat(length), 2), Ok(()));
+	}
+	assert_eq!(oversized("fixture", &"x".repeat(9), 2), Err(Error::new("fixture", Rule::Bytes)));
+	assert_eq!(oversized("fixture", "x", usize::MAX), Ok(()));
+	assert_eq!(
+		BoundedText::<TwoByteText>::new(&"\0".repeat(9)).unwrap_err().rule,
+		Rule::Bytes,
+		"reject excessive raw input before interpreting forbidden characters"
+	);
+	assert_eq!(BoundedText::<TwoByteText>::new("\0").unwrap_err().rule, Rule::Character);
+}
+
+#[test]
+fn debug_retains_metadata_without_payloads() {
+	let error = BoundedText::<Title>::new("SECRET\u{202e}payload").unwrap_err();
+	assert_eq!(format!("{error:?}"), "title: Character (U+202E)");
+	assert_eq!(format!("{:?}", Error::new("title", Rule::Bytes)), "title: Bytes");
+	let path = RepoPath::new("SECRET.rs").unwrap();
+	assert_eq!(format!("{path:?}"), "RepoPath(len=9)");
+	let json = BoundedJson::<Payload>::new(r#""SECRET""#).unwrap();
+	assert_eq!(format!("{json:?}"), "BoundedJson<payload>(len=8)");
+}
+
+struct JsonBudget<const BYTES: usize, const DEPTH: usize>;
+impl<const BYTES: usize, const DEPTH: usize> JsonPolicy for JsonBudget<BYTES, DEPTH> {
+	const FIELD: &'static str = "json_budget";
+	const MAX_BYTES: usize = BYTES;
+	const MAX_DEPTH: usize = DEPTH;
+	const MAX_NODES: usize = 32;
+}
+
+#[test]
+fn embedded_json_checks_the_final_canonical_byte_boundary() {
+	// Embedded Deserialize relies on the caller's bounded request body. Unlike
+	// new(), it can reach the canonical cap with a larger raw representation.
+	for raw in ["1", "12"] {
+		let json: BoundedJson<JsonBudget<2, 1>> = serde_json::from_str(raw).unwrap();
+		assert_eq!(json.expose(), raw);
+	}
+	let error = serde_json::from_str::<BoundedJson<JsonBudget<2, 1>>>("123").unwrap_err();
+	assert!(error.to_string().contains("json_budget: Bytes"), "{error}");
+}
+
+#[test]
+fn embedded_json_charges_raw_strings_before_normalization() {
+	// Six decoded bytes contract to four; with the quotes, the canonical
+	// representation fits the same six-byte budget exactly.
+	let exact = "\"e\u{301}e\u{301}\"";
+	let json: BoundedJson<JsonBudget<6, 1>> = serde_json::from_str(exact).unwrap();
+	assert_eq!(json.expose(), "\"éé\"");
+	let over = "\"e\u{301}e\u{301}e\u{301}\"";
+	let error = serde_json::from_str::<BoundedJson<JsonBudget<6, 1>>>(over).unwrap_err();
+	assert!(error.to_string().contains("json_budget: Bytes"), "{error}");
+}
+
+#[test]
+fn json_scalar_visitors_preserve_values() {
+	for raw in ["null", "true", "false", "-37", "1.25", "-1.25"] {
+		let json = BoundedJson::<Payload>::new(raw).unwrap();
+		assert_eq!(json.expose(), raw, "preserve scalar {raw}");
+		assert_eq!(serde_json::to_string(&json).unwrap(), raw);
+	}
+	let owned = serde::de::value::StringDeserializer::<serde::de::value::Error>::new(
+		"Cafe\u{301}".to_owned(),
+	);
+	let json = BoundedJson::<Payload>::deserialize(owned).unwrap();
+	assert_eq!(json.expose(), "\"Café\"");
+}
+
+#[test]
+fn unsupported_json_types_report_the_expected_kind() {
+	let bytes = serde::de::value::BytesDeserializer::<serde::de::value::Error>::new(b"secret");
+	let error = BoundedJson::<Payload>::deserialize(bytes).unwrap_err();
+	assert_eq!(error.to_string(), "invalid type: byte array, expected bounded JSON");
+}
+
+#[test]
+fn json_map_values_count_toward_the_depth_boundary() {
+	let exact = BoundedJson::<JsonBudget<64, 2>>::new(r#"{"a":0}"#).unwrap();
+	assert_eq!(exact.expose(), r#"{"a":0}"#);
+	let error = BoundedJson::<JsonBudget<64, 2>>::new(r#"{"a":{"b":0}}"#).unwrap_err();
+	assert_eq!(error.rule, Rule::JsonDepth, "nested object values must consume depth");
+}
