@@ -9,6 +9,8 @@
 #
 # <crate> <harness>
 loupe-core canonical_object_keys_are_sorted
+loupe-core json_string_preflight_counts_bounded_tokens
+loupe-core json_string_preflight_accepts_surrogate_pairs
 loupe-proto protocol_error_names_exact_versions
 loupe-worker argv_never_contains_a_forbidden_flag
 loupe-worker setenv_names_are_fixed_or_explicit

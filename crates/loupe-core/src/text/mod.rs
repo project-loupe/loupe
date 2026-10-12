@@ -9,12 +9,14 @@
 
 pub(crate) mod checked;
 pub(crate) mod json;
+pub(crate) mod json_string;
 pub mod policy;
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
 
 pub use json::BoundedJson;
+pub use json_string::decode_json_string_bounded;
 use serde::{Deserialize, Serialize};
 use unicode_general_category::{get_general_category, GeneralCategory as G};
 use unicode_normalization::UnicodeNormalization;
@@ -279,5 +281,7 @@ pub struct SourceRef {
 	pub symbol: Option<BoundedText<policy::Symbol>>,
 }
 
+#[cfg(test)]
+mod json_string_tests;
 #[cfg(test)]
 mod tests;

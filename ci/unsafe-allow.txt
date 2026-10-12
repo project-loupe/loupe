@@ -13,9 +13,12 @@ crates/loupe-provenance/src/tests.rs test fixture: mints labels for input the te
 crates/loupe-provenance/src/untrusted.rs declares `unsafe fn Ingress::new`, the minting contract (P3)
 crates/loupe-provenance/src/volatile.rs volatile writes that zeroise secrets (P9)
 crates/loupe-core/tests/source_migration.rs test fixture: mints labels for input the test made up
+crates/loupe-storage/tests/support/stored.rs test fixture: mints Db only for original SQLite column reads
+crates/loupe-proto/tests/support/verdict.rs test fixture: mints Worker for original messages the test made up
 fuzz/src/smoke.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_bounded.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_exact.rs fuzz entry point and fixture: mints Agent for input the fuzzer made up
+fuzz/src/core_json_string.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_ident.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_canonical.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_json.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

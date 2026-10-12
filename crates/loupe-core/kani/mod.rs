@@ -414,3 +414,81 @@ fn canonical_object_keys_are_sorted() {
 	std::mem::forget(ordered);
 	std::mem::forget(fields);
 }
+
+// invariant: I6. Actual no-allocation JSON-string preflight on at most eight
+// arbitrary valid UTF-8 bytes, with full usize byte/scalar caps. This bounded
+// proof covers malformed/short escapes, admission/count boundaries and direct
+// UTF-8 counts; it does not claim induction over longer tokens or serde parity.
+// Longer/surrogate tokens and serde equivalence are independently tested/fuzzed.
+#[kani::proof]
+#[kani::unwind(12)]
+fn json_string_preflight_counts_bounded_tokens() {
+	use crate::text::json_string::preflight;
+	let bytes: [u8; 8] = kani::any();
+	let len: usize = kani::any();
+	kani::assume(len <= bytes.len());
+	let Ok(raw) = std::str::from_utf8(&bytes[..len]) else {
+		kani::assume(false);
+		return;
+	};
+	let max_bytes: usize = kani::any();
+	let max_chars: usize = kani::any();
+	let unlimited = preflight(raw, "proof", usize::MAX, usize::MAX);
+	let bounded = preflight(raw, "proof", max_bytes, max_chars);
+	if let Ok(size) = &unlimited {
+		assert_eq!(bounded.is_ok(), size.bytes <= max_bytes && size.chars <= max_chars);
+		if !raw.contains('\\') {
+			let contents = &raw[1..raw.len() - 1];
+			assert_eq!(size.bytes, contents.len());
+			assert_eq!(size.chars, contents.chars().count());
+		}
+	}
+	if let Ok(size) = &bounded {
+		assert!(unlimited.is_ok());
+		assert!(size.bytes <= max_bytes && size.chars <= max_chars);
+	}
+	kani::cover!(raw == r#""é""# && bounded.is_ok(), "borrowed Unicode token");
+	kani::cover!(raw == r#""\n""# && bounded.is_ok(), "escaped scalar token");
+	kani::cover!(
+		matches!(bounded, Err(ref e) if e.rule == crate::text::Rule::Bytes),
+		"byte cap rejects"
+	);
+	kani::cover!(
+		matches!(bounded, Err(ref e) if e.rule == crate::text::Rule::Chars),
+		"scalar cap rejects"
+	);
+}
+
+// invariant: I6. Every valid high/low surrogate pair, actual preflight, full
+// usize caps. The 14-byte encoded token must decode to exactly four UTF-8 bytes
+// and one scalar. This supplements, rather than shrinks, the arbitrary-token
+// bound above. No allocation or external parser is stubbed.
+#[kani::proof]
+#[kani::unwind(16)]
+fn json_string_preflight_accepts_surrogate_pairs() {
+	use crate::text::json_string::preflight;
+	let high: u16 = kani::any();
+	let low: u16 = kani::any();
+	kani::assume((0xd800..=0xdbff).contains(&high));
+	kani::assume((0xdc00..=0xdfff).contains(&low));
+	let hex = b"0123456789abcdef";
+	let mut token = *br#""\u0000\u0000""#;
+	for (offset, value) in [(3, high), (9, low)] {
+		for index in 0..4 {
+			token[offset + index] = hex[((value >> (12 - index * 4)) & 15) as usize];
+		}
+	}
+	let raw = std::str::from_utf8(&token).unwrap();
+	let max_bytes: usize = kani::any();
+	let max_chars: usize = kani::any();
+	let result = preflight(raw, "proof", max_bytes, max_chars);
+	assert_eq!(result.is_ok(), max_bytes >= 4 && max_chars >= 1);
+	if let Ok(size) = result {
+		assert_eq!((size.bytes, size.chars), (4, 1));
+	}
+	kani::cover!(
+		high == 0xd800 && low == 0xdc00 && max_bytes == 4 && max_chars == 1,
+		"first supplementary scalar"
+	);
+	kani::cover!(high == 0xdbff && low == 0xdfff && max_bytes == 3, "last scalar exceeds byte cap");
+}

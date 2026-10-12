@@ -290,6 +290,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `core_canonical` | Independent sorted serialization, reordered/whitespace-equivalent JSON, idempotence, bounded output and BLAKE3 digest |
 | `core_state_machine` | Independent adjacency/precedence tables, terminal exits only through documented operator retries; SQL permutation/scope invariant covered in storage tests |
 | `core_text_bounded` | All ten policies: exact admission, raw/normalized caps, NFC, character categories, whitespace and metadata-only diagnostics |
+| `core_json_string` | Original JSON string tokens versus serde, exact decoded bytes, byte/scalar limits and error order, borrowed/owned output and fixed diagnostics |
 | `core_text_exact` | All 17 source-aware exact policies: independent admission, decoded caps, unchanged UTF-8/wire bytes, named policy combinations and redacted diagnostics |
 | `core_text_ident` | Four policies: independent byte recognizers, length/spacing limits, exact spelling and metadata-only diagnostics |
 | `core_text_json` | Duplicate-preserving reference tree, depth/node/byte budgets, composed key/leaf rules, entry-point equivalence and redaction |
