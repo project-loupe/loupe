@@ -300,7 +300,7 @@ async fn run_flow(
 	}));
 
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![
 		Arc::new(LlmCodeReviewScanner::new(backend.clone())),
 		Arc::new(LlmVerifierScanner::new(backend)),

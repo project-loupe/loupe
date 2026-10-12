@@ -271,7 +271,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 		.unwrap();
 
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	let runner = Runner::new(server_client, cache, scanners);
 	let cancel = CancellationToken::new();
@@ -678,7 +678,7 @@ async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
 		.await
 		.unwrap();
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	let runner = Runner::new(server_client, cache, scanners);
 	assert!(runner.step(&CancellationToken::new()).await.unwrap());

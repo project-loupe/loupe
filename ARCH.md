@@ -61,6 +61,53 @@ transport budget. Transport boundary regressions use valid JSON with trailing
 whitespace at the exact budget and one byte over, including chunked responses
 without Content-Length.
 
+### Git credential delivery
+
+The worker keeps the Git CLI for bare clone and fetch. A PAT stays in its
+shared `Arc<Secret<String>>` owner and is available only to a private,
+operation-scoped host helper. The helper socket lives in a random 0700 host
+`/tmp` directory with a 0600 socket, outside the cache, worktrees and sandbox
+binds. The internal `git-credential` worker mode loads no worker configuration
+or tracing. Only socket metadata enters its arguments; credential bytes cross
+the socket and Git's helper stdout pipe.
+
+PAT delivery requires HTTPS and an exact normalized host, effective port and
+decoded repository path. HTTP(S) userinfo and ambiguous/control-bearing URLs
+are rejected. Git's credential context already decodes paths, so the helper
+does not decode it again. `store` and `erase` discard input without persistence.
+Protocol buffers have a fixed 16 KiB limit and wipe on drop; PATs are at most
+8 KiB. Each helper exchange has a three-second I/O deadline, and an operation
+accepts at most 16 connections. These are helper limits, not a network-transfer
+timeout for the Git child.
+
+For a credentialed operation, a bounded local Git query resolves the current
+URL's rewrite without a helper or network access. A unique invocation-only
+transport alias pins that exact validated spelling through Git's single rewrite
+pass. Exact HTTP settings reject redirects even when inherited URL-specific
+settings allow them. Command-owned config keys and values are separate so an
+`=` in the URL cannot alter a config key. Inherited helpers, askpass, config
+environment and Git/curl tracing are reset. Clone skips templates and resets
+the merged origin URL list, explicitly selecting the `origin` remote; fetch
+uses the explicit transport alias with the
+three branch/remote-HEAD refspecs, pruning and tags.
+
+The rewrite projection validates borrowed bytes before placing the resolved
+URL in command metadata. It rejects URI userinfo after one percent-decoding
+pass, malformed authority escapes, controls, ambiguous delimiters and brackets.
+Native SSH's unusual cross-path bracketed-host syntax is also refused. SCP
+syntax stays literal; local paths with a slash before the first colon retain
+Git's local-path interpretation, including names containing `@`. Accepted URL
+spelling remains unchanged.
+
+Every cached fetch first replaces all local origin URL values from the current
+clean lease URL, including leases without a PAT. Clone restores that clean URL
+before returning. Neither path reads an old credential-bearing origin to derive
+its replacement. The blocking operation owns its repository lock, cache pin,
+helper and token until the real Git child exits, even if its async waiter is
+cancelled or the helper reaches its connection limit. Git, TLS and kernel
+copies are outside Loupe's owned-buffer erasure guarantee; cleanup of current
+origin contents does not erase filesystem snapshots or forensic remnants.
+
 ## Component diagram
 
 ```

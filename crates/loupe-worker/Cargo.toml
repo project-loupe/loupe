@@ -35,7 +35,7 @@ loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 regex = { workspace = true }
 reqwest = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["event", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -49,6 +49,9 @@ walkdir = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 # Keep this test dependency path-only: Cargo omits it on publication,
 # avoiding a server/worker cycle in the registry dependency graph.
 loupe-server = { path = "../loupe-server" }

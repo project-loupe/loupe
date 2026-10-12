@@ -239,7 +239,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 		}
 	}));
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(LlmCodeReviewScanner::new(stub_backend))];
 	let runner = Runner::new(server_client, cache, scanners);
 	let cancel = CancellationToken::new();

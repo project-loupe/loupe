@@ -7,6 +7,7 @@ mod test_env;
 pub mod client;
 pub mod config;
 pub mod fingerprint;
+mod git_credentials;
 pub mod llm;
 pub mod mcp;
 pub mod repo_cache;
@@ -18,6 +19,8 @@ pub mod scanners;
 pub(crate) mod source_discovery;
 
 pub use client::ServerClient;
+#[doc(hidden)]
+pub use git_credentials::run_git_credential_helper;
 pub use repo_cache::{RepoCache, RepoKey};
 pub use runner::Runner;
 pub use scanner::{ScanContext, Scanner, VerifyContext, VerifyOutcome};

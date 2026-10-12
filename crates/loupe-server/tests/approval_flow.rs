@@ -229,7 +229,7 @@ async fn make_worker_runner(h: &Harness) -> (Runner, tempfile::TempDir) {
 	let server_client =
 		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	(Runner::new(server_client, cache, scanners), cache_dir)
 }

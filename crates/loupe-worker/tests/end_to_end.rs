@@ -158,7 +158,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	assert_eq!(resp.status(), 201);
 
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	let runner = Runner::new(server_client, cache, scanners);
 

@@ -54,6 +54,16 @@ enum Cmd {
 	/// Internal supervisor for one isolated sandbox network.
 	#[command(hide = true)]
 	SandboxExec(SandboxExecArgs),
+	/// Internal host-side Git credential pipe.
+	#[command(hide = true)]
+	GitCredential(GitCredentialArgs),
+}
+
+#[derive(Debug, Parser)]
+struct GitCredentialArgs {
+	#[arg(long)]
+	socket: PathBuf,
+	operation: String,
 }
 
 #[derive(Debug, Parser)]
@@ -201,8 +211,19 @@ struct SandboxExecArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	// Parse the private mode before RunArgs: unrelated worker environment
+	// must neither load credentials nor prevent Git authentication.
+	if std::env::args_os().nth(1).is_some_and(|arg| arg == "git-credential") {
+		let args = GitCredentialArgs::parse_from(std::env::args_os().skip(1));
+		loupe_worker::run_git_credential_helper(&args.socket, &args.operation);
+		return Ok(());
+	}
 	let cli = Cli::parse();
 	match cli.cmd {
+		Some(Cmd::GitCredential(args)) => {
+			loupe_worker::run_git_credential_helper(&args.socket, &args.operation);
+			Ok(())
+		},
 		Some(Cmd::Run(args)) => {
 			let cfg = load_worker_config(&args)?;
 			init_tracing(&cfg.logging);
@@ -260,7 +281,13 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		&tls.key_pem,
 		server_url.clone(),
 	)?);
-	let cache = Arc::new(RepoCache::new(cache_dir.clone(), cfg.cache.max_gb * 1_073_741_824)?);
+	let worker_binary =
+		std::env::current_exe().context("resolving the loupe-worker binary path")?;
+	let cache = Arc::new(RepoCache::new(
+		cache_dir.clone(),
+		cfg.cache.max_gb * 1_073_741_824,
+		Some(worker_binary.clone()),
+	)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 
@@ -333,8 +360,6 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// The agent gets only this binary's credential-free proxy mode and
 	// a per-invocation Unix socket. The authenticated client remains in
 	// the trusted parent process.
-	let worker_binary = std::env::current_exe()
-		.context("resolving the loupe-worker binary path for MCP bind-mount")?;
 	let mcp_ctx = McpContext {
 		worker_binary: worker_binary.clone(),
 		client: client.clone(),

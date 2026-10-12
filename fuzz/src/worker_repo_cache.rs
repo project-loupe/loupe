@@ -1,6 +1,6 @@
-//! Raw bytes exercise the actual persisted-cursor and git-origin decoders.
-//! Origin strings intentionally remain opaque, including lossy UTF-8; this
-//! target does not impose a new URL or SHA grammar on the legacy cache.
+//! Raw bytes exercise the persisted cursor and actual Git credential matcher.
+//! Legacy origins are replaced without reading them; credential contexts must
+//! match the current HTTPS host, effective port and decoded repository path.
 
 use loupe_worker::repo_cache::fuzz_support;
 
@@ -19,17 +19,31 @@ pub fn do_test(data: &[u8]) {
 		assert_eq!(fuzz_support::decode_cursor(&encoded).as_deref(), Some(sha.as_str()));
 	}
 
-	assert_eq!(fuzz_support::parse_origin_output(false, data), None);
-	let origin = fuzz_support::parse_origin_output(true, data);
-	let text = String::from_utf8_lossy(data);
-	let trimmed = text.trim();
-	assert_eq!(origin.as_deref(), (!trimmed.is_empty()).then_some(trimmed));
-	if let Some(origin) = origin {
-		assert_eq!(
-			fuzz_support::parse_origin_output(true, origin.as_bytes()).as_deref(),
-			Some(origin.as_str()),
-			"origin normalization must be idempotent"
-		);
+	let url = "https://example.invalid/acme/repo.git";
+	let matched = fuzz_support::matches_credential_context(url, data);
+	assert_eq!(
+		matched,
+		fuzz_support::matches_credential_context(
+			"https://example.invalid:443/acme/repo%2Egit/",
+			data
+		)
+	);
+	if matched {
+		for other in [
+			"http://example.invalid/acme/repo.git",
+			"https://other.invalid/acme/repo.git",
+			"https://example.invalid:444/acme/repo.git",
+			"https://example.invalid/acme/repo.git/child",
+		] {
+			assert!(!fuzz_support::matches_credential_context(other, data));
+		}
+	}
+	if let Ok(path) = std::str::from_utf8(data)
+		&& !path.bytes().any(|byte| byte.is_ascii_control())
+	{
+		let frame = format!("protocol=https\nhost=example.invalid\npath={path}\n\n");
+		let expected = frame.len() <= 16 * 1024 && path.trim_matches('/') == "acme/repo.git";
+		assert_eq!(fuzz_support::matches_credential_context(url, frame.as_bytes()), expected);
 	}
 }
 
