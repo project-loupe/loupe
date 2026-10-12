@@ -32,12 +32,17 @@ pub(crate) struct RequestBuffer {
 	#[cfg(test)]
 	audit: Option<CleanupAudit>,
 }
+
+/// Numeric admission used before allocating or copying an incoming chunk.
+/// Also reject overflow and invalid starting lengths without subtraction.
+pub(crate) fn request_body_next_len(used: usize, incoming: usize) -> Option<usize> {
+	used.checked_add(incoming).filter(|required| *required <= BODY_CAP)
+}
+
 impl RequestBuffer {
 	pub(crate) fn append(&mut self, chunk: &[u8]) -> Result<(), StatusCode> {
-		if chunk.len() > BODY_CAP - self.used {
-			return Err(StatusCode::PAYLOAD_TOO_LARGE);
-		}
-		let required = self.used + chunk.len();
+		let required =
+			request_body_next_len(self.used, chunk.len()).ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
 		if required > self.allocation.len() {
 			let mut replacement = Self {
 				allocation: vec![0; required.next_power_of_two().min(BODY_CAP)].into_boxed_slice(),

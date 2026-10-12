@@ -1,6 +1,7 @@
 use axum::http::HeaderValue;
 use loupe_core::{JobKind, JobState};
 
+use crate::ingress::{request_body_next_len, BODY_CAP};
 use crate::job_capability::{capability_admits, legacy_kind, parse_capability_value, LeaseFacts};
 use crate::request_budget::Budget;
 use crate::routes::jobs::{route_admits_kind, Route};
@@ -150,4 +151,25 @@ fn request_budget_is_monotone() {
 	kani::cover!(!admitted, "insufficient credit refused");
 	kani::cover!(now < last && admitted, "backward clock creates no credit");
 	kani::cover!(earned.is_none(), "refill overflow saturates");
+}
+
+// invariant: I6. Full usize inputs on this 64-bit target, no assumptions or
+// stubs. Independent u128 arithmetic checks the production append admission.
+// This proves numeric limits only: actual collection, allocation, byte debt
+// and wipe-on-drop remain separate runtime and fuzz obligations.
+// ci: fast
+#[kani::proof]
+fn request_body_length_admission_is_exact() {
+	assert!(usize::BITS <= 64);
+	let used: usize = kani::any();
+	let incoming: usize = kani::any();
+	let admitted = request_body_next_len(used, incoming);
+	let sum = used as u128 + incoming as u128;
+	let expected = if sum <= BODY_CAP as u128 { Some(sum as usize) } else { None };
+	assert_eq!(admitted, expected);
+	kani::cover!(used == 0 && incoming == 0 && admitted == Some(0), "empty append admitted");
+	kani::cover!(sum == BODY_CAP as u128 && admitted.is_some(), "exact cap admitted");
+	kani::cover!(sum == BODY_CAP as u128 + 1 && admitted.is_none(), "first over-cap byte refused");
+	kani::cover!(sum > usize::MAX as u128 && admitted.is_none(), "arithmetic overflow refused");
+	kani::cover!(used > BODY_CAP && incoming == 0 && admitted.is_none(), "invalid start refused");
 }
