@@ -108,3 +108,40 @@ impl Validate<&[u8], Reporter> for LabelResponseDecoder {
 		Ok(input.get().windows(b"already_exists".len()).any(|window| window == b"already_exists"))
 	}
 }
+
+/// Pure fixtures exercise the same named decoders as HTTP. Status, actual
+/// bounded collection, cancellation and authentication need transport tests.
+#[cfg(fuzzing)]
+pub(crate) mod fuzz_support {
+	use super::*;
+
+	#[allow(unsafe_code)]
+	pub(in crate::reporters) fn original(body: &[u8]) -> Untrusted<&[u8], Reporter> {
+		// SAFETY: the fuzzer supplied this synthetic Reporter response body.
+		Untrusted::new(body, unsafe { Ingress::<Reporter>::new() })
+	}
+
+	pub(in crate::reporters) fn diagnostic(error: ReporterDecodeError) -> String {
+		assert!(std::error::Error::source(&error).is_none());
+		assert_eq!(format!("{error:?}"), format!("ReporterDecodeError({:?})", error.0));
+		error.to_string()
+	}
+
+	pub fn app(body: &[u8]) -> Result<(u64, String), String> {
+		let app = original(body).validate(AppMetadataDecoder).map_err(diagnostic)?;
+		let slug: &BoundedText<GithubAppSlug, Reporter> = &app.slug;
+		Ok((app.id, slug.expose().to_owned()))
+	}
+
+	pub fn installation(body: &[u8]) -> Result<u64, String> {
+		original(body).validate(InstallationDecoder).map_err(diagnostic)
+	}
+
+	pub fn issue(body: &[u8]) -> Result<Option<i64>, String> {
+		original(body).validate(IssueReceiptDecoder).map_err(diagnostic)
+	}
+
+	pub fn label(body: &[u8]) -> Result<bool, String> {
+		original(body).validate(LabelResponseDecoder).map_err(diagnostic)
+	}
+}

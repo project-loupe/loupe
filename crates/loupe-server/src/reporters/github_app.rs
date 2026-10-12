@@ -407,6 +407,17 @@ impl Validate<&[u8], ReporterSource> for AccessTokenDecoder {
 	}
 }
 
+/// Fixed Reporter fixture for the actual confidential endpoint decoder.
+#[cfg(fuzzing)]
+pub fn fuzz_access_token(body: &[u8]) -> std::result::Result<Secret<String>, String> {
+	let token: Secret<String> = super::ingress::fuzz_support::original(body)
+		.validate(AccessTokenDecoder)
+		.map_err(super::ingress::fuzz_support::diagnostic)?;
+	assert_eq!(format!("{token:?}"), "[redacted]");
+	assert_eq!(format!("{token}"), "[redacted]");
+	Ok(token)
+}
+
 /// Decode an installation token; response bodies never become error text.
 pub fn parse_access_token_response(
 	status: StatusCode, body: &[u8], installation_id: u64,

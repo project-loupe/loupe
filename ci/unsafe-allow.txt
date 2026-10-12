@@ -18,7 +18,7 @@ crates/loupe-storage/src/ingress/mod.rs actual original SQLite TEXT/BLOB reads m
 crates/loupe-server/src/auth.rs mints Worker/Operator after active certificate fingerprint authentication
 crates/loupe-server/src/config.rs actual configuration-file reads mint Config before TOML decoding
 crates/loupe-server/src/main.rs actual CLI/environment/file owners mint Config before named validation
-crates/loupe-server/src/reporters/ingress.rs actual bounded GitHub HTTP responses mint Reporter before parsing
+crates/loupe-server/src/reporters/ingress.rs actual bounded GitHub HTTP responses and cfg-only synthetic response fixtures mint Reporter before parsing
 crates/loupe-server/src/reporters/github_app.rs actual guarded GitHub token responses mint Reporter before parsing
 crates/loupe-server/src/ingress/jobs.rs test fixture: mints Worker for original synthetic messages
 crates/loupe-cli/src/config_input.rs actual Clap argv/environment values and guarded native PEM file reads mint Config

@@ -299,7 +299,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `proto_version` | Inclusive protocol windows, inverted-window rejection and exact mismatch fields and diagnostics |
 | `server_capability_header` | Exact header-text/length admission, unchanged hash bytes and closed denial diagnostics |
 | `server_config` | Actual file loader, owner-list rejection, root keys, and exact relative path resolution |
-| `server_github_response` | All five real response decoders, typed-serde object/sequence admission, ignored-field syntax, closed error diagnostics and credential Debug |
+| `server_github_response` | All five production Reporter validators via fixed cfg-only fixtures; independent exact slug policy and raw schema oracles, compact escaped/unescaped 2 MiB boundary recipes, fixed errors and token redaction. Legacy status helpers remain separate compatibility controls; actual HTTP collection belongs to transport tests. |
 | `server_report_email` | Exact header boundary, CR/LF admission and finding-content isolation from headers |
 | `server_report_github` | Title normalization, title/body character caps and observed S3 fence-containment cases |
 | `server_request_parsers` | Protocol headers, state/kind filters, legacy clone URLs and exact FTS stripping/token admission |

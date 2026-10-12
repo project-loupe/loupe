@@ -7,6 +7,8 @@
 pub mod auth;
 pub mod background;
 pub mod config;
+#[cfg(fuzzing)]
+pub mod fuzz_support;
 mod ingress;
 pub mod init;
 pub mod job_capability;

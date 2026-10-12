@@ -1,10 +1,13 @@
-//! Parse every provider response through the same pure cores as HTTP dispatch.
-//! Diagnostics have an exact metadata-only vocabulary; token Debug is constant.
+//! Exercise all five actual Reporter validators through fixed-source fixtures.
+//! Legacy helpers separately pin historical status/schema behavior; they do not
+//! stand in for actual typed decoding, HTTP collection or authentication.
 use http::StatusCode;
+use loupe_server::fuzz_support;
 use loupe_server::reporters::{github, github_app, ReporterCredential};
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserializer;
 use serde_json::Value;
+use unicode_general_category::{get_general_category, GeneralCategory};
 
 use crate::utils::input::ByteSource;
 use crate::utils::redact::{assert_redacted, Redaction};
@@ -69,11 +72,121 @@ impl<'de> Visitor<'de> for Fields {
 	}
 }
 
+// Independent exact single-line policy oracle. No production constructor or
+// predicate decides whether its own input should have been admitted.
+fn app_slug_admitted(text: &str) -> bool {
+	text.len() <= 2 * 1024 * 1024
+		&& text.chars().all(|c| {
+			let point = u32::from(c);
+			!matches!(
+				get_general_category(c),
+				GeneralCategory::Control
+					| GeneralCategory::Format
+					| GeneralCategory::Unassigned
+					| GeneralCategory::PrivateUse
+					| GeneralCategory::LineSeparator
+					| GeneralCategory::ParagraphSeparator
+			) && !(0xfdd0..=0xfdef).contains(&point)
+				&& !matches!(point % 0x10000, 0xfffe | 0xffff)
+		})
+}
+
+fn check_actual_decoder(kind: u8, body: &[u8]) {
+	match kind {
+		0 => {
+			let expected = Fields(&["id", "slug"]).decode(body).and_then(|fields| {
+				let id = fields.first()?.as_u64()?;
+				let slug = fields.get(1)?.as_str()?;
+				app_slug_admitted(slug).then(|| (id, slug.to_owned()))
+			});
+			let actual = fuzz_support::reporter_app(body);
+			assert_eq!(actual.is_ok(), expected.is_some(), "actual app admission differs");
+			match actual {
+				Ok(app) => assert_eq!(Some(app), expected, "actual app fields differ"),
+				Err(error) => {
+					assert_eq!(error, "parsing GitHub App metadata: invalid response body")
+				},
+			}
+		},
+		1 => {
+			let expected = Fields(&["id"])
+				.decode(body)
+				.and_then(|fields| fields.first().and_then(Value::as_u64));
+			let actual = fuzz_support::reporter_installation(body);
+			assert_eq!(actual.is_ok(), expected.is_some(), "actual installation admission differs");
+			match actual {
+				Ok(id) => assert_eq!(Some(id), expected, "actual installation ID differs"),
+				Err(error) => {
+					assert_eq!(error, "parsing installation response: invalid response body")
+				},
+			}
+		},
+		2 => {
+			let expected = Fields(&["token"])
+				.decode(body)
+				.and_then(|fields| fields.first().and_then(Value::as_str).map(str::to_owned));
+			let actual = fuzz_support::reporter_token(body);
+			assert_eq!(actual.is_ok(), expected.is_some(), "actual token admission differs");
+			match actual {
+				Ok(token) => {
+					assert_eq!(
+						Some(token.expose()),
+						expected.as_ref(),
+						"actual token bytes differ"
+					);
+					assert_eq!(format!("{token:?}"), "[redacted]");
+					assert_eq!(format!("{token}"), "[redacted]");
+				},
+				Err(error) => {
+					assert_eq!(error, "parsing installation token: invalid response body")
+				},
+			}
+		},
+		3 => {
+			let expected = serde_json::from_slice::<Value>(body)
+				.ok()
+				.map(|v| v.get("number").and_then(Value::as_i64));
+			let actual = fuzz_support::reporter_issue(body);
+			assert_eq!(actual.is_ok(), expected.is_some(), "actual issue admission differs");
+			match actual {
+				Ok(number) => assert_eq!(Some(number), expected, "actual issue number differs"),
+				Err(error) => assert_eq!(error, "parsing issue response: invalid response body"),
+			}
+		},
+		_ => {
+			let expected = String::from_utf8_lossy(body).contains("already_exists");
+			assert_eq!(
+				fuzz_support::reporter_label(body),
+				Ok(expected),
+				"actual label decision differs"
+			);
+		},
+	}
+}
+
 pub fn do_test(data: &[u8]) {
+	// Compact boundary recipes preserve the existing kind/status/raw format
+	// for all ordinary corpus cases. Even escaped expansion stays below the
+	// actual 16 MiB response budget; no giant seed file is needed.
+	if let [255, b'B', encoding @ (b'N' | b'X'), edge, ..] = data {
+		let length = 2 * 1024 * 1024 - 1 + usize::from(edge % 3);
+		let token = if *encoding == b'X' { "\\u0073" } else { "s" };
+		let body = format!(r#"{{"id":7,"slug":"{}"}}"#, token.repeat(length));
+		assert!(body.len() < 16 * 1024 * 1024);
+		check_response(0, StatusCode::OK, body.as_bytes());
+		return;
+	}
 	let mut input = ByteSource::new(data);
 	let kind = input.u8().unwrap_or(0) % 5;
 	let Ok(status) = StatusCode::from_u16(input.u16().unwrap_or(200)) else { return };
 	let body = input.rest();
+	check_response(kind, status, body);
+}
+
+fn check_response(kind: u8, status: StatusCode, body: &[u8]) {
+	check_actual_decoder(kind, body);
+	// Historical helpers deliberately retain their old schema-only admission.
+	// Actual production App slug admission above also applies the exact policy.
 	match kind {
 		0 => {
 			let expected = Fields(&["id", "slug"]).decode(body);
@@ -395,6 +508,50 @@ mod tests {
 		] {
 			check(3, body);
 			check(4, body);
+		}
+	}
+
+	#[test]
+	fn app_slug_policy_and_exact_text_controls() {
+		for slug in
+			["", " exact e\u{301} *markup* ", "line\ncontrol", "bidi\u{202e}", "\u{85}", "\u{e000}"]
+		{
+			let body = serde_json::json!({"id":7,"slug":slug}).to_string();
+			check(0, body.as_bytes());
+		}
+		for length in [2 * 1024 * 1024 - 1, 2 * 1024 * 1024, 2 * 1024 * 1024 + 1] {
+			let body = serde_json::json!({"id":7,"slug":"s".repeat(length)}).to_string();
+			check(0, body.as_bytes());
+		}
+	}
+
+	#[test]
+	fn direct_app_link() {
+		check(0, br#"{"id":7,"slug":" exact e\u0301 "}"#);
+	}
+	#[test]
+	fn direct_installation_link() {
+		check(1, br#"{"id":7}"#);
+	}
+	#[test]
+	fn direct_token_link() {
+		check(2, br#"{"token":" exact e\u0301\r\n\t "}"#);
+	}
+	#[test]
+	fn direct_issue_link() {
+		check(3, br#"{"number":7}"#);
+	}
+	#[test]
+	fn direct_label_link() {
+		check(4, b"already_exists\xff");
+	}
+
+	#[test]
+	fn compact_boundaries_reach_decoded_caps() {
+		for encoding in *b"NX" {
+			for edge in 0..3 {
+				do_test(&[255, b'B', encoding, edge]);
+			}
 		}
 	}
 }

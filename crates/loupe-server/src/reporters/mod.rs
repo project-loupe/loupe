@@ -14,9 +14,10 @@ pub mod email;
 pub mod github;
 pub mod github_app;
 mod ingress;
-
 pub use email::EmailReporter;
 pub use github::GithubReporter;
+#[cfg(fuzzing)]
+pub(crate) use ingress::fuzz_support as ingress_fuzz;
 
 /// Result of a successful dispatch — opaque receipt the caller can stamp
 /// onto `findings.reported_at` (or scan_history) for audit.
