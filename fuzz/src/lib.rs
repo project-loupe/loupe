@@ -29,6 +29,7 @@ pub mod server_capability_header;
 mod server_common;
 pub mod server_config;
 pub mod server_github_response;
+pub mod server_ingress_requests;
 pub mod server_report_email;
 pub mod server_report_github;
 pub mod server_request_parsers;

@@ -11,6 +11,10 @@ use serde_json::value::RawValue;
 use super::text::{json_secret, json_text};
 use super::{DecodeError, OperatorJson};
 
+#[cfg(fuzzing)]
+#[path = "registry_fuzz.rs"]
+pub(crate) mod fuzz;
+
 // No general Serialize/Deserialize/Debug or public Value escape. This exact
 // forward document deliberately does not apply semantic Payload normalization.
 struct OperatorScannerConfig(serde_json::Value);

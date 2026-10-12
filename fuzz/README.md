@@ -308,6 +308,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `server_capability_header` | Exact header-text/length admission, unchanged hash bytes and closed denial diagnostics |
 | `server_config` | Actual file loader, owner-list rejection, root keys, and exact relative path resolution |
 | `server_github_response` | All five production Reporter validators via fixed cfg-only fixtures; independent exact slug policy and raw schema oracles, compact escaped/unescaped 2 MiB boundary recipes, fixed errors and token redaction. Legacy status helpers remain separate compatibility controls; actual HTTP collection belongs to transport tests. |
+| `server_ingress_requests` | All six Worker/eight Operator body decoders and three queries; independent exact fields, Unicode/path/secret policies, original Agent spans and closed diagnostics |
 | `server_report_email` | Exact header boundary, CR/LF admission and finding-content isolation from headers |
 | `server_report_github` | Title normalization, title/body character caps and observed S3 fence-containment cases |
 | `server_request_parsers` | Protocol headers, state/kind filters, legacy clone URLs and exact FTS stripping/token admission |
@@ -391,6 +392,19 @@ Protocol versions allow the existing unsigned-decimal leading plus; clone
 URLs retain their permissive legacy grammar. See [server target contracts](SERVER-TARGETS.md)
 for these parsers, configuration and reporting boundaries, including the
 GitHub response target.
+
+`server_ingress_requests` uses byte zero modulo 17 to select six Worker bodies,
+eight Operator bodies, Worker/Operator search or the Operator job query. Remaining
+bytes are original JSON or a URI, capped at 64 KiB for ordinary harness inputs.
+Legacy DTOs supply the schema oracle; independent rules check exact admitted
+text, paths, secrets and closed errors before any legacy projection. A compact
+`[255, 'S', mode]` recipe records expected Agent token positions while appending
+the original message, including equal-content unused/neighbor tokens, escaped
+keys, NFD and surrogate pairs. `[255, 'B', field, edge, encoding]` generates
+literal or escaped cap-minus-one/exact/plus-one fields (2 MiB text/credential or
+512-byte path). These are pure decoder boundaries, distinct from the HTTP
+collector's 2 MiB cap. The target does not exercise authentication, budget
+charging, stream cancellation or cleanup; those require actual transport checks.
 
 The report targets pass JSON findings to the actual renderers. Email input
 also supplies `from`, `to` and `subject`, whose newline checks must match

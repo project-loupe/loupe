@@ -10,6 +10,10 @@ use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
 
+#[cfg(fuzzing)]
+#[path = "query_fuzz.rs"]
+pub(crate) mod fuzz;
+
 struct SearchText;
 impl TextPolicy for SearchText {
 	const FIELD: &'static str = "finding_search";

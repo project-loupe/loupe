@@ -10,6 +10,10 @@ use serde_json::value::RawValue;
 use super::text::json_text;
 use super::{DecodeError, WorkerBody, WorkerJson};
 
+#[cfg(fuzzing)]
+#[path = "jobs_fuzz.rs"]
+pub(crate) mod fuzz;
+
 pub(crate) struct LeaseRequestDecoder;
 pub(crate) struct LeaseInput {
 	protocol_version: u16,
@@ -163,6 +167,8 @@ macro_rules! carried {
 			.checked_add(token.get().len())
 			.filter(|end| *end <= bytes.len())
 			.ok_or(DecodeError::Syntax)?;
+		#[cfg(fuzzing)]
+		crate::fuzz_support::observe_carry(stringify!($validator), start, end);
 		$view.carry::<Agent>(start..end).ok_or(DecodeError::Syntax)?.validate($validator)?
 	}};
 }

@@ -79,3 +79,7 @@ crates/loupe-worker/src/mcp/legacy_test_api.rs test-only fixed Sandbox fixture e
 crates/loupe-cli/src/fuzz_support.rs cfg-only fixed Server response fixture mint; no normal API or arbitrary source decoder
 fuzz/src/cli_config_input.rs C fuzz entry borrows the runner-provided readable input slice
 fuzz/src/cli_ingress_response.rs C fuzz entry borrows the runner-provided readable input slice
+crates/loupe-server/src/ingress/jobs_fuzz.rs fixed Worker fixture: synthetic original message bytes only in cfg(fuzzing)
+crates/loupe-server/src/ingress/registry_fuzz.rs fixed Operator fixture: synthetic original message bytes only in cfg(fuzzing)
+crates/loupe-server/src/ingress/query_fuzz.rs fixed Worker/Operator query fixtures: original synthetic Uri only in cfg(fuzzing)
+fuzz/src/server_ingress_requests.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

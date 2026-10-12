@@ -21,7 +21,7 @@ fn decimal_u16(bytes: &[u8]) -> Option<u16> {
 	Some(value)
 }
 
-fn clone_url_shape(text: &str) -> Option<(String, String, String)> {
+pub(super) fn clone_url_shape(text: &str) -> Option<(String, String, String)> {
 	let (scheme, rest) = text.split_once("://")?;
 	let segments: Vec<_> = rest.split('/').collect();
 	let (host, owner, raw_repo) = match scheme {

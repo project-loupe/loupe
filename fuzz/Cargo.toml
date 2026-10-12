@@ -8,6 +8,7 @@ rust-version = "1.88"
 [dependencies]
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_urlencoded = { version = "0.7", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 loupe-core = { path = "../crates/loupe-core", features = ["source-migration"] }
 loupe-cli = { path = "../crates/loupe-cli" }
