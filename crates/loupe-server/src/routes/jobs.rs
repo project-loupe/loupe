@@ -288,7 +288,7 @@ pub(crate) const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
 pub async fn lease(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Json(req): Json<LeaseRequest>,
-) -> Result<Json<LeaseResponse>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
 	check_version(req.protocol_version)?;
 	// A worker is eligible for verify jobs iff it advertised at least
 	// one `verify:*` capability. Fine-grained tag matching (e.g.
@@ -297,10 +297,12 @@ pub async fn lease(
 	let accepts_verify = req.capabilities.iter().any(|c| c.starts_with("verify:"));
 
 	if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
-		return Ok(Json(LeaseResponse::Lease(Box::new(env))));
+		return super::credential_response::lease(&LeaseResponse::Lease(Box::new(env)));
 	}
 	if req.wait_seconds == 0 {
-		return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+		return super::credential_response::lease(&LeaseResponse::Empty {
+			protocol_version: PROTOCOL_VERSION,
+		});
 	}
 
 	let wait = std::time::Duration::from_secs(req.wait_seconds.min(MAX_LEASE_WAIT_SECS) as u64);
@@ -312,19 +314,21 @@ pub async fn lease(
 		tokio::pin!(notified);
 
 		if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
-			return Ok(Json(LeaseResponse::Lease(Box::new(env))));
+			return super::credential_response::lease(&LeaseResponse::Lease(Box::new(env)));
 		}
 
 		let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 		if remaining.is_zero() {
-			return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+			return super::credential_response::lease(&LeaseResponse::Empty {
+				protocol_version: PROTOCOL_VERSION,
+			});
 		}
 		tokio::select! {
 			_ = &mut notified => {
 				// New job — loop and try the lease again.
 			}
 			_ = tokio::time::sleep(remaining) => {
-				return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+				return super::credential_response::lease(&LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION });
 			}
 		}
 	}

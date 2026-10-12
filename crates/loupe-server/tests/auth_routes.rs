@@ -102,6 +102,8 @@ async fn admin_mints_worker_then_revokes_it() {
 	let req = RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: "w1".into() };
 	let resp = admin.post("https://loupe-server/v1/workers").json(&req).send().await.unwrap();
 	assert_eq!(resp.status(), 201, "register worker: {}", resp.status());
+	assert_eq!(resp.headers()["content-type"], "application/json");
+	assert_eq!(resp.headers()[PROTOCOL_VERSION_HEADER], PROTOCOL_VERSION.to_string());
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	assert!(bundle.worker_id > 0);
 	assert!(bundle.client_cert_pem.contains("BEGIN CERTIFICATE"));

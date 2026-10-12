@@ -197,6 +197,8 @@ async fn lease_job(worker: &reqwest::Client) -> LeaseEnvelope {
 		.await
 		.unwrap();
 	assert!(resp.status().is_success());
+	assert_eq!(resp.headers()["content-type"], "application/json");
+	assert_eq!(resp.headers()[loupe_proto::PROTOCOL_VERSION_HEADER], PROTOCOL_VERSION.to_string());
 	match resp.json::<LeaseResponse>().await.unwrap() {
 		LeaseResponse::Lease(env) => *env,
 		LeaseResponse::Empty { .. } => panic!("queue should not be empty"),
@@ -215,6 +217,8 @@ async fn lease_verify_job(worker: &reqwest::Client) -> LeaseEnvelope {
 		.await
 		.unwrap();
 	assert!(resp.status().is_success());
+	assert_eq!(resp.headers()["content-type"], "application/json");
+	assert_eq!(resp.headers()[loupe_proto::PROTOCOL_VERSION_HEADER], PROTOCOL_VERSION.to_string());
 	match resp.json::<LeaseResponse>().await.unwrap() {
 		LeaseResponse::Lease(env) => *env,
 		LeaseResponse::Empty { .. } => panic!("verify queue should not be empty"),

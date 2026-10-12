@@ -7,6 +7,7 @@
 //! the `X-Loupe-Protocol` request/response header cover routes whose
 //! request body is empty or query-string only.
 
+mod credential_wire;
 mod findings_admin;
 mod job_io;
 mod lease;

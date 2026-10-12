@@ -21,7 +21,7 @@ use crate::state::AppState;
 /// records its fingerprint as a `kind = 'worker'` row.
 pub async fn create(
 	State(state): State<AppState>, Json(req): Json<RegisterWorkerRequest>,
-) -> Result<(StatusCode, Json<RegisterWorkerResponse>), (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -52,7 +52,7 @@ pub async fn create(
 		client_key_pem: bundle.key_pem,
 		ca_cert_pem: state.ca.cert_pem().to_owned(),
 	};
-	Ok((StatusCode::CREATED, Json(resp)))
+	super::credential_response::worker(&resp)
 }
 
 /// `DELETE /v1/workers/:id` — admin-only. Marks the worker revoked.

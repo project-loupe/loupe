@@ -18,6 +18,8 @@ use loupe_proto::{
 };
 use loupe_provenance::Secret;
 
+mod credential_request;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe operator CLI")]
 struct Cli {
@@ -519,7 +521,12 @@ async fn github_app_set(
 		app_id: a.app_id,
 		private_key_pem: loupe_provenance::Secret::new(private_key_pem),
 	};
-	let resp = client.put(url(base, "/v1/github-app")).json(&req).send().await?;
+	let resp = credential_request::with_body(
+		client.put(url(base, "/v1/github-app")),
+		req.credential_json()?,
+	)
+	.send()
+	.await?;
 	server_response(resp, "configure GitHub App").await?;
 	println!("github app {} configured", a.app_id);
 	Ok(())
@@ -647,7 +654,10 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		verification_enabled,
 		require_approval,
 	};
-	let resp = client.post(url(base, "/v1/repos")).json(&req).send().await?;
+	let resp =
+		credential_request::with_body(client.post(url(base, "/v1/repos")), req.credential_json()?)
+			.send()
+			.await?;
 	let body: RegisterRepoResponse =
 		serde_json::from_slice(&server_response(resp, "register repo").await?)?;
 	println!("repo_id={}", body.repo_id);
@@ -753,11 +763,12 @@ async fn repo_rotate_pat(
 ) -> Result<()> {
 	let req =
 		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: Secret::new(a.pat) };
-	let resp = client
-		.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id)))
-		.json(&req)
-		.send()
-		.await?;
+	let resp = credential_request::with_body(
+		client.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id))),
+		req.credential_json()?,
+	)
+	.send()
+	.await?;
 	server_response(resp, "rotate repo PAT").await?;
 	Ok(())
 }
@@ -771,11 +782,12 @@ async fn repo_set_github_reporting(
 		target_repo: a.target_repo,
 		github_pat: a.pat.map(Secret::new),
 	};
-	let resp = client
-		.put(url(base, &format!("/v1/repos/{}/reporting/github", a.id)))
-		.json(&req)
-		.send()
-		.await?;
+	let resp = credential_request::with_body(
+		client.put(url(base, &format!("/v1/repos/{}/reporting/github", a.id))),
+		req.credential_json()?,
+	)
+	.send()
+	.await?;
 	server_response(resp, "set GitHub reporting").await?;
 	Ok(())
 }
