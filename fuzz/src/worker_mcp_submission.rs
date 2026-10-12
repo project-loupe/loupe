@@ -72,25 +72,52 @@ pub fn do_test(data: &[u8]) {
 					})
 					.collect::<Vec<_>>()
 					.join("\n");
+				assert_eq!(fingerprint, independent_fingerprint(&relative, &window));
+			} else {
 				assert_eq!(
 					fingerprint,
-					loupe_worker::fingerprint::compute(
-						loupe_worker::scanners::llm_code_review::SCANNER_ID,
-						&relative,
-						&window
-					)
+					independent_fingerprint(&relative, &format!("L{start}-L{end}")),
+					"unreadable or invalid UTF-8 source changed fallback hash"
 				);
 			}
 			let args = serde_json::json!({"severity":"high","title":"title","file":path,
 				"line_start":start,"line_end":end,"description":"description","poc_unified":"diff"});
-			let finding = fuzz_support::finding(workdir.path(), &args)
-				.unwrap_or_else(|e| panic!("finding: {e}"));
-			assert_eq!(finding.line_start, Some(start));
-			assert_eq!(finding.line_end, Some(end));
+			let finding = fuzz_support::finding(workdir.path(), &args);
+			// This fixture includes into_legacy_submission: after the first
+			// path owner admits a whitespace basename, that temporary exit
+			// refuses it. This is not a general repeated-normalization rule.
+			// M must rebind this check when it removes the legacy exit; the
+			// complete submission must still reject a whitespace-only path.
+			let admitted = crate::worker_mcp_ingress::oracle::normalized_path(path)
+				.is_ok_and(|normalized| !normalized.trim().is_empty());
+			assert_eq!(finding.is_ok(), admitted, "actual original MCP finding admission differs");
+			if let Ok(finding) = finding {
+				assert_eq!(finding.file_path, relative);
+				assert_eq!(finding.line_start, start);
+				assert_eq!(finding.line_end, end);
+				assert_eq!(finding.fingerprint, fingerprint);
+			}
 		}
 	}
 	#[cfg(unix)]
 	assert!(fuzz_support::normalize(workdir.path(), "escape/file").is_err());
+}
+
+fn independent_fingerprint(file: &str, window: &str) -> String {
+	let normalized = window
+		.lines()
+		.filter_map(|line| {
+			let words = line.split_whitespace().collect::<Vec<_>>();
+			(!words.is_empty()).then(|| words.join(" ").to_lowercase())
+		})
+		.collect::<Vec<_>>()
+		.join("\n");
+	let mut digest = blake3::Hasher::new();
+	digest.update(b"llm-code-review\0");
+	digest.update(file.as_bytes());
+	digest.update(b"\0");
+	digest.update(normalized.as_bytes());
+	digest.finalize().to_hex().to_string()
 }
 
 pub fn worker_mcp_submission_test<Out: test_logger::Output>(data: &[u8], _out: Out) {
@@ -104,4 +131,60 @@ pub fn worker_mcp_submission_test<Out: test_logger::Output>(data: &[u8], _out: O
 pub unsafe extern "C" fn worker_mcp_submission_run(data: *const u8, datalen: usize) {
 	// SAFETY: supplied by the caller as documented above.
 	do_test(unsafe { std::slice::from_raw_parts(data, datalen) });
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn path_input(path: &str) -> Vec<u8> {
+		let mut input = Vec::new();
+		input.extend(1u32.to_le_bytes());
+		input.extend(1u32.to_le_bytes());
+		input.extend(
+			u16::try_from(path.len()).unwrap_or_else(|e| panic!("path length: {e}")).to_le_bytes(),
+		);
+		input.extend(path.as_bytes());
+		input.extend(b"fn source() {}\n");
+		input
+	}
+
+	fn check_path(path: &str, expected_first: Option<&str>, projection_admitted: bool) {
+		let first = crate::worker_mcp_ingress::oracle::normalized_path(path);
+		assert_eq!(first.as_deref().ok(), expected_first, "first path owner changed");
+		let workdir = tempfile::tempdir().unwrap_or_else(|e| panic!("worktree: {e}"));
+		let args = serde_json::json!({"severity":"high","title":"title","file":path,
+			"line_start":1,"line_end":1,"description":"description","poc_unified":"diff"});
+		let finding = fuzz_support::finding(workdir.path(), &args);
+		assert_eq!(finding.is_ok(), projection_admitted, "actual legacy projection changed");
+		if let Ok(finding) = finding {
+			assert_eq!(Some(finding.file_path.as_str()), expected_first);
+		}
+		do_test(&path_input(path));
+	}
+
+	#[test]
+	fn captured_whitespace_path_reaches_legacy_refusal() {
+		do_test(include_bytes!(
+			"../test_cases/worker_mcp_submission/whitespace-projection-captured"
+		));
+	}
+
+	#[test]
+	fn space_slash_reaches_legacy_refusal() {
+		check_path(" /", Some(" "), false);
+	}
+
+	#[test]
+	fn space_curdir_reaches_legacy_refusal() {
+		check_path(" /./", Some(" "), false);
+	}
+
+	#[test]
+	fn raw_space_refusal_and_significant_space_controls() {
+		check_path(" ", None, false);
+		check_path(" /a", Some(" /a"), true);
+		check_path(" a/", Some(" a"), true);
+		check_path("src/lib.rs", Some("src/lib.rs"), true);
+	}
 }

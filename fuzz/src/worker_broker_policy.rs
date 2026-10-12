@@ -20,8 +20,13 @@ pub fn do_test(data: &[u8]) {
 		let original = serde_json::from_slice::<Value>(data).ok();
 		let expected = original.as_ref().is_some_and(|value| policy_allows(value, claude));
 		let actual = fuzzing::request_policy(data, &backend);
-		assert_eq!(actual.is_some(), expected, "broker policy acceptance differs from oracle");
-		if let Some(body) = actual {
+		assert_eq!(actual.is_ok(), expected, "broker policy acceptance differs from oracle");
+		assert_eq!(
+			actual.as_ref().err().copied(),
+			denial(original.as_ref(), claude),
+			"closed denial class/precedence differs"
+		);
+		if let Ok(body) = actual {
 			let value: Value = serde_json::from_slice(&body)
 				.unwrap_or_else(|_| panic!("broker emitted invalid JSON"));
 			assert_eq!(value["model"], "pinned-model");
@@ -30,7 +35,7 @@ pub fn do_test(data: &[u8]) {
 			assert!(policy_allows(&value, claude));
 			assert_eq!(
 				fuzzing::request_policy(&body, &backend),
-				Some(body.clone()),
+				Ok(body.clone()),
 				"policy rewrite is not idempotent"
 			);
 			// Rewriting model/effort must preserve every unrelated request field.
@@ -41,6 +46,9 @@ pub fn do_test(data: &[u8]) {
 			}
 			expected[field]["effort"] = Value::String("high".into());
 			assert_eq!(value, expected, "policy rewrite changed unrelated fields");
+			if original_matches(data, claude) {
+				assert_eq!(body, data, "matching request lost original wire bytes");
+			}
 		}
 	}
 	let headers = headers(data);
@@ -70,6 +78,37 @@ pub fn do_test(data: &[u8]) {
 		total += expected;
 		assert_eq!(u128::from(budget.total()), total);
 	}
+}
+
+fn original_matches(bytes: &[u8], claude: bool) -> bool {
+	serde_json::from_slice::<Value>(bytes).ok().is_some_and(|value| {
+		value["model"] == "pinned-model"
+			&& value[if claude { "output_config" } else { "reasoning" }]["effort"] == "high"
+	})
+}
+
+fn denial(value: Option<&Value>, claude: bool) -> Option<fuzzing::PolicyError> {
+	use fuzzing::PolicyError;
+	let Some(object) = value.and_then(Value::as_object) else {
+		return Some(PolicyError::InvalidJson);
+	};
+	if object
+		.get("mcp_servers")
+		.is_some_and(|servers| servers.as_array().is_none_or(|items| !items.is_empty()))
+	{
+		return Some(PolicyError::McpServers);
+	}
+	for tool in object.get("tools").and_then(Value::as_array).into_iter().flatten() {
+		if let Some(kind) = tool.get("type").and_then(Value::as_str) {
+			if kind == "web_fetch" || kind.starts_with("web_fetch_") {
+				return Some(PolicyError::ProviderFetch);
+			}
+			if !claude && ["mcp", "remote_mcp"].contains(&kind) {
+				return Some(PolicyError::RemoteMcp);
+			}
+		}
+	}
+	None
 }
 
 fn policy_allows(value: &Value, claude: bool) -> bool {
@@ -151,4 +190,12 @@ pub fn worker_broker_policy_test<Out: test_logger::Output>(data: &[u8], _out: Ou
 pub unsafe extern "C" fn worker_broker_policy_run(data: *const u8, datalen: usize) {
 	// SAFETY: the caller provides readable bytes for the duration of this call.
 	do_test(unsafe { std::slice::from_raw_parts(data, datalen) });
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn fixed_sandbox_request_owner_preserves_denials_and_allowed_bytes() {
+		for body in [b"invalid".as_slice(),b"[]",br#"{}"#,br#"{"mcp_servers":[],"tools":[{"type":"web_search"}]}"#,br#"{"mcp_servers":[{}],"tools":[{"type":"web_fetch"}]}"#,br#"{"tools":[{"type":"web_fetch"}]}"#,br#"{"tools":[{"type":"web_fetch_20250910"}]}"#,br#"{"tools":[{"type":"mcp"}]}"#,br#"{"tools":[{"type":"remote_mcp"}]}"#,br#"{ "model":"pinned-model", "output_config":{"effort":"high"}, "reasoning":{"effort":"high"}, "messages":[{"content":"exact"}] }"#] { super::do_test(body); }
+	}
 }

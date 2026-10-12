@@ -67,6 +67,8 @@ impl RepoFinding {
 	/// Temporary concrete Scanner::scan exit. M changes the trait to Repo
 	/// findings; no Agent mark is introduced by this projection.
 	pub(super) fn into_legacy(self) -> loupe_core::Finding {
+		#[cfg(fuzzing)]
+		observe::record(&self.0);
 		let f = self.0;
 		loupe_core::Finding {
 			scanner_id: f.scanner_id.expose().to_owned(),
@@ -81,5 +83,58 @@ impl RepoFinding {
 			poc_unified: None,
 			fingerprint: f.fingerprint.expose().to_owned(),
 		}
+	}
+}
+
+/// Observe the actual Repo-typed result immediately before its temporary exit.
+#[cfg(fuzzing)]
+pub(super) mod observe {
+	use std::cell::RefCell;
+
+	use super::*;
+	#[derive(Debug, PartialEq, Eq)]
+	pub struct RepoFindingObservation {
+		pub scanner: String,
+		pub title: String,
+		pub description: String,
+		pub path: Option<String>,
+		pub start: Option<u32>,
+		pub end: Option<u32>,
+		pub cwe: Option<String>,
+		pub fingerprint: String,
+	}
+	thread_local! { static FINDINGS: RefCell<Option<Vec<RepoFindingObservation>>> = const { RefCell::new(None) }; }
+	pub(crate) struct Scope;
+	impl Scope {
+		pub(crate) fn begin() -> Self {
+			FINDINGS.with(|state| *state.borrow_mut() = Some(Vec::new()));
+			Self
+		}
+		pub(crate) fn finish(self) -> Vec<RepoFindingObservation> {
+			FINDINGS.with(|state| state.borrow_mut().take().unwrap_or_default())
+		}
+	}
+	impl Drop for Scope {
+		fn drop(&mut self) {
+			FINDINGS.with(|state| {
+				state.borrow_mut().take();
+			});
+		}
+	}
+	pub(super) fn record(finding: &Finding<Repo>) {
+		FINDINGS.with(|state| {
+			if let Some(observed) = state.borrow_mut().as_mut() {
+				observed.push(RepoFindingObservation {
+					scanner: finding.scanner_id.expose().to_owned(),
+					title: finding.title.expose().to_owned(),
+					description: finding.description.expose().to_owned(),
+					path: finding.file_path.as_ref().map(|v| v.expose().to_owned()),
+					start: finding.line_start,
+					end: finding.line_end,
+					cwe: finding.cwe.as_ref().map(|v| v.expose().to_owned()),
+					fingerprint: finding.fingerprint.expose().to_owned(),
+				});
+			}
+		});
 	}
 }

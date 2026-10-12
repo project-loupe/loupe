@@ -410,16 +410,15 @@ impl RepoCursor {
 	}
 }
 
-#[cfg(fuzzing)]
-fn decode_cursor(bytes: &[u8]) -> Option<String> {
-	cursor_text(bytes).map(str::to_owned)
-}
-
 /// Exercise the persisted cursor and credential context boundary.
 #[cfg(fuzzing)]
 pub mod fuzz_support {
+	#[allow(unsafe_code)]
 	pub fn decode_cursor(bytes: &[u8]) -> Option<String> {
-		super::decode_cursor(bytes)
+		use super::*;
+		// SAFETY: cfg-only original Repo cursor fixture bytes, before decoding.
+		let original = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
+		original.validate(RepoCursorDecoder).unwrap().map(RepoCursor::legacy_revision)
 	}
 
 	pub fn encode_cursor(sha: &str) -> Vec<u8> {

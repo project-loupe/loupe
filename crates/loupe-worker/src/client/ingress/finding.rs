@@ -49,6 +49,8 @@ macro_rules! carry {
 	($u:expr, $token:expr, $validator:expr) => {{
 		let token = $token;
 		let range = token_range($u.get(), token)?;
+		#[cfg(fuzzing)]
+		crate::ingress_text::observe::agent(range.clone());
 		$u.carry::<Agent>(range).ok_or(DecodeError::Syntax)?.validate($validator)?
 	}};
 }

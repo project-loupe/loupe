@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use loupe_core::format_finding_id;
-#[cfg(any(test, fuzzing))]
+#[cfg(test)]
 use loupe_core::{Finding, Severity};
 #[cfg(test)]
 use loupe_proto::PROTOCOL_VERSION;
@@ -75,7 +75,7 @@ const FINGERPRINT_CONTEXT_LINES: u32 = 2;
 /// Pull a required string argument out of an MCP `tools/call` payload.
 /// Compresses the `args.get(k).and_then(as_str).context(...)` triplet
 /// repeated across every tool handler.
-#[cfg(any(test, fuzzing))]
+#[cfg(test)]
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 	args.get(key)
 		.and_then(|v| v.as_str())
@@ -87,7 +87,7 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 /// large line number doesn't poison downstream arithmetic — line
 /// counts are 1-indexed and capped well below 4 billion in any real
 /// source file.
-#[cfg(any(test, fuzzing))]
+#[cfg(test)]
 fn arg_u32(args: &Value, key: &str) -> Result<u32> {
 	let v = args
 		.get(key)
@@ -375,6 +375,8 @@ where
 }
 
 mod framing;
+#[cfg(kani)]
+pub(crate) use framing::admitted_record_len;
 mod ingress;
 #[cfg(test)]
 mod legacy_test_api;
@@ -871,7 +873,7 @@ async fn query_prior_findings(
 /// Pure function — extracted from `tool_submit_finding` so tests can
 /// exercise the fingerprint / clamp / parse logic without standing
 /// up an MCP server or a real HTTP backend.
-#[cfg(any(test, fuzzing))]
+#[cfg(test)]
 pub(crate) fn build_finding_from_args(workdir: &Path, args: &Value) -> Result<Finding> {
 	let severity_str = arg_str(args, "severity")?;
 	let severity: Severity =

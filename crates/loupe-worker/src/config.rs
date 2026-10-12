@@ -469,6 +469,54 @@ impl WorkerConfig {
 #[cfg(fuzzing)]
 pub mod fuzzing {
 	use super::*;
+	#[derive(Clone, Copy, Debug)]
+	pub enum ArgumentCase {
+		Text,
+		Url,
+		Path,
+	}
+	#[derive(Debug, PartialEq, Eq)]
+	pub enum ArgumentValue {
+		Text(String),
+		Url(String),
+		Path(std::ffi::OsString),
+	}
+	pub fn argument(
+		case: ArgumentCase, original: &std::ffi::OsStr,
+	) -> Result<ArgumentValue, String> {
+		use clap::builder::TypedValueParser;
+
+		use crate::config_value_parsers::{
+			ConfiguredPathParser, ConfiguredTextParser, ConfiguredUrlParser,
+		};
+		let command = clap::Command::new("worker-fixture");
+		let arg = clap::Arg::new("value");
+		match case {
+			ArgumentCase::Text => ConfiguredTextParser
+				.parse_ref(&command, Some(&arg), original)
+				.map(|v| ArgumentValue::Text(v.legacy_override())),
+			ArgumentCase::Url => ConfiguredUrlParser
+				.parse_ref(&command, Some(&arg), original)
+				.map(|v| ArgumentValue::Url(v.legacy_override().to_string())),
+			ArgumentCase::Path => {
+				ConfiguredPathParser.parse_ref(&command, Some(&arg), original).map(|v| {
+					let path = v.legacy_override();
+					assert_eq!(path.as_path(), v.as_path());
+					ArgumentValue::Path(path.into_os_string())
+				})
+			},
+		}
+		.map_err(|error| error.to_string())
+	}
+	#[allow(unsafe_code)]
+	pub fn file_document(original: &[u8]) -> Result<FileConfig, String> {
+		// SAFETY: cfg-only original Config file fixture, before UTF-8/TOML decoding.
+		let original = Untrusted::new(original, unsafe { Ingress::<Config>::new() });
+		original
+			.validate(ingress::WorkerFileConfigDecoder)
+			.map(ingress::DecodedWorkerFileConfig::into_legacy)
+			.map_err(|error| error.to_string())
+	}
 	pub fn merge(file: FileConfig) -> Result<WorkerConfig> {
 		let mut config = WorkerConfig::default();
 		config.apply_file(file)?;

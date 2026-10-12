@@ -9,6 +9,8 @@ use serde_json::value::RawValue;
 use crate::ingress_text::DecodeError;
 
 mod finding;
+#[cfg(fuzzing)]
+pub mod fuzz_support;
 mod lease;
 mod scanner;
 

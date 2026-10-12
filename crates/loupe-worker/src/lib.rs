@@ -6,6 +6,8 @@ mod test_env;
 
 pub mod client;
 pub mod config;
+#[cfg(fuzzing)]
+mod config_value_parsers;
 pub mod fingerprint;
 mod git_credentials;
 pub mod host_outcome;

@@ -57,6 +57,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
 struct Request {
 	#[allow(dead_code)]
 	jsonrpc: String,
+	#[allow(dead_code)]
 	id: Option<Value>,
 	method: String,
 	params: Option<Value>,
@@ -188,7 +189,7 @@ pub fn do_test(data: &[u8]) {
 		let mut verdict = None;
 		let mut patch = false;
 		for line in lines.iter().filter(|line| !line.trim().is_empty()) {
-			let request = serde_json::from_str::<Request>(line);
+			let request = crate::worker_mcp_ingress::oracle::request(line);
 			if request.as_ref().is_ok_and(|req| req.id.is_none()) {
 				continue;
 			}
@@ -201,6 +202,15 @@ pub fn do_test(data: &[u8]) {
 				continue;
 			};
 			assert_eq!(Some(&reply["id"]), request.id.as_ref());
+			if request.method == "tools/call" && request.arguments.is_err() {
+				assert_eq!(
+					reply["result"]["isError"], true,
+					"invalid original fields reached tool dispatch"
+				);
+				continue;
+			}
+			let request: Request = serde_json::from_str(line)
+				.unwrap_or_else(|error| panic!("admitted original record: {error}"));
 			match request.method.as_str() {
 				"initialize" | "ping" | "notifications/initialized" => {
 					assert!(reply.get("result").is_some())
@@ -325,7 +335,7 @@ fn check_tool(
 	let name = params["name"].as_str().unwrap_or("");
 	let args = &params["arguments"];
 	let failed = reply["result"]["isError"] == true;
-	if args.get("protocol_version").is_some_and(|value| value.as_u64() != Some(1)) {
+	if !crate::worker_mcp_ingress::oracle::arguments_admitted(name, args) {
 		assert!(failed);
 		return;
 	}

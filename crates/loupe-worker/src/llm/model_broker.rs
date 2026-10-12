@@ -935,10 +935,81 @@ fn empty_response(status: StatusCode) -> Response<BrokerBody> {
 #[cfg(fuzzing)]
 pub mod fuzzing {
 	use super::*;
-	pub fn request_policy(body: &[u8], backend: &ModelBrokerBackend) -> Option<Vec<u8>> {
-		enforce_request_policy(&Bytes::copy_from_slice(body), backend)
-			.ok()
-			.map(|body| body.to_vec())
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub enum PolicyError {
+		InvalidJson,
+		ProviderFetch,
+		RemoteMcp,
+		McpServers,
+	}
+	#[allow(unsafe_code)]
+	pub fn request_policy(
+		body: &[u8], backend: &ModelBrokerBackend,
+	) -> Result<Vec<u8>, PolicyError> {
+		// SAFETY: original cfg-only Sandbox request bytes, before the real policy owner.
+		let body = loupe_provenance::Untrusted::new(Bytes::copy_from_slice(body), unsafe {
+			loupe_provenance::Ingress::<loupe_provenance::Sandbox>::new()
+		});
+		ingress::UpstreamRequest::admit(body, backend)
+			.map(ingress::UpstreamRequest::observe_forwarded)
+			.map_err(|error| match error {
+				RequestPolicyError::InvalidJson => PolicyError::InvalidJson,
+				RequestPolicyError::DeniedTool(DeniedToolReason::ProviderFetch) => {
+					PolicyError::ProviderFetch
+				},
+				RequestPolicyError::DeniedTool(DeniedToolReason::RemoteMcp) => {
+					PolicyError::RemoteMcp
+				},
+				RequestPolicyError::DeniedTool(DeniedToolReason::McpServers) => {
+					PolicyError::McpServers
+				},
+			})
+	}
+	#[derive(Debug)]
+	pub struct ProviderObservation {
+		pub forwarded: Vec<u8>,
+		pub captured: Vec<u8>,
+		pub overflow: bool,
+		pub output_total: u64,
+		pub tokens: u64,
+	}
+	#[allow(unsafe_code)]
+	pub fn provider_chunks(
+		chunks: &[&[u8]], initial_output: u64, ceiling: u64,
+	) -> ProviderObservation {
+		let usage = UsageCounters::default();
+		usage.output_bytes.store(initial_output, Ordering::Relaxed);
+		let mut capture = ingress::ProviderCapture::default();
+		let mut forwarded = Vec::new();
+		let mut overflow = false;
+		for original in chunks {
+			// SAFETY: original cfg-only Provider chunk, before capture or interpretation.
+			let chunk =
+				loupe_provenance::Untrusted::new(Bytes::copy_from_slice(original), unsafe {
+					loupe_provenance::Ingress::<loupe_provenance::Provider>::new()
+				});
+			let admitted = chunk
+				.validate(ingress::ToSandbox {
+					capture: &mut capture,
+					usage: &usage,
+					output_ceiling: ceiling,
+				})
+				.unwrap();
+			if let Some(bytes) = admitted.bytes {
+				forwarded.extend_from_slice(&bytes);
+			}
+			if admitted.overflowed {
+				overflow = true;
+				break;
+			}
+		}
+		ProviderObservation {
+			forwarded,
+			captured: capture.observe_captured(),
+			overflow,
+			output_total: usage.snapshot().output_bytes,
+			tokens: capture.token_usage(),
+		}
 	}
 
 	pub fn strip_header(name: &HeaderName, headers: &HeaderMap) -> bool {
@@ -956,9 +1027,6 @@ pub mod fuzzing {
 		}
 	}
 
-	pub fn token_usage(body: &[u8]) -> u64 {
-		token_usage_from_response(body)
-	}
 	pub fn response_headers(headers: &HeaderMap) -> HeaderMap {
 		sanitize_response_headers(headers)
 	}

@@ -56,14 +56,55 @@ pub(crate) fn json_text<P: TextPolicy, S: Source>(
 }
 
 pub(crate) fn token_range(body: &[u8], token: &RawValue) -> Result<Range<usize>, DecodeError> {
-	let start = (token.get().as_ptr() as usize)
-		.checked_sub(body.as_ptr() as usize)
-		.ok_or(DecodeError::Syntax)?;
-	let end = start
-		.checked_add(token.get().len())
-		.filter(|end| *end <= body.len())
-		.ok_or(DecodeError::Syntax)?;
-	Ok(start..end)
+	contained_token_range(
+		body.as_ptr() as usize,
+		body.len(),
+		token.get().as_ptr() as usize,
+		token.get().len(),
+	)
+	.ok_or(DecodeError::Syntax)
+}
+
+/// Arithmetic containment only; the caller still owns the original borrowed token.
+pub(crate) fn contained_token_range(
+	body_address: usize, body_len: usize, token_address: usize, token_len: usize,
+) -> Option<Range<usize>> {
+	let start = token_address.checked_sub(body_address)?;
+	let end = start.checked_add(token_len).filter(|end| *end <= body_len)?;
+	Some(start..end)
+}
+
+/// Fuzz-only observation of the exact range passed by concrete Agent carries.
+/// Scope drop clears observations on early return or unwinding.
+#[cfg(fuzzing)]
+pub(crate) mod observe {
+	use std::cell::RefCell;
+	use std::ops::Range;
+	thread_local! { static SPANS: RefCell<Option<Vec<Range<usize>>>> = const { RefCell::new(None) }; }
+	pub(crate) struct Scope;
+	impl Scope {
+		pub(crate) fn begin() -> Self {
+			SPANS.with(|spans| *spans.borrow_mut() = Some(Vec::new()));
+			Self
+		}
+		pub(crate) fn finish(self) -> Vec<Range<usize>> {
+			SPANS.with(|spans| spans.borrow_mut().take().unwrap_or_default())
+		}
+	}
+	impl Drop for Scope {
+		fn drop(&mut self) {
+			SPANS.with(|spans| {
+				spans.borrow_mut().take();
+			});
+		}
+	}
+	pub(crate) fn agent(range: Range<usize>) {
+		SPANS.with(|spans| {
+			if let Some(spans) = spans.borrow_mut().as_mut() {
+				spans.push(range);
+			}
+		});
+	}
 }
 
 macro_rules! exact_policy {

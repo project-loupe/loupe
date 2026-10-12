@@ -3,6 +3,8 @@ use loupe_core::source_migration::text::{BoundedText, RepoPath};
 use loupe_provenance::{Mark, Repo, Unvalidated, Validate};
 
 use crate::ingress_text::{DecodeError, RevisionText};
+#[cfg(fuzzing)]
+pub mod fuzz_support;
 
 pub(super) struct CheckedOutRevision(BoundedText<RevisionText, Repo>);
 pub(super) struct CheckedOutRevisionDecoder;

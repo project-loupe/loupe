@@ -21,6 +21,10 @@ impl Validate<Bytes, Sandbox> for RequestPolicy<'_> {
 	}
 }
 impl UpstreamRequest {
+	#[cfg(fuzzing)]
+	pub(super) fn observe_forwarded(self) -> Vec<u8> {
+		self.0.to_vec()
+	}
 	pub(super) fn admit(
 		body: Untrusted<Bytes, Sandbox>, backend: &ModelBrokerBackend,
 	) -> Result<Self, RequestPolicyError> {
@@ -40,6 +44,10 @@ impl UpstreamRequest {
 #[derive(Default)]
 pub(super) struct ProviderCapture(Vec<u8>);
 impl ProviderCapture {
+	#[cfg(fuzzing)]
+	pub(super) fn observe_captured(&self) -> Vec<u8> {
+		self.0.clone()
+	}
 	pub(super) fn token_usage(&self) -> u64 {
 		ProviderTokenUsage::decode(self)
 	}

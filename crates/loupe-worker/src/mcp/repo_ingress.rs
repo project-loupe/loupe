@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use loupe_core::source_migration::text::RepoPath;
 use loupe_provenance::{Mark, Repo, Unvalidated, Validate};
+#[cfg(fuzzing)]
+pub(super) mod fuzz_support;
 
 pub(super) struct SubmittedPathMembership<'a> {
 	pub(super) workdir: &'a Path,

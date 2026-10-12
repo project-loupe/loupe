@@ -9,10 +9,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use loupe_http::MAX_RESPONSE_BYTES;
-use loupe_proto::{
-	FindingDetail, HeartbeatResponse, JobCapability, LeaseResponse, ListFindingsResponse,
-	PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-};
+use loupe_proto::{JobCapability, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_worker::ServerClient;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
@@ -32,14 +29,9 @@ pub fn do_test(data: &[u8]) {
 		254 => MAX_RESPONSE_BYTES.max(bytes.len()),
 		_ => bytes.len(),
 	};
-	let expected_decode = length <= MAX_RESPONSE_BYTES
-		&& match kind {
-			0 => serde_json::from_slice::<LeaseResponse>(bytes).is_ok(),
-			1 => serde_json::from_slice::<HeartbeatResponse>(bytes).is_ok(),
-			2 => serde_json::from_slice::<ListFindingsResponse>(bytes).is_ok(),
-			3 => serde_json::from_slice::<FindingDetail>(bytes).is_ok(),
-			_ => false,
-		};
+	let expected = (kind < 4 && length <= MAX_RESPONSE_BYTES)
+		.then(|| crate::worker_client_ingress::oracle::client(kind, bytes))
+		.flatten();
 	// A new listening port per input exhausts the ephemeral range with
 	// TIME_WAIT sockets during sustained campaigns. Keep the endpoint and
 	// its owning reactor together for the lifetime of this target.
@@ -84,10 +76,10 @@ pub fn do_test(data: &[u8]) {
 			let client = ServerClient::from_parts(reqwest::Client::new(), base);
 			let capability = JobCapability::from_secret("fuzz-capability");
 			let result = match kind {
-				0 => client.lease(Vec::new(), 0).await.map(|_| ()),
-				1 | 4 => client.heartbeat(1, &capability).await.map(|_| ()),
-				2 => client.search_findings(1, &capability, "", 100).await.map(|_| ()),
-				_ => client.get_finding(1, &capability).await.map(|_| ()),
+				0 => client.lease(Vec::new(), 0).await.map(serde_json::to_value),
+				1 | 4 => client.heartbeat(1, &capability).await.map(serde_json::to_value),
+				2 => client.search_findings(1, &capability, "", 100).await.map(serde_json::to_value),
+				_ => client.get_finding(1, &capability).await.map(serde_json::to_value),
 			};
 			// Rejecting an oversized body can close the socket before the
 			// sender finishes. Join failures, unlike write failures, are bugs.
@@ -98,7 +90,10 @@ pub fn do_test(data: &[u8]) {
 				assert!(message.contains("response body exceeds"));
 				assert!(message.len() < 512);
 			} else {
-				assert_eq!(result.is_ok(), expected_decode, "worker response decoder disagrees");
+				assert_eq!(result.is_ok(), expected.is_some(), "worker response decoder disagrees");
+				if let Ok(actual) = &result {
+					assert_eq!(actual.as_ref().ok(), expected.as_ref(), "actual HTTP decoder changed admitted field values");
+				}
 				if kind == 4 {
 					let error = result.err().unwrap_or_else(|| panic!("accepted server error"));
 					assert!(format!("{error:#}").contains("409 Conflict"));

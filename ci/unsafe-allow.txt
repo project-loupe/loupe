@@ -67,7 +67,7 @@ crates/loupe-web/src/ingress/server.rs actual upstream HTTP response capture min
 crates/loupe-web/src/config/input.rs actual native argument/environment and selected PEM/file reads mint Config before named validation
 crates/loupe-worker/src/client.rs actual bounded HTTP response capture mints Server before decoding
 crates/loupe-worker/src/config.rs actual configuration file bytes mint Config before TOML decoding
-crates/loupe-worker/src/config_arguments.rs actual native argument and environment values mint Config before interpretation
+crates/loupe-worker/src/config_value_parsers.rs actual native argument and environment values mint Config before interpretation
 crates/loupe-worker/src/llm/cli_output.rs actual bounded subprocess pipe bytes mint Sandbox before decoding
 crates/loupe-worker/src/llm/model_broker.rs actual limited request body and upstream chunks mint Sandbox and Provider before interpretation
 crates/loupe-worker/src/mcp.rs actual framed MCP records mint Sandbox; filesystem and Git observations mint Repo before interpretation
@@ -85,3 +85,10 @@ crates/loupe-server/src/ingress/query_fuzz.rs fixed Worker/Operator query fixtur
 fuzz/src/server_ingress_requests.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/server_ingress_transport.rs fuzz entry point: actual router and guarded collector controls
 fuzz/src/web_server_response.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+crates/loupe-worker/src/client/ingress/fuzz_support.rs cfg-only fixed Server fixture enters actual client response validators
+crates/loupe-worker/src/mcp/ingress/fuzz_support.rs cfg-only fixed Sandbox fixture enters actual framed record and argument validators
+crates/loupe-worker/src/mcp/repo_ingress/fuzz_support.rs cfg-only fixed Repo observations enter actual filesystem and Git validators
+crates/loupe-worker/src/runner/repo_ingress/fuzz_support.rs cfg-only fixed Repo observations enter actual OID and gitlink validators
+fuzz/src/worker_client_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/worker_mcp_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/worker_repo_observations.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

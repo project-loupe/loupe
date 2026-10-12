@@ -21,6 +21,8 @@ use crate::host_outcome::{CheckoutFailure, HostVerifyReason, ReviewedRevisionFac
 use crate::repo_cache::{RepoCache, RepoKey};
 use crate::scanner::{ScanContext, Scanner, VerifyContext};
 mod repo_ingress;
+#[cfg(fuzzing)]
+pub use repo_ingress::fuzz_support as fuzz_repo;
 
 /// How often the runner heartbeat-pings during a long scan.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);

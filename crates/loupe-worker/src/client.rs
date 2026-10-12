@@ -15,6 +15,8 @@ use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use reqwest::Url;
 
 mod ingress;
+#[cfg(fuzzing)]
+pub use ingress::fuzz_support;
 
 /// Named authentication handoff: Bytes keeps this shared secret owner alive
 /// through header clones. HTTP/TLS encoding and kernel copies are not covered

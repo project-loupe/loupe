@@ -1,6 +1,8 @@
 //! Test-only access to the real MCP request loop and filesystem validators.
 //! The fuzz harness supplies an HTTP stub and a worktree with `fuzz-git`.
 
+pub use super::ingress::fuzz_support::{observe_records, RecordObservation, RequestObservation};
+pub use super::repo_ingress::fuzz_support::{observe_repo, RepoCase, RepoObservation};
 use super::*;
 
 pub struct FuzzSession(Arc<Session>);
@@ -56,8 +58,8 @@ pub fn fingerprint(workdir: &Path, file: &str, start: u32, end: u32) -> String {
 	fingerprint_for(workdir, file, start, end)
 }
 
-pub fn finding(workdir: &Path, args: &Value) -> Result<Finding> {
-	build_finding_from_args(workdir, args)
+pub fn finding(workdir: &Path, args: &Value) -> Result<LlmFindingSubmission> {
+	ingress::fuzz_support::finding_fixture(workdir, args)
 }
 
 pub fn catalogue(verify: bool) -> Value {

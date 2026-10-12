@@ -31,7 +31,9 @@ use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
 mod config_arguments;
-use config_arguments::{ConfiguredPath, ConfiguredText, ConfiguredUrl, WorkerOverridesDecoder};
+mod config_value_parsers;
+use config_arguments::WorkerOverridesDecoder;
+use config_value_parsers::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe scan/verify worker")]

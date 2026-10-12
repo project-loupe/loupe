@@ -2,6 +2,87 @@
 //! Run only through ci/kani.sh; host discovery and JSON wire parsing remain
 //! exercised by their integration tests and S1 fuzz targets.
 
+// Full-usize numeric containment only: actual allocation identity and the
+// borrowed RawValue/source carry remain runtime, type and direct fuzz checks.
+#[cfg(kani)]
+#[kani::proof]
+fn original_token_range_is_contained_without_wrap() {
+	let body: usize = kani::any();
+	let length: usize = kani::any();
+	let token: usize = kani::any();
+	let token_length: usize = kani::any();
+	let actual = crate::ingress_text::contained_token_range(body, length, token, token_length);
+	let start = (token as u128).wrapping_sub(body as u128);
+	let end = start.checked_add(token_length as u128);
+	let expected = token >= body && end.is_some_and(|end| end <= length as u128);
+	assert_eq!(actual.is_some(), expected);
+	if let Some(range) = &actual {
+		assert!(range.start <= range.end && range.end <= length);
+		assert_eq!(range.start as u128, start);
+		assert_eq!(Some(range.end as u128), end);
+	}
+	kani::cover!(
+		actual.as_ref().is_some_and(|r| r.start == 0 && r.end > 0),
+		"starts at original body"
+	);
+	kani::cover!(
+		actual.as_ref().is_some_and(|r| r.end == length && r.start > 0),
+		"ends exactly at body bound"
+	);
+	kani::cover!(token < body && actual.is_none(), "foreign preceding address rejected");
+	kani::cover!(
+		token >= body && start <= usize::MAX as u128 && end.is_some_and(|n| n > usize::MAX as u128),
+		"offset addition overflow rejected"
+	);
+	kani::cover!(
+		actual.as_ref().is_some_and(|r| r.start == length && r.end == length),
+		"empty token at bound"
+	);
+	kani::cover!(
+		token > body && start > length as u128 && actual.is_none(),
+		"foreign following address rejected"
+	);
+}
+
+// Length admission only. Reader framing, delimiters, allocations and async
+// cancellation are deliberately outside this full-usize numeric theorem.
+#[cfg(kani)]
+#[kani::proof]
+fn mcp_record_length_admits_only_content_and_pending_cr() {
+	let current: usize = kani::any();
+	let take: usize = kani::any();
+	let limit: usize = kani::any();
+	let pending: bool = kani::any();
+	let eof: bool = kani::any();
+	let sum = current as u128 + take as u128;
+	// A pending CR is an actual final byte, never an empty phantom byte.
+	kani::assume(!pending || sum > 0);
+	kani::assume(!eof || take == 0);
+	let content = sum - u128::from(pending && !eof);
+	let expected = sum <= usize::MAX as u128 && content <= limit as u128;
+	let actual = crate::mcp::admitted_record_len(current, take, limit, pending, eof);
+	assert_eq!(actual.is_some(), expected);
+	if let Some(length) = actual {
+		assert_eq!(length as u128, sum);
+		assert!(length as u128 <= limit as u128 + u128::from(pending && !eof));
+	}
+	kani::cover!(
+		sum == limit as u128 && actual.is_some() && !pending,
+		"exact content limit accepted"
+	);
+	kani::cover!(
+		sum == limit as u128 + 1 && pending && !eof && actual.is_some(),
+		"one pending CR admitted"
+	);
+	kani::cover!(
+		sum == limit as u128 + 1 && pending && eof && actual.is_none(),
+		"EOF CR counts as content"
+	);
+	kani::cover!(sum > usize::MAX as u128 && actual.is_none(), "length addition overflow rejected");
+	kani::cover!(sum == 0 && limit == 0 && actual == Some(0), "empty content accepted");
+	kani::cover!(sum > limit as u128 + 1 && actual.is_none(), "more than one excess byte rejected");
+}
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 

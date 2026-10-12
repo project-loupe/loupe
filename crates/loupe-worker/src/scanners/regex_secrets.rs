@@ -21,6 +21,8 @@ const SCANNER_ID: &str = "regex-secrets";
 const CAPABILITIES: &[&str] = &["scan:secrets"];
 const MAX_FILE_BYTES: u64 = 1_048_576; // 1 MB; bigger files are skipped.
 mod ingress;
+#[cfg(fuzzing)]
+pub use ingress::observe::RepoFindingObservation;
 
 pub struct RegexSecretsScanner {
 	re: Regex,
@@ -43,6 +45,14 @@ impl RegexSecretsScanner {
 			cancel.cancel();
 		}
 		walk(workdir, &self.re, "fuzz-head", &cancel)
+	}
+	#[cfg(fuzzing)]
+	pub fn fuzz_walk_observed(
+		&self, workdir: &Path, cancelled: bool,
+	) -> Result<(Vec<Finding>, Vec<RepoFindingObservation>)> {
+		let observation = ingress::observe::Scope::begin();
+		let findings = self.fuzz_walk(workdir, cancelled)?;
+		Ok((findings, observation.finish()))
 	}
 }
 

@@ -13,6 +13,8 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 
 use crate::ingress_text::{json_text, token_range, DecodeError, DiscardContent};
+#[cfg(fuzzing)]
+pub(super) mod fuzz_support;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RecordError {
@@ -229,6 +231,8 @@ macro_rules! carry {
 	($u:expr, $raw:expr, $validator:expr) => {{
 		let raw = $raw;
 		let range = token_range($u.get(), raw)?;
+		#[cfg(fuzzing)]
+		crate::ingress_text::observe::agent(range.clone());
 		$u.carry::<Agent>(range).ok_or(DecodeError::Syntax)?.validate($validator)?
 	}};
 }

@@ -319,21 +319,23 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `tls_fingerprint` | Exact SHA-256 of arbitrary DER bytes and repeatability |
 | `tls_input` | Actual guarded file/base64/argument owners, exact bytes, UTF-8 admission, fixed errors and redacted formatting |
 | `tls_pem` | Certificate/key/root parsing, successful CA reload, direct-loader controls and shared reqwest admission against its previous constructor |
-| `worker_broker_policy` | Both provider policies, denied tools and request headers, exact output reservation accounting |
-| `worker_broker_usage` | Independent JSON/SSE accounting, response header filtering and an empty tracing baseline |
-| `worker_config` | Actual file load/merge/validation, absolute resolved paths, model/effort/host policy and nonzero resource limits |
+| `worker_broker_policy` | Actual Sandbox request owner, both provider policies, independent denial precedence, exact rewritten output and request headers |
+| `worker_broker_usage` | Actual Provider chunk admission, capture and counters; independent JSON/SSE accounting, reservation overflow and response header filtering |
+| `worker_client_ingress` | Six actual private Server decoders, original Agent token spans, independent schema/field admission, leased scanner compatibility and exact host outcomes |
+| `worker_config` | Actual Config file and native Clap owners, independent policy/error oracle, exact argument caps and native path bytes |
 | `worker_extract_json` | Independent character-based balanced-span oracle, quoted braces, escapes and malformed JSON |
-| `worker_mcp_rpc` | Real dispatcher/catalogues, request IDs and notifications, stateful verdict/patch order, independent finding admission and metadata-only logs |
-| `worker_mcp_submission` | Independent lexical admission, existing-file containment, symlink rejection, unchanged submitted ranges and snippet clamping |
+| `worker_mcp_ingress` | Actual bounded record framer and private Sandbox decoder, all seven tools, original Agent token spans, syntax/policy precedence and 16 MiB record edges |
+| `worker_mcp_rpc` | Real dispatcher/catalogues, original record and field-policy admission, request IDs, notifications, stateful verdict/patch order and metadata-only logs |
+| `worker_mcp_submission` | Actual original-record finding projection, independent lexical admission, containment, symlink rejection, unchanged ranges and snippet clamping |
 | `worker_network_host` | RFC 1123 hostname boundaries, IPv4 acceptance and complete allowlist/public nft rule templates |
 | `worker_network_parsers` | Actual PID, uid_map, route and address parsers, typed-serde PID forms, identity-pair and complete-set checks |
-| `worker_regex_secrets` | Actual scanner walk, independent byte-match/line oracle, size/cancellation/symlink behavior and metadata-only finding Debug |
-| `worker_repo_cache` | Exact cursor magic/version/body, round trips and status/UTF-8/whitespace behavior of git origin parsing |
+| `worker_regex_secrets` | Actual scanner walk and Repo finding observation, native path admission with legitimate siblings, independent matches/lines/hash and redacted Debug |
+| `worker_repo_cache` | Actual Repo cursor decoder and file reads, independent exact policy and caps, plus git origin status/UTF-8/whitespace behavior |
+| `worker_repo_observations` | Six actual private Repo validators: native paths, file bytes, fingerprint windows, Git diagnostics, binary OIDs and gitlink bytes |
 | `worker_sandbox_args` | Exact namespace/safety flags, supervisor framing, explicit environment names and bind operands, including flag-shaped values |
-| `worker_server_response` | Actual client methods over chunked HTTP, typed response admission, exact byte budget and bounded errors |
-| `worker_source_discovery` | Actual manifest/glob/exclusion parsing, canonical containment, sorted unique paths and complete known-fixture selection |
-| `web_api` | Actual Browser guards, six optional body owners, query/path forwarding and Config callbacks; exact unknown/duplicate/PAT semantics, no upstream call on rejection, stream caps and live cleanup |
-| `web_server_response` | Actual private forwarding over HTTP; protocol/status precedence, 16 MiB collection, lossy UTF-8 expansion, exact diagnostics and source-owner lifetime |
+| `worker_server_response` | Actual clients over chunked HTTP, independent private-decoder admission, exact byte budget and bounded errors |
+| `worker_source_discovery` | Actual Repo manifest/glob/exclusion parsing, independent exact exclusion values, native names, containment and complete fixture selection |
+| `web_api` | Actual browser guards, no upstream call on rejected headers, JSON-enclosed diagnostics and bounded responses |
 
 `storage_source_refs` takes one policy byte (even: 32 items, odd: 64),
 followed by JSON reference bytes. Inputs up to 128 KiB exercise both sides of
@@ -492,13 +494,6 @@ separate fixture directory keeps arbitrary entrypoint names from colliding
 with the package installation. Flag-shaped values remain operands in the
 oracle; the target does not mistake those values for security options.
 
-The web targets share a persistent loopback fixture, use iteration-local
-observations of actual private owners, and join every sender task. The request
-target covers Browser router input and concrete Config callbacks; the response
-target reaches the actual private AdminClient forwarding consumer. Their
-[boundary contract](../crates/loupe-web/DIRECT-COVERAGE.md) records recipes,
-independent oracles and the limits of the cleanup and transport observations.
-
 All 34 main-surface S1 targets plus smoke are registered. S3 additionally
 registers `core_text_exact` for the marked exact-text policies and `tls_input`
 for guarded PEM readers and exports. The former's temporary
@@ -523,7 +518,7 @@ or resource-limit coverage remains an explicit gap in the broad ingress rule.
 | Sendmail status/stderr and pipe interaction | [email_dispatch.rs](../crates/loupe-server/tests/email_dispatch.rs) covers successful stdin delivery; renderer tests reject header injection. No dedicated failure/backpressure target or process-output budget is specified. S3's renderer/log work alone does not establish those properties. |
 | Reporter HTTP collection | `server_ingress_transport` reaches all five actual HTTP consumers, including ordinary 16 MiB and token 256 KiB collection, status precedence, ignored bodies and authentication retry counts. TLS handshakes and dependency-owned copies remain outside this target. |
 | CLI collection and Git diagnostics | Both CLI backend tests exercise L5's one-MiB retention, drain, head/tail and deadlines. L2 tests UTF-8-safe Git display truncation after collection, not a Git pipe-allocation limit. S3 owns labels and disclosure; bounded buffers do not imply redacted logs. |
-| MCP framing and session resources | The RPC target reaches the real loop with at most 64 KiB and 32 fixture lines. Production line collection and session resources have no corresponding transport budget; this remains an unassigned resource-limit gap. S3 labels alone do not impose those limits. |
+| MCP framing and session resources | `worker_mcp_ingress` reaches the actual 16 MiB record framer with compact at/over-cap, delimiter, EOF and cancellation recipes. The RPC target separately exercises the real session with bounded fixtures. These record limits do not establish an aggregate session-resource bound. |
 | Supervisor process output | PID, uid-map, route and address targets bound fixture bytes and cover actual parsers. PID accumulation, command stdout and file reads retain their existing I/O behavior; no production allocation ceiling follows from the harness caps. |
 | HTTP/TLS and DAO authorization orchestration | Server auth/health/jobs and storage scope/lease integration tests own full request/database behavior. Header/DTO/TLS targets cover named custom parsers. S2 adds authority/scope proofs while retaining SQL-boundary tests; S3 adds ingress labels. |
 | Broker relay and stream effects | [model_broker.rs](../crates/loupe-worker/src/llm/model_broker.rs) tests output termination, token exhaustion, authenticated routing and redirect isolation. Policy/accounting targets complement those tests. S2/S3 add proofs and labels. |
