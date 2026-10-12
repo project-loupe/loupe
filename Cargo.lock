@@ -1017,6 +1017,7 @@ dependencies = [
  "clap",
  "loupe-http",
  "loupe-proto",
+ "loupe-provenance",
  "loupe-server",
  "loupe-storage",
  "loupe-tls",

@@ -1121,6 +1121,7 @@ dependencies = [
  "clap",
  "loupe-http",
  "loupe-proto",
+ "loupe-provenance",
  "rand_core 0.6.4",
  "reqwest",
  "serde",

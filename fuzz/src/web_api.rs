@@ -64,7 +64,7 @@ pub fn do_test(data: &[u8]) {
 		);
 		let token = Token::generate();
 		let secret = token.reveal().to_owned();
-		assert_eq!(format!("{token:?}"), "Token(redacted)");
+		assert_eq!(format!("{token:?}"), "[redacted]");
 		let state = WebState::new(
 			client,
 			token,
