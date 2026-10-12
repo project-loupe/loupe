@@ -1,15 +1,15 @@
 //! Concrete Server response validators. Original owner-backed Bytes stay live
-//! through all nested carries; legacy DTO exits are private and removed at M.
+//! through all nested carries and final source-bearing DTO construction.
 
 use bytes::Bytes;
-use loupe_provenance::{Mark, Server, Untrusted, Unvalidated, Validate, ValidateCarrying};
+use loupe_provenance::{Agent, Mark, Server, Untrusted, Unvalidated, Validate, ValidateCarrying};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::ingress_text::DecodeError;
 
 mod finding;
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 pub mod fuzz_support;
 mod lease;
 mod scanner;
@@ -52,8 +52,8 @@ impl ValidateCarrying<&[u8], Server> for FindingDetailResponseDecoder {
 }
 pub(super) fn detail(
 	body: &Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::FindingDetail, DecodeError> {
-	Ok(body.as_bytes().validate_carrying(FindingDetailResponseDecoder)?.into_legacy())
+) -> Result<loupe_proto::FindingDetail<Agent, Server>, DecodeError> {
+	body.as_bytes().validate_carrying(FindingDetailResponseDecoder)
 }
 
 #[derive(Deserialize)]
@@ -62,18 +62,7 @@ struct RawSearch<'a> {
 	#[serde(borrow)]
 	findings: Vec<&'a RawValue>,
 }
-struct DecodedSearchResponse {
-	protocol_version: u16,
-	findings: Vec<finding::DecodedSummary>,
-}
-impl DecodedSearchResponse {
-	fn into_legacy(self) -> loupe_proto::ListFindingsResponse {
-		loupe_proto::ListFindingsResponse {
-			protocol_version: self.protocol_version,
-			findings: self.findings.into_iter().map(finding::DecodedSummary::into_legacy).collect(),
-		}
-	}
-}
+type DecodedSearchResponse = loupe_proto::ListFindingsResponse<Agent, Server>;
 struct SearchFindingsResponseDecoder;
 impl ValidateCarrying<&[u8], Server> for SearchFindingsResponseDecoder {
 	type Output = DecodedSearchResponse;
@@ -87,22 +76,32 @@ impl ValidateCarrying<&[u8], Server> for SearchFindingsResponseDecoder {
 }
 pub(super) fn search(
 	body: &Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::ListFindingsResponse, DecodeError> {
-	Ok(body.as_bytes().validate_carrying(SearchFindingsResponseDecoder)?.into_legacy())
+) -> Result<loupe_proto::ListFindingsResponse<Agent, Server>, DecodeError> {
+	body.as_bytes().validate_carrying(SearchFindingsResponseDecoder)
 }
 
-/// Temporary legacy diagnostic exit, not a general byte extraction adapter.
+pub(super) struct ServerDiagnostic(String);
+impl std::fmt::Debug for ServerDiagnostic {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ServerDiagnostic<Server>([redacted])")
+	}
+}
+impl ServerDiagnostic {
+	pub(super) fn for_diagnostic(&self) -> &str {
+		&self.0
+	}
+}
 struct ServerErrorResponse;
 impl Validate<&[u8], Server> for ServerErrorResponse {
-	type Output = String;
+	type Output = ServerDiagnostic;
 	type Error = std::convert::Infallible;
 	fn validate<'view>(
 		self, u: Unvalidated<'view, &[u8]>, _: Mark<'view, Server>,
-	) -> Result<String, Self::Error> {
-		Ok(String::from_utf8_lossy(u.get()).trim().to_owned())
+	) -> Result<ServerDiagnostic, Self::Error> {
+		Ok(ServerDiagnostic(String::from_utf8_lossy(u.get()).trim().to_owned()))
 	}
 }
-pub(super) fn error(body: &Untrusted<Bytes, Server>) -> String {
+pub(super) fn error(body: &Untrusted<Bytes, Server>) -> ServerDiagnostic {
 	match body.as_bytes().validate(ServerErrorResponse) {
 		Ok(value) => value,
 		Err(never) => match never {},

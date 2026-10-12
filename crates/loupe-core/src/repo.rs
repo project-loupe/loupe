@@ -1,112 +1,153 @@
-use serde::{Deserialize, Serialize};
+use loupe_provenance::Source;
+use serde::Serialize;
 
-/// Where a worker can find a repository to scan.
-///
-/// `clone_url` is what the worker passes to `git clone` — typically an
-/// `https://` URL. The host/owner/repo triple is duplicated so the server
-/// can index without re-parsing every URL.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoSpec {
-	pub host: String,
-	pub owner: String,
-	pub repo: String,
-	pub clone_url: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub branch: Option<String>,
+use super::text::BoundedText;
+use crate::text::policy::{
+	CloneUrl, GitBranch, MailAddress, MailSubjectPrefix, RepoHost, RepoName, RepoOwner,
+};
+
+/// Exact repository settings from the named configuration or wire boundary.
+/// The Git sink separately validates destination and credential authority.
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct RepoSpec<S: Source> {
+	pub host: BoundedText<RepoHost, S>,
+	pub owner: BoundedText<RepoOwner, S>,
+	pub repo: BoundedText<RepoName, S>,
+	pub clone_url: BoundedText<CloneUrl, S>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub branch: Option<BoundedText<GitBranch, S>>,
 }
+record_impls!(RepoSpec { host, owner, repo, clone_url, branch });
 
-/// How a confirmed finding should be reported.
-///
-/// Tagged so future variants (`GithubPr`, ...) can be added without an
-/// `unknown variant` error breaking older clients — readers that don't
-/// know a variant should mark the destination invalid rather than
-/// crash. See `loupe-storage::repos` for that handling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ReportingDestination {
-	/// Open an issue on the target repo, either with a stored GitHub PAT
-	/// or through the server-wide GitHub App.
+/// Source-retaining report settings. Text validation alone does not authorize
+/// a destination or admit these strings as email headers.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
+pub enum ReportingDestination<S: Source> {
 	GithubIssue {
-		target_owner: String,
-		target_repo: String,
-		/// Foreign key into `loupe-storage`'s `secrets` table — the PAT
-		/// itself never travels in serialized `RepoSpec`/`ReportingDestination`
-		/// payloads. `None` means the server files issues as its GitHub
-		/// App instead; rows written before app support always carry the
-		/// id and keep deserializing unchanged.
-		#[serde(default, skip_serializing_if = "Option::is_none")]
+		target_owner: BoundedText<RepoOwner, S>,
+		target_repo: BoundedText<RepoName, S>,
+		#[serde(skip_serializing_if = "Option::is_none")]
 		pat_secret_id: Option<i64>,
 	},
-	/// Send an email to one or more recipients via the server's
-	/// configured `sendmail` binary.
 	Email {
-		to: Vec<String>,
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		from: Option<String>,
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		subject_prefix: Option<String>,
+		to: Vec<BoundedText<MailAddress, S>>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		from: Option<BoundedText<MailAddress, S>>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		subject_prefix: Option<BoundedText<MailSubjectPrefix, S>>,
 	},
-	/// No automatic reporter is configured. Confirmed findings remain
-	/// `confirmed` until an operator either handles them out-of-band or
-	/// configures a reporter and retries delivery.
 	Manual,
 }
-
+impl<S: Source> Clone for ReportingDestination<S> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::GithubIssue { target_owner, target_repo, pat_secret_id } => Self::GithubIssue {
+				target_owner: target_owner.clone(),
+				target_repo: target_repo.clone(),
+				pat_secret_id: *pat_secret_id,
+			},
+			Self::Email { to, from, subject_prefix } => Self::Email {
+				to: to.clone(),
+				from: from.clone(),
+				subject_prefix: subject_prefix.clone(),
+			},
+			Self::Manual => Self::Manual,
+		}
+	}
+}
+impl<S: Source> PartialEq for ReportingDestination<S> {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(
+				Self::GithubIssue { target_owner: a, target_repo: b, pat_secret_id: c },
+				Self::GithubIssue { target_owner: x, target_repo: y, pat_secret_id: z },
+			) => a == x && b == y && c == z,
+			(
+				Self::Email { to: a, from: b, subject_prefix: c },
+				Self::Email { to: x, from: y, subject_prefix: z },
+			) => a == x && b == y && c == z,
+			(Self::Manual, Self::Manual) => true,
+			_ => false,
+		}
+	}
+}
+impl<S: Source> Eq for ReportingDestination<S> {}
+impl<S: Source> std::fmt::Debug for ReportingDestination<S> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "ReportingDestination<{}>([redacted])", S::NAME)
+	}
+}
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use loupe_provenance::Agent;
+
+	use crate::test_support::text;
+	type RepoSpec = super::RepoSpec<Agent>;
+	type ReportingDestination = super::ReportingDestination<Agent>;
 
 	#[test]
 	fn repo_spec_round_trips() {
 		let s = RepoSpec {
-			host: "github.com".into(),
-			owner: "lightningdevkit".into(),
-			repo: "ldk-node".into(),
-			clone_url: "https://github.com/lightningdevkit/ldk-node.git".into(),
-			branch: Some("main".into()),
+			host: text("github.com").unwrap(),
+			owner: text("lightningdevkit").unwrap(),
+			repo: text("ldk-node").unwrap(),
+			clone_url: text("https://github.com/lightningdevkit/ldk-node.git").unwrap(),
+			branch: Some(text("main").unwrap()),
 		};
 		let json = serde_json::to_string(&s).unwrap();
-		let back: RepoSpec = serde_json::from_str(&json).unwrap();
-		assert_eq!(s, back);
+		let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(
+			back,
+			serde_json::json!({"host":"github.com", "owner":"lightningdevkit", "repo":"ldk-node", "clone_url":"https://github.com/lightningdevkit/ldk-node.git", "branch":"main"})
+		);
 	}
 
 	#[test]
 	fn reporting_destination_is_externally_tagged() {
 		let r = ReportingDestination::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "security-tracker".into(),
+			target_owner: text("acme").unwrap(),
+			target_repo: text("security-tracker").unwrap(),
 			pat_secret_id: Some(7),
 		};
 		let json = serde_json::to_string(&r).unwrap();
 		assert!(json.contains(r#""kind":"github_issue""#));
-		let back: ReportingDestination = serde_json::from_str(&json).unwrap();
-		assert_eq!(r, back);
+		let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(
+			back,
+			serde_json::json!({"kind":"github_issue", "target_owner":"acme", "target_repo":"security-tracker", "pat_secret_id":7})
+		);
 	}
 
 	#[test]
 	fn github_issue_without_pat_secret_round_trips_and_reads_legacy_rows() {
-		// Rows persisted before GitHub App support always carry the id.
+		// PAT reporting requires a stored secret ID.
 		let legacy =
 			r#"{"kind":"github_issue","target_owner":"acme","target_repo":"t","pat_secret_id":7}"#;
-		let back: ReportingDestination = serde_json::from_str(legacy).unwrap();
+		let back: serde_json::Value = serde_json::from_str(legacy).unwrap();
 		assert_eq!(
 			back,
-			ReportingDestination::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "t".into(),
+			serde_json::to_value(ReportingDestination::GithubIssue {
+				target_owner: text("acme").unwrap(),
+				target_repo: text("t").unwrap(),
 				pat_secret_id: Some(7),
-			}
+			})
+			.unwrap()
 		);
 
 		// App mode omits the field entirely rather than writing `null`.
 		let app = ReportingDestination::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "t".into(),
+			target_owner: text("acme").unwrap(),
+			target_repo: text("t").unwrap(),
 			pat_secret_id: None,
 		};
 		let json = serde_json::to_string(&app).unwrap();
 		assert!(!json.contains("pat_secret_id"), "app mode must not serialize the field: {json}");
-		let back: ReportingDestination = serde_json::from_str(&json).unwrap();
-		assert_eq!(back, app);
+		let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(
+			back,
+			serde_json::json!({"kind":"github_issue", "target_owner":"acme", "target_repo":"t"})
+		);
 	}
 }

@@ -6,11 +6,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use clap::builder::TypedValueParser;
 use git2::{Repository, Signature};
-use loupe_proto::{
-	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, PROTOCOL_VERSION,
-};
+use loupe_proto::{RegisterWorkerResponse, ScanRequest, PROTOCOL_VERSION};
+use loupe_server::config::{HostnameParser, PathParser};
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
@@ -55,27 +54,28 @@ fn make_planted_repo() -> (tempfile::TempDir, String) {
 async fn worker_runs_a_scan_and_emits_a_finding() {
 	let (_repo_tmp, clone_url) = make_planted_repo();
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
+	let command = clap::Command::new("fixture");
+	let server_path = PathParser.parse_ref(&command, None, server_dir.path().as_os_str()).unwrap();
+	let hostname =
+		HostnameParser.parse_ref(&command, None, std::ffi::OsStr::new("loupe-server")).unwrap();
+	let init = run_init(&server_path, &[hostname], None).unwrap();
 
 	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
-		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		server_cert_pem: init.layout.server_cert.read_tls_pem().unwrap(),
+		server_key_pem: init.layout.server_key.read_tls_pem().unwrap(),
+		ca_cert_pem: init.layout.ca_cert.read_tls_pem().unwrap(),
+		ca_key_pem: init.layout.ca_key.read_tls_pem().unwrap(),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),
@@ -97,20 +97,13 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 
 	let resp = admin
 		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
-			protocol_version: PROTOCOL_VERSION,
-			clone_url: "https://github.com/loupe/test-target.git".into(),
-			branch: None,
-			scan_interval_seconds: None,
-			reporting: ReportingSetup::GithubIssue {
-				target_owner: "x".into(),
-				target_repo: "y".into(),
-				github_pat: Some(loupe_provenance::Secret::new("ghp".into())),
-			},
-			scanner_config: serde_json::Value::Null,
-			verification_enabled: Some(false),
-			require_approval: None,
-		})
+		// This fixture enters through the real server HTTP decoder.
+		.json(&serde_json::json!({
+			"protocol_version": PROTOCOL_VERSION,
+			"clone_url": "https://github.com/loupe/test-target.git",
+			"reporting": {"kind": "github_issue", "target_owner": "x", "target_repo": "y", "github_pat": "ghp"},
+			"verification_enabled": false
+		}))
 		.send()
 		.await
 		.unwrap();
@@ -129,7 +122,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 
 	let resp = admin
 		.post("https://loupe-server/v1/workers")
-		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: "w1".into() })
+		.json(&serde_json::json!({"protocol_version": PROTOCOL_VERSION, "name": "w1"}))
 		.send()
 		.await
 		.unwrap();

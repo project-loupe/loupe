@@ -982,6 +982,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake3",
+ "clap",
  "futures-util",
  "http",
  "hyper",

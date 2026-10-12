@@ -1,6 +1,6 @@
 //! One actual HTTP response owns its Server token, original guarded bytes and
-//! optional guarded UTF-8 replacement. This opaque forwarding owner is removed
-//! at M; it does not mint Agent text from replacement or reserialized bytes.
+//! optional guarded UTF-8 replacement through the fixed dashboard response sink.
+//! Forwarding never mints Agent text from replacement or reserialized bytes.
 use std::marker::PhantomData;
 
 use axum::http::{HeaderMap, StatusCode};
@@ -27,13 +27,13 @@ pub(crate) enum Failure {
 	EmptyHealth,
 }
 impl Failure {
-	fn status(&self) -> Option<StatusCode> {
+	pub(crate) fn status(&self) -> Option<StatusCode> {
 		match self {
 			Self::BodyTooLarge(s) | Self::BodyRead(s) => *s,
 			_ => None,
 		}
 	}
-	fn message(&self) -> String {
+	pub(crate) fn message(&self) -> String {
 		match self {
             Self::Url => "building upstream URL failed".into(),
             Self::Transport => "upstream request failed".into(),
@@ -48,8 +48,8 @@ impl Failure {
             Self::EmptyHealth => "/v1/health returned an empty body".into(),
         }
 	}
-	pub(crate) fn into_error_legacy(self) -> UpstreamError {
-		UpstreamError { status: self.status(), message: self.message() }
+	pub(crate) fn into_error(self) -> UpstreamError {
+		UpstreamError::host(self)
 	}
 }
 impl IntoResponse for Failure {
@@ -155,7 +155,7 @@ impl Validate<Bytes, Server> for DashboardServerJson {
 	}
 }
 impl ServerJson {
-	fn into_response_legacy(self, status: StatusCode) -> Result<Response, Failure> {
+	fn into_response(self, status: StatusCode) -> Result<Response, Failure> {
 		#[cfg(fuzzing)]
 		crate::fuzz_support::record(crate::fuzz_support::Observation::ServerJsonDebug(format!(
 			"{self:?}"
@@ -163,9 +163,6 @@ impl ServerJson {
 		let bytes = json::encode_server(self.0.text().as_bytes()).map_err(|_| Failure::Encoding)?;
 		Ok((status, [(axum::http::header::CONTENT_TYPE, "application/json")], bytes)
 			.into_response())
-	}
-	fn into_value_legacy(self) -> Result<serde_json::Value, Failure> {
-		serde_json::from_str(self.0.text()).map_err(|_| Failure::Json)
 	}
 }
 pub(crate) struct ServerDiagnostic {
@@ -185,7 +182,7 @@ impl Validate<Bytes, Server> for DashboardServerDiagnostic {
 	}
 }
 impl ServerDiagnostic {
-	fn into_error_response_legacy(self) -> Result<Response, Failure> {
+	fn into_error_response(self) -> Result<Response, Failure> {
 		let text = self.text.text().trim();
 		let fallback;
 		let text = if text.is_empty() {
@@ -202,16 +199,19 @@ impl ServerDiagnostic {
 		)
 			.into_response())
 	}
-	fn into_error_legacy(self) -> UpstreamError {
+	pub(crate) fn status(&self) -> StatusCode {
+		self.status
+	}
+	pub(crate) fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let text = self.text.text().trim();
-		UpstreamError {
-			status: Some(self.status),
-			message: if text.is_empty() {
-				format!("server returned {}", self.status)
-			} else {
-				text.to_owned()
-			},
+		if text.is_empty() {
+			write!(f, "server returned {}", self.status)
+		} else {
+			f.write_str(text)
 		}
+	}
+	fn into_error(self) -> UpstreamError {
+		UpstreamError::diagnostic(self)
 	}
 }
 pub(crate) enum Outcome {
@@ -219,32 +219,19 @@ pub(crate) enum Outcome {
 	Diagnostic(ServerDiagnostic),
 }
 impl Outcome {
-	pub(crate) fn into_response_legacy(self) -> Response {
+	pub(crate) fn into_response(self) -> Response {
 		let response = match self {
 			Self::Success { status, body: None } => Ok(status.into_response()),
-			Self::Success { status, body: Some(body) } => body.into_response_legacy(status),
-			Self::Diagnostic(diagnostic) => diagnostic.into_error_response_legacy(),
+			Self::Success { status, body: Some(body) } => body.into_response(status),
+			Self::Diagnostic(diagnostic) => diagnostic.into_error_response(),
 		};
 		response.unwrap_or_else(IntoResponse::into_response)
 	}
-	pub(crate) fn into_call_legacy(
-		self,
-	) -> UpstreamResult<(StatusCode, Option<serde_json::Value>)> {
-		match self {
-			Self::Success { status, body } => Ok((
-				status,
-				body.map(ServerJson::into_value_legacy)
-					.transpose()
-					.map_err(Failure::into_error_legacy)?,
-			)),
-			Self::Diagnostic(diagnostic) => Err(diagnostic.into_error_legacy()),
-		}
-	}
-	pub(crate) fn into_health_legacy(self) -> UpstreamResult<crate::client::HealthResponse> {
+	pub(crate) fn into_health(self) -> UpstreamResult<crate::client::HealthResponse> {
 		match self {
 			Self::Success { body: Some(body), .. } => Ok(crate::client::HealthResponse(body)),
-			Self::Success { body: None, .. } => Err(Failure::EmptyHealth.into_error_legacy()),
-			Self::Diagnostic(diagnostic) => Err(diagnostic.into_error_legacy()),
+			Self::Success { body: None, .. } => Err(Failure::EmptyHealth.into_error()),
+			Self::Diagnostic(diagnostic) => Err(diagnostic.into_error()),
 		}
 	}
 }
@@ -299,7 +286,7 @@ mod tests {
 		] {
 			let response = outcome(upstream, b" \"<script>FAKE_SERVER_DIAGNOSTIC</script>\"\n ")
 				.await
-				.into_response_legacy();
+				.into_response();
 			assert_eq!(
 				response.status(),
 				if matches!(upstream, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -323,7 +310,7 @@ mod tests {
 			(StatusCode::OK, b"{}"),
 			(StatusCode::NO_CONTENT, b""),
 		] {
-			let response = outcome(status, body).await.into_response_legacy();
+			let response = outcome(status, body).await.into_response();
 			assert_eq!(response.status(), status);
 			let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
 			assert_eq!(bytes.as_ref(), body);

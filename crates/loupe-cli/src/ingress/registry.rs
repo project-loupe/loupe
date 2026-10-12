@@ -18,7 +18,7 @@ struct RawAppResponse<'a> {
 }
 struct ShowGithubApp;
 impl Validate<&[u8], Server> for ShowGithubApp {
-	type Output = loupe_proto::GithubAppResponse;
+	type Output = loupe_proto::GithubAppResponse<Server>;
 	type Error = anyhow::Error;
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
@@ -31,16 +31,16 @@ impl Validate<&[u8], Server> for ShowGithubApp {
 				.map(|a| {
 					Ok::<_, anyhow::Error>(loupe_proto::GithubAppSummary {
 						app_id: a.app_id,
-						slug: slug_legacy(&mark, a.slug)?,
+						slug: slug(&mark, a.slug)?,
 					})
 				})
 				.transpose()?,
 		})
 	}
 }
-pub(crate) fn show_github_app_legacy(
+pub(crate) fn show_github_app(
 	body: Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::GithubAppResponse> {
+) -> Result<loupe_proto::GithubAppResponse<Server>> {
 	#[cfg(fuzzing)]
 	entered(Entry::ShowApp);
 	body.as_bytes().validate(ShowGithubApp)
@@ -82,7 +82,7 @@ struct RawRepos<'a> {
 }
 struct ListRepos;
 impl Validate<&[u8], Server> for ListRepos {
-	type Output = loupe_proto::ListReposResponse;
+	type Output = loupe_proto::ListReposResponse<Server>;
 	type Error = anyhow::Error;
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
@@ -94,29 +94,23 @@ impl Validate<&[u8], Server> for ListRepos {
 			.map(|r| {
 				Ok(loupe_proto::RepoSummary {
 					id: r.id,
-					clone_url: clone_url_legacy(&mark, r.clone_url)?,
-					host: host_legacy(&mark, r.host)?,
-					owner: owner_legacy(&mark, r.owner)?,
-					repo: repo_legacy(&mark, r.repo)?,
-					default_branch: r
-						.default_branch
-						.map(|t| branch_legacy(&mark, t))
-						.transpose()?,
+					clone_url: clone_url(&mark, r.clone_url)?,
+					host: host(&mark, r.host)?,
+					owner: owner(&mark, r.owner)?,
+					repo: repo(&mark, r.repo)?,
+					default_branch: r.default_branch.map(|t| branch(&mark, t)).transpose()?,
 					scan_interval_seconds: r.scan_interval_seconds,
 					disabled_at: r.disabled_at,
 					verification_enabled: r.verification_enabled,
 					require_approval: r.require_approval,
-					last_scanned_sha: r
-						.last_scanned_sha
-						.map(|t| revision_legacy(&mark, t))
-						.transpose()?,
+					last_scanned_sha: r.last_scanned_sha.map(|t| revision(&mark, t)).transpose()?,
 					last_scanned_at: r.last_scanned_at,
 					created_at: r.created_at,
 					// The response envelope, repos array, and RepoSummary consume three
 					// structural recursion levels before internally tagged reporting.
 					reporting: r
 						.reporting
-						.map(|t| reporting::reporting_summary_legacy(&mark, t, 3))
+						.map(|t| reporting::reporting_summary(&mark, t, 3))
 						.transpose()?,
 				})
 			})
@@ -124,9 +118,9 @@ impl Validate<&[u8], Server> for ListRepos {
 		Ok(loupe_proto::ListReposResponse { protocol_version: r.protocol_version, repos })
 	}
 }
-pub(crate) fn list_repos_legacy(
+pub(crate) fn list_repos(
 	body: Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::ListReposResponse> {
+) -> Result<loupe_proto::ListReposResponse<Server>> {
 	#[cfg(fuzzing)]
 	entered(Entry::ListRepos);
 	body.as_bytes().validate(ListRepos)
@@ -179,7 +173,7 @@ impl Validate<&[u8], Server> for RegisterWorker {
 		})
 	}
 }
-pub(crate) fn register_worker_bundle_legacy(
+pub(crate) fn register_worker_bundle(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::RegisterWorkerResponse> {
 	#[cfg(fuzzing)]

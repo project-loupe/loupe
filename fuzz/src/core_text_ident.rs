@@ -2,7 +2,7 @@
 //! UTF-8 input; the recognizer never calls the production policy predicate.
 
 use loupe_core::text::policy::{ClientKey, Family, JsonKey, Label};
-use loupe_core::text::{IdentPolicy, Identifier, Rule};
+use loupe_core::text::{IdentPolicy, Rule};
 
 use crate::utils::test_logger;
 
@@ -46,14 +46,14 @@ fn check<P: IdentPolicy>(raw: &str, policy: u8) {
 		&& raw.len() <= P::MAX_LEN
 		&& !raw.ends_with(' ')
 		&& !raw.as_bytes().windows(2).any(|pair| pair == b"  ");
-	let result = Identifier::<P>::new(raw);
+	let result = crate::fixtures::identifier::<P>(raw);
 	assert_eq!(result.is_ok(), accepted, "identifier acceptance disagrees with oracle");
 	match result {
 		Ok(value) => {
 			assert_eq!(value.expose(), raw, "identifier spelling must be preserved");
 			assert_eq!(
 				format!("{value:?}"),
-				format!("Identifier<{}>(len={})", P::FIELD, raw.len()),
+				format!("Identifier<{}, agent>([redacted])", P::FIELD),
 				"identifier Debug must contain only metadata"
 			);
 		},

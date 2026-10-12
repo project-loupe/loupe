@@ -13,7 +13,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-loupe-core = { version = "0.1.0", path = "../loupe-core", features = ["source-migration"] }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
 loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
 rand_core = { workspace = true }
 rusqlite = { workspace = true }
@@ -23,7 +23,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-loupe-core = { version = "0.1.0", path = "../loupe-core", features = ["source-migration"] }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
 loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 tempfile = { workspace = true }

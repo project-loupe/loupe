@@ -1,9 +1,7 @@
 //! Validated deployment configuration and immutable campaign snapshots.
 use std::fmt;
 
-use loupe_core::text::policy::Payload;
-use loupe_core::text::BoundedJson;
-use loupe_storage::scheduler::{ClaimPolicy, PRIORITY_MAX};
+use loupe_storage::scheduler::{CampaignPolicy, ClaimPolicy, PRIORITY_MAX};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPolicy {
@@ -261,29 +259,27 @@ impl ReviewPolicy {
 		}
 	}
 
-	pub fn snapshot(&self) -> Result<BoundedJson<Payload>, PolicyError> {
+	pub fn snapshot(&self) -> Result<CampaignPolicy, PolicyError> {
 		self.validate()?;
-		let value = serde_json::json!({
-			"version": 1,
-			"survey_units_per_job": self.survey_units_per_job,
-			"survey_deadline_seconds": self.survey_deadline_seconds,
-			"survey_submit_margin_seconds": self.survey_submit_margin_seconds,
-			"drilldown_deadline_seconds": self.drilldown_deadline_seconds,
-			"drilldown_submit_margin_seconds": self.drilldown_submit_margin_seconds,
-			"verify_deadline_seconds": self.verify_deadline_seconds,
-			"verify_submit_margin_seconds": self.verify_submit_margin_seconds,
-			"max_attempts": self.max_attempts,
-			"retry_backoff_base_seconds": self.retry_backoff_base_seconds,
-			"retry_backoff_cap_seconds": self.retry_backoff_cap_seconds,
-			"campaign_handoff_reserve": self.campaign_handoff_reserve,
-			"campaign_deadline_seconds": self.campaign_deadline_seconds,
-			"campaign_max_jobs": self.campaign_max_jobs,
-			"survey_token_budget": self.survey_token_budget,
-			"drilldown_token_budget": self.drilldown_token_budget,
-			"verify_token_budget": self.verify_token_budget,
-		});
-		BoundedJson::new(&value.to_string())
-			.map_err(|error| PolicyError { violations: vec![error.to_string()] })
+		Ok(CampaignPolicy {
+			version: 1,
+			survey_units_per_job: self.survey_units_per_job,
+			survey_deadline_seconds: self.survey_deadline_seconds,
+			survey_submit_margin_seconds: self.survey_submit_margin_seconds,
+			drilldown_deadline_seconds: self.drilldown_deadline_seconds,
+			drilldown_submit_margin_seconds: self.drilldown_submit_margin_seconds,
+			verify_deadline_seconds: self.verify_deadline_seconds,
+			verify_submit_margin_seconds: self.verify_submit_margin_seconds,
+			max_attempts: self.max_attempts,
+			retry_backoff_base_seconds: self.retry_backoff_base_seconds,
+			retry_backoff_cap_seconds: self.retry_backoff_cap_seconds,
+			campaign_handoff_reserve: self.campaign_handoff_reserve,
+			campaign_deadline_seconds: self.campaign_deadline_seconds,
+			campaign_max_jobs: self.campaign_max_jobs,
+			survey_token_budget: self.survey_token_budget,
+			drilldown_token_budget: self.drilldown_token_budget,
+			verify_token_budget: self.verify_token_budget,
+		})
 	}
 }
 

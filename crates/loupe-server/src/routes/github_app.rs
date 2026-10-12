@@ -18,7 +18,7 @@ use crate::state::AppState;
 pub async fn set(
 	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let req = crate::ingress::registry::SetGithubAppDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::SetGithubAppDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -38,7 +38,9 @@ pub async fn set(
 			StatusCode::BAD_REQUEST,
 			format!(
 				"private key belongs to GitHub App {} ({}), not {}",
-				info.id, info.slug, req.app_id
+				info.id,
+				info.slug.expose(),
+				req.app_id
 			),
 		));
 	}
@@ -60,7 +62,7 @@ pub async fn set(
 /// without ever returning the key.
 pub async fn get(
 	State(state): State<AppState>,
-) -> Result<Json<GithubAppResponse>, (StatusCode, String)> {
+) -> Result<Json<GithubAppResponse<loupe_provenance::Db>>, (StatusCode, String)> {
 	let stored = state
 		.db
 		.with_conn(|c| Ok(github_app::summary(c)?))

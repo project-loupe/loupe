@@ -16,12 +16,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use git2::{Repository, Signature};
-use loupe_core::{Severity, Verdict, VerdictPatch};
-use loupe_proto::{
+use common::wire::{
 	LlmFindingSubmission, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
 	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
+use git2::{Repository, Signature};
+use loupe_core::{Severity, Verdict, VerdictPatch};
 use serde::Deserialize;
 
 /// Test-input shape mirroring what the verifier agent would call
@@ -45,16 +45,22 @@ struct VerifyStubPatch {
 }
 
 impl VerifyStubInput {
-	fn into_verdict(self) -> Verdict {
+	fn into_verdict(self) -> Verdict<loupe_provenance::Agent> {
 		match self.verdict.as_str() {
 			"confirmed" => Verdict::Confirmed {
-				notes: Some(self.notes),
-				patch: self
-					.patch
-					.map(|p| VerdictPatch { patch_unified: p.patch_unified, notes: p.notes }),
+				notes: Some(common::marked::agent::text(&self.notes)),
+				patch: self.patch.map(|p| VerdictPatch {
+					patch_unified: common::marked::agent::text(&p.patch_unified),
+					notes: common::marked::agent::text(&p.notes),
+				}),
 			},
-			"dismissed" => Verdict::Dismissed { notes: Some(self.notes) },
-			"inconclusive" => Verdict::Inconclusive { reason: self.notes, terminal: false },
+			"dismissed" => {
+				Verdict::Dismissed { notes: Some(common::marked::agent::text(&self.notes)) }
+			},
+			"inconclusive" => Verdict::Inconclusive {
+				reason: common::marked::agent::text(&self.notes),
+				terminal: false,
+			},
 			other => panic!("unknown verdict in test input: {other}"),
 		}
 	}
@@ -146,26 +152,31 @@ async fn run_flow(
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
-		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();
@@ -225,6 +236,7 @@ async fn run_flow(
 		.use_rustls_tls()
 		.build()
 		.unwrap();
+	let stub_http = raw.clone();
 	let server_client =
 		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
 
@@ -247,11 +259,13 @@ async fn run_flow(
 	//     `Verdict::Confirmed { ..., patch: Some(...) }`. The stub
 	//     parses the test-supplied JSON into a real `Verdict` and
 	//     POSTs it.
+	let http_for_stub = stub_http;
 	let server_client_for_stub = server_client.clone();
 	let backend = Arc::new(StubLlmBackend::new_async("stub", move |req: LlmRequest| {
+		let http = http_for_stub.clone();
 		let server_client = server_client_for_stub.clone();
 		async move {
-			if req.prompt.contains("independent second opinion") {
+			if req.prompt.for_cli_argument().contains("independent second opinion") {
 				let job_id = req.job_id.expect("verify sessions must carry a job_id");
 				let job_capability =
 					req.job_capability.expect("verify sessions must carry a job capability");
@@ -294,7 +308,13 @@ async fn run_flow(
 						.into(),
 				fingerprint: "e".repeat(64),
 			};
-			server_client.submit_llm_finding(job_id, &job_capability, &finding).await?;
+			http.post(format!("https://loupe-server/v1/jobs/{job_id}/llm-findings"))
+				.header(loupe_proto::PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+				.header(loupe_proto::JOB_CAPABILITY_HEADER, job_capability.expose_secret())
+				.json(&finding)
+				.send()
+				.await?
+				.error_for_status()?;
 			Ok(String::new())
 		}
 	}));

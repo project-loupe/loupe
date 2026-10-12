@@ -9,12 +9,51 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glob::Pattern;
-use loupe_core::source_migration::text::{BoundedText, RepoPath};
-use loupe_provenance::{Ingress, Mark, Repo, Untrusted, Unvalidated, Validate};
-use serde::Deserialize;
+use loupe_core::text::{BoundedText, RepoPath, TextPolicy};
+use loupe_provenance::{Config, Ingress, Mark, Repo, Server, Untrusted, Unvalidated, Validate};
 
-use crate::ingress_text::ScannerExcludePattern;
+pub use crate::ingress_text::{ScannerExcludePattern, ScannerExtension};
 use crate::llm::DEFAULT_REQUEST_TIMEOUT;
+
+/// The selected list keeps its actual source; built-in literals require no mark.
+pub enum ScannerList<P: TextPolicy> {
+	Builtin(&'static [&'static str]),
+	Configured(Vec<BoundedText<P, Config>>),
+	Leased(Vec<BoundedText<P, Server>>),
+}
+impl<P: TextPolicy> Clone for ScannerList<P> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Builtin(values) => Self::Builtin(values),
+			Self::Configured(values) => Self::Configured(values.clone()),
+			Self::Leased(values) => Self::Leased(values.clone()),
+		}
+	}
+}
+impl<P: TextPolicy> std::fmt::Debug for ScannerList<P> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let source = match self {
+			Self::Builtin(_) => "builtin",
+			Self::Configured(_) => "config",
+			Self::Leased(_) => "server",
+		};
+		write!(f, "ScannerList<{source}>([redacted])")
+	}
+}
+impl<P: TextPolicy> ScannerList<P> {
+	pub fn iter(&self) -> impl Iterator<Item = &str> {
+		let len = match self {
+			Self::Builtin(values) => values.len(),
+			Self::Configured(values) => values.len(),
+			Self::Leased(values) => values.len(),
+		};
+		(0..len).map(|index| match self {
+			Self::Builtin(values) => values[index],
+			Self::Configured(values) => values[index].expose(),
+			Self::Leased(values) => values[index].expose(),
+		})
+	}
+}
 
 /// Config knobs operators can set via the repo's `scanner_config`
 /// JSON. Defaults cover Rust, C/C++, JS/TS, Python, Go, Ruby, PHP,
@@ -29,13 +68,13 @@ pub struct ScannerConfig {
 	pub per_request_timeout: Duration,
 	/// File extensions the walk will consider, lower-cased and without
 	/// the leading dot (e.g. `["rs", "cpp"]`).
-	pub include_extensions: Vec<String>,
+	pub include_extensions: ScannerList<ScannerExtension>,
 	/// Exclusion patterns that disqualify a path. Built-in patterns
 	/// use `dir:<name>` for exact path components, `file:<glob>` for
 	/// basename matches, and `dotnet-output:<name>` for .NET build
 	/// output directories. Legacy custom strings still match as path
 	/// substrings, except `/name` matches an exact component.
-	pub exclude_path_substrings: Vec<String>,
+	pub exclude_path_substrings: ScannerList<ScannerExcludePattern>,
 }
 
 impl Default for ScannerConfig {
@@ -60,14 +99,13 @@ impl Default for ScannerConfig {
 /// writes `{"include_extensions":["c","h"]}` for a C-only repo they
 /// almost always *don't* want our default Rust/JS/Python/etc.
 /// extensions silently appended.
-#[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScannerConfigPatch {
 	pub max_concurrent_files: Option<usize>,
 	pub max_file_bytes: Option<u64>,
 	pub per_request_timeout_seconds: Option<u64>,
-	pub include_extensions: Option<Vec<String>>,
-	pub exclude_path_substrings: Option<Vec<String>>,
+	pub include_extensions: Option<ScannerList<ScannerExtension>>,
+	pub exclude_path_substrings: Option<ScannerList<ScannerExcludePattern>>,
 }
 
 impl ScannerConfig {
@@ -90,8 +128,8 @@ impl ScannerConfig {
 	}
 }
 
-fn default_extensions() -> Vec<String> {
-	[
+fn default_extensions() -> ScannerList<ScannerExtension> {
+	ScannerList::Builtin(&[
 		// Rust.
 		"rs", // C / C++ / Obj-C.
 		"c", "h", "cc", "hh", "cpp", "hpp", "cxx", "hxx", "m", "mm", // JS / TS.
@@ -104,14 +142,11 @@ fn default_extensions() -> Vec<String> {
 		"swift",  // .NET.
 		"cs", "fs", "fsi", "fsx", "vb", // Misc.
 		"dart", "ex", "exs", "rs.in",
-	]
-	.into_iter()
-	.map(String::from)
-	.collect()
+	])
 }
 
-fn default_excludes() -> Vec<String> {
-	[
+fn default_excludes() -> ScannerList<ScannerExcludePattern> {
+	ScannerList::Builtin(&[
 		// Rust / Java / general "tests" dirs and matching filename suffixes.
 		"dir:tests",
 		"dir:test",
@@ -145,10 +180,7 @@ fn default_excludes() -> Vec<String> {
 		"dir:.gradle",
 		"dir:.mypy_cache",
 		"dir:.pytest_cache",
-	]
-	.into_iter()
-	.map(String::from)
-	.collect()
+	])
 }
 
 /// Walk the worktree for production source files. Strategy:
@@ -164,7 +196,7 @@ fn default_excludes() -> Vec<String> {
 /// All walks honour the extension allowlist, exclude patterns, and
 /// per-file size cap. `.git` and any excluded directory is skipped
 /// wholesale.
-pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<PathBuf> {
+pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<DiscoveredSourcePath> {
 	let Ok(canonical_workdir) = workdir.canonicalize() else {
 		return Vec::new();
 	};
@@ -186,8 +218,8 @@ pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<Path
 		}
 	}
 
-	out.sort();
-	out.dedup();
+	out.sort_by(|a, b| a.native.cmp(&b.native));
+	out.dedup_by(|a, b| a.native == b.native);
 	out
 }
 
@@ -241,16 +273,17 @@ fn add_rust_package_roots(package: &Path, roots: &mut DiscoveryRoots) {
 
 #[derive(Debug, Default)]
 struct WorkspaceManifest {
-	exclude: Vec<String>,
+	exclude: Vec<BoundedText<ScannerExcludePattern, Repo>>,
 }
 
 fn parse_workspace(cargo_toml: &Path) -> Option<WorkspaceManifest> {
 	let manifest = parse_manifest(cargo_toml)?;
-	manifest.legacy_discovery()
+	manifest.exclude.map(|exclude| WorkspaceManifest { exclude })
 }
 
 fn cargo_package_manifests(
-	workdir: &Path, cfg: &ScannerConfig, workspace_exclude: &[String],
+	workdir: &Path, cfg: &ScannerConfig,
+	workspace_exclude: &[BoundedText<ScannerExcludePattern, Repo>],
 ) -> Vec<PathBuf> {
 	let mut out: Vec<PathBuf> = walkdir::WalkDir::new(workdir)
 		.into_iter()
@@ -327,14 +360,6 @@ impl Validate<&[u8], Repo> for CargoDiscoveryManifestDecoder {
 		}))
 	}
 }
-impl CargoDiscoveryManifest {
-	/// Temporary marked Repo exclusion projection into the legacy selector.
-	fn legacy_discovery(self) -> Option<WorkspaceManifest> {
-		self.exclude.map(|values| WorkspaceManifest {
-			exclude: values.into_iter().map(|v| v.expose().to_owned()).collect(),
-		})
-	}
-}
 
 /// Fuzz-only access to production manifest parsing and source selection.
 #[cfg(fuzzing)]
@@ -347,18 +372,27 @@ pub mod fuzz_support {
 	}
 
 	pub fn workspace_excludes(path: &Path) -> Option<Vec<String>> {
-		super::parse_workspace(path).map(|workspace| workspace.exclude)
+		super::parse_workspace(path)
+			.map(|workspace| workspace.exclude.into_iter().map(|v| v.expose().to_owned()).collect())
 	}
 
-	pub fn walk(workdir: &Path, excludes: &[String]) -> Vec<PathBuf> {
+	pub fn walk(workdir: &Path, excludes: &[String]) -> Result<Vec<PathBuf>, String> {
 		let mut cfg = super::ScannerConfig::default();
-		cfg.exclude_path_substrings.extend_from_slice(excludes);
-		super::walk_source_files(workdir, &cfg)
+		let values: Vec<_> =
+			cfg.exclude_path_substrings.iter().chain(excludes.iter().map(String::as_str)).collect();
+		let token = serde_json::json!({"exclude_path_substrings":values}).to_string();
+		let patch = crate::client::test_scanner_patch(&token)?
+			.ok_or_else(|| "scanner fixture omitted patch".to_owned())?;
+		cfg.apply_patch(patch);
+		Ok(super::walk_source_files(workdir, &cfg).into_iter().map(|v| v.native).collect())
 	}
 }
 
-fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
+fn matches_workspace_exclude(
+	rel: &Path, excludes: &[BoundedText<ScannerExcludePattern, Repo>],
+) -> bool {
 	excludes.iter().any(|exclude| {
+		let exclude = exclude.expose();
 		if exclude == rel.to_string_lossy().as_ref() {
 			return true;
 		}
@@ -366,7 +400,9 @@ fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
 	})
 }
 
-fn is_workspace_excluded_descendant(workdir: &Path, path: &Path, excludes: &[String]) -> bool {
+fn is_workspace_excluded_descendant(
+	workdir: &Path, path: &Path, excludes: &[BoundedText<ScannerExcludePattern, Repo>],
+) -> bool {
 	if excludes.is_empty() {
 		return false;
 	}
@@ -443,7 +479,9 @@ fn add_existing_dirs(base: &Path, names: &[&str], out: &mut Vec<PathBuf>) {
 	}
 }
 
-fn collect_from_root(workdir: &Path, root: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
+fn collect_from_root(
+	workdir: &Path, root: &Path, cfg: &ScannerConfig, out: &mut Vec<DiscoveredSourcePath>,
+) {
 	walkdir::WalkDir::new(root)
 		.into_iter()
 		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
@@ -452,7 +490,9 @@ fn collect_from_root(workdir: &Path, root: &Path, cfg: &ScannerConfig, out: &mut
 		.for_each(|entry| collect_file(workdir, entry.path(), cfg, out));
 }
 
-fn collect_file(workdir: &Path, path: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
+fn collect_file(
+	workdir: &Path, path: &Path, cfg: &ScannerConfig, out: &mut Vec<DiscoveredSourcePath>,
+) {
 	// SAFETY: native file path from an actual walk entry or the observed
 	// package build.rs file, before file-name interpretation here.
 	#[allow(unsafe_code)]
@@ -461,15 +501,17 @@ fn collect_file(workdir: &Path, path: &Path, cfg: &ScannerConfig, out: &mut Vec<
 		.validate(DiscoveredSourcePathDecoder { workdir, cfg })
 		.expect("infallible path selection")
 	{
-		out.push(path.legacy_discovery_path());
+		out.push(path);
 	}
 }
 
+#[derive(Clone)]
 enum SourcePathRepresentation {
 	Relative(RepoPath<Repo>),
 	UnrepresentableNative,
 }
-struct DiscoveredSourcePath {
+#[derive(Clone)]
+pub(crate) struct DiscoveredSourcePath {
 	native: PathBuf,
 	representation: SourcePathRepresentation,
 }
@@ -501,16 +543,11 @@ impl Validate<PathBuf, Repo> for DiscoveredSourcePathDecoder<'_> {
 	}
 }
 impl DiscoveredSourcePath {
-	/// Temporary native operational exit for the existing prompt consumer.
-	/// Unrepresentable names stay native; they are never lossy RepoPath text.
-	fn legacy_discovery_path(self) -> PathBuf {
-		match self.representation {
-			SourcePathRepresentation::Relative(path) => {
-				let _ = path;
-			},
-			SourcePathRepresentation::UnrepresentableNative => {},
+	pub(crate) fn for_prompt(&self) -> Option<&RepoPath<Repo>> {
+		match &self.representation {
+			SourcePathRepresentation::Relative(path) => Some(path),
+			SourcePathRepresentation::UnrepresentableNative => None,
 		}
-		self.native
 	}
 }
 
@@ -521,7 +558,7 @@ fn is_excluded_dir(path: &Path, cfg: &ScannerConfig) -> bool {
 	cfg.exclude_path_substrings.iter().any(|pattern| matches_exclude(path, pattern))
 }
 
-fn is_excluded_path(path: &Path, excludes: &[String]) -> bool {
+fn is_excluded_path(path: &Path, excludes: &ScannerList<ScannerExcludePattern>) -> bool {
 	excludes.iter().any(|pattern| matches_exclude(path, pattern))
 }
 
@@ -577,7 +614,7 @@ fn has_dotnet_project_marker(dir: &Path) -> bool {
 	})
 }
 
-fn has_allowed_extension(path: &Path, exts: &[String]) -> bool {
+fn has_allowed_extension(path: &Path, exts: &ScannerList<ScannerExtension>) -> bool {
 	let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
 		return false;
 	};
@@ -605,7 +642,10 @@ mod tests {
 		std::fs::write(&path, "[workspace]\nexclude = [\"bad\\u0001\"]\n").unwrap();
 		assert!(parse_workspace(&path).is_none(), "Repo Cargo exclude control bytes were admitted");
 		std::fs::write(&path, "[workspace]\nexclude = [\" exact \" , 7, \"exact\"]\n").unwrap();
-		assert_eq!(parse_workspace(&path).unwrap().exclude, vec![" exact ", "exact"]);
+		assert_eq!(
+			parse_workspace(&path).unwrap().exclude.iter().map(|v| v.expose()).collect::<Vec<_>>(),
+			vec![" exact ", "exact"]
+		);
 	}
 
 	fn write_crate(root: &Path, files: &[(&str, &str)]) {
@@ -625,8 +665,11 @@ mod tests {
 		}
 	}
 
-	fn rel_names(root: &Path, files: Vec<PathBuf>) -> Vec<String> {
-		files.iter().map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned()).collect()
+	fn rel_names(root: &Path, files: Vec<DiscoveredSourcePath>) -> Vec<String> {
+		files
+			.iter()
+			.map(|p| p.native.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+			.collect()
 	}
 
 	#[cfg(unix)]
@@ -641,9 +684,12 @@ mod tests {
 		std::fs::write(outside.join("build.rs"), "private build script").unwrap();
 		std::os::unix::fs::symlink(outside.join("build.rs"), root.join("build.rs")).unwrap();
 		let files = walk_source_files(&root, &ScannerConfig::default());
-		assert!(files.contains(&root.join("src/local.rs")), "retain legitimate source");
 		assert!(
-			files.iter().all(|path| path.canonicalize().unwrap().starts_with(&root)),
+			files.iter().any(|v| v.native == root.join("src/local.rs")),
+			"retain legitimate source"
+		);
+		assert!(
+			files.iter().all(|path| path.native.canonicalize().unwrap().starts_with(&root)),
 			"source discovery selected a build script outside the workdir"
 		);
 	}
@@ -661,7 +707,7 @@ mod tests {
 		std::os::unix::fs::symlink(&outside, root.join("src")).unwrap();
 		let files = walk_source_files(&root, &ScannerConfig::default());
 		assert!(
-			files.iter().all(|path| path.canonicalize().unwrap().starts_with(&root)),
+			files.iter().all(|path| path.native.canonicalize().unwrap().starts_with(&root)),
 			"source discovery selected a source root outside the workdir"
 		);
 	}
@@ -679,8 +725,8 @@ mod tests {
 		std::os::unix::fs::symlink(root.join("internal"), root.join("src")).unwrap();
 		std::os::unix::fs::symlink(root.join("internal/build.rs"), root.join("build.rs")).unwrap();
 		let files = walk_source_files(root, &ScannerConfig::default());
-		assert!(files.contains(&root.join("src/local.rs")));
-		assert!(files.contains(&root.join("build.rs")));
+		assert!(files.iter().any(|file| file.native == root.join("src/local.rs")));
+		assert!(files.iter().any(|file| file.native == root.join("build.rs")));
 	}
 
 	#[test]
@@ -704,33 +750,40 @@ mod tests {
 	fn patch_overrides_only_the_fields_present() {
 		let mut cfg = ScannerConfig::default();
 		let original_excludes = cfg.exclude_path_substrings.clone();
-		let patch: ScannerConfigPatch =
-			serde_json::from_str(r#"{"include_extensions":["c","h"]}"#).unwrap();
+		let patch = crate::test_support::patch(r#"{"include_extensions":["c","h"]}"#);
 		cfg.apply_patch(patch);
-		assert_eq!(cfg.include_extensions, vec!["c".to_owned(), "h".to_owned()]);
-		assert_eq!(cfg.exclude_path_substrings, original_excludes);
+		assert_eq!(
+			cfg.include_extensions.iter().collect::<Vec<_>>(),
+			vec!["c".to_owned(), "h".to_owned()]
+		);
+		assert_eq!(
+			cfg.exclude_path_substrings.iter().collect::<Vec<_>>(),
+			original_excludes.iter().collect::<Vec<_>>()
+		);
 	}
 
 	#[test]
 	fn patch_preserves_exact_lists_and_accepts_zero_scalars() {
 		let extensions = vec!["RS", "cafe\u{301}", "RS", "", " rs "];
 		let excludes = vec!["dir:Tests", "cafe\u{301}", "file:[", "", "dir:Tests"];
-		let patch: ScannerConfigPatch = serde_json::from_value(serde_json::json!({
-			"max_concurrent_files": 0,
-			"max_file_bytes": 0,
-			"per_request_timeout_seconds": 0,
-			"include_extensions": extensions,
-			"exclude_path_substrings": excludes,
-			"future_option": {"arbitrary": [false, null, {"x": 1}]}
-		}))
-		.unwrap();
+		let patch = crate::test_support::patch(
+			&serde_json::json!({
+				"max_concurrent_files": 0,
+				"max_file_bytes": 0,
+				"per_request_timeout_seconds": 0,
+				"include_extensions": extensions,
+				"exclude_path_substrings": excludes,
+				"future_option": {"arbitrary": [false, null, {"x": 1}]}
+			})
+			.to_string(),
+		);
 		let mut cfg = ScannerConfig::default();
 		cfg.apply_patch(patch);
 		assert_eq!(cfg.max_concurrent_files, 0);
 		assert_eq!(cfg.max_file_bytes, 0);
 		assert_eq!(cfg.per_request_timeout, Duration::ZERO);
-		assert_eq!(cfg.include_extensions, extensions);
-		assert_eq!(cfg.exclude_path_substrings, excludes);
+		assert_eq!(cfg.include_extensions.iter().collect::<Vec<_>>(), extensions);
+		assert_eq!(cfg.exclude_path_substrings.iter().collect::<Vec<_>>(), excludes);
 	}
 
 	#[test]
@@ -738,30 +791,43 @@ mod tests {
 		let mut cfg = ScannerConfig::default();
 		let baseline = cfg.clone();
 		cfg.apply_patch(
-			serde_json::from_str(
-				r#"{"max_concurrent_files":null,"max_file_bytes":null,"per_request_timeout_seconds":null,"include_extensions":null,"exclude_path_substrings":null}"#,
-			)
-			.unwrap(),
+			crate::test_support::patch(r#"{"max_concurrent_files":null,"max_file_bytes":null,"per_request_timeout_seconds":null,"include_extensions":null,"exclude_path_substrings":null}"#),
 		);
 		assert_eq!(cfg.max_concurrent_files, baseline.max_concurrent_files);
 		assert_eq!(cfg.max_file_bytes, baseline.max_file_bytes);
 		assert_eq!(cfg.per_request_timeout, baseline.per_request_timeout);
-		assert_eq!(cfg.include_extensions, baseline.include_extensions);
-		assert_eq!(cfg.exclude_path_substrings, baseline.exclude_path_substrings);
-		cfg.apply_patch(
-			serde_json::from_str(r#"{"include_extensions":[],"exclude_path_substrings":[]}"#)
-				.unwrap(),
+		assert_eq!(
+			cfg.include_extensions.iter().collect::<Vec<_>>(),
+			baseline.include_extensions.iter().collect::<Vec<_>>()
 		);
-		assert!(cfg.include_extensions.is_empty());
-		assert!(cfg.exclude_path_substrings.is_empty());
+		assert_eq!(
+			cfg.exclude_path_substrings.iter().collect::<Vec<_>>(),
+			baseline.exclude_path_substrings.iter().collect::<Vec<_>>()
+		);
+		cfg.apply_patch(crate::test_support::patch(
+			r#"{"include_extensions":[],"exclude_path_substrings":[]}"#,
+		));
+		assert!(cfg.include_extensions.iter().next().is_none());
+		assert!(cfg.exclude_path_substrings.iter().next().is_none());
 	}
 
 	#[test]
 	fn legacy_patch_decoder_accepts_embedded_controls_without_rewriting() {
 		// Baseline evidence for the deliberate new single-line admission rule;
 		// this acceptance is not a requirement of the future marked decoder.
+		// Frozen historical serde oracle; this does not exercise production admission.
+		#[derive(Default, serde::Deserialize)]
+		#[serde(default)]
+		#[allow(dead_code)]
+		struct LegacyPatch {
+			max_concurrent_files: Option<usize>,
+			max_file_bytes: Option<u64>,
+			per_request_timeout_seconds: Option<u64>,
+			include_extensions: Option<Vec<String>>,
+			exclude_path_substrings: Option<Vec<String>>,
+		}
 		let raw = "case\r\ncafe\u{301}\t\0";
-		let patch: ScannerConfigPatch = serde_json::from_value(serde_json::json!({
+		let patch: LegacyPatch = serde_json::from_value(serde_json::json!({
 			"include_extensions": [raw], "exclude_path_substrings": [raw]
 		}))
 		.unwrap();
@@ -789,13 +855,13 @@ mod tests {
 		] {
 			assert_eq!(matches_exclude(Path::new(path), pattern), expected, "{path}: {pattern}");
 		}
-		let extensions = vec!["RS".to_owned(), "Rs.In".to_owned(), "E\u{301}".to_owned()];
+		let extensions = ScannerList::Builtin(&["RS", "Rs.In", "E\u{301}"]);
 		assert!(has_allowed_extension(Path::new("src/main.rS"), &extensions));
 		assert!(has_allowed_extension(Path::new("src/generated.RS.IN"), &extensions));
 		assert!(has_allowed_extension(Path::new("src/main.E\u{301}"), &extensions));
 		assert!(!has_allowed_extension(Path::new("src/main.\u{c9}"), &extensions));
 		assert!(!has_allowed_extension(Path::new("src/main.rs.bak"), &extensions));
-		assert_eq!(extensions, ["RS", "Rs.In", "E\u{301}"]);
+		assert_eq!(extensions.iter().collect::<Vec<_>>(), ["RS", "Rs.In", "E\u{301}"]);
 	}
 
 	#[test]

@@ -160,10 +160,10 @@ macro_rules! string_enum {
 pub(crate) use string_enum;
 
 macro_rules! standalone {
-	($($name:ident ($($arg:ident : $ty:ty),* $(,)?) -> $result:ty;)+) => {
+	($($name:ident $(<$($source:ident),+>)? ($($arg:ident : $ty:ty),* $(,)?) -> $result:ty;)+) => {
 		/// Convenience entry points that own an IMMEDIATE transaction.
 		pub mod standalone { use super::*; $(
-			pub fn $name(conn: &mut rusqlite::Connection, $($arg: $ty),*) -> crate::Result<$result> {
+			pub fn $name $(<$($source: loupe_provenance::Source),+>)? (conn: &mut rusqlite::Connection, $($arg: $ty),*) -> crate::Result<$result> {
 				crate::transaction::immediate(conn, |tx| super::$name(tx, $($arg),*))
 			}
 		)+ }

@@ -14,7 +14,7 @@
 //! the runner gets back a `VerifyOutcome::Submitted` and stays out
 //! of the way (no double POST).
 //!
-//! The scanner intentionally returns an empty `Vec<Finding>` from
+//! The scanner intentionally returns an empty `Vec<Finding<loupe_provenance::Repo>>` from
 //! `scan()` — a verifier is not also a discoverer, even though the
 //! trait surface allows it to be. Wiring a verifier worker to also
 //! advertise `scan:*` is just a matter of pairing it with another
@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::{format_finding_id, Finding};
+use loupe_core::Finding;
 
-use crate::llm::prompts::{self, VERIFY};
+use crate::llm::prompts::Prompt;
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::scanner::{ScanContext, Scanner, VerifyContext, VerifyOutcome};
 
@@ -53,7 +53,7 @@ impl Scanner for LlmVerifierScanner {
 		CAPABILITIES
 	}
 
-	async fn scan(&self, _ctx: &ScanContext) -> Result<Vec<Finding>> {
+	async fn scan(&self, _ctx: &ScanContext) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 		Ok(Vec::new())
 	}
 
@@ -62,19 +62,7 @@ impl Scanner for LlmVerifierScanner {
 		// it needs to decide whether the report holds up. The MCP
 		// server's `query_prior_findings` / `get_finding_by_id`
 		// tools cover everything else.
-		let finding_json = serde_json::json!({
-			"id": format_finding_id(ctx.finding_id),
-			"severity": ctx.finding.severity.as_str(),
-			"title": ctx.finding.title,
-			"file": ctx.finding.file_path,
-			"line_start": ctx.finding.line_start,
-			"line_end": ctx.finding.line_end,
-			"description": ctx.finding.description,
-			"cwe": ctx.finding.cwe,
-		});
-		let file = ctx.finding.file_path.as_deref().unwrap_or("(unknown)");
-		let prompt =
-			prompts::render(VERIFY, &[("file", file), ("finding_json", &finding_json.to_string())]);
+		let prompt = Prompt::verification(ctx.finding_id, &ctx.finding);
 
 		// `finding_id` + `job_id` are what flip the MCP server into
 		// verify mode — the verify-mode tool catalog
@@ -106,40 +94,29 @@ mod tests {
 	use std::path::PathBuf;
 	use std::sync::Mutex;
 
-	use loupe_core::{Finding, RepoSpec, Severity};
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
 	use crate::llm::testing::StubLlmBackend;
 
 	fn ctx() -> VerifyContext {
+		let original = br#"{"kind":"lease","protocol_version":1,"job_id":42,"repo_id":1,"job_capability":"test-capability","repo":{"host":"github.com","owner":"a","repo":"b","clone_url":"https://github.com/a/b.git"},"scanner_config":null,"lease_expires_at":300,"payload":{"kind":"verify","finding_id":7,"finding":{"scanner_id":"llm-code-review","severity":"high","title":"OOB index","description":"no bounds check","file_path":"src/lib.rs","line_start":1,"line_end":1,"cwe":null,"patch_unified":null,"poc_unified":null,"fingerprint":"fp1"}}}"#;
+		let loupe_proto::LeaseResponse::Lease(env) = crate::client::test_lease(original).response
+		else {
+			panic!("lease")
+		};
+		let loupe_proto::LeasePayload::Verify { finding, .. } = env.payload else {
+			panic!("verify")
+		};
 		VerifyContext {
 			workdir: PathBuf::from("/tmp"),
 			repo_id: 1,
 			job_id: 42,
 			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
 			finding_id: 7,
-			repo: RepoSpec {
-				host: "github.com".into(),
-				owner: "a".into(),
-				repo: "b".into(),
-				clone_url: "https://github.com/a/b.git".into(),
-				branch: None,
-			},
-			finding: Finding {
-				scanner_id: "llm-code-review".into(),
-				severity: Severity::High,
-				title: "OOB index".into(),
-				description: "no bounds check".into(),
-				file_path: Some("src/lib.rs".into()),
-				line_start: Some(1),
-				line_end: Some(1),
-				cwe: None,
-				patch_unified: None,
-				poc_unified: None,
-				fingerprint: "fp1".into(),
-			},
-			config: serde_json::Value::Null,
+			repo: env.repo,
+			finding: *finding,
+			config: None,
 			cancel: CancellationToken::new(),
 		}
 	}
@@ -148,7 +125,7 @@ mod tests {
 	async fn original_report_contains_prefixed_finding_id() {
 		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
 			assert!(
-				req.prompt.contains("\"id\":\"LUP-7\""),
+				req.prompt.for_cli_argument().contains("\"id\":\"LUP-7\""),
 				"original report must identify the finding as LUP-7"
 			);
 			Ok(String::new())

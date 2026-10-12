@@ -15,14 +15,17 @@
 //! same shape as the cert files), and prints a hint pointing operators
 //! at the file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use loupe_storage::secrets::MasterKey;
-use loupe_storage::workers::{self, WorkerKind};
-use loupe_storage::Db;
+#[cfg(test)]
+use loupe_storage::workers::WorkerKind;
+use loupe_storage::{workers, Db};
 use loupe_tls::{cert_fingerprint, Ca, CertBundle};
+
+use crate::config::{ConfiguredHostname, ConfiguredPath};
 
 #[derive(Debug, Clone, Copy)]
 pub struct InitOptions {
@@ -40,20 +43,20 @@ impl Default for InitOptions {
 
 /// Layout of files written under the data dir.
 pub struct DataDirLayout {
-	pub root: PathBuf,
-	pub db_path: PathBuf,
-	pub ca_cert: PathBuf,
-	pub ca_key: PathBuf,
-	pub server_cert: PathBuf,
-	pub server_key: PathBuf,
-	pub admin_cert: PathBuf,
-	pub admin_key: PathBuf,
-	pub master_key: PathBuf,
+	pub root: ConfiguredPath,
+	pub db_path: ConfiguredPath,
+	pub ca_cert: ConfiguredPath,
+	pub ca_key: ConfiguredPath,
+	pub server_cert: ConfiguredPath,
+	pub server_key: ConfiguredPath,
+	pub admin_cert: ConfiguredPath,
+	pub admin_key: ConfiguredPath,
+	pub master_key: ConfiguredPath,
 }
 
 impl DataDirLayout {
-	pub fn at(root: impl Into<PathBuf>) -> Self {
-		let root = root.into();
+	pub fn at(root: &ConfiguredPath) -> Self {
+		let root = root.clone();
 		Self {
 			db_path: root.join("loupe.sqlite"),
 			ca_cert: root.join("ca.pem"),
@@ -80,7 +83,7 @@ impl DataDirLayout {
 			&self.db_path,
 		]
 		.iter()
-		.any(|p| p.exists())
+		.any(|p| p.as_path().exists())
 	}
 }
 
@@ -118,34 +121,38 @@ pub struct InitOutput {
 /// mints fresh randomness and persists it to `data_dir/master.key` so
 /// the next `serve` can read it.
 pub fn run_init(
-	data_dir: &Path, server_hostnames: &[String], caller_key: Option<MasterKey>,
+	data_dir: &ConfiguredPath, server_hostnames: &[ConfiguredHostname],
+	caller_key: Option<MasterKey>,
 ) -> Result<InitOutput> {
 	run_init_with_options(data_dir, server_hostnames, caller_key, InitOptions::default())
 }
 
 pub fn run_init_with_options(
-	data_dir: &Path, server_hostnames: &[String], caller_key: Option<MasterKey>,
-	options: InitOptions,
+	data_dir: &ConfiguredPath, server_hostnames: &[ConfiguredHostname],
+	caller_key: Option<MasterKey>, options: InitOptions,
 ) -> Result<InitOutput> {
 	let layout = DataDirLayout::at(data_dir);
 
-	std::fs::create_dir_all(&layout.root)
-		.with_context(|| format!("creating data dir {}", layout.root.display()))?;
+	std::fs::create_dir_all(layout.root.as_path())
+		.with_context(|| format!("creating data dir {}", layout.root.as_path().display()))?;
 	if layout.any_exists() {
-		bail!("data dir {} already initialised — refusing to overwrite", layout.root.display());
+		bail!(
+			"data dir {} already initialised — refusing to overwrite",
+			layout.root.as_path().display()
+		);
 	}
 
 	let ca = Ca::new("loupe").context("minting internal CA")?;
-	let server = ca.mint_server("loupe-server", server_hostnames).context("minting server cert")?;
+	let server = ConfiguredHostname::mint_server(&ca, server_hostnames)?;
 	let admin = ca.mint_client("admin").context("minting admin client cert")?;
 
 	if options.persist_secrets {
-		write_secret(&layout.ca_cert, ca.cert_pem().as_bytes())?;
-		write_secret(&layout.ca_key, ca.key_pem().expose().as_bytes())?;
-		write_secret(&layout.server_cert, server.cert_pem.as_bytes())?;
-		write_secret(&layout.server_key, server.key_pem.expose().as_bytes())?;
-		write_secret(&layout.admin_cert, admin.cert_pem.as_bytes())?;
-		write_secret(&layout.admin_key, admin.key_pem.expose().as_bytes())?;
+		write_secret(layout.ca_cert.as_path(), ca.cert_pem().as_bytes())?;
+		write_secret(layout.ca_key.as_path(), ca.key_pem().expose().as_bytes())?;
+		write_secret(layout.server_cert.as_path(), server.cert_pem.as_bytes())?;
+		write_secret(layout.server_key.as_path(), server.key_pem.expose().as_bytes())?;
+		write_secret(layout.admin_cert.as_path(), admin.cert_pem.as_bytes())?;
+		write_secret(layout.admin_key.as_path(), admin.key_pem.expose().as_bytes())?;
 	}
 
 	let (master_key, minted_master_key) = match caller_key {
@@ -156,18 +163,18 @@ pub fn run_init_with_options(
 			// on disk and what an operator would paste into `PRAGMA key`.
 			if options.persist_secrets {
 				let hex = k.to_hex();
-				write_secret_parts(&layout.master_key, &[hex.expose().as_bytes(), b"\n"])?;
+				write_secret_parts(layout.master_key.as_path(), &[hex.expose().as_bytes(), b"\n"])?;
 			}
 			(k, true)
 		},
 	};
 
-	let db = Db::open(&layout.db_path, &master_key)
-		.with_context(|| format!("opening db at {}", layout.db_path.display()))?;
+	let db = Db::open(layout.db_path.as_path(), &master_key)
+		.with_context(|| format!("opening db at {}", layout.db_path.as_path().display()))?;
 	let admin_der = pem_first_cert_der(&admin.cert_pem)?;
 	let fingerprint = cert_fingerprint(&admin_der);
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	db.with_conn(|c| Ok(workers::insert(c, "admin", WorkerKind::Admin, &fingerprint, now)?))
+	db.with_conn(|c| Ok(workers::insert_bootstrap_admin(c, &fingerprint, now)?))
 		.context("recording admin in workers table")?;
 
 	let (ca_cert_pem, ca_key_pem) = ca.into_pem();
@@ -226,16 +233,24 @@ mod tests {
 	#[test]
 	fn bootstraps_a_fresh_data_dir_and_persists_the_master_key() {
 		let tmp = tempfile::tempdir().unwrap();
-		let out = run_init(tmp.path(), &["localhost".to_owned()], None).unwrap();
-		assert!(out.layout.ca_cert.exists());
-		assert!(out.layout.server_cert.exists());
-		assert!(out.layout.admin_cert.exists());
-		assert!(out.layout.master_key.exists(), "init must persist the freshly-minted key");
-		assert!(out.layout.db_path.exists());
+		let out = run_init(
+			&crate::test_support::path(tmp.path()),
+			&crate::test_support::hostnames(&["localhost"]),
+			None,
+		)
+		.unwrap();
+		assert!(out.layout.ca_cert.as_path().exists());
+		assert!(out.layout.server_cert.as_path().exists());
+		assert!(out.layout.admin_cert.as_path().exists());
+		assert!(
+			out.layout.master_key.as_path().exists(),
+			"init must persist the freshly-minted key"
+		);
+		assert!(out.layout.db_path.as_path().exists());
 		assert!(out.minted_master_key, "minted_master_key must be true when no caller_key");
 
 		// master.key must be 64 hex chars + newline.
-		let raw = std::fs::read_to_string(&out.layout.master_key).unwrap();
+		let raw = std::fs::read_to_string(out.layout.master_key.as_path()).unwrap();
 		let trimmed = raw.trim_end();
 		assert_eq!(raw.len(), 65);
 		assert_eq!(raw.as_bytes().last(), Some(&b'\n'));
@@ -245,7 +260,8 @@ mod tests {
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::PermissionsExt;
-			let mode = std::fs::metadata(&out.layout.master_key).unwrap().permissions().mode();
+			let mode =
+				std::fs::metadata(out.layout.master_key.as_path()).unwrap().permissions().mode();
 			assert_eq!(mode & 0o777, 0o600);
 		}
 
@@ -257,7 +273,7 @@ mod tests {
 		// same key to read it back.
 		let key_bytes = decode_hex(trimmed);
 		let key = MasterKey::from_bytes(key_bytes);
-		let db = Db::open(&out.layout.db_path, &key).unwrap();
+		let db = Db::open(out.layout.db_path.as_path(), &key).unwrap();
 		let admin_der = pem_first_cert_der(&out.admin_bundle.cert_pem).unwrap();
 		let fp = cert_fingerprint(&admin_der);
 		let row = db
@@ -265,47 +281,52 @@ mod tests {
 			.unwrap()
 			.expect("admin must be registered after init");
 		assert_eq!(row.kind, WorkerKind::Admin);
-		assert_eq!(row.name, "admin");
+		assert_eq!(row.name.expose(), "admin");
 	}
 
 	#[test]
 	fn caller_supplied_key_is_used_and_not_persisted() {
 		let tmp = tempfile::tempdir().unwrap();
 		let key = MasterKey::from_bytes([0x42u8; 32]);
-		let out = run_init(tmp.path(), &["localhost".to_owned()], Some(key)).unwrap();
+		let out = run_init(
+			&crate::test_support::path(tmp.path()),
+			&crate::test_support::hostnames(&["localhost"]),
+			Some(key),
+		)
+		.unwrap();
 		assert!(
-			!out.layout.master_key.exists(),
+			!out.layout.master_key.as_path().exists(),
 			"caller-supplied key must not be persisted to disk"
 		);
 		assert!(!out.minted_master_key);
 		// DB only opens with the same key — proves init actually used it.
 		let same = MasterKey::from_bytes([0x42u8; 32]);
-		assert!(Db::open(&out.layout.db_path, &same).is_ok());
-		assert!(Db::open(&out.layout.db_path, &MasterKey::from_bytes([0x43; 32])).is_err());
+		assert!(Db::open(out.layout.db_path.as_path(), &same).is_ok());
+		assert!(Db::open(out.layout.db_path.as_path(), &MasterKey::from_bytes([0x43; 32])).is_err());
 	}
 
 	#[test]
 	fn can_bootstrap_without_persisting_secret_files() {
 		let tmp = tempfile::tempdir().unwrap();
 		let out = run_init_with_options(
-			tmp.path(),
-			&["localhost".to_owned()],
+			&crate::test_support::path(tmp.path()),
+			&crate::test_support::hostnames(&["localhost"]),
 			None,
 			InitOptions { persist_secrets: false },
 		)
 		.unwrap();
-		assert!(!out.layout.ca_cert.exists());
-		assert!(!out.layout.ca_key.exists());
-		assert!(!out.layout.server_cert.exists());
-		assert!(!out.layout.server_key.exists());
-		assert!(!out.layout.admin_cert.exists());
-		assert!(!out.layout.admin_key.exists());
-		assert!(!out.layout.master_key.exists());
-		assert!(out.layout.db_path.exists());
+		assert!(!out.layout.ca_cert.as_path().exists());
+		assert!(!out.layout.ca_key.as_path().exists());
+		assert!(!out.layout.server_cert.as_path().exists());
+		assert!(!out.layout.server_key.as_path().exists());
+		assert!(!out.layout.admin_cert.as_path().exists());
+		assert!(!out.layout.admin_key.as_path().exists());
+		assert!(!out.layout.master_key.as_path().exists());
+		assert!(out.layout.db_path.as_path().exists());
 		assert!(out.minted_master_key);
 		assert!(!out.persisted_secrets);
 
-		let db = Db::open(&out.layout.db_path, &out.master_key).unwrap();
+		let db = Db::open(out.layout.db_path.as_path(), &out.master_key).unwrap();
 		let admin_der = pem_first_cert_der(&out.admin_bundle.cert_pem).unwrap();
 		let fp = cert_fingerprint(&admin_der);
 		let row = db
@@ -313,14 +334,23 @@ mod tests {
 			.unwrap()
 			.expect("admin must be registered after env-only init");
 		assert_eq!(row.kind, WorkerKind::Admin);
-		assert_eq!(row.name, "admin");
+		assert_eq!(row.name.expose(), "admin");
 	}
 
 	#[test]
 	fn second_init_refuses_existing_data_dir() {
 		let tmp = tempfile::tempdir().unwrap();
-		run_init(tmp.path(), &["localhost".to_owned()], None).unwrap();
-		let err = match run_init(tmp.path(), &["localhost".to_owned()], None) {
+		run_init(
+			&crate::test_support::path(tmp.path()),
+			&crate::test_support::hostnames(&["localhost"]),
+			None,
+		)
+		.unwrap();
+		let err = match run_init(
+			&crate::test_support::path(tmp.path()),
+			&crate::test_support::hostnames(&["localhost"]),
+			None,
+		) {
 			Err(e) => e,
 			Ok(_) => panic!("second init must fail against an existing data dir"),
 		};

@@ -5,7 +5,6 @@
 mod fixture;
 
 use loupe_storage::secrets::MasterKey;
-use loupe_storage::source_refs::UnitRefs;
 use loupe_storage::{findings, review_units, Db};
 
 #[test]
@@ -25,8 +24,14 @@ fn invalid_legacy_columns_remain_unchanged_when_actual_read_rejects_them() {
 		conn.execute("UPDATE findings SET title='admitted' WHERE id=?1", [id])?;
 		finding.title = "admitted".into();
 		let row = findings::get(conn, id)?.unwrap();
-		assert_eq!(row.approved_by_cn.as_deref(), Some("same"));
-		assert_eq!(row.into_finding(), finding);
+		assert_eq!(
+			row.approved_by_cn.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("same")
+		);
+		assert_eq!(
+			serde_json::to_value(row.into_finding()).unwrap(),
+			serde_json::to_value(&finding).unwrap()
+		);
 		Ok(())
 	})
 	.unwrap();
@@ -46,7 +51,7 @@ fn legacy_refs_read_actual_column_and_preserve_path_spelling_and_symbol_policy()
 		)?;
 		assert_eq!(stored, raw);
 		let unit = review_units::get(conn, 1)?.unwrap();
-		assert_eq!(unit.source_refs, raw.parse::<UnitRefs>().unwrap());
+		assert_eq!(unit.source_refs.expose(), "[{\"path\":\"src/cafe\u{301}.rs\",\"symbol\":\"Café token\"},{\"path\":\"src/cafe\u{301}.rs\",\"symbol\":null},{\"path\":\"src/x.rs\",\"symbol\":null}]");
 		assert_eq!(unit.source_refs.as_slice()[0].path.expose(), "src/cafe\u{301}.rs");
 		assert_eq!(unit.source_refs.as_slice()[0].symbol.as_ref().unwrap().expose(), "Café token");
 		assert!(unit.source_refs.as_slice()[1].symbol.is_none());

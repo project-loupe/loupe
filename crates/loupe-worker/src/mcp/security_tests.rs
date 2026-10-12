@@ -161,5 +161,5 @@ async fn git_diagnostic_truncation_handles_multibyte_boundary() {
 		.stderr(Stdio::piped());
 	let result = check_diff_applies_with_command(command, "diff").await.unwrap();
 	let DiffCheck::Rejects { stderr } = result else { panic!("expected rejected diff") };
-	assert_eq!(stderr, format!("{}\n…(truncated)", "x".repeat(4095)));
+	assert_eq!(stderr.for_tool_response(), format!("{}\n…(truncated)", "x".repeat(4095)));
 }

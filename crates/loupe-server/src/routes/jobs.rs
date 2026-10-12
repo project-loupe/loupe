@@ -22,10 +22,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
-	validate_llm_finding_submission, CompleteOutcome, HeartbeatResponse, JobCapability, JobInfo,
-	LeaseEnvelope, LeasePayload, LeaseResponse, ScanResponse, LLM_CODE_REVIEW_SCANNER_ID,
-	PROTOCOL_VERSION,
+	CompleteOutcome, HeartbeatResponse, JobCapability, JobInfo, LeaseEnvelope, LeasePayload,
+	LeaseResponse, ScanResponse, LLM_CODE_REVIEW_SCANNER_ID, PROTOCOL_VERSION,
 };
+use loupe_provenance::{Agent, Db, Operator};
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, secrets};
 use serde::Deserialize;
@@ -40,7 +40,9 @@ pub(crate) enum Route {
 	Verdict,
 }
 
-pub(crate) fn route_admits_kind(route: Route, kind: &JobKind) -> bool {
+pub(crate) fn route_admits_kind<S: loupe_provenance::Source>(
+	route: Route, kind: &JobKind<S>,
+) -> bool {
 	match route {
 		Route::Findings | Route::LlmFinding => matches!(kind, JobKind::Scan),
 		Route::Verdict => matches!(kind, JobKind::Verify),
@@ -59,7 +61,7 @@ fn check_version(version: u16) -> Result<(), (StatusCode, String)> {
 	}
 }
 
-fn job_to_info(row: &JobRow) -> JobInfo {
+fn job_to_info(row: &JobRow) -> JobInfo<Db> {
 	JobInfo {
 		job_id: row.id,
 		repo_id: row.repo_id,
@@ -121,17 +123,21 @@ pub fn parse_states(raw: Option<&str>) -> Result<Vec<JobState>, (StatusCode, Str
 	Ok(states)
 }
 
-pub fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind>, (StatusCode, String)> {
+pub fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind<Operator>>, (StatusCode, String)> {
 	raw.map(|k| {
-		let kind: JobKind = k.parse().expect("infallible kind parser");
-		if kind.is_known() {
-			Ok(kind)
-		} else {
-			Err((
-				StatusCode::BAD_REQUEST,
-				format!("unknown job kind {k:?}; expected scan, verify, survey or drilldown"),
-			))
-		}
+		let kind = match k {
+			"scan" => JobKind::Scan,
+			"verify" => JobKind::Verify,
+			"survey" => JobKind::Survey,
+			"drilldown" => JobKind::Drilldown,
+			_ => {
+				return Err((
+					StatusCode::BAD_REQUEST,
+					format!("unknown job kind {k:?}; expected scan, verify, survey or drilldown"),
+				))
+			},
+		};
+		Ok(kind)
 	})
 	.transpose()
 }
@@ -140,7 +146,7 @@ pub fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind>, (StatusCode, Str
 pub async fn enqueue_scan(
 	State(state): State<AppState>, Path(repo_id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<(StatusCode, Json<ScanResponse>), (StatusCode, String)> {
-	let req = crate::ingress::registry::EnqueueScanDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::EnqueueScanDecoder::decode(body)?;
 	check_version(req.protocol_version)?;
 	let now = now_secs();
 
@@ -179,7 +185,7 @@ pub async fn enqueue_scan(
 pub async fn list(
 	State(state): State<AppState>,
 	crate::ingress::query::OperatorJobQuery(filter): crate::ingress::query::OperatorJobQuery,
-) -> Result<Json<Vec<JobInfo>>, (StatusCode, String)> {
+) -> Result<Json<Vec<JobInfo<Db>>>, (StatusCode, String)> {
 	let rows = state
 		.db
 		.with_conn(|c| Ok(jobs::list(c, &filter)?))
@@ -190,7 +196,7 @@ pub async fn list(
 /// `GET /v1/jobs/:id` — admin gets one job.
 pub async fn get(
 	State(state): State<AppState>, Path(id): Path<i64>,
-) -> Result<Json<JobInfo>, (StatusCode, String)> {
+) -> Result<Json<JobInfo<Db>>, (StatusCode, String)> {
 	let row = state
 		.db
 		.with_conn(|c| Ok(jobs::get(c, id)?))
@@ -210,7 +216,7 @@ pub async fn get(
 /// deliberately rather than revive it by accident.
 pub async fn retry(
 	State(state): State<AppState>, Path(id): Path<i64>,
-) -> Result<Json<JobInfo>, (StatusCode, String)> {
+) -> Result<Json<JobInfo<Db>>, (StatusCode, String)> {
 	let now = now_secs();
 	let result = state
 		.db
@@ -235,7 +241,7 @@ pub async fn retry(
 /// `POST /v1/jobs/:id/cancel` — admin cancels queued or leased work.
 pub async fn cancel(
 	State(state): State<AppState>, Path(id): Path<i64>,
-) -> Result<Json<JobInfo>, (StatusCode, String)> {
+) -> Result<Json<JobInfo<Db>>, (StatusCode, String)> {
 	let now = now_secs();
 	let outcome = state
 		.db
@@ -277,13 +283,13 @@ pub async fn lease(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	body: crate::ingress::WorkerJson,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-	let req = crate::ingress::jobs::LeaseRequestDecoder::decode_legacy(body)?;
+	let req = crate::ingress::jobs::LeaseRequestDecoder::decode(body)?;
 	check_version(req.protocol_version)?;
 	// A worker is eligible for verify jobs iff it advertised at least
 	// one `verify:*` capability. Fine-grained tag matching (e.g.
 	// `verify:secrets` only matches secret-flavoured verify jobs) is a
 	// follow-up; today we only have one tag in flight.
-	let accepts_verify = req.capabilities.iter().any(|c| c.starts_with("verify:"));
+	let accepts_verify = req.capabilities.iter().any(|c| c.expose().starts_with("verify:"));
 
 	if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
 		return super::credential_response::lease(&LeaseResponse::Lease(Box::new(env)));
@@ -327,10 +333,10 @@ pub async fn lease(
 /// queued. `accepts_verify` gates verify-kind jobs.
 fn try_lease(
 	state: &AppState, worker_id: i64, accepts_verify: bool,
-) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
+) -> Result<Option<LeaseEnvelope<Agent, Db>>, (StatusCode, String)> {
 	let now = now_secs();
 	let (job_capability, job_capability_hash) = job_capability::issue();
-	let kinds =
+	let kinds: Vec<JobKind<Db>> =
 		if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
 	let row = crate::review::scheduler::claim_for_worker(
 		state,
@@ -349,7 +355,7 @@ fn try_lease(
 
 fn build_lease_envelope(
 	state: &AppState, row: &JobRow, job_capability: JobCapability,
-) -> anyhow::Result<LeaseEnvelope> {
+) -> anyhow::Result<LeaseEnvelope<Agent, Db>> {
 	let repo = state
 		.db
 		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?
@@ -414,7 +420,7 @@ pub async fn heartbeat(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerBody,
 ) -> Result<Json<HeartbeatResponse>, (StatusCode, String)> {
-	if let Some(req) = crate::ingress::jobs::HeartbeatDecoder::decode_legacy(body)? {
+	if let Some(req) = crate::ingress::jobs::HeartbeatDecoder::decode(body)? {
 		check_version(req.protocol_version)?;
 	}
 	let now = now_secs();
@@ -444,7 +450,7 @@ pub async fn submit_findings(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let batch = crate::ingress::jobs::FindingsBatchDecoder::decode_legacy(body)?;
+	let batch = crate::ingress::jobs::FindingsBatchDecoder::decode(body)?;
 	check_version(batch.protocol_version)?;
 	let now = now_secs();
 
@@ -453,7 +459,11 @@ pub async fn submit_findings(
 	if !route_admits_kind(Route::Findings, &row.kind) {
 		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
 	}
-	if batch.findings.iter().any(|finding| finding.scanner_id == LLM_CODE_REVIEW_SCANNER_ID) {
+	if batch
+		.findings
+		.iter()
+		.any(|finding| finding.scanner_id.expose() == LLM_CODE_REVIEW_SCANNER_ID)
+	{
 		return Err((
 			StatusCode::BAD_REQUEST,
 			"LLM findings must use the strict /llm-findings endpoint".into(),
@@ -469,7 +479,7 @@ pub async fn submit_findings(
 		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".to_owned()))?;
 	let verification_required = repo.verification_enabled;
 	for finding in &batch.findings {
-		validate_report_size(&repo, finding, row.head_sha.as_deref())?;
+		validate_report_size(&repo, finding, row.head_sha.as_ref())?;
 	}
 
 	let submitted = state
@@ -513,13 +523,16 @@ fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCod
 }
 
 fn validate_report_size(
-	repo: &repos::RepoRow, finding: &loupe_core::Finding, reviewed_revision: Option<&str>,
+	repo: &repos::RepoRow, finding: &loupe_core::Finding<Agent>,
+	reviewed_revision: Option<
+		&loupe_core::text::BoundedText<loupe_core::text::policy::RevisionText, Db>,
+	>,
 ) -> Result<(), (StatusCode, String)> {
 	if matches!(repo.reporting, loupe_core::ReportingDestination::GithubIssue { .. }) {
 		loupe_core::report_limits::validate_report_content(
-			&finding.description,
-			finding.poc_unified.as_deref(),
-			finding.patch_unified.as_deref(),
+			finding.description.expose(),
+			finding.poc_unified.as_ref().map(|v| v.expose()),
+			finding.patch_unified.as_ref().map(|v| v.expose()),
 		)
 		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 		reporters::github::validate_finding_body(
@@ -529,7 +542,7 @@ fn validate_report_size(
 				// width of a stored ID for its public report reference.
 				id: i64::MAX,
 				finding: finding.clone(),
-				reviewed_revision: reviewed_revision.map(str::to_owned),
+				reviewed_revision: reviewed_revision.cloned(),
 			},
 		)
 		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
@@ -542,7 +555,7 @@ pub async fn submit_llm_finding(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let submission = crate::ingress::jobs::LlmFindingDecoder::decode_legacy(body)?;
+	let submission = crate::ingress::jobs::LlmFindingDecoder::decode(body)?;
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
 	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
@@ -550,27 +563,14 @@ pub async fn submit_llm_finding(
 	if !route_admits_kind(Route::LlmFinding, &row.kind) {
 		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
 	}
-	validate_llm_finding_submission(&submission)
-		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+	submission.validate().map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 	let repo = state
 		.db
 		.with_conn(|conn| Ok(repos::get(conn, row.repo_id)?))
 		.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {error}")))?
 		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".into()))?;
-	let finding = loupe_core::Finding {
-		scanner_id: LLM_CODE_REVIEW_SCANNER_ID.into(),
-		severity: submission.severity,
-		title: submission.title,
-		description: submission.description,
-		file_path: Some(submission.file_path),
-		line_start: Some(submission.line_start),
-		line_end: Some(submission.line_end),
-		cwe: submission.cwe,
-		patch_unified: None,
-		poc_unified: Some(submission.poc_unified),
-		fingerprint: submission.fingerprint,
-	};
-	validate_report_size(&repo, &finding, row.head_sha.as_deref())?;
+	let finding = submission.into_finding();
+	validate_report_size(&repo, &finding, row.head_sha.as_ref())?;
 	let submitted = state
 		.db
 		.with_conn(|conn| {
@@ -599,7 +599,7 @@ pub async fn submit_verdict(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let submission = crate::ingress::jobs::VerdictSubmissionDecoder::decode_legacy(body)?;
+	let submission = crate::ingress::jobs::VerdictSubmissionDecoder::decode(body)?;
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
 
@@ -612,20 +612,13 @@ pub async fn submit_verdict(
 		.target_finding_id
 		.ok_or((StatusCode::BAD_REQUEST, "verify job missing target finding".into()))?;
 
-	let (verdict_str, notes, terminal_inconclusive) = match &submission.verdict {
-		loupe_core::Verdict::Confirmed { notes, .. } => ("confirmed", notes.clone(), false),
-		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone(), false),
-		loupe_core::Verdict::Inconclusive { reason, terminal } => {
-			("inconclusive", Some(reason.clone()), *terminal)
-		},
-	};
+	let terminal_inconclusive =
+		matches!(&submission.verdict, loupe_core::Verdict::Inconclusive { terminal: true, .. });
 	// Patches only ride on Confirmed verdicts (pinned by the
 	// `Verdict` type itself); pull the diff out here so the closure
 	// below can borrow it cleanly without re-matching on the variant.
-	let patch_to_attach: Option<(&str, &str)> = match &submission.verdict {
-		loupe_core::Verdict::Confirmed { patch: Some(p), .. } => {
-			Some((p.patch_unified.as_str(), p.notes.as_str()))
-		},
+	let patch_to_attach = match &submission.verdict {
+		loupe_core::Verdict::Confirmed { patch: Some(p), .. } => Some((&p.patch_unified, &p.notes)),
 		_ => None,
 	};
 	let by_cn = worker.name().to_owned();
@@ -648,8 +641,8 @@ pub async fn submit_verdict(
 			.ok_or((StatusCode::NOT_FOUND, "target finding missing".into()))?;
 		let mut report = report_finding_from_row(&state, finding_row)
 			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get report: {e}")))?;
-		report.finding.patch_unified = Some(patch_unified.to_owned());
-		validate_report_size(&repo, &report.finding, report.reviewed_revision.as_deref())?;
+		report.finding.patch_unified = Some(patch_unified.clone());
+		validate_report_size(&repo, &report.finding, report.reviewed_revision.as_ref())?;
 	}
 	// Insert the verdict + apply the rollup policy in a single
 	// transaction so a concurrent verdict from a second verifier
@@ -662,11 +655,14 @@ pub async fn submit_verdict(
 				c,
 				authorized.active_lease(worker.id(), now),
 				|tx, active| {
-					tx.execute(
-						"INSERT INTO finding_verifications
-						   (finding_id, job_id, verdict, notes, created_at)
-						 VALUES (?1, ?2, ?3, ?4, ?5)",
-						(target_finding_id, active.id, verdict_str, &notes, now),
+					findings::insert_verification(
+						tx,
+						target_finding_id,
+						findings::VerificationInput::Submitted {
+							job_id: active.id,
+							verdict: &submission.verdict,
+						},
+						now,
 					)?;
 					// Attach a verifier-proposed patch (when Confirmed and one
 					// was supplied) inside the same tx as the verdict insert,
@@ -717,7 +713,7 @@ pub async fn complete(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let req = crate::ingress::jobs::CompleteDecoder::decode_legacy(body)?;
+	let req = crate::ingress::jobs::CompleteDecoder::decode(body)?;
 	check_version(req.protocol_version)?;
 	let new_state = match req.outcome {
 		CompleteOutcome::Succeeded => JobState::Succeeded,
@@ -734,7 +730,13 @@ pub async fn complete(
 	if matches!(new_state, JobState::Succeeded) {
 		match job.kind {
 			JobKind::Scan => {
-				if req.head_sha.as_deref().map(str::trim).filter(|sha| !sha.is_empty()).is_none() {
+				if req
+					.head_sha
+					.as_ref()
+					.map(|v| v.expose().trim())
+					.filter(|sha| !sha.is_empty())
+					.is_none()
+				{
 					return Err((
 						StatusCode::BAD_REQUEST,
 						"successful scan completion requires non-empty head_sha".into(),
@@ -792,8 +794,8 @@ pub async fn complete(
 				&tx,
 				authorized.lease_identity(worker.id()),
 				new_state,
-				req.head_sha.as_deref(),
-				req.error.as_deref(),
+				req.head_sha.as_ref(),
+				req.error.as_ref(),
 				now,
 			)?;
 			if !updated {
@@ -802,12 +804,12 @@ pub async fn complete(
 				return Ok(false);
 			}
 			if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan {
-				if let Some(sha) = req.head_sha.as_deref() {
+				if let Some(sha) = req.head_sha.as_ref() {
 					tx.execute(
 						"UPDATE registered_repos
 						   SET last_scanned_sha = ?1, last_scanned_at = ?2
 						 WHERE id = ?3",
-						(sha, now, job.repo_id),
+						(sha.expose(), now, job.repo_id),
 					)?;
 				}
 				tx.execute(
@@ -819,8 +821,8 @@ pub async fn complete(
 					(
 						job.repo_id,
 						job_id,
-						req.head_sha.as_deref().unwrap_or(""),
-						job.since_sha.clone(),
+						req.head_sha.as_ref().map(|v| v.expose()).unwrap_or(""),
+						job.since_sha.as_ref().map(|v| v.expose()),
 						job.started_at.map(|s| (now - s) * 1_000).unwrap_or(0),
 						now,
 					),
@@ -1098,7 +1100,7 @@ mod route_kind_tests {
 			JobKind::Verify,
 			JobKind::Survey,
 			JobKind::Drilldown,
-			JobKind::Unknown("verify".into()),
+			JobKind::Unknown(crate::test_support::text("verify")),
 		] {
 			assert_eq!(route_admits_kind(Route::Findings, &kind), kind == JobKind::Scan);
 			assert_eq!(route_admits_kind(Route::LlmFinding, &kind), kind == JobKind::Scan);

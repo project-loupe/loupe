@@ -84,7 +84,7 @@ async fn worker_no_content_is_empty_success() {
 		.complete(
 			1,
 			&JobCapability::from_secret("test"),
-			&loupe_proto::CompleteRequest {
+			&loupe_proto::CompleteRequest::<loupe_provenance::Repo, loupe_provenance::Server> {
 				protocol_version: PROTOCOL_VERSION,
 				outcome: loupe_proto::CompleteOutcome::Succeeded,
 				head_sha: None,
@@ -120,9 +120,9 @@ async fn conservative_escaped_finding_fixture_fits_budget() {
 	let base = chunked_response("200 OK", body.as_bytes(), body.len()).await;
 	let client = ServerClient::from_parts(reqwest::Client::new(), base);
 	let finding = client.get_finding(1, &JobCapability::from_secret("test")).await.unwrap();
-	assert_eq!(finding.description, description);
-	assert_eq!(finding.poc_unified.as_deref(), Some(diff.as_str()));
-	assert_eq!(finding.patch_unified.as_deref(), Some(diff.as_str()));
+	assert_eq!(finding.description.expose(), description);
+	assert_eq!(finding.poc_unified.as_ref().map(|value| value.expose()), Some(diff.as_str()));
+	assert_eq!(finding.patch_unified.as_ref().map(|value| value.expose()), Some(diff.as_str()));
 }
 
 #[tokio::test]
@@ -131,10 +131,30 @@ async fn all_worker_response_paths_reject_malformed_dtos() {
 	for route in 0..4 {
 		let base = chunked_response("200 OK", b"{}", 2).await;
 		let client = ServerClient::from_parts(reqwest::Client::new(), base);
+		if route == 2 {
+			// The query owner is admitted from the original MCP request. The
+			// same client search response decoder must still reject this DTO.
+			let context = loupe_worker::mcp::McpSessionContext {
+				client: std::sync::Arc::new(client),
+				job_capability: capability.clone(),
+				repo_id: 1,
+				job_id: None,
+				finding_id: None,
+				workdir: std::env::temp_dir(),
+			};
+			let request = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{"query":"","limit":100}}}"#;
+			let mut output = Vec::new();
+			loupe_worker::mcp::run_stream_server(context, request.as_slice(), &mut output)
+				.await
+				.unwrap();
+			let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+			assert_eq!(response["result"]["isError"], true);
+			assert!(String::from_utf8(output).unwrap().contains("missing field"));
+			continue;
+		}
 		let result = match route {
 			0 => client.lease(Vec::new(), 0).await.map(|_| ()),
 			1 => client.heartbeat(1, &capability).await.map(|_| ()),
-			2 => client.search_findings(1, &capability, "", 100).await.map(|_| ()),
 			_ => client.get_finding(1, &capability).await.map(|_| ()),
 		};
 		let error = result.unwrap_err();

@@ -285,13 +285,53 @@ Scope of knowledge — read carefully:
 /// Substitute `{key}` placeholders in a template. Simple sentinel-
 /// based replacement — no escaping, no nested templates. Used for the
 /// prompts above.
-pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
+fn render(template: &str, vars: &[(&str, &str)]) -> String {
 	let mut out = template.to_owned();
 	for (k, v) in vars {
 		let needle = format!("{{{k}}}");
 		out = out.replace(&needle, v);
 	}
 	out
+}
+
+/// Completed prompt bytes created only by the named discovery and verification
+/// consumers. Full data framing is a later sink-hardening step.
+#[derive(Clone)]
+pub struct Prompt(String);
+impl std::fmt::Debug for Prompt {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("Prompt([redacted])")
+	}
+}
+impl Prompt {
+	pub(crate) fn discovery(
+		file: &loupe_core::text::RepoPath<loupe_provenance::Repo>, bkb_hint: &'static str,
+	) -> Self {
+		Self(render(DISCOVERY, &[("file", file.expose()), ("bkb_hint", bkb_hint)]))
+	}
+	pub(crate) fn verification(
+		finding_id: i64, finding: &loupe_core::Finding<loupe_provenance::Agent>,
+	) -> Self {
+		let finding_json = serde_json::json!({
+			"id": loupe_core::format_finding_id(finding_id),
+			"severity": finding.severity.as_str(),
+			"title": finding.title,
+			"file": finding.file_path,
+			"line_start": finding.line_start,
+			"line_end": finding.line_end,
+			"description": finding.description,
+			"cwe": finding.cwe,
+		});
+		let file = finding.file_path.as_ref().map(|v| v.expose()).unwrap_or("(unknown)");
+		Self(render(VERIFY, &[("file", file), ("finding_json", &finding_json.to_string())]))
+	}
+	/// Static host instructions contain no runtime source text.
+	pub fn instruction(text: &'static str) -> Self {
+		Self(text.to_owned())
+	}
+	pub fn for_cli_argument(&self) -> &str {
+		&self.0
+	}
 }
 
 #[cfg(test)]

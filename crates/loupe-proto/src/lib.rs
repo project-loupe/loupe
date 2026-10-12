@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 //! Wire-format DTOs for loupe.
 //!
 //! Every DTO request and response carries a `protocol_version: u16` so
@@ -7,6 +8,8 @@
 //! the `X-Loupe-Protocol` request/response header cover routes whose
 //! request body is empty or query-string only.
 
+#[macro_use]
+mod record;
 mod credential_wire;
 mod findings_admin;
 mod job_io;
@@ -16,15 +19,21 @@ mod scan;
 mod secret_serde;
 mod version;
 
+#[cfg(test)]
+#[path = "../tests/support/fixtures.rs"]
+mod test_support;
+
 pub use credential_wire::server_certificate_json_pretty;
 pub use findings_admin::{
 	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyRequest, RetryVerifyResponse,
 };
 pub use job_io::{
-	validate_llm_finding_submission, CompleteOutcome, CompleteRequest, FindingsBatch,
-	HeartbeatRequest, HeartbeatResponse, LlmFindingSubmission, VerdictSubmission,
+	validate_llm_finding, validate_llm_finding_submission, CompleteOutcome, CompleteRequest,
+	FindingsBatch, HeartbeatRequest, HeartbeatResponse, LlmFindingSubmission, LlmFindingValidation,
+	VerdictSubmission,
 };
 pub use lease::{JobCapability, LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse};
+pub use loupe_core::ScannerDocument;
 pub use registry::{
 	GithubAppResponse, GithubAppSummary, GithubReportingAuth, ListReposResponse,
 	RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse,
@@ -51,6 +60,13 @@ pub const JOB_CAPABILITY_TOKEN_CHARS: usize = 43;
 /// submissions and refuses it on the batch endpoint, so the two must
 /// agree; a silent drift would reopen the batch path to LLM findings.
 pub const LLM_CODE_REVIEW_SCANNER_ID: &str = "llm-code-review";
+
+/// Observe the actual strict-submission lexical path predicate. The normal
+/// validator reaches it only after its source-retaining RepoPath admission.
+#[cfg(fuzzing)]
+pub fn fuzz_llm_path_is_normalized(raw: &str) -> bool {
+	job_io::llm_path_is_normalized(raw)
+}
 
 #[cfg(kani)]
 #[path = "../kani/mod.rs"]

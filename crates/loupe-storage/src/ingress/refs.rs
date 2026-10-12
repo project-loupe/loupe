@@ -2,8 +2,9 @@
 use std::fmt;
 use std::ops::Range;
 
-use loupe_core::source_migration::text::{BoundedText, RepoPath, SourceRef};
-use loupe_core::text::{decode_json_string_bounded, policy, Error, Rule, TextPolicy};
+use loupe_core::text::{
+	decode_json_string_bounded, policy, BoundedText, Error, RepoPath, Rule, SourceRef, TextPolicy,
+};
 use loupe_provenance::{Agent, Db as DbSource, Mark, Unvalidated, Validate, ValidateCarrying};
 use rusqlite::Row;
 use serde::de::{self, SeqAccess, Visitor};
@@ -22,15 +23,14 @@ struct Span {
 	column_len: usize,
 	carried_address: usize,
 }
-struct StoredRefs {
-	refs: Vec<SourceRef<Agent>>,
-	canonical: String,
+struct StoredRefs<const MAX: usize> {
+	refs: crate::source_refs::SourceRefs<MAX, Agent>,
 	spans: Vec<Span>,
 }
 
-fn refs_legacy<const MAX: usize>(
+fn refs<const MAX: usize>(
 	row: &Row<'_>, index: usize,
-) -> rusqlite::Result<crate::source_refs::SourceRefs<MAX>> {
+) -> rusqlite::Result<crate::source_refs::SourceRefs<MAX, Agent>> {
 	let marked = column(row, index)?
 		.validate_carrying(StoredRefColumn::<MAX>)
 		.map_err(|e| sql_error(index, ReadError::existing(e)))?;
@@ -44,34 +44,30 @@ fn refs_legacy<const MAX: usize>(
 		debug_assert!(span.range.end <= span.column_len);
 		debug_assert!(span.index < MAX && matches!(span.field, "path" | "symbol"));
 	}
-	let refs = marked
-		.refs
-		.into_iter()
-		.map(|entry| {
-			Ok(loupe_core::text::SourceRef {
-				path: loupe_core::text::RepoPath::new(entry.path.expose())?,
-				symbol: entry
-					.symbol
-					.map(|s| loupe_core::text::BoundedText::new(s.expose()))
-					.transpose()?,
-			})
-		})
-		.collect::<Result<Vec<_>, Error>>()
-		.map_err(|e| sql_error(index, ReadError::existing(e)))?;
-	let legacy = crate::source_refs::SourceRefs::<MAX>::new(refs)
-		.map_err(|e| sql_error(index, ReadError::existing(e)))?;
-	debug_assert_eq!(legacy.expose(), marked.canonical);
-	Ok(legacy)
+	Ok(marked.refs)
 }
-pub(crate) fn unit_refs_legacy(
+pub(crate) fn unit_refs(
 	row: &Row<'_>, index: usize,
-) -> rusqlite::Result<crate::source_refs::UnitRefs> {
-	refs_legacy::<32>(row, index)
+) -> rusqlite::Result<crate::source_refs::UnitRefs<Agent>> {
+	refs::<32>(row, index)
 }
-pub(crate) fn inspected_refs_legacy(
+pub(crate) fn inspected_refs(
 	row: &Row<'_>, index: usize,
-) -> rusqlite::Result<crate::source_refs::InspectedRefs> {
-	refs_legacy::<64>(row, index)
+) -> rusqlite::Result<crate::source_refs::InspectedRefs<Agent>> {
+	refs::<64>(row, index)
+}
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_decode<const MAX: usize>(
+	raw: &[u8],
+) -> Result<crate::source_refs::SourceRefs<MAX, Agent>, Error> {
+	// SAFETY: synthetic original Db column fixture; the actual production
+	// validator carries its original path/symbol token spans before decoding.
+	#[allow(unsafe_code)]
+	let ingress = unsafe { loupe_provenance::Ingress::<DbSource>::new() };
+	loupe_provenance::Untrusted::new(raw, ingress)
+		.validate_carrying(StoredRefColumn::<MAX>)
+		.map(|value| value.refs)
 }
 struct StoredRefColumn<const MAX: usize>;
 #[derive(Deserialize)]
@@ -106,9 +102,9 @@ impl<'de, const MAX: usize> Deserialize<'de> for RawRefs<'de, MAX> {
 	}
 }
 impl<'a, const MAX: usize> ValidateCarrying<&'a [u8], DbSource> for StoredRefColumn<MAX> {
-	type Output = StoredRefs;
+	type Output = StoredRefs<MAX>;
 	type Error = Error;
-	fn validate(self, u: Unvalidated<'_, &'a [u8], DbSource>) -> Result<StoredRefs, Error> {
+	fn validate(self, u: Unvalidated<'_, &'a [u8], DbSource>) -> Result<StoredRefs<MAX>, Error> {
 		let bytes = *u.get();
 		if bytes.len() > 65536 {
 			return Err(Error::new("source_refs", Rule::Bytes));
@@ -136,15 +132,24 @@ impl<'a, const MAX: usize> ValidateCarrying<&'a [u8], DbSource> for StoredRefCol
 			};
 			refs.push(SourceRef { path, symbol });
 		}
-		// Named canonical storage projection of already validated values. This
-		// serialization is never fed back into a carry operation.
-		let value = serde_json::to_value(&refs).map_err(|_| invalid())?;
-		let canonical = loupe_core::canonical::canonical_bytes(&value);
-		if canonical.len() > 65536 {
-			return Err(Error::new("source_refs", Rule::Bytes));
-		}
-		let canonical = String::from_utf8(canonical).map_err(|_| invalid())?;
-		Ok(StoredRefs { refs, canonical, spans })
+		// The collection itself, including an empty one, retains the source of
+		// this designated original SQL column. Element carries above remain
+		// bound to their individual original tokens.
+		let refs = u
+			.carry::<Agent>(0..bytes.len())
+			.ok_or_else(invalid)?
+			.validate(AgentRefCollection::<MAX>(refs))?;
+		Ok(StoredRefs { refs, spans })
+	}
+}
+struct AgentRefCollection<const MAX: usize>(Vec<SourceRef<Agent>>);
+impl<const MAX: usize> Validate<&[u8], Agent> for AgentRefCollection<MAX> {
+	type Output = crate::source_refs::SourceRefs<MAX, Agent>;
+	type Error = Error;
+	fn validate<'view>(
+		self, _: Unvalidated<'view, &[u8]>, mark: Mark<'view, Agent>,
+	) -> Result<Self::Output, Error> {
+		crate::source_refs::SourceRefs::new(&mark, self.0)
 	}
 }
 fn token_span(
@@ -212,7 +217,9 @@ mod tests {
                     assert_eq!(span.column_len,raw.len());
                     println!("actual nested SQL carry {field} {index}: {:?}, offset={}",span.range,span.carried_address-span.column_address);
                 }
-                assert_eq!(unit_refs_legacy(row,0)?.expose(),refs.canonical);
+                let canonical = r#"[{"path":"same","symbol":"same"},{"path":"same","symbol":"same"}]"#;
+                assert_eq!(refs.refs.expose(),canonical);
+                assert_eq!(unit_refs(row,0)?.expose(),canonical);
                 Ok(())
             })?;
             assert_eq!(crate::review_units::get(conn,31)?.unwrap().source_refs.as_slice().len(),2);

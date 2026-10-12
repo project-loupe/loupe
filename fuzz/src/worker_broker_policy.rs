@@ -13,9 +13,15 @@ pub fn do_test(data: &[u8]) {
 	}
 	for claude in [true, false] {
 		let backend = if claude {
-			ModelBrokerBackend::Claude { model: "pinned-model".into(), effort: "high".into() }
+			ModelBrokerBackend::Claude {
+				model: loupe_worker::config::ConfiguredText::Builtin("pinned-model"),
+				effort: loupe_worker::config::ConfiguredText::Builtin("high"),
+			}
 		} else {
-			ModelBrokerBackend::Codex { model: "pinned-model".into(), effort: "high".into() }
+			ModelBrokerBackend::Codex {
+				model: loupe_worker::config::ConfiguredText::Builtin("pinned-model"),
+				effort: loupe_worker::config::ConfiguredText::Builtin("high"),
+			}
 		};
 		let original = serde_json::from_slice::<Value>(data).ok();
 		let expected = original.as_ref().is_some_and(|value| policy_allows(value, claude));

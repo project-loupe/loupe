@@ -46,15 +46,15 @@ impl ResponseCase {
 }
 #[derive(Debug)]
 pub enum ResponseValue {
-	App(loupe_proto::GithubAppResponse),
+	App(loupe_proto::GithubAppResponse<Server>),
 	Repo(loupe_proto::RegisterRepoResponse),
-	Repos(loupe_proto::ListReposResponse),
+	Repos(loupe_proto::ListReposResponse<Server>),
 	Scan(loupe_proto::ScanResponse),
 	Worker(loupe_proto::RegisterWorkerResponse),
-	Jobs(Vec<loupe_proto::JobInfo>),
-	Job(loupe_proto::JobInfo),
-	Findings(loupe_proto::ListFindingsResponse),
-	Finding(loupe_proto::FindingDetail),
+	Jobs(Vec<loupe_proto::JobInfo<Server>>),
+	Job(loupe_proto::JobInfo<Server>),
+	Findings(loupe_proto::ListFindingsResponse<loupe_provenance::Agent, Server>),
+	Finding(loupe_proto::FindingDetail<loupe_provenance::Agent, Server>),
 	Verification(loupe_proto::RetryVerifyResponse),
 	Discard,
 }
@@ -94,24 +94,22 @@ pub fn observe_response(case: ResponseCase, raw: &[u8]) -> ResponseObservation {
 	let input =
 		Untrusted::new(bytes::Bytes::from_owner(FixtureBody(Secret::new(raw.to_vec()))), token);
 	let result = match case {
-		ResponseCase::ShowApp => ingress::show_github_app_legacy(input).map(ResponseValue::App),
+		ResponseCase::ShowApp => ingress::show_github_app(input).map(ResponseValue::App),
 		ResponseCase::RegisterRepo => ingress::register_repo(input).map(ResponseValue::Repo),
-		ResponseCase::ListRepos => ingress::list_repos_legacy(input).map(ResponseValue::Repos),
+		ResponseCase::ListRepos => ingress::list_repos(input).map(ResponseValue::Repos),
 		ResponseCase::ScanRepo => ingress::scan_repo(input).map(ResponseValue::Scan),
 		ResponseCase::RegisterWorker => {
-			ingress::register_worker_bundle_legacy(input).map(ResponseValue::Worker)
+			ingress::register_worker_bundle(input).map(ResponseValue::Worker)
 		},
-		ResponseCase::ListJobs => ingress::list_jobs_legacy(input).map(ResponseValue::Jobs),
-		ResponseCase::GetJob => ingress::get_job_legacy(input).map(ResponseValue::Job),
-		ResponseCase::RetryJob => ingress::retry_job_legacy(input).map(ResponseValue::Job),
-		ResponseCase::CancelJob => ingress::cancel_job_legacy(input).map(ResponseValue::Job),
-		ResponseCase::ListFindings => {
-			ingress::list_findings_legacy(input).map(ResponseValue::Findings)
-		},
+		ResponseCase::ListJobs => ingress::list_jobs(input).map(ResponseValue::Jobs),
+		ResponseCase::GetJob => ingress::get_job(input).map(ResponseValue::Job),
+		ResponseCase::RetryJob => ingress::retry_job(input).map(ResponseValue::Job),
+		ResponseCase::CancelJob => ingress::cancel_job(input).map(ResponseValue::Job),
+		ResponseCase::ListFindings => ingress::list_findings(input).map(ResponseValue::Findings),
 		ResponseCase::SearchFindings => {
-			ingress::search_findings_legacy(input).map(ResponseValue::Findings)
+			ingress::search_findings(input).map(ResponseValue::Findings)
 		},
-		ResponseCase::GetFinding => ingress::get_finding_legacy(input).map(ResponseValue::Finding),
+		ResponseCase::GetFinding => ingress::get_finding(input).map(ResponseValue::Finding),
 		ResponseCase::RetryVerification => {
 			ingress::retry_verification(input).map(ResponseValue::Verification)
 		},
@@ -197,28 +195,28 @@ pub fn observe_config(
 	let _reset = ResetConfig;
 	let command = clap::Command::new("fixture");
 	let result = match case {
-		ConfigCase::CloneUrl => {
-			config::CloneUrlLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::Branch => {
-			config::BranchLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::Owner => {
-			config::OwnerLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::Repo => {
-			config::RepoLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::WorkerName => {
-			config::WorkerNameLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::Search => {
-			config::SearchLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::Hostname => {
-			config::HostnameLegacy.parse_ref(&command, None, value).map(ConfigValue::Text)
-		},
-		ConfigCase::CommonName => config::CommonNameLegacy
+		ConfigCase::CloneUrl => config::CloneUrlArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::Branch => config::BranchArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::Owner => config::OwnerArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::Repo => config::RepoArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::WorkerName => config::WorkerNameArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::Search => config::SearchArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::Hostname => config::HostnameArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Text(v.expose().to_owned())),
+		ConfigCase::CommonName => config::CommonNameArgument
 			.parse_ref_(
 				&command,
 				None,
@@ -229,14 +227,16 @@ pub fn observe_config(
 					CommonNameSource::Default => clap::parser::ValueSource::DefaultValue,
 				},
 			)
-			.map(ConfigValue::Text),
-		ConfigCase::Path => {
-			config::PathLegacy.parse_ref(&command, None, value).map(ConfigValue::Path)
-		},
-		ConfigCase::Url => config::UrlLegacy.parse_ref(&command, None, value).map(ConfigValue::Url),
-		ConfigCase::Pem => config::PemLegacy.parse_ref(&command, None, value).map(|v| {
-			assert_eq!(format!("{v:?}"), "[redacted]");
-			ConfigValue::Pem(v.expose().to_owned())
+			.map(|v| ConfigValue::Text(v.for_certificate().to_owned())),
+		ConfigCase::Path => config::PathArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Path(v.for_filesystem().to_path_buf())),
+		ConfigCase::Url => config::UrlArgument
+			.parse_ref(&command, None, value)
+			.map(|v| ConfigValue::Url(v.for_request().clone())),
+		ConfigCase::Pem => config::PemArgument.parse_ref(&command, None, value).map(|v| {
+			assert_eq!(format!("{v:?}"), "ConfiguredPem([redacted])");
+			ConfigValue::Pem(v.observe_pem())
 		}),
 		ConfigCase::Pat => config::Pat
 			.parse_ref(&command, None, value)
@@ -248,5 +248,25 @@ pub fn observe_config(
 		Rejection::SchemaOrPolicy
 	});
 	let (callbacks, typed_text) = config::take_callbacks();
+	// Preserve the independent target's historical observation vocabulary.
+	// Events still originate in the actual callback, never the case selector.
+	let callbacks = callbacks
+		.into_iter()
+		.map(|callback| match callback {
+			"CloneUrlArgument" => "CloneUrlLegacy",
+			"BranchArgument" => "BranchLegacy",
+			"OwnerArgument" => "OwnerLegacy",
+			"RepoArgument" => "RepoLegacy",
+			"WorkerNameArgument" => "WorkerNameLegacy",
+			"SearchArgument" => "SearchLegacy",
+			"HostnameArgument" => "HostnameLegacy",
+			"CommonNameArgument" => "CommonNameLegacy",
+			"PathArgument" => "PathLegacy",
+			"UrlArgument" => "UrlLegacy",
+			"PemArgument" => "PemLegacy",
+			"Pat" => "Pat",
+			_ => panic!("unknown actual Config callback"),
+		})
+		.collect();
 	ConfigObservation { case, result, mints: config::mints(), callbacks, typed_text }
 }

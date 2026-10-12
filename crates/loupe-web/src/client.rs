@@ -1,213 +1,235 @@
-//! Typed client for the `loupe-server` admin RPCs.
-//!
-//! Modelled on `loupe-worker`'s client rather than `loupectl`'s: it sends
-//! `X-Loupe-Protocol` on every request *and* validates it on every
-//! response, and folds the response body into its errors. Both matter for
-//! a UI — server errors are plain text, not JSON, so the body is the only
-//! useful message, and a protocol cutover should surface as one clear
-//! banner instead of a wall of opaque 400s.
-
-use anyhow::{Context, Result};
+//! Closed admin operations. Browser, Server and Config owners survive to their
+//! selected HTTP/TLS sinks; the client has no arbitrary request or JSON exit.
+use anyhow::Result;
+use axum::response::{IntoResponse, Response};
 use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
-use reqwest::{Method, StatusCode, Url};
+use reqwest::{Method, StatusCode};
 
-/// An upstream call that failed. Keeps the status so the dashboard can
-/// pass a meaningful code back to the browser rather than flattening
-/// everything to 500.
-#[derive(Debug)]
-pub struct UpstreamError {
-	pub status: Option<StatusCode>,
-	pub message: String,
+use crate::config::{ConfigUrl, ConnArgs};
+use crate::ingress::bodies::*;
+use crate::ingress::queries::{BrowserJobs, BrowserSearch};
+use crate::ingress::server::{self, Failure, ServerDiagnostic};
+use crate::ingress::BrowserLimit;
+
+/// An upstream failure retains the original Server diagnostic until Display.
+/// Debug only renders the status and a redaction marker.
+///
+/// ```compile_fail,E0609
+/// fn raw(error: loupe_web::client::UpstreamError) -> String { error.message }
+/// ```
+pub struct UpstreamError(ErrorSource);
+enum ErrorSource {
+	Host(Failure),
+	Server(ServerDiagnostic),
 }
-
-impl std::fmt::Display for UpstreamError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self.status {
-			Some(status) => write!(f, "{status}: {}", self.message),
-			None => f.write_str(&self.message),
+impl UpstreamError {
+	pub(crate) fn host(failure: Failure) -> Self {
+		Self(ErrorSource::Host(failure))
+	}
+	pub(crate) fn diagnostic(diagnostic: ServerDiagnostic) -> Self {
+		Self(ErrorSource::Server(diagnostic))
+	}
+	pub fn status(&self) -> Option<StatusCode> {
+		match &self.0 {
+			ErrorSource::Host(f) => f.status(),
+			ErrorSource::Server(d) => Some(d.status()),
 		}
 	}
 }
-
-impl std::error::Error for UpstreamError {}
-
-impl UpstreamError {
-	fn transport(message: String) -> Self {
-		Self { status: None, message }
+impl std::fmt::Debug for UpstreamError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("UpstreamError")
+			.field("status", &self.status())
+			.field("message", &"[redacted]")
+			.finish()
 	}
 }
-
+impl std::fmt::Display for UpstreamError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		if let Some(status) = self.status() {
+			write!(f, "{status}: ")?;
+		}
+		match &self.0 {
+			ErrorSource::Host(failure) => f.write_str(&failure.message()),
+			ErrorSource::Server(diagnostic) => diagnostic.fmt_message(f),
+		}
+	}
+}
+impl std::error::Error for UpstreamError {}
 pub type UpstreamResult<T> = std::result::Result<T, UpstreamError>;
 
 /// Opaque startup response. Server text stays in its guarded source owner.
-///
-/// The production health owner cannot become an arbitrary JSON value:
 ///
 /// ```compile_fail,E0308
 /// async fn raw_response(client: &loupe_web::AdminClient) {
 ///     let _: serde_json::Value = client.health().await.unwrap();
 /// }
 /// ```
-///
-/// Its diagnostic form is available without exposing Server content:
-///
+/// ```compile_fail,E0308
+/// async fn agent_response(client: &loupe_web::AdminClient) {
+///     let _: loupe_core::text::BoundedText<loupe_core::text::policy::FindingTitle, loupe_provenance::Agent> = client.health().await.unwrap();
+/// }
+/// ```
 /// ```
 /// fn requires_debug<T: std::fmt::Debug>() {}
 /// requires_debug::<loupe_web::client::HealthResponse>();
 /// ```
-pub struct HealthResponse(pub(crate) crate::ingress::server::ServerJson);
+pub struct HealthResponse(pub(crate) server::ServerJson);
 impl std::fmt::Debug for HealthResponse {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		self.0.fmt(f)
 	}
 }
 
-/// Admin-authenticated client. Holds the mTLS identity; every method is a
-/// thin pass-through so the dashboard never invents its own semantics.
+/// The only operations the browser router can dispatch. Text-bearing variants
+/// require the corresponding actual Browser extractor, never raw JSON/strings.
+pub(crate) enum AdminRequest {
+	Health,
+	Whoami,
+	GithubApp,
+	ListRepos(BrowserLimit),
+	CreateRepo(BrowserCreateRepo),
+	UpdateRepo(i64, BrowserUpdateRepo),
+	DeleteRepo(i64),
+	RotatePat(i64, BrowserRotatePat),
+	SetGithubReporting(i64, BrowserSetGithubReporting),
+	EnqueueScan(i64, BrowserEnqueueScan),
+	ListJobs(BrowserJobs),
+	GetJob(i64),
+	RetryJob(i64),
+	CancelJob(i64),
+	ListFindings(i64, BrowserLimit),
+	SearchFindings(i64, BrowserSearch),
+	GetFinding(i64),
+	ApproveFinding(i64),
+	RejectFinding(i64),
+	RetryReportFinding(i64),
+	RetryVerify(BrowserRetryVerify),
+}
+impl AdminRequest {
+	fn endpoint(&self) -> (Method, std::borrow::Cow<'static, str>) {
+		use AdminRequest::*;
+		match self {
+			Health => (Method::GET, "/v1/health".into()),
+			Whoami => (Method::GET, "/v1/whoami".into()),
+			GithubApp => (Method::GET, "/v1/github-app".into()),
+			ListRepos(_) => (Method::GET, "/v1/repos".into()),
+			CreateRepo(_) => (Method::POST, "/v1/repos".into()),
+			UpdateRepo(id, _) => (Method::PATCH, format!("/v1/repos/{id}").into()),
+			DeleteRepo(id) => (Method::DELETE, format!("/v1/repos/{id}").into()),
+			RotatePat(id, _) => {
+				(Method::POST, format!("/v1/repos/{id}/reporting/github-pat").into())
+			},
+			SetGithubReporting(id, _) => {
+				(Method::PUT, format!("/v1/repos/{id}/reporting/github").into())
+			},
+			EnqueueScan(id, _) => (Method::POST, format!("/v1/repos/{id}/scan").into()),
+			ListJobs(_) => (Method::GET, "/v1/jobs".into()),
+			GetJob(id) => (Method::GET, format!("/v1/jobs/{id}").into()),
+			RetryJob(id) => (Method::POST, format!("/v1/jobs/{id}/retry").into()),
+			CancelJob(id) => (Method::POST, format!("/v1/jobs/{id}/cancel").into()),
+			ListFindings(id, _) => (Method::GET, format!("/v1/repos/{id}/findings").into()),
+			SearchFindings(id, _) => {
+				(Method::GET, format!("/v1/repos/{id}/findings/search").into())
+			},
+			GetFinding(id) => (Method::GET, format!("/v1/findings/{id}").into()),
+			ApproveFinding(id) => (Method::POST, format!("/v1/findings/{id}/approve").into()),
+			RejectFinding(id) => (Method::POST, format!("/v1/findings/{id}/reject").into()),
+			RetryReportFinding(id) => {
+				(Method::POST, format!("/v1/findings/{id}/retry-report").into())
+			},
+			RetryVerify(_) => (Method::POST, "/v1/findings/retry-verify".into()),
+		}
+	}
+}
+
+/// Admin-authenticated client with a closed endpoint set.
+///
+/// ```compile_fail,E0599
+/// async fn arbitrary(client: &loupe_web::AdminClient) {
+///     client.call(reqwest::Method::GET, "/arbitrary", &[], None).await;
+/// }
+/// ```
+/// ```compile_fail,E0599
+/// async fn arbitrary(client: &loupe_web::AdminClient) {
+///     client.get_typed::<serde_json::Value>("/arbitrary").await;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct AdminClient {
 	http: reqwest::Client,
-	base: Url,
+	base: ConfigUrl,
 }
-
 impl AdminClient {
-	/// Build from PEM material. Pins the private loupe CA as an additional
-	/// root and presents the admin cert; certificate verification stays on.
-	pub fn new(base: Url, ca_pem: &str, cert_pem: &str, key_pem: &str) -> Result<Self> {
-		let tls = loupe_tls::reqwest_client_config(cert_pem, key_pem, ca_pem)?;
-		let http = reqwest::Client::builder()
-			.use_preconfigured_tls(tls)
-			.build()
-			.context("building reqwest client")?;
+	/// Select the actual Config inputs and borrow PEM only at the TLS sink.
+	pub fn new(config: &ConnArgs) -> Result<Self> {
+		let base = config.server_url()?;
+		let http = config.tls_client()?;
 		Ok(Self { http, base })
 	}
-
-	/// Test-only constructor for a pre-built client (lets integration
-	/// tests use `.resolve()` to reach an ephemeral port).
-	pub fn from_parts(http: reqwest::Client, base: Url) -> Self {
+	/// Use an already configured transport with a URL admitted by actual Clap.
+	/// Integration tests use this to resolve a test server's ephemeral address.
+	/// ```compile_fail,E0308
+	/// fn raw(http: reqwest::Client, url: reqwest::Url) {
+	///     loupe_web::AdminClient::from_parts(http, url);
+	/// }
+	/// ```
+	pub fn from_parts(http: reqwest::Client, base: ConfigUrl) -> Self {
 		Self { http, base }
 	}
-
-	/// Perform an admin request and return the raw JSON body.
-	///
-	/// Everything the dashboard exposes is a proxy, so one generic method
-	/// beats a hand-written wrapper per route: there is no place for the
-	/// two to drift, and the browser gets the server's own JSON shapes.
-	/// Returns the upstream status alongside the body so the proxy can pass
-	/// it through rather than flattening every success to 200 — `201` on
-	/// create and `204` on the mutating routes are both meaningful.
-	pub async fn call(
-		&self, method: Method, path: &str, query: &[(&str, String)],
-		body: Option<serde_json::Value>,
-	) -> UpstreamResult<(StatusCode, Option<serde_json::Value>)> {
-		let body = body
-			.as_ref()
-			.map(crate::ingress::json::legacy_value_bytes)
-			.transpose()
-			.map_err(|_| UpstreamError::transport("encoding upstream request failed".into()))?;
-		self.call_forward(method, path, query, body)
-			.await
-			.map_err(crate::ingress::server::Failure::into_error_legacy)?
-			.into_call_legacy()
+	fn request(&self, operation: &AdminRequest) -> Result<reqwest::RequestBuilder, Failure> {
+		let (method, path) = operation.endpoint();
+		Ok(self
+			.base
+			.admin_request(&self.http, method, &path)?
+			.header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string()))
 	}
-
-	pub(crate) async fn call_forward(
-		&self, method: Method, path: &str, query: &[(&str, String)], body: Option<bytes::Bytes>,
-	) -> Result<crate::ingress::server::Outcome, crate::ingress::server::Failure> {
-		use crate::ingress::server::{self, Failure};
-		let mut url = self.base.join(path).map_err(|_| Failure::Url)?;
-		if !query.is_empty() {
-			// Built through `query_pairs_mut` so values are percent-encoded:
-			// the search term is free-form operator input.
-			let mut pairs = url.query_pairs_mut();
-			for (name, value) in query {
-				pairs.append_pair(name, value);
-			}
-		}
-		let mut req = self
-			.http
-			.request(method, url)
-			.header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
-		if let Some(body) = body {
-			req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
-		}
-		let resp = req.send().await.map_err(|_| Failure::Transport)?;
-		server::receive(resp).await
-	}
-
-	/// GET a path and deserialize into `T`. Used for the few places the
-	/// dashboard itself needs to understand a response.
-	pub async fn get_typed<T: serde::de::DeserializeOwned>(&self, path: &str) -> UpstreamResult<T> {
-		let (_, value) = self.call(Method::GET, path, &[], None).await?;
-		let value = value
-			.ok_or_else(|| UpstreamError::transport("upstream returned an empty body".into()))?;
-		serde_json::from_value(value)
-			.map_err(|_| UpstreamError::transport("decoding upstream response failed".into()))
-	}
-
-	/// Stamp `protocol_version` into an outgoing body.
-	///
-	/// Every admin request DTO carries the field, and the server rejects a
-	/// mismatch with a 400. Filling it in here means the browser never
-	/// sends a version and cannot get it wrong.
-	pub fn with_protocol_version(mut body: serde_json::Value) -> serde_json::Value {
-		if let Some(map) = body.as_object_mut() {
-			map.insert("protocol_version".to_owned(), serde_json::Value::from(PROTOCOL_VERSION));
-		}
-		body
-	}
-
-	/// Unauthenticated liveness probe. Returns the server's protocol
-	/// version so the UI can diagnose a mismatch explicitly.
-	pub async fn health(&self) -> UpstreamResult<HealthResponse> {
-		self.call_forward(Method::GET, "/v1/health", &[], None)
-			.await
-			.map_err(crate::ingress::server::Failure::into_error_legacy)?
-			.into_health_legacy()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn protocol_version_is_stamped_into_an_object() {
-		let body = AdminClient::with_protocol_version(serde_json::json!({"incremental": true}));
-		assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
-		assert_eq!(body["incremental"], true);
-	}
-
-	#[test]
-	fn a_client_supplied_protocol_version_is_overwritten() {
-		// The browser must not be able to talk a different protocol than
-		// the build it is served from.
-		let body =
-			AdminClient::with_protocol_version(serde_json::json!({"protocol_version": 9999}));
-		assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
-	}
-
-	#[test]
-	fn non_objects_pass_through_unchanged() {
-		let body = AdminClient::with_protocol_version(serde_json::json!([1, 2, 3]));
-		assert_eq!(body, serde_json::json!([1, 2, 3]));
-	}
-
-	#[test]
-	fn upstream_error_renders_status_and_body() {
-		let err = UpstreamError {
-			status: Some(StatusCode::CONFLICT),
-			message: "job 3 is Succeeded, not queued or leased".into(),
+	pub(crate) async fn forward(&self, operation: AdminRequest) -> Response {
+		let request = match self.request(&operation) {
+			Ok(request) => request,
+			Err(error) => return error.into_response(),
 		};
-		let rendered = err.to_string();
-		assert!(rendered.contains("409"));
-		assert!(rendered.contains("not queued or leased"));
+		use AdminRequest::*;
+		let response = match operation {
+			CreateRepo(body) => body.send(request).await.map_err(|response| *response),
+			UpdateRepo(_, body) => body.send(request).await.map_err(|response| *response),
+			RotatePat(_, body) => body.send(request).await.map_err(|response| *response),
+			SetGithubReporting(_, body) => body.send(request).await.map_err(|response| *response),
+			EnqueueScan(_, body) => body.send(request).await.map_err(|response| *response),
+			RetryVerify(body) => body.send(request).await.map_err(|response| *response),
+			ListJobs(query) => {
+				query.send(request).await.map_err(|_| Failure::Transport.into_response())
+			},
+			SearchFindings(_, query) => {
+				query.send(request).await.map_err(|_| Failure::Transport.into_response())
+			},
+			ListRepos(query) | ListFindings(_, query) => {
+				query.send(request).await.map_err(|_| Failure::Transport.into_response())
+			},
+			_ => request.send().await.map_err(|_| Failure::Transport.into_response()),
+		};
+		match response {
+			Ok(response) => match server::receive(response).await {
+				Ok(outcome) => outcome.into_response(),
+				Err(error) => error.into_response(),
+			},
+			Err(response) => response,
+		}
 	}
-
-	#[test]
-	fn transport_error_renders_without_a_status() {
-		let err = UpstreamError::transport("upstream request failed: connection refused".into());
-		assert_eq!(err.to_string(), "upstream request failed: connection refused");
+	/// Fixed startup liveness probe; no generic Server JSON projection exists.
+	pub async fn health(&self) -> UpstreamResult<HealthResponse> {
+		let response = self
+			.request(&AdminRequest::Health)
+			.map_err(Failure::into_error)?
+			.send()
+			.await
+			.map_err(|_| Failure::Transport.into_error())?;
+		server::receive(response).await.map_err(Failure::into_error)?.into_health()
+	}
+	/// Render the selected Config URL and opaque health only at startup's log or
+	/// terminal diagnostic sink.
+	pub async fn check_startup(&self) -> Result<()> {
+		self.base.report_startup(self.health().await)
 	}
 }
 
@@ -222,7 +244,15 @@ mod tls_constructor_controls {
 	use super::*;
 
 	fn application_client(ca: &str, cert: &str, key: &str) -> anyhow::Result<reqwest::Client> {
-		Ok(AdminClient::new("https://localhost/".parse().unwrap(), ca, cert, key)?.http)
+		use clap::Parser;
+		let cli = crate::Cli::try_parse_from([
+			"loupe-web".to_owned(),
+			"--server-url=https://localhost/".to_owned(),
+			format!("--ca-cert-pem={ca}"),
+			format!("--admin-cert-pem={cert}"),
+			format!("--admin-key-pem={key}"),
+		])?;
+		Ok(AdminClient::new(&cli.conn)?.http)
 	}
 
 	async fn exchange(

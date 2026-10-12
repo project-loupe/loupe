@@ -23,34 +23,34 @@ pub(crate) fn seed(db: &Db) {
 		Ok(())
 	}).unwrap();
 }
-pub(crate) fn payload() -> BoundedJson<Payload> {
-	BoundedJson::new("{}").unwrap()
+pub(crate) fn payload() -> BoundedJson<Payload, loupe_provenance::Agent> {
+	crate::test_support::json("{}").unwrap()
 }
-pub(crate) fn reason() -> BoundedText<Reason> {
-	BoundedText::new("completed").unwrap()
+pub(crate) fn reason() -> BoundedText<Reason, loupe_provenance::Agent> {
+	crate::test_support::text("completed").unwrap()
 }
 
 #[test]
 fn inventory_real_paths_win_across_ingestion_batches() {
-	use loupe_core::text::{RepoPath, SourceRef};
+	use loupe_core::text::SourceRef;
 
 	use crate::{inventory as i, transaction};
 	let db = fixture();
 	db.with_conn(|conn| {
-		let invalid = i::InventoryPath::from_git_bytes(b"bad\xff.rs");
-		let first = i::NewEntry {
+		let invalid = crate::test_support::inventory_path(b"bad\xff.rs");
+		let first = i::NewEntry::<loupe_provenance::Repo, loupe_provenance::Db, loupe_provenance::Agent> {
 			path: &invalid,
-			blob_sha: Some("invalid-blob"),
+			blob_sha: Some(&crate::test_support::db_text("invalid-blob").unwrap()),
 			kind: i::EntryKind::Tracked,
 			disposition: i::Disposition::Unresolved,
 			reason: None,
 			highlighted: false,
 		};
 		i::standalone::insert(conn, 1, 11, &[first], 0)?;
-		let real = i::InventoryPath::from_git_bytes(b"bad%FF.rs");
-		let entry = i::NewEntry {
+		let real = crate::test_support::inventory_path(b"bad%FF.rs");
+		let entry = i::NewEntry::<loupe_provenance::Repo, loupe_provenance::Db, loupe_provenance::Agent> {
 			path: &real,
-			blob_sha: Some("real-blob"),
+			blob_sha: Some(&crate::test_support::db_text("real-blob").unwrap()),
 			kind: i::EntryKind::Tracked,
 			disposition: i::Disposition::Mapped,
 			reason: None,
@@ -62,23 +62,23 @@ fn inventory_real_paths_win_across_ingestion_batches() {
 		let rows = i::list(conn, 11)?;
 		assert_eq!(rows.len(), 1);
 		assert!(rows[0].path.representable());
-		assert_eq!(rows[0].blob_sha.as_deref(), Some("real-blob"));
+		assert_eq!(rows[0].blob_sha.as_ref().map(loupe_core::text::BoundedText::expose), Some("real-blob"));
 		assert_eq!(rows[0].disposition, i::Disposition::Mapped);
 		transaction::immediate(conn, |tx| {
 			i::verify_refs(
 				tx,
 				11,
-				&[SourceRef { path: RepoPath::new("bad%FF.rs").unwrap(), symbol: None }],
+				&[SourceRef { path: crate::test_support::path("bad%FF.rs").unwrap(), symbol: None }],
 			)
 		})?;
 		// Once evidence refers to an exclusion, replacing its display alias
 		// would silently change that evidence's target; fail closed instead.
-		let first=i::NewEntry{path:&invalid,blob_sha:Some("invalid-blob"),kind:i::EntryKind::Tracked,disposition:i::Disposition::Unresolved,reason:None,highlighted:false};
+		let first=i::NewEntry::<loupe_provenance::Repo, loupe_provenance::Db, loupe_provenance::Agent>{path:&invalid,blob_sha: Some(&crate::test_support::db_text("invalid-blob").unwrap()),kind:i::EntryKind::Tracked,disposition:i::Disposition::Unresolved,reason:None,highlighted:false};
 		i::standalone::insert(conn,1,12,&[first],0)?;
 		conn.execute_batch("INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES (31,12,'evidence','title','objective','[]',0);
             INSERT INTO review_unit_results (review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,corroborates_inventory_exclusion_id,created_at)
             SELECT 31,'next',1,'not_applicable','[]','{}',zeroblob(32),inventory_entry_id,0 FROM generation_inventory WHERE generation_id=12;")?;
-		let entry=i::NewEntry{path:&real,blob_sha:Some("real-blob"),kind:i::EntryKind::Tracked,disposition:i::Disposition::Mapped,reason:None,highlighted:true};
+		let entry=i::NewEntry::<loupe_provenance::Repo, loupe_provenance::Db, loupe_provenance::Agent>{path:&real,blob_sha: Some(&crate::test_support::db_text("real-blob").unwrap()),kind:i::EntryKind::Tracked,disposition:i::Disposition::Mapped,reason:None,highlighted:true};
 		assert!(matches!(i::standalone::insert(conn,1,12,&[entry],1),Err(crate::Error::Conflict(crate::Conflict::InventoryPath))));
 		assert!(!i::list(conn,12)?[0].path.representable());
 		Ok(())
@@ -94,8 +94,14 @@ fn inventory_reingestion_of_identical_paths_is_idempotent() {
 	use crate::{inventory as i, Conflict, Error};
 	let db = fixture();
 	db.with_conn(|conn| {
-		let path = i::InventoryPath::from_git_bytes(b"src/lib.rs");
-		let entry = |blob: &'static str| i::NewEntry {
+		let path = crate::test_support::inventory_path(b"src/lib.rs");
+		let first_blob = crate::test_support::db_text("blob-a").unwrap();
+		let second_blob = crate::test_support::db_text("blob-b").unwrap();
+		let entry = |blob| i::NewEntry::<
+			loupe_provenance::Repo,
+			loupe_provenance::Db,
+			loupe_provenance::Agent,
+		> {
 			path: &path,
 			blob_sha: Some(blob),
 			kind: i::EntryKind::Tracked,
@@ -104,24 +110,27 @@ fn inventory_reingestion_of_identical_paths_is_idempotent() {
 			highlighted: false,
 		};
 		assert_eq!(
-			i::standalone::insert(conn, 1, 11, &[entry("blob-a"), entry("blob-a")], 0)?,
+			i::standalone::insert(conn, 1, 11, &[entry(&first_blob), entry(&first_blob)], 0)?,
 			i::Inserted { inserted: 1, excluded: 0, skipped: 1 },
 			"a duplicate inside one batch is skipped, not fatal"
 		);
 		assert_eq!(
-			i::standalone::insert(conn, 1, 11, &[entry("blob-a")], 1)?,
+			i::standalone::insert(conn, 1, 11, &[entry(&first_blob)], 1)?,
 			i::Inserted { inserted: 0, excluded: 0, skipped: 1 },
 			"re-ingesting the identical path is idempotent"
 		);
 		assert_eq!(i::list(conn, 11)?.len(), 1);
 		assert!(
 			matches!(
-				i::standalone::insert(conn, 1, 11, &[entry("blob-b")], 2),
+				i::standalone::insert(conn, 1, 11, &[entry(&second_blob)], 2),
 				Err(Error::Conflict(Conflict::InventoryPath))
 			),
 			"the same path with different content is a real conflict"
 		);
-		assert_eq!(i::list(conn, 11)?[0].blob_sha.as_deref(), Some("blob-a"));
+		assert_eq!(
+			i::list(conn, 11)?[0].blob_sha.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("blob-a")
+		);
 		Ok(())
 	})
 	.unwrap();
@@ -132,16 +141,17 @@ fn inventory_reason_cannot_impersonate_a_synthetic_exclusion() {
 	use crate::{inventory as i, Error};
 	let db = fixture();
 	db.with_conn(|conn| {
-		let real = i::InventoryPath::from_git_bytes(b"source.rs");
-		let reserved = BoundedText::new("unrepresentable-path").unwrap();
-		let entry = i::NewEntry {
-			path: &real,
-			blob_sha: None,
-			kind: i::EntryKind::Tracked,
-			disposition: i::Disposition::Excluded,
-			reason: Some(&reserved),
-			highlighted: false,
-		};
+		let real = crate::test_support::inventory_path(b"source.rs");
+		let reserved = crate::test_support::text("unrepresentable-path").unwrap();
+		let entry =
+			i::NewEntry::<loupe_provenance::Repo, loupe_provenance::Db, loupe_provenance::Agent> {
+				path: &real,
+				blob_sha: None,
+				kind: i::EntryKind::Tracked,
+				disposition: i::Disposition::Excluded,
+				reason: Some(&reserved),
+				highlighted: false,
+			};
 		assert!(
 			matches!(i::standalone::insert(conn, 1, 11, &[entry], 0), Err(Error::Validation(_))),
 			"reserve the synthetic exclusion marker for ingestion"
@@ -177,9 +187,9 @@ fn campaign_and_generation_reject_each_foreign_parent() {
 				recipe: c::Recipe::Bootstrap,
 				trigger: c::Trigger::Manual,
 				requested_base_sha: None,
-				target_commit_sha: "base",
+				target_commit_sha: &crate::test_support::db_text("base").unwrap(),
 				generation_id: None,
-				effective_policy: &policy,
+				effective_policy: c::CampaignPolicyInput::Submitted(&policy),
 				deadline_at: None,
 				root_campaign_id: None,
 				continuation_of_campaign_id: None,
@@ -207,7 +217,7 @@ fn campaign_and_generation_reject_each_foreign_parent() {
 					&g::NewGeneration {
 						repo_id: 1,
 						predecessor_generation_id: Some(21),
-						commit_sha: "new",
+						commit_sha: &crate::test_support::db_text("new").unwrap(),
 						workflow_contract_version: 1
 					},
 					0
@@ -215,7 +225,13 @@ fn campaign_and_generation_reject_each_foreign_parent() {
 				Err(Error::Ownership(Ownership::GenerationPredecessor))
 			));
 			assert!(matches!(
-				i::insert(tx, 1, 21, &[], 0),
+				i::insert::<loupe_provenance::Repo, loupe_provenance::Db, loupe_provenance::Agent>(
+					tx,
+					1,
+					21,
+					&[],
+					0
+				),
 				Err(Error::Ownership(Ownership::InventoryGeneration))
 			));
 			let summary = c::summarize(tx, 2)?;
@@ -234,7 +250,7 @@ fn profiles_are_canonical_versioned_and_frozen_on_retirement() {
 	use crate::{generations as g, transaction};
 	let db = fixture();
 	db.with_conn(|conn| transaction::immediate(conn, |tx| {
-		let profile=BoundedJson::new("{\"z\":1, \"a\":2}").unwrap();
+		let profile=crate::test_support::json("{\"z\":1, \"a\":2}").unwrap();
 		g::set_profile(tx,11,1,&profile)?;
 		assert!(g::set_profile(tx,11,1,&profile).is_err());
 		g::set_profile(tx,11,2,&profile)?;
@@ -249,20 +265,24 @@ fn profiles_are_canonical_versioned_and_frozen_on_retirement() {
 
 #[test]
 fn inventory_exclusions_are_visible_but_not_referenceable() {
-	use loupe_core::text::{RepoPath, SourceRef};
+	use loupe_core::text::SourceRef;
 
 	use crate::{inventory as i, transaction, Conflict, Error};
 	let db = fixture();
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			let paths = [
-				i::InventoryPath::from_git_bytes(b"bad\xff.rs"),
-				i::InventoryPath::from_git_bytes(b"bad%FF.rs"),
-				i::InventoryPath::from_git_bytes(b"other\n.rs"),
+				crate::test_support::inventory_path(b"bad\xff.rs"),
+				crate::test_support::inventory_path(b"bad%FF.rs"),
+				crate::test_support::inventory_path(b"other\n.rs"),
 			];
 			let entries: Vec<_> = paths
 				.iter()
-				.map(|path| i::NewEntry {
+				.map(|path| i::NewEntry::<
+					loupe_provenance::Repo,
+					loupe_provenance::Db,
+					loupe_provenance::Agent,
+				> {
 					path,
 					blob_sha: None,
 					kind: i::EntryKind::Tracked,
@@ -283,16 +303,26 @@ fn inventory_exclusions_are_visible_but_not_referenceable() {
 			i::verify_refs(
 				tx,
 				11,
-				&[SourceRef { path: RepoPath::new("bad%FF.rs").unwrap(), symbol: None }],
+				&[SourceRef {
+					path: crate::test_support::path("bad%FF.rs").unwrap(),
+					symbol: None,
+				}],
 			)?;
 			assert!(i::verify_refs(
 				tx,
 				11,
-				&[SourceRef { path: RepoPath::new("other%0A.rs").unwrap(), symbol: None }]
+				&[SourceRef {
+					path: crate::test_support::path("other%0A.rs").unwrap(),
+					symbol: None
+				}]
 			)
 			.is_err());
 			let too_many: Vec<_> = (0..=i::MAX_ENTRIES)
-				.map(|_| i::NewEntry {
+				.map(|_| i::NewEntry::<
+					loupe_provenance::Repo,
+					loupe_provenance::Db,
+					loupe_provenance::Agent,
+				> {
 					path: &paths[1],
 					blob_sha: None,
 					kind: i::EntryKind::Tracked,
@@ -331,7 +361,7 @@ fn campaign_snapshots_stay_scoped_and_survive_generation_purge() {
 		tx.execute("DELETE FROM review_generations WHERE generation_id=11",[])?;
 		let campaign=c::get(tx,1)?.unwrap();
 		assert_eq!(campaign.generation_id,None);
-		assert_eq!(campaign.terminal_counts,Some(summary.counts));
+		assert_eq!(campaign.terminal_counts.as_ref().map(BoundedJson::expose),Some(summary.counts.expose()));
 		for table in ["review_units","leads","generation_inventory"] {
 			let count:i64=tx.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE generation_id=11"),[],|r|r.get(0))?;
 			assert_eq!(count,0);
@@ -384,9 +414,9 @@ fn campaign_and_generation_lifecycles_are_guarded_and_atomic() {
 			recipe: c::Recipe::Bootstrap,
 			trigger: c::Trigger::Manual,
 			requested_base_sha: None,
-			target_commit_sha: "base",
+			target_commit_sha: &crate::test_support::db_text("base").unwrap(),
 			generation_id: Some(11),
-			effective_policy: &policy,
+			effective_policy: c::CampaignPolicyInput::Submitted(&policy),
 			deadline_at: None,
 			root_campaign_id: None,
 			continuation_of_campaign_id: None,
@@ -426,19 +456,23 @@ fn campaign_and_generation_lifecycles_are_guarded_and_atomic() {
 
 #[test]
 fn inventory_preserves_unicode_paths_and_scope() {
-	use loupe_core::text::{RepoPath, SourceRef};
+	use loupe_core::text::SourceRef;
 
 	use crate::{inventory as i, transaction};
 	let db = fixture();
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			let paths = [
-				i::InventoryPath::from_git_bytes("café.rs".as_bytes()),
-				i::InventoryPath::from_git_bytes("cafe\u{301}.rs".as_bytes()),
+				crate::test_support::inventory_path("café.rs".as_bytes()),
+				crate::test_support::inventory_path("cafe\u{301}.rs".as_bytes()),
 			];
 			let entries: Vec<_> = paths
 				.iter()
-				.map(|path| i::NewEntry {
+				.map(|path| i::NewEntry::<
+					loupe_provenance::Repo,
+					loupe_provenance::Db,
+					loupe_provenance::Agent,
+				> {
 					path,
 					blob_sha: None,
 					kind: i::EntryKind::Tracked,
@@ -452,15 +486,26 @@ fn inventory_preserves_unicode_paths_and_scope() {
 			assert_eq!(rows.len(), 2);
 			assert!(rows.iter().any(|e| e.path.expose() == "café.rs"));
 			assert!(rows.iter().any(|e| e.path.expose() == "cafe\u{301}.rs"));
-			let refs = [SourceRef { path: RepoPath::new("cafe\u{301}.rs").unwrap(), symbol: None }];
+			let refs = [SourceRef {
+				path: crate::test_support::path("cafe\u{301}.rs").unwrap(),
+				symbol: None,
+			}];
 			i::verify_refs(tx, 11, &refs)?;
 			assert!(i::verify_refs(
 				tx,
 				11,
-				&[SourceRef { path: RepoPath::new("missing.rs").unwrap(), symbol: None }]
+				&[SourceRef {
+					path: crate::test_support::path("missing.rs").unwrap(),
+					symbol: None
+				}]
 			)
 			.is_err());
-			assert!(i::insert(tx, 2, 11, &[], 0).is_err());
+			assert!(i::insert::<
+				loupe_provenance::Repo,
+				loupe_provenance::Db,
+				loupe_provenance::Agent,
+			>(tx, 2, 11, &[], 0)
+			.is_err());
 			Ok(())
 		})
 	})

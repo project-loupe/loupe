@@ -1,43 +1,128 @@
 //! DAO for the `findings` table.
 
+use loupe_core::text::policy::*;
+use loupe_core::text::{BoundedText, RepoPath};
 use loupe_core::{
 	initial_finding_state, roll_up_verdicts, Finding, FindingState, FindingTransition, Severity,
 	StateTransitionError, VerdictRollup,
 };
+use loupe_provenance::{Agent, Db as DbSource, Source};
 use rusqlite::{params, Connection, OptionalExtension};
 
 pub const VALIDATING_DEADLINE_EXPIRED_NOTE: &str = "validating_deadline expired";
+
+/// The two real verification writers. The fixed deadline tuple never acquires
+/// an Agent prose label merely because it shares a SQL column with submissions.
+pub enum VerificationInput<'a> {
+	Submitted { job_id: i64, verdict: &'a loupe_core::Verdict<Agent> },
+	DeadlineExpired,
+}
+pub fn insert_verification(
+	conn: &Connection, finding_id: i64, input: VerificationInput<'_>, now: i64,
+) -> rusqlite::Result<i64> {
+	let (job_id, outcome, notes) = match input {
+		VerificationInput::Submitted { job_id, verdict } => {
+			let (outcome, notes) = match verdict {
+				loupe_core::Verdict::Confirmed { notes, .. } => {
+					("confirmed", notes.as_ref().map(BoundedText::expose))
+				},
+				loupe_core::Verdict::Dismissed { notes } => {
+					("dismissed", notes.as_ref().map(BoundedText::expose))
+				},
+				loupe_core::Verdict::Inconclusive { reason, .. } => {
+					("inconclusive", Some(reason.expose()))
+				},
+			};
+			(Some(job_id), outcome, notes)
+		},
+		VerificationInput::DeadlineExpired => {
+			(None, "inconclusive", Some(VALIDATING_DEADLINE_EXPIRED_NOTE))
+		},
+	};
+	conn.execute("INSERT INTO finding_verifications(finding_id,job_id,verdict,notes,created_at,source) VALUES(?1,?2,?3,?4,?5,'agent')", params![finding_id,job_id,outcome,notes,now])?;
+	Ok(conn.last_insert_rowid())
+}
+
+pub struct SearchText;
+impl loupe_core::text::TextPolicy for SearchText {
+	const FIELD: &'static str = "finding_search";
+	const MAX_BYTES: usize = LEGACY_TEXT_MAX_BYTES;
+	const MAX_CHARS: usize = LEGACY_TEXT_MAX_BYTES;
+	const MULTILINE: bool = true;
+	const ALLOW_CR: bool = true;
+	const ALLOW_EMPTY: bool = true;
+	const NORMALIZATION: loupe_core::text::Normalization = loupe_core::text::Normalization::Exact;
+	const WHITESPACE: loupe_core::text::Whitespace = loupe_core::text::Whitespace::Significant;
+}
+/// Named FTS egress retains the actual admitted keyword or syntax owner.
+pub struct SearchQuery<S: Source> {
+	input: BoundedText<SearchText, S>,
+	keywords: Option<String>,
+}
+impl<S: Source> SearchQuery<S> {
+	pub fn keywords(input: BoundedText<SearchText, S>) -> Self {
+		let keywords = Some(sanitize_fts_query(input.expose()));
+		Self { input, keywords }
+	}
+	pub fn syntax(input: BoundedText<SearchText, S>) -> Self {
+		Self { input, keywords: None }
+	}
+	fn expose(&self) -> &str {
+		self.keywords.as_deref().unwrap_or_else(|| self.input.expose())
+	}
+	pub fn is_empty(&self) -> bool {
+		self.expose().is_empty()
+	}
+}
+
+/// Immutable row identity used by report-scope binding, never a wire field.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FindingIdentity([u8; crate::report_identity::BYTES]);
+impl FindingIdentity {
+	pub fn scope_bytes(&self) -> &[u8; crate::report_identity::BYTES] {
+		&self.0
+	}
+}
+impl std::fmt::Debug for FindingIdentity {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("FindingIdentity([redacted])")
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingRow {
 	pub id: i64,
 	pub repo_id: i64,
 	pub job_id: i64,
-	pub scanner_id: String,
+	pub scanner_id: BoundedText<ScannerIdText, Agent>,
 	pub severity: Severity,
-	pub title: String,
-	pub description: String,
-	pub file_path: Option<String>,
+	pub title: BoundedText<FindingTitle, Agent>,
+	pub description: BoundedText<FindingDescription, Agent>,
+	pub file_path: Option<RepoPath<Agent>>,
 	pub line_start: Option<u32>,
 	pub line_end: Option<u32>,
-	pub cwe: Option<String>,
-	pub patch_unified: Option<String>,
-	pub poc_unified: Option<String>,
-	pub fingerprint: String,
+	pub cwe: Option<BoundedText<CweText, Agent>>,
+	pub patch_unified: Option<BoundedText<PatchUnified, Agent>>,
+	pub poc_unified: Option<BoundedText<PocUnified, Agent>>,
+	pub fingerprint: BoundedText<FindingFingerprintText, Agent>,
 	pub state: FindingState,
 	pub verification_required: bool,
 	pub created_at: i64,
 	pub approved_at: Option<i64>,
-	pub approved_by_cn: Option<String>,
+	pub approved_by_cn: Option<BoundedText<AuditName, DbSource>>,
 	pub rejected_at: Option<i64>,
-	pub rejected_by_cn: Option<String>,
+	pub rejected_by_cn: Option<BoundedText<AuditName, DbSource>>,
 	pub patch_proposed_at: Option<i64>,
-	pub patch_proposed_by_cn: Option<String>,
-	pub patch_notes: Option<String>,
+	pub patch_proposed_by_cn: Option<BoundedText<AuditName, DbSource>>,
+	pub patch_notes: Option<BoundedText<PatchNotes, Agent>>,
+	report_identity: FindingIdentity,
 }
 
 impl FindingRow {
-	pub fn into_finding(self) -> Finding {
+	pub fn report_identity(&self) -> FindingIdentity {
+		self.report_identity
+	}
+	pub fn into_finding(self) -> Finding<Agent> {
 		Finding {
 			scanner_id: self.scanner_id,
 			severity: self.severity,
@@ -63,34 +148,52 @@ impl FindingRow {
 /// straight through. Inserted rows start as `pending`; the complete
 /// handler is what flips them.
 pub fn insert_or_ignore(
-	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding, verification_required: bool,
+	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding<Agent>, verification_required: bool,
 	now: i64,
+) -> rusqlite::Result<Option<i64>> {
+	insert_with_identity(
+		conn,
+		repo_id,
+		job_id,
+		f,
+		verification_required,
+		now,
+		crate::report_identity::generate,
+	)
+}
+
+fn insert_with_identity(
+	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding<Agent>, verification_required: bool,
+	now: i64, generate: impl FnOnce() -> rusqlite::Result<[u8; crate::report_identity::BYTES]>,
 ) -> rusqlite::Result<Option<i64>> {
 	let initial_state = initial_finding_state(FindingTransition::ScanAccepted)
 		.map_err(sql_state_transition_error)?;
+	let report_identity = generate()?;
 	let n = conn.execute(
-		"INSERT OR IGNORE INTO findings
+		"INSERT INTO findings
 		   (repo_id, job_id, scanner_id, severity, title, description,
 		    file_path, line_start, line_end, cwe, patch_unified,
-		    poc_unified, fingerprint, state, verification_required, created_at)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+		    poc_unified, fingerprint, state, verification_required, created_at, report_identity, source)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'agent')
+		 ON CONFLICT(repo_id, fingerprint) DO NOTHING",
 		params![
 			repo_id,
 			job_id,
-			&f.scanner_id,
+			f.scanner_id.expose(),
 			f.severity.as_str(),
-			&f.title,
-			&f.description,
-			&f.file_path,
+			f.title.expose(),
+			f.description.expose(),
+			f.file_path.as_ref().map(RepoPath::expose),
 			f.line_start,
 			f.line_end,
-			&f.cwe,
-			&f.patch_unified,
-			&f.poc_unified,
-			&f.fingerprint,
+			f.cwe.as_ref().map(BoundedText::expose),
+			f.patch_unified.as_ref().map(BoundedText::expose),
+			f.poc_unified.as_ref().map(BoundedText::expose),
+			f.fingerprint.expose(),
 			initial_state.as_str(),
 			verification_required as i64,
 			now,
+			report_identity.as_slice(),
 		],
 	)?;
 	Ok(if n > 0 { Some(conn.last_insert_rowid()) } else { None })
@@ -102,7 +205,7 @@ const FINDING_COLUMNS: &str = "id, repo_id, job_id, scanner_id, severity, title,
         file_path, line_start, line_end, cwe, patch_unified,
         poc_unified, fingerprint, state, verification_required, created_at,
         approved_at, approved_by_cn, rejected_at, rejected_by_cn,
-        patch_proposed_at, patch_proposed_by_cn, patch_notes";
+        patch_proposed_at, patch_proposed_by_cn, patch_notes, report_identity, source";
 
 pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<FindingRow>> {
 	let mut stmt = conn.prepare(&format!(
@@ -180,12 +283,7 @@ pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Resul
 		rows.collect::<rusqlite::Result<Vec<i64>>>()?
 	};
 	for fid in &stale {
-		tx.execute(
-			"INSERT INTO finding_verifications
-			   (finding_id, job_id, verdict, notes, created_at)
-			 VALUES (?1, NULL, 'inconclusive', ?2, ?3)",
-			(fid, VALIDATING_DEADLINE_EXPIRED_NOTE, now),
-		)?;
+		insert_verification(&tx, *fid, VerificationInput::DeadlineExpired, now)?;
 		tx.execute(
 			"UPDATE findings SET state = ?1, dismissed_at = ?2
 			 WHERE id = ?3 AND state = ?4",
@@ -297,8 +395,8 @@ pub fn list_for_repo(
 /// double-quotes each token, and gives "every token must appear"
 /// semantics, which is what an agent calling
 /// `query_prior_findings(keywords=...)` reasonably expects.
-pub fn search(
-	conn: &Connection, repo_id: i64, query: &str, limit: i64,
+pub fn search<S: Source>(
+	conn: &Connection, repo_id: i64, query: &SearchQuery<S>, limit: i64,
 ) -> rusqlite::Result<Vec<FindingRow>> {
 	// FINDING_COLUMNS is unqualified; the FTS join puts a second
 	// `title` / `description` / `file_path` in scope (the FTS5
@@ -320,7 +418,7 @@ pub fn search(
 		 LIMIT ?3"
 	);
 	let mut stmt = conn.prepare(&sql)?;
-	let rows = stmt.query_map(params![query, repo_id, limit], row_to_finding)?;
+	let rows = stmt.query_map(params![query.expose(), repo_id, limit], row_to_finding)?;
 	rows.collect()
 }
 
@@ -395,14 +493,15 @@ pub enum PatchAttachOutcome {
 /// `routes/jobs.rs::submit_verdict`) is what enforces the invariant
 /// that a patch can only ride on a confirmed verdict.
 pub fn attach_proposed_patch(
-	conn: &Connection, finding_id: i64, patch_unified: &str, notes: &str, by_cn: &str, now: i64,
+	conn: &Connection, finding_id: i64, patch_unified: &BoundedText<PatchUnified, Agent>,
+	notes: &BoundedText<PatchNotes, Agent>, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
 ) -> rusqlite::Result<PatchAttachOutcome> {
 	let n = conn.execute(
 		"UPDATE findings
 		    SET patch_unified = ?1, patch_notes = ?2,
 		        patch_proposed_by_cn = ?3, patch_proposed_at = ?4
 		  WHERE id = ?5 AND patch_unified IS NULL",
-		params![patch_unified, notes, by_cn, now, finding_id],
+		params![patch_unified.expose(), notes.expose(), by_cn.expose(), now, finding_id],
 	)?;
 	Ok(if n > 0 { PatchAttachOutcome::Attached } else { PatchAttachOutcome::AlreadyPresent })
 }
@@ -425,7 +524,7 @@ pub enum ApprovalOutcome {
 /// pick it up. Idempotent on already-approved rows: re-running on a
 /// `confirmed` row returns `NotPending` rather than re-stamping.
 pub fn approve(
-	conn: &Connection, id: i64, by_cn: &str, now: i64,
+	conn: &Connection, id: i64, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
 ) -> rusqlite::Result<ApprovalOutcome> {
 	let target_state = FindingState::AwaitingApproval
 		.apply(FindingTransition::Approve)
@@ -434,7 +533,13 @@ pub fn approve(
 		"UPDATE findings
 		    SET state = ?1, approved_at = ?2, approved_by_cn = ?3
 		  WHERE id = ?4 AND state = ?5",
-		params![target_state.as_str(), now, by_cn, id, FindingState::AwaitingApproval.as_str()],
+		params![
+			target_state.as_str(),
+			now,
+			by_cn.expose(),
+			id,
+			FindingState::AwaitingApproval.as_str()
+		],
 	)?;
 	Ok(if n > 0 {
 		ApprovalOutcome::Applied
@@ -451,7 +556,7 @@ pub fn approve(
 /// `dismissed_at` is also stamped so dashboards that group on
 /// `dismissed_at` don't need to special-case the rejection path.
 pub fn reject(
-	conn: &Connection, id: i64, by_cn: &str, now: i64,
+	conn: &Connection, id: i64, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
 ) -> rusqlite::Result<ApprovalOutcome> {
 	let target_state = FindingState::AwaitingApproval
 		.apply(FindingTransition::Reject)
@@ -461,7 +566,13 @@ pub fn reject(
 		    SET state = ?1, dismissed_at = ?2,
 		        rejected_at = ?2, rejected_by_cn = ?3
 		  WHERE id = ?4 AND state = ?5",
-		params![target_state.as_str(), now, by_cn, id, FindingState::AwaitingApproval.as_str()],
+		params![
+			target_state.as_str(),
+			now,
+			by_cn.expose(),
+			id,
+			FindingState::AwaitingApproval.as_str()
+		],
 	)?;
 	Ok(if n > 0 {
 		ApprovalOutcome::Applied
@@ -495,33 +606,91 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 }
 
 fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
+	crate::ingress::require_agent_source(row, 25)?;
+	let identity = match row.get_ref(24)? {
+		rusqlite::types::ValueRef::Blob(bytes) => {
+			<[u8; crate::report_identity::BYTES]>::try_from(bytes)
+				.map_err(|_| crate::review::invalid_scalar(24))?
+		},
+		_ => return Err(crate::review::invalid_scalar(24)),
+	};
 	let severity = crate::review::parsed(row, 4)?;
 	Ok(FindingRow {
+		report_identity: FindingIdentity(identity),
 		id: row.get(0)?,
 		repo_id: row.get(1)?,
 		job_id: row.get(2)?,
-		scanner_id: crate::ingress::scanner_legacy(row, 3)?,
+		scanner_id: crate::ingress::scanner(row, 3)?,
 		severity,
-		title: crate::ingress::finding_title_legacy(row, 5)?,
-		description: crate::ingress::description_legacy(row, 6)?,
-		file_path: crate::ingress::optional_finding_path_legacy(row, 7)?,
+		title: crate::ingress::finding_title(row, 5)?,
+		description: crate::ingress::description(row, 6)?,
+		file_path: crate::ingress::optional_finding_path(row, 7)?,
 		line_start: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
 		line_end: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
-		cwe: crate::ingress::optional_cwe_legacy(row, 10)?,
-		patch_unified: crate::ingress::optional_patch_legacy(row, 11)?,
-		poc_unified: crate::ingress::optional_poc_legacy(row, 12)?,
-		fingerprint: crate::ingress::fingerprint_legacy(row, 13)?,
+		cwe: crate::ingress::optional_cwe(row, 10)?,
+		patch_unified: crate::ingress::optional_patch(row, 11)?,
+		poc_unified: crate::ingress::optional_poc(row, 12)?,
+		fingerprint: crate::ingress::fingerprint(row, 13)?,
 		state: crate::review::parsed(row, 14)?,
 		verification_required: row.get::<_, i64>(15)? != 0,
 		created_at: row.get(16)?,
 		approved_at: row.get(17)?,
-		approved_by_cn: crate::ingress::optional_audit_legacy(row, 18)?,
+		approved_by_cn: crate::ingress::optional_audit(row, 18)?,
 		rejected_at: row.get(19)?,
-		rejected_by_cn: crate::ingress::optional_audit_legacy(row, 20)?,
+		rejected_by_cn: crate::ingress::optional_audit(row, 20)?,
 		patch_proposed_at: row.get(21)?,
-		patch_proposed_by_cn: crate::ingress::optional_audit_legacy(row, 22)?,
-		patch_notes: crate::ingress::optional_patch_notes_legacy(row, 23)?,
+		patch_proposed_by_cn: crate::ingress::optional_audit(row, 22)?,
+		patch_notes: crate::ingress::optional_patch_notes(row, 23)?,
 	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(conn, "findings", FINDING_COLUMNS, row_to_finding)?;
+	crate::migrations::admission::scan(
+		conn,
+		"findings",
+		"validating_deadline,confirmed_at,dismissed_at,reported_at",
+		|_| Ok::<_, rusqlite::Error>(()),
+	)
+}
+
+pub(crate) fn validate_stored_verifications(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(
+		conn,
+		"finding_verifications",
+		"id,finding_id,job_id,verdict,notes,created_at,source",
+		|r| {
+			crate::ingress::require_agent_source(r, 6)?;
+			let verdict: String = r.get(3)?;
+			match verdict.as_str() {
+				"confirmed" | "dismissed" => {
+					if !matches!(r.get_ref(4)?, rusqlite::types::ValueRef::Null) {
+						crate::ingress::verdict_notes(r, 4)?;
+					}
+				},
+				"inconclusive" => {
+					if !matches!(r.get_ref(4)?, rusqlite::types::ValueRef::Null) {
+						crate::ingress::verdict_reason(r, 4)?;
+					}
+				},
+				_ => return Err(crate::review::invalid_scalar(3)),
+			}
+			Ok(())
+		},
+	)
+}
+
+pub(crate) fn validate_stored_history(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(
+		conn,
+		"scan_history",
+		"id,repo_id,job_id,head_sha,base_sha,finding_count,duration_ms,finished_at",
+		|r| {
+			crate::ingress::revision(r, 3)?;
+			crate::ingress::optional_revision(r, 4)?;
+			Ok::<_, rusqlite::Error>(())
+		},
+	)
 }
 
 #[cfg(test)]
@@ -534,7 +703,7 @@ mod tests {
 	use crate::secrets::{self, SecretKind};
 	use crate::Db;
 
-	fn fixture() -> (Db, i64, i64) {
+	pub(super) fn fixture() -> (Db, i64, i64) {
 		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
 		let secret_id =
 			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
@@ -543,16 +712,17 @@ mod tests {
 				Ok(repos::insert(
 					c,
 					&NewRepo {
-						clone_url: "https://github.com/a/b.git".into(),
-						host: "github.com".into(),
-						owner: "a".into(),
-						repo: "b".into(),
+						clone_url: crate::test_support::db_text("https://github.com/a/b.git")
+							.unwrap(),
+						host: crate::test_support::db_text("github.com").unwrap(),
+						owner: crate::test_support::db_text("a").unwrap(),
+						repo: crate::test_support::db_text("b").unwrap(),
 						default_branch: None,
 						scan_interval_seconds: None,
-						scanner_config: serde_json::Value::Null,
+						scanner_config: crate::test_support::scanner(serde_json::Value::Null),
 						reporting: ReportingDestination::GithubIssue {
-							target_owner: "a".into(),
-							target_repo: "t".into(),
+							target_owner: crate::test_support::db_text("a").unwrap(),
+							target_repo: crate::test_support::db_text("t").unwrap(),
 							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
@@ -568,7 +738,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: loupe_core::JobKind::Scan,
+						kind: loupe_core::JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -581,19 +751,19 @@ mod tests {
 		(db, repo_id, job_id)
 	}
 
-	fn sample(fingerprint: &str) -> Finding {
+	pub(super) fn sample(fingerprint: &str) -> Finding<loupe_provenance::Agent> {
 		Finding {
-			scanner_id: "regex".into(),
+			scanner_id: crate::test_support::text("regex").unwrap(),
 			severity: Severity::High,
-			title: "AWS access key".into(),
-			description: "Found AKIA...".into(),
-			file_path: Some("src/x.rs".into()),
+			title: crate::test_support::text("AWS access key").unwrap(),
+			description: crate::test_support::text("Found AKIA...").unwrap(),
+			file_path: Some(crate::test_support::path("src/x.rs").unwrap()),
 			line_start: Some(1),
 			line_end: Some(1),
-			cwe: Some("CWE-798".into()),
+			cwe: Some(crate::test_support::text("CWE-798").unwrap()),
 			patch_unified: None,
 			poc_unified: None,
-			fingerprint: fingerprint.into(),
+			fingerprint: crate::test_support::text(fingerprint).unwrap(),
 		}
 	}
 
@@ -677,7 +847,7 @@ mod tests {
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, id);
 		assert_eq!(listed[0].severity, Severity::High);
-		assert_eq!(listed[0].fingerprint, "fp1");
+		assert_eq!(listed[0].fingerprint.expose(), "fp1");
 	}
 
 	#[test]
@@ -762,42 +932,45 @@ mod tests {
 		// Three findings, deliberately distinct in title + description so
 		// we can exercise tokenization, ranking, and per-repo isolation.
 		let mut a = sample("fp-a");
-		a.title = "Integer underflow in claim_for_id".into();
-		a.description = "checked_sub returns None; payment is blocked".into();
-		a.file_path = Some("src/payment/bolt11.rs".into());
+		a.title = crate::test_support::text("Integer underflow in claim_for_id").unwrap();
+		a.description =
+			crate::test_support::text("checked_sub returns None; payment is blocked").unwrap();
+		a.file_path = Some(crate::test_support::path("src/payment/bolt11.rs").unwrap());
 		let mut b = sample("fp-b");
-		b.title = "Unbounded allocation in handle_open_channel".into();
-		b.description = "peer-controlled count drives a Vec::with_capacity".into();
-		b.file_path = Some("src/peer/handler.rs".into());
+		b.title = crate::test_support::text("Unbounded allocation in handle_open_channel").unwrap();
+		b.description =
+			crate::test_support::text("peer-controlled count drives a Vec::with_capacity").unwrap();
+		b.file_path = Some(crate::test_support::path("src/peer/handler.rs").unwrap());
 		let mut c = sample("fp-c");
-		c.title = "Race in closing_signed".into();
-		c.description = "two threads can apply opposite fee updates".into();
-		c.file_path = Some("src/channel/closing.rs".into());
+		c.title = crate::test_support::text("Race in closing_signed").unwrap();
+		c.description =
+			crate::test_support::text("two threads can apply opposite fee updates").unwrap();
+		c.file_path = Some(crate::test_support::path("src/channel/closing.rs").unwrap());
 		for f in &[&a, &b, &c] {
 			db.with_conn(|conn| Ok(insert_or_ignore(conn, repo_id, job_id, f, false, 0)?)).unwrap();
 		}
 
 		// Single-keyword match.
-		let q = sanitize_fts_query("underflow");
+		let q = SearchQuery::keywords(crate::test_support::text("underflow").unwrap());
 		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
 		assert_eq!(hits.len(), 1);
-		assert!(hits[0].title.contains("Integer underflow"));
+		assert!(hits[0].title.expose().contains("Integer underflow"));
 
 		// Multi-keyword AND: must hit a row that contains both.
-		let q = sanitize_fts_query("vec capacity");
+		let q = SearchQuery::keywords(crate::test_support::text("vec capacity").unwrap());
 		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
 		assert_eq!(hits.len(), 1);
-		assert!(hits[0].title.contains("Unbounded allocation"));
+		assert!(hits[0].title.expose().contains("Unbounded allocation"));
 
 		// Path-component match (file_path is one of the indexed
 		// columns).
-		let q = sanitize_fts_query("closing.rs");
+		let q = SearchQuery::keywords(crate::test_support::text("closing.rs").unwrap());
 		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
 		assert_eq!(hits.len(), 1);
-		assert!(hits[0].title.contains("Race"));
+		assert!(hits[0].title.expose().contains("Race"));
 
 		// No matches → empty Vec, not an error.
-		let q = sanitize_fts_query("no-such-token-anywhere");
+		let q = SearchQuery::keywords(crate::test_support::text("no-such-token-anywhere").unwrap());
 		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
 		assert!(hits.is_empty());
 	}
@@ -816,16 +989,17 @@ mod tests {
 				Ok(repos::insert(
 					c,
 					&repos::NewRepo {
-						clone_url: "https://github.com/c/d.git".into(),
-						host: "github.com".into(),
-						owner: "c".into(),
-						repo: "d".into(),
+						clone_url: crate::test_support::db_text("https://github.com/c/d.git")
+							.unwrap(),
+						host: crate::test_support::db_text("github.com").unwrap(),
+						owner: crate::test_support::db_text("c").unwrap(),
+						repo: crate::test_support::db_text("d").unwrap(),
 						default_branch: None,
 						scan_interval_seconds: None,
-						scanner_config: serde_json::Value::Null,
+						scanner_config: crate::test_support::scanner(serde_json::Value::Null),
 						reporting: ReportingDestination::GithubIssue {
-							target_owner: "c".into(),
-							target_repo: "t".into(),
+							target_owner: crate::test_support::db_text("c").unwrap(),
+							target_repo: crate::test_support::db_text("t").unwrap(),
 							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
@@ -841,7 +1015,7 @@ mod tests {
 					c,
 					&jobs::NewJob {
 						repo_id: repo_id_b,
-						kind: loupe_core::JobKind::Scan,
+						kind: loupe_core::JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -853,14 +1027,14 @@ mod tests {
 			.unwrap();
 
 		let mut f_a = sample("fa");
-		f_a.title = "shared keyword overflow".into();
+		f_a.title = crate::test_support::text("shared keyword overflow").unwrap();
 		let mut f_b = sample("fb");
-		f_b.title = "shared keyword overflow".into();
+		f_b.title = crate::test_support::text("shared keyword overflow").unwrap();
 
 		db.with_conn(|c| Ok(insert_or_ignore(c, repo_id_a, job_id_a, &f_a, false, 0)?)).unwrap();
 		db.with_conn(|c| Ok(insert_or_ignore(c, repo_id_b, job_id_b, &f_b, false, 0)?)).unwrap();
 
-		let q = sanitize_fts_query("overflow");
+		let q = SearchQuery::keywords(crate::test_support::text("overflow").unwrap());
 		let hits_a = db.with_conn(|c| Ok(search(c, repo_id_a, &q, 10)?)).unwrap();
 		assert_eq!(hits_a.len(), 1, "search must filter by repo_id; got {hits_a:?}");
 		assert_eq!(hits_a[0].repo_id, repo_id_a);
@@ -876,13 +1050,13 @@ mod tests {
 		// returns nothing instead of stale hits.
 		let (db, repo_id, job_id) = fixture();
 		let mut f = sample("fp-del");
-		f.title = "very specific deletable phrase".into();
+		f.title = crate::test_support::text("very specific deletable phrase").unwrap();
 		let id = db
 			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 0)?))
 			.unwrap()
 			.unwrap();
 		// Search hits.
-		let q = sanitize_fts_query("deletable phrase");
+		let q = SearchQuery::keywords(crate::test_support::text("deletable phrase").unwrap());
 		assert_eq!(db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap().len(), 1);
 		// Delete the finding.
 		db.with_conn(|c| {
@@ -921,9 +1095,9 @@ mod tests {
 				Ok(attach_proposed_patch(
 					c,
 					id,
-					"--- a/x\n+++ b/x\n@@\n-old\n+new\n",
-					"swap operator",
-					"alice",
+					&crate::test_support::text("--- a/x\n+++ b/x\n@@\n-old\n+new\n").unwrap(),
+					&crate::test_support::text("swap operator").unwrap(),
+					&crate::test_support::db_text("alice").unwrap(),
 					200,
 				)?)
 			})
@@ -931,9 +1105,18 @@ mod tests {
 		assert_eq!(outcome, PatchAttachOutcome::Attached);
 
 		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
-		assert_eq!(row.patch_unified.as_deref(), Some("--- a/x\n+++ b/x\n@@\n-old\n+new\n"));
-		assert_eq!(row.patch_notes.as_deref(), Some("swap operator"));
-		assert_eq!(row.patch_proposed_by_cn.as_deref(), Some("alice"));
+		assert_eq!(
+			row.patch_unified.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("--- a/x\n+++ b/x\n@@\n-old\n+new\n")
+		);
+		assert_eq!(
+			row.patch_notes.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("swap operator")
+		);
+		assert_eq!(
+			row.patch_proposed_by_cn.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("alice")
+		);
 		assert_eq!(row.patch_proposed_at, Some(200));
 	}
 
@@ -953,21 +1136,44 @@ mod tests {
 
 		let first = db
 			.with_conn(|c| {
-				Ok(attach_proposed_patch(c, id, "first patch", "first reason", "alice", 200)?)
+				Ok(attach_proposed_patch(
+					c,
+					id,
+					&crate::test_support::text("first patch").unwrap(),
+					&crate::test_support::text("first reason").unwrap(),
+					&crate::test_support::db_text("alice").unwrap(),
+					200,
+				)?)
 			})
 			.unwrap();
 		assert_eq!(first, PatchAttachOutcome::Attached);
 		let second = db
 			.with_conn(|c| {
-				Ok(attach_proposed_patch(c, id, "second patch", "second reason", "bob", 300)?)
+				Ok(attach_proposed_patch(
+					c,
+					id,
+					&crate::test_support::text("second patch").unwrap(),
+					&crate::test_support::text("second reason").unwrap(),
+					&crate::test_support::db_text("bob").unwrap(),
+					300,
+				)?)
 			})
 			.unwrap();
 		assert_eq!(second, PatchAttachOutcome::AlreadyPresent);
 
 		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
-		assert_eq!(row.patch_unified.as_deref(), Some("first patch"));
-		assert_eq!(row.patch_notes.as_deref(), Some("first reason"));
-		assert_eq!(row.patch_proposed_by_cn.as_deref(), Some("alice"));
+		assert_eq!(
+			row.patch_unified.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("first patch")
+		);
+		assert_eq!(
+			row.patch_notes.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("first reason")
+		);
+		assert_eq!(
+			row.patch_proposed_by_cn.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some("alice")
+		);
 		assert_eq!(row.patch_proposed_at, Some(200));
 	}
 
@@ -984,3 +1190,7 @@ mod tests {
 		assert_eq!(db.with_conn(|c| Ok(list_for_job(c, job_id)?)).unwrap().len(), 1);
 	}
 }
+
+#[cfg(test)]
+#[path = "findings_identity_tests.rs"]
+mod atomic_m_identity_tests;

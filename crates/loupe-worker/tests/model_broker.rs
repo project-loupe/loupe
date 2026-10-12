@@ -116,7 +116,7 @@ async fn claude_reaches_fake_upstream_only_through_the_broker() {
 		.with_model_broker_context(context);
 	let response = backend
 		.run(LlmRequest {
-			prompt: "ignored by fake CLI".into(),
+			prompt: loupe_worker::llm::prompts::Prompt::instruction("ignored by fake CLI"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(10),
 			cancel: CancellationToken::new(),
@@ -127,7 +127,7 @@ async fn claude_reaches_fake_upstream_only_through_the_broker() {
 		})
 		.await
 		.expect("Claude must run through the real no-egress sandbox and model proxy");
-	assert_eq!(response.text, "BROKERED");
+	assert_eq!(response.text.for_log(), "BROKERED");
 
 	let captured = captured.lock().await;
 	assert_eq!(captured.len(), 1);
@@ -217,7 +217,7 @@ exec /usr/bin/curl --silent --show-error --fail-with-body -X POST "${base_url}/r
 		.with_model_broker_context(context);
 	let response = backend
 		.run(LlmRequest {
-			prompt: "ignored by fake CLI".into(),
+			prompt: loupe_worker::llm::prompts::Prompt::instruction("ignored by fake CLI"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(10),
 			cancel: CancellationToken::new(),
@@ -228,7 +228,7 @@ exec /usr/bin/curl --silent --show-error --fail-with-body -X POST "${base_url}/r
 		})
 		.await
 		.expect("Codex must run through the real no-egress sandbox and model proxy");
-	assert_eq!(response.text, "BROKERED-CODEX");
+	assert_eq!(response.text.for_log(), "BROKERED-CODEX");
 
 	let captured = captured.lock().await;
 	assert_eq!(captured.len(), 1);
@@ -281,7 +281,9 @@ async fn selected_claude_cli_reaches_the_messages_contract() {
 	let workdir = tempfile::tempdir().unwrap();
 	let cli_result = backend
 		.run(LlmRequest {
-			prompt: "Return OK and do nothing else.".into(),
+			prompt: loupe_worker::llm::prompts::Prompt::instruction(
+				"Return OK and do nothing else.",
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(3),
 			cancel: CancellationToken::new(),
@@ -346,7 +348,9 @@ async fn selected_codex_cli_reaches_the_responses_contract() {
 	let workdir = tempfile::tempdir().unwrap();
 	let cli_result = backend
 		.run(LlmRequest {
-			prompt: "Return OK and do nothing else.".into(),
+			prompt: loupe_worker::llm::prompts::Prompt::instruction(
+				"Return OK and do nothing else.",
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(3),
 			cancel: CancellationToken::new(),
@@ -524,7 +528,7 @@ async fn selected_codex_cli_completes_commands_and_mcp_under_the_worker_policy()
 		worker_binary,
 		client: Arc::new(ServerClient::from_parts(reqwest::Client::new(), upstream)),
 		bkb_mcp_path: None,
-		bkb_api_url: "https://example.invalid".into(),
+		bkb_api_url: loupe_worker::config::ConfiguredText::Builtin("https://example.invalid"),
 	};
 	let workdir = tempfile::tempdir().unwrap();
 	std::fs::write(workdir.path().join("input.txt"), "repo-readable").unwrap();
@@ -539,7 +543,9 @@ async fn selected_codex_cli_completes_commands_and_mcp_under_the_worker_policy()
 		.with_model_broker_context(model)
 		.with_mcp_context(mcp)
 		.run(LlmRequest {
-			prompt: "Run the permission check and query prior findings.".into(),
+			prompt: loupe_worker::llm::prompts::Prompt::instruction(
+				"Run the permission check and query prior findings.",
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(30),
 			cancel: CancellationToken::new(),
@@ -552,7 +558,7 @@ async fn selected_codex_cli_completes_commands_and_mcp_under_the_worker_policy()
 	server.abort();
 	let response =
 		result.expect("Codex must complete through both brokers with its command sandbox");
-	assert_eq!(response.text.trim(), "PERMISSIONS_AND_MCP_OK");
+	assert_eq!(response.text.for_log().trim(), "PERMISSIONS_AND_MCP_OK");
 	assert!(!workdir.path().join("forbidden").exists(), "repository writes must stay blocked");
 	let captured = captured.lock().await;
 	assert_eq!(captured.len(), 4);

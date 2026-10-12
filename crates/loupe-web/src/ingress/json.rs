@@ -284,20 +284,6 @@ pub(super) fn encode_diagnostic(text: &str) -> Result<bytes::Bytes, Failure> {
 	Ok(bytes::Bytes::from_owner(buffer))
 }
 
-/// Existing public AdminClient::call compatibility facade only. Production
-/// routes use the six named Browser owners. Atomic M removes this Value exit.
-pub(crate) fn legacy_value_bytes(value: &serde_json::Value) -> Result<bytes::Bytes, Failure> {
-	let mut count = Writer { count: 0, buffer: None };
-	serde_json::to_writer(&mut count, value).map_err(|_| Failure::Json)?;
-	let mut buffer = Buffer::new(count.count);
-	let mut write = Writer { count: 0, buffer: Some(&mut buffer) };
-	serde_json::to_writer(&mut write, value).map_err(|_| Failure::Json)?;
-	if write.count != count.count {
-		return Err(Failure::Json);
-	}
-	Ok(bytes::Bytes::from_owner(buffer))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

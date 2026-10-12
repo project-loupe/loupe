@@ -38,8 +38,10 @@ pub(super) async fn tool_validate_diff(
 	workdir: &Path, args: &Value, field: &str,
 ) -> Result<String> {
 	match arguments(if field == "poc_unified" { "validate_poc" } else { "validate_patch" }, args)? {
-		ingress::Arguments::Poc(diff) => validate_diff(workdir, diff.expose()).await,
-		ingress::Arguments::ValidatePatch(diff) => validate_diff(workdir, diff.expose()).await,
+		ingress::Arguments::Poc(diff) => validate_diff(workdir, AgentDiff::Poc(&diff)).await,
+		ingress::Arguments::ValidatePatch(diff) => {
+			validate_diff(workdir, AgentDiff::Patch(&diff)).await
+		},
 		_ => unreachable!(),
 	}
 }
@@ -49,7 +51,7 @@ pub(super) async fn tool_query_prior_findings(
 	let ingress::Arguments::Query(args) = arguments("query_prior_findings", args)? else {
 		unreachable!()
 	};
-	query_prior_findings(client, capability, repo_id, args.query.expose(), args.limit).await
+	query_prior_findings(client, capability, repo_id, &args.query, args.limit).await
 }
 pub(super) async fn tool_get_finding_by_id(
 	client: &Arc<ServerClient>, capability: &JobCapability, args: &Value,

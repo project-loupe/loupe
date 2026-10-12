@@ -39,7 +39,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 		// — we don't want to pile up duplicates.
 		let pending: i64 = db.with_conn(|c| Ok(jobs::count_active_scans_for_repo(c, repo.id)?))?;
 		if pending > 0 {
-			tracing::debug!(repo = %repo.clone_url, "skipping due repo: prior scan still in flight");
+			tracing::debug!(repo = %repo.clone_url.expose(), "skipping due repo: prior scan still in flight");
 			continue;
 		}
 		db.with_conn(|c| {
@@ -47,7 +47,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 				c,
 				&NewJob {
 					repo_id: repo.id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: since_sha.is_some(),
 					since_sha,
 					parent_job_id: None,
@@ -57,7 +57,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 			)
 		})?;
 		enqueued += 1;
-		tracing::info!(repo = %repo.clone_url, "scheduler enqueued periodic scan");
+		tracing::info!(repo = %repo.clone_url.expose(), "scheduler enqueued periodic scan");
 	}
 	Ok(enqueued)
 }
@@ -151,16 +151,16 @@ mod tests {
 				Ok(repos::insert(
 					c,
 					&NewRepo {
-						clone_url: "https://github.com/a/b.git".into(),
-						host: "github.com".into(),
-						owner: "a".into(),
-						repo: "b".into(),
+						clone_url: crate::test_support::text("https://github.com/a/b.git"),
+						host: crate::test_support::text("github.com"),
+						owner: crate::test_support::text("a"),
+						repo: crate::test_support::text("b"),
 						default_branch: None,
 						scan_interval_seconds: Some(60),
-						scanner_config: serde_json::Value::Null,
+						scanner_config: crate::test_support::scanner(serde_json::Value::Null),
 						reporting: ReportingDestination::GithubIssue {
-							target_owner: "x".into(),
-							target_repo: "y".into(),
+							target_owner: crate::test_support::text("x"),
+							target_repo: crate::test_support::text("y"),
 							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
@@ -171,7 +171,15 @@ mod tests {
 			})
 			.unwrap();
 		let worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w1", WorkerKind::Worker, &[1u8; 32], 0)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w1"),
+					WorkerKind::Worker,
+					&[1u8; 32],
+					0,
+				)?)
+			})
 			.unwrap();
 		(db, repo_id, worker_id)
 	}
@@ -195,7 +203,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -212,7 +220,7 @@ mod tests {
 					tx,
 					&loupe_storage::scheduler::ClaimRequest {
 						worker_id,
-						kinds: &[JobKind::Scan],
+						kinds: &[JobKind::<loupe_provenance::Db>::Scan],
 						now: 100,
 						legacy_lease_seconds: 10,
 						capability_hash: &[1; 32],

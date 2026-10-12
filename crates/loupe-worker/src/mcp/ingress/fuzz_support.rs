@@ -1,4 +1,5 @@
 //! Original bounded Sandbox record fixtures, without tool dispatch or reminting.
+#![cfg_attr(test, allow(dead_code))]
 use loupe_provenance::{Ingress, Untrusted};
 use serde_json::json;
 
@@ -33,13 +34,13 @@ fn argument_value(arguments: Arguments) -> Value {
 			json!({"patch_unified":args.patch.patch_unified.expose(),"notes":args.patch.notes.expose()})
 		},
 		Arguments::Verdict(args) => match args.verdict {
-			loupe_core::source_migration::Verdict::Confirmed { notes, .. } => {
+			loupe_core::Verdict::Confirmed { notes, .. } => {
 				json!({"verdict":"confirmed","notes":notes.map(|s|s.expose().to_owned())})
 			},
-			loupe_core::source_migration::Verdict::Dismissed { notes } => {
+			loupe_core::Verdict::Dismissed { notes } => {
 				json!({"verdict":"dismissed","notes":notes.map(|s|s.expose().to_owned())})
 			},
-			loupe_core::source_migration::Verdict::Inconclusive { reason, terminal } => {
+			loupe_core::Verdict::Inconclusive { reason, terminal } => {
 				json!({"verdict":"inconclusive","notes":reason.expose(),"terminal":terminal})
 			},
 		},
@@ -98,18 +99,24 @@ pub async fn observe_records(
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn finding_fixture(
-	workdir: &std::path::Path, args: &Value,
-) -> Result<loupe_proto::LlmFindingSubmission> {
+pub(crate) fn arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
 	// Serialization constructs the fixture's original wire record. The production
 	// decoder has not interpreted any part of it and receives no decoded Value.
 	let original = serde_json::to_vec(
-		&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"submit_finding","arguments":args}}),
+		&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}}),
 	)?;
 	// SAFETY: cfg-only original complete Sandbox record constructed above.
 	let original = Untrusted::new(original, unsafe { Ingress::<Sandbox>::new() });
 	let request =
 		original.as_bytes().validate_carrying(McpRequestDecoder)?.expect("fixture record");
-	let Arguments::Finding(args) = request.call.arguments? else { anyhow::bail!("not finding") };
-	args.into_legacy_submission(workdir)
+	request.call.arguments
+}
+
+pub(crate) fn finding_fixture(
+	workdir: &std::path::Path, args: &Value,
+) -> Result<super::McpFindingSubmission> {
+	let Arguments::Finding(args) = arguments_fixture("submit_finding", args)? else {
+		anyhow::bail!("not finding")
+	};
+	args.into_submission(workdir)
 }

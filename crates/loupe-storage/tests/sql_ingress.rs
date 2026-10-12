@@ -1,4 +1,6 @@
 //! Actual DAO admission and diagnostic regression guards for SQL ingress.
+#[path = "support/legacy_reporting.rs"]
+mod legacy_reporting;
 #[test]
 fn actual_job_error_does_not_reflect_sql_text() {
 	let (db, _) = seeded();
@@ -109,14 +111,9 @@ fn actual_generation_revision_admission() {
 fn actual_app_summary_slug_admission() {
 	let (db, _) = seeded();
 	db.with_conn(|c| {
-		github_app::set(
-			c,
-			&github_app::StoredGithubApp {
-				app_id: 7,
-				slug: "bad\nslug".into(),
-				private_key_pem: loupe_provenance::Secret::new("fake-private-key".into()),
-			},
-			0,
+		c.execute(
+			"INSERT INTO secrets(kind,label,value,created_at) VALUES('github_app','server',?1,0)",
+			[br#"{"app_id":7,"slug":"bad\nslug","private_key_pem":"fake-private-key"}"#.as_slice()],
 		)?;
 		assert!(github_app::summary(c).is_err(), "invalid summary slug accepted");
 		Ok(())
@@ -202,7 +199,7 @@ fn actual_finding_admits_exact_text_but_rejects_controls_caps_and_invalid_paths(
 	db.with_conn(|c| {
 		for title in [String::new(), "cafe\u{301}  ".into(), "x".repeat(CAP)] {
 			c.execute("UPDATE findings SET title=?1", [&title])?;
-			assert_eq!(findings::get(c, id)?.unwrap().title, title);
+			assert_eq!(findings::get(c, id)?.unwrap().title.expose(), title);
 		}
 		for title in ["bad\0title".into(), "bad\rtitle".into(), "x".repeat(CAP + 1)] {
 			c.execute("UPDATE findings SET title=?1", [&title])?;
@@ -244,14 +241,9 @@ fn actual_metadata_reads_reject_invalid_text() {
 fn actual_app_reads_reject_invalid_slug_without_changing_pem_owner() {
 	let (db, _) = seeded();
 	db.with_conn(|c| {
-		github_app::set(
-			c,
-			&github_app::StoredGithubApp {
-				app_id: 7,
-				slug: "bad\nslug".into(),
-				private_key_pem: loupe_provenance::Secret::new("fake-private-key".into()),
-			},
-			0,
+		c.execute(
+			"INSERT INTO secrets(kind,label,value,created_at) VALUES('github_app','server',?1,0)",
+			[br#"{"app_id":7,"slug":"bad\nslug","private_key_pem":"fake-private-key"}"#.as_slice()],
 		)?;
 		assert!(github_app::get(c).is_err(), "invalid stored app slug accepted");
 		assert!(github_app::summary(c).is_err(), "invalid summary slug accepted");
@@ -280,12 +272,12 @@ fn compatibility_reopen_exact_fields_unknown_job_kind_and_scanner_fallback() {
 	drop(db);
 	let db = Db::open(&path, &key).unwrap();
 	db.with_conn(|c| {
-        assert_eq!(findings::get(c, id)?.unwrap().into_finding(), original);
-        assert_eq!(jobs::get(c, 1)?.unwrap().head_sha.as_deref(), Some("base"));
-        assert_eq!(repos::get(c, 1)?.unwrap().scanner_config, serde_json::Value::Null);
+        assert_eq!(serde_json::to_value(findings::get(c, id)?.unwrap().into_finding()).unwrap(), serde_json::to_value(&original).unwrap());
+        assert_eq!(jobs::get(c, 1)?.unwrap().head_sha.as_ref().map(loupe_core::text::BoundedText::expose), Some("base"));
+        assert!(repos::get(c, 1)?.unwrap().scanner_config.is_null());
         c.pragma_update(None, "foreign_keys", false)?;
         c.execute("UPDATE jobs SET kind='future-job'", [])?;
-        assert!(matches!(jobs::get(c, 1)?.unwrap().kind, loupe_core::JobKind::Unknown(ref name) if name == "future-job"));
+        assert!(matches!(jobs::get(c, 1)?.unwrap().kind, loupe_core::JobKind::Unknown(ref name) if name.expose() == "future-job"));
         Ok(())
     }).unwrap();
 }
@@ -303,7 +295,7 @@ fn compatibility_reporting_preserves_original_serde_schema_rules() {
 		r#"{"kind":"email","to":null}"#,
 		r#"["manual"]"#,
 	] {
-		let expected = serde_json::from_str::<loupe_core::ReportingDestination>(raw);
+		let expected = serde_json::from_str::<legacy_reporting::ReportingDestination>(raw);
 		db.with_conn(|c| {
 			c.execute("UPDATE registered_repos SET reporting=?1", [raw])?;
 			let actual = repos::get(c, 1);
@@ -368,13 +360,16 @@ fn compatibility_reporting_all_variants_sequences_and_ignored_content() {
 		r#"{"kind":"email","to":[null]}"#,
 	];
 	for raw in cases {
-		let expected = serde_json::from_str::<loupe_core::ReportingDestination>(raw);
+		let expected = serde_json::from_str::<legacy_reporting::ReportingDestination>(raw);
 		db.with_conn(|c| {
 			c.execute("UPDATE registered_repos SET reporting=?1", [raw])?;
 			let actual = repos::get(c, 1);
 			assert_eq!(actual.is_ok(), expected.is_ok(), "reporting compatibility: {raw}");
 			if let (Ok(row), Ok(expected)) = (actual, &expected) {
-				assert_eq!(row.unwrap().reporting, *expected);
+				assert_eq!(
+					serde_json::to_value(row.unwrap().reporting).unwrap(),
+					serde_json::to_value(expected).unwrap()
+				);
 			}
 			Ok(())
 		})
@@ -392,18 +387,32 @@ fn compatibility_actual_reference_reads_match_existing_schema_and_canonical_byte
 		r#"[{"path":"\uD800"}]"#.into(),
 		r#"[["src/cafe\u0301.rs","Cafe\u0301"]]"#.into(),
 		r#"[["src/x.rs"]]"#.into(),
+		r#"[["src/x.rs",null]]"#.into(),
+		r#"[{"path":"src/x.rs"}]"#.into(),
 		r#"[{"symbol":"same","path":"same"},{"path":"same","symbol":"same"}]"#.into(),
 		format!("[{}]", vec![r#"{"path":"a"}"#; 33].join(",")),
 		format!("[]{}", " ".repeat(65535)),
 	];
-	for raw in cases {
-		let expected = raw.parse::<loupe_storage::source_refs::UnitRefs>();
+	let expected = [
+		None,
+		None,
+		None,
+		None,
+		Some("[{\"path\":\"src/cafe\u{301}.rs\",\"symbol\":\"Café\"}]"),
+		None, // Old positional serde requires the second slot, even for Option.
+		Some("[{\"path\":\"src/x.rs\",\"symbol\":null}]"),
+		Some("[{\"path\":\"src/x.rs\",\"symbol\":null}]"),
+		Some(r#"[{"path":"same","symbol":"same"},{"path":"same","symbol":"same"}]"#),
+		None,
+		None,
+	];
+	for (raw, expected) in cases.into_iter().zip(expected) {
 		db.with_conn(|c| {
 			c.execute("UPDATE review_units SET source_refs=?1", [&raw])?;
 			let actual = loupe_storage::review_units::get(c, 1);
-			assert_eq!(actual.is_ok(), expected.is_ok(), "reference compatibility: {raw}");
-			if let (Ok(row), Ok(expected)) = (actual, &expected) {
-				assert_eq!(&row.unwrap().source_refs, expected);
+			assert_eq!(actual.is_ok(), expected.is_some(), "reference compatibility: {raw}");
+			if let (Ok(row), Some(expected)) = (actual, expected) {
+				assert_eq!(row.unwrap().source_refs.expose(), expected);
 			}
 			Ok(())
 		})
@@ -419,6 +428,11 @@ fn compatibility_full_app_and_summary_keep_distinct_schemas() {
 		slug: String,
 		private_key_pem: String,
 	}
+	#[derive(serde::Deserialize)]
+	struct OldSummary {
+		app_id: u64,
+		slug: String,
+	}
 	let (db, _) = seeded();
 	for raw in [
 		r#"{"app_id":7,"slug":"cafe\u0301","private_key_pem":"fake\nkey"}"#,
@@ -431,17 +445,17 @@ fn compatibility_full_app_and_summary_keep_distinct_schemas() {
 		r#"{"app_id":7,"slug":"same","unknown":"\uD800","private_key_pem":"fake"}"#,
 	] {
 		let old = serde_json::from_str::<OldApp>(raw);
-		let old_summary = serde_json::from_str::<github_app::StoredGithubAppSummary>(raw);
+		let old_summary = serde_json::from_str::<OldSummary>(raw);
 		db.with_conn(|c| {
             c.execute("INSERT INTO secrets(kind,label,value,created_at) VALUES('github_app','server',?1,0) ON CONFLICT(kind,label) DO UPDATE SET value=excluded.value",[raw.as_bytes()])?;
             let actual=github_app::get(c);
             assert_eq!(actual.is_ok(),old.is_ok(),"full App compatibility: {raw}");
             if let (Ok(Some(actual)),Ok(old))=(actual,old) {
-                assert_eq!((actual.app_id,actual.slug,actual.private_key_pem.expose()),(old.app_id,old.slug,&old.private_key_pem));
+                assert_eq!((actual.app_id,actual.slug.expose(),actual.private_key_pem.expose()),(old.app_id,old.slug.as_str(),&old.private_key_pem));
             }
             let summary=github_app::summary(c);
             assert_eq!(summary.is_ok(),old_summary.is_ok(),"summary compatibility: {raw}");
-            if let (Ok(Some(actual)),Ok(old))=(summary,old_summary) { assert_eq!((actual.app_id,actual.slug),(old.app_id,old.slug)); }
+            if let (Ok(Some(actual)),Ok(old))=(summary,old_summary) { assert_eq!((actual.app_id,actual.slug.expose()),(old.app_id,old.slug.as_str())); }
             Ok(())
         }).unwrap();
 	}
@@ -459,7 +473,7 @@ fn compatibility_original_document_recursion_budget_is_not_reset_for_tokens() {
 			format!(r#"{{"kind":"email","to":["same"],"ignored":{nested}}}"#),
 			format!(r#"["github_issue","same","same",null,{nested}]"#),
 		] {
-			let expected = serde_json::from_str::<loupe_core::ReportingDestination>(&raw);
+			let expected = serde_json::from_str::<legacy_reporting::ReportingDestination>(&raw);
 			if expected.is_ok() {
 				accepted += 1;
 			} else {
@@ -475,10 +489,7 @@ fn compatibility_original_document_recursion_budget_is_not_reset_for_tokens() {
 		let refs = format!(r#"[{{"path":{nested}}}]"#);
 		db.with_conn(|c| {
 			c.execute("UPDATE review_units SET source_refs=?1", [&refs])?;
-			assert_eq!(
-				loupe_storage::review_units::get(c, 1).is_ok(),
-				refs.parse::<loupe_storage::source_refs::UnitRefs>().is_ok()
-			);
+			assert!(loupe_storage::review_units::get(c, 1).is_err());
 			Ok(())
 		})
 		.unwrap();

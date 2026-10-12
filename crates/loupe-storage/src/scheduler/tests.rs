@@ -1,5 +1,5 @@
 use loupe_core::text::policy::{Payload, Reason};
-use loupe_core::text::{BoundedJson, BoundedText};
+use loupe_core::text::BoundedJson;
 use loupe_core::{JobKind, JobState};
 use rusqlite::params;
 
@@ -9,7 +9,7 @@ use crate::{jobs, review_tests, transaction, Conflict, Error, Ownership};
 fn fixture() -> crate::Db {
 	let db = review_tests::fixture();
 	db.with_conn(|conn| {
-		let policy = BoundedJson::<Payload>::new(&serde_json::to_string(&CampaignPolicy::default()).unwrap())?;
+		let policy = crate::test_support::json::<Payload>(&serde_json::to_string(&CampaignPolicy::default()).unwrap())?;
 		conn.execute("UPDATE review_campaigns SET effective_policy=?1,effective_policy_digest=?2,deadline_at=10000", params![policy.expose(),policy.digest().as_slice()])?;
 		conn.execute_batch("UPDATE jobs SET state='succeeded';
 		INSERT INTO leads (lead_id,generation_id,identity_family,identity_anchor,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,created_at)
@@ -24,17 +24,19 @@ fn fixture() -> crate::Db {
 	db
 }
 
-fn recipe() -> BoundedJson<Payload> {
-	BoundedJson::new(
+fn recipe() -> BoundedJson<Payload, loupe_provenance::Agent> {
+	crate::test_support::json(
 		r#"{"version":1,"phase":"survey","recipe":"coverage","assignment_key":"ordinary"}"#,
 	)
 	.unwrap()
 }
 
-fn survey(recipe: &BoundedJson<Payload>) -> NewPhaseJob<'_> {
+fn survey(
+	recipe: &BoundedJson<Payload, loupe_provenance::Agent>,
+) -> NewPhaseJob<'_, loupe_provenance::Agent> {
 	NewPhaseJob {
 		repo_id: 1,
-		kind: JobKind::Survey,
+		kind: JobKind::<loupe_provenance::Agent>::Survey,
 		campaign_id: 1,
 		generation_id: Some(11),
 		assigned_lead_id: None,
@@ -44,7 +46,7 @@ fn survey(recipe: &BoundedJson<Payload>) -> NewPhaseJob<'_> {
 		effective_priority: 0,
 		eligible_at: 0,
 		token_budget: None,
-		recipe,
+		recipe: PhaseRecipeInput::Submitted(recipe),
 		handoff: false,
 	}
 }
@@ -56,11 +58,16 @@ fn phase_enqueue_checks_shape_ownership_and_round_trips_columns() {
 		transaction::immediate(conn, |tx| {
 			let recipe = recipe();
 			let mut new = survey(&recipe);
-			for kind in [JobKind::Scan, JobKind::Unknown("survey".into())] {
+			for kind in [
+				JobKind::<loupe_provenance::Agent>::Scan,
+				JobKind::<loupe_provenance::Agent>::Unknown(
+					crate::test_support::text("survey").unwrap(),
+				),
+			] {
 				new.kind = kind;
 				assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
 			}
-			new.kind = JobKind::Drilldown;
+			new.kind = JobKind::<loupe_provenance::Agent>::Drilldown;
 			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
 			new.assigned_lead_id = Some(12);
 			assert!(matches!(
@@ -88,13 +95,13 @@ fn phase_enqueue_checks_shape_ownership_and_round_trips_columns() {
 			assert_eq!(row.eligible_at, Some(20));
 			assert_eq!(row.token_budget, Some(100));
 			assert_eq!(row.scheduling_band, Some(Band::Normal));
-			assert_eq!(row.recipe.as_ref(), Some(&recipe));
+			assert_eq!(row.recipe.as_ref().map(BoundedJson::expose), Some(recipe.expose()));
 			assert_eq!(row.workflow_contract_version, Some(1));
 			assert!(matches!(
 				enqueue_phase(tx, &new, 1),
 				Err(Error::Conflict(Conflict::ActiveDrilldown))
 			));
-			new.kind = JobKind::Verify;
+			new.kind = JobKind::<loupe_provenance::Agent>::Verify;
 			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
 			new.assigned_lead_id = None;
 			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
@@ -191,7 +198,8 @@ fn campaign_budget_reserves_handoffs_and_counts_terminal_jobs() {
 				campaign_handoff_reserve: 1,
 				..CampaignPolicy::default()
 			};
-			let value = BoundedJson::<Payload>::new(&serde_json::to_string(&policy).unwrap())?;
+			let value =
+				crate::test_support::json::<Payload>(&serde_json::to_string(&policy).unwrap())?;
 			tx.execute(
 				"UPDATE review_campaigns SET effective_policy=?1 WHERE campaign_id=1",
 				[value.expose()],
@@ -204,10 +212,10 @@ fn campaign_budget_reserves_handoffs_and_counts_terminal_jobs() {
 				enqueue_phase(tx, &new, 1),
 				Err(Error::Conflict(Conflict::CampaignBudget))
 			));
-			new.kind = JobKind::Drilldown;
+			new.kind = JobKind::<loupe_provenance::Agent>::Drilldown;
 			new.assigned_lead_id = Some(11);
 			enqueue_phase(tx, &new, 1)?;
-			new.kind = JobKind::Verify;
+			new.kind = JobKind::<loupe_provenance::Agent>::Verify;
 			new.assigned_lead_id = None;
 			new.target_finding_id = Some(11);
 			assert!(matches!(
@@ -223,7 +231,8 @@ fn campaign_budget_reserves_handoffs_and_counts_terminal_jobs() {
 #[test]
 fn frozen_policy_round_trip_and_backoff_are_bounded() {
 	let policy = CampaignPolicy::default();
-	let snapshot = BoundedJson::<Payload>::new(&serde_json::to_string(&policy).unwrap()).unwrap();
+	let snapshot =
+		crate::test_support::json::<Payload>(&serde_json::to_string(&policy).unwrap()).unwrap();
 	assert_eq!(CampaignPolicy::from_snapshot(&snapshot).unwrap(), policy);
 	assert_eq!(
 		(1..=8).map(|n| policy.retry_delay(n)).collect::<Vec<_>>(),
@@ -236,7 +245,7 @@ fn frozen_policy_round_trip_and_backoff_are_bounded() {
 		&snapshot.expose().replace("\"max_attempts\":3", "\"max_attempts\":0"),
 	] {
 		assert!(matches!(
-			CampaignPolicy::from_snapshot(&BoundedJson::new(raw).unwrap()),
+			CampaignPolicy::from_snapshot(&crate::test_support::json(raw).unwrap()),
 			Err(Error::Conflict(Conflict::CampaignPolicy))
 		));
 	}
@@ -247,13 +256,13 @@ fn retries_use_snapshot_limits_and_preserve_assignments() {
 	let db = fixture();
 	db.with_conn(|conn| transaction::immediate(conn, |tx| {
 		let policy = CampaignPolicy { max_attempts: 5, ..CampaignPolicy::default() };
-		let snapshot = BoundedJson::<Payload>::new(&serde_json::to_string(&policy).unwrap())?;
+		let snapshot = crate::test_support::json::<Payload>(&serde_json::to_string(&policy).unwrap())?;
 		tx.execute("UPDATE review_campaigns SET effective_policy=?1 WHERE campaign_id=1", [snapshot.expose()])?;
 		tx.execute_batch("UPDATE jobs SET state='leased',attempts=4,hard_deadline_at=500,submit_by=400,soft_deadline_at=400,job_capability_hash=zeroblob(32) WHERE id=101;
 		INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES (1,11,'u','t','o','[]',0);
 		INSERT INTO job_assigned_review_units VALUES (101,1,0,0);")?;
-		let error = BoundedText::<Reason>::new("execution failure")?;
-		assert_eq!(retry_or_fail(tx, 101, 100, &error)?, RetryOutcome::Requeued { eligible_at: 580 });
+		let error = crate::test_support::text::<Reason>("execution failure")?;
+		assert_eq!(retry_or_fail(tx, 101, 100, FailureReason::Submitted(&error))?, RetryOutcome::Requeued { eligible_at: 580 });
 		let job = jobs::get(tx, 101)?.unwrap();
 		assert_eq!(job.state, JobState::Queued);
 		assert_eq!(job.eligible_at, Some(580));
@@ -262,9 +271,9 @@ fn retries_use_snapshot_limits_and_preserve_assignments() {
 		assert_eq!(job.soft_deadline_at, None);
 		assert_eq!(tx.query_row("SELECT COUNT(*) FROM job_assigned_review_units WHERE job_id=101", [], |r|r.get::<_,i64>(0))?, 1);
 		tx.execute("UPDATE jobs SET state='leased',attempts=5 WHERE id=101", [])?;
-		assert_eq!(retry_or_fail(tx, 101, 1000, &error)?, RetryOutcome::Failed);
-		assert_eq!(jobs::get(tx, 101)?.unwrap().error.as_deref(), Some("execution failure"));
-		assert!(retry_or_fail(tx, 101, 1001, &error).is_err(), "terminal jobs must not be retried");
+		assert_eq!(retry_or_fail(tx, 101, 1000, FailureReason::Submitted(&error))?, RetryOutcome::Failed);
+		assert_eq!(jobs::get(tx, 101)?.unwrap().error.as_ref().map(loupe_core::text::BoundedText::expose), Some("execution failure"));
+		assert!(retry_or_fail(tx, 101, 1001, FailureReason::Submitted(&error)).is_err(), "terminal jobs must not be retried");
 		Ok(())
 	})).unwrap();
 }
@@ -274,7 +283,7 @@ fn queued_cancellation_leaves_leased_jobs_alone() {
 	let db = fixture();
 	db.with_conn(|conn| transaction::immediate(conn, |tx| {
 		tx.execute_batch("UPDATE jobs SET state='queued' WHERE id=101; UPDATE jobs SET state='leased' WHERE id=102;")?;
-		assert_eq!(cancel_queued_children(tx, 1, 100, &BoundedText::new("campaign deadline")?)?, 1);
+		assert_eq!(cancel_queued_children(tx, 1, 100, &crate::test_support::text("campaign deadline")?)?, 1);
 		assert_eq!(jobs::get(tx, 101)?.unwrap().state, JobState::Cancelled);
 		assert_eq!(jobs::get(tx, 101)?.unwrap().finished_at, Some(100));
 		assert_eq!(jobs::get(tx, 102)?.unwrap().state, JobState::Leased);
@@ -287,7 +296,7 @@ fn reaper_uses_campaign_attempts_without_changing_legacy_limits() {
 	let db = fixture();
 	db.with_conn(|conn| {
 		let policy = CampaignPolicy { max_attempts: 5, ..CampaignPolicy::default() };
-		let snapshot = BoundedJson::<Payload>::new(&serde_json::to_string(&policy).unwrap())?;
+		let snapshot = crate::test_support::json::<Payload>(&serde_json::to_string(&policy).unwrap())?;
 		conn.execute("UPDATE review_campaigns SET effective_policy=?1 WHERE campaign_id=1", [snapshot.expose()])?;
 		conn.execute_batch("UPDATE jobs SET kind='verify',state='leased',lease_expires_at=100,attempts=3 WHERE id=101;
 		INSERT INTO jobs (repo_id,kind,state,lease_expires_at,attempts,enqueued_at) VALUES (1,'scan','leased',100,3,0);")?;
@@ -309,16 +318,16 @@ fn inactive_drilldown_reaping_releases_assignment_for_next_campaign() {
 		assert_eq!(jobs::reap_stale_leases(conn, 101)?, 1);
 		assert_eq!(jobs::get(conn, 101)?.unwrap().state, JobState::Failed);
 		transaction::immediate(conn, |tx| {
-			let snapshot = BoundedJson::<Payload>::new(&serde_json::to_string(&CampaignPolicy::default()).unwrap())?;
+			let snapshot = crate::test_support::json::<Payload>(&serde_json::to_string(&CampaignPolicy::default()).unwrap())?;
 			let campaign = crate::campaigns::create(tx, &crate::campaigns::NewCampaign {
 				repo_id: 1, recipe: crate::campaigns::Recipe::Incremental, trigger: crate::campaigns::Trigger::Manual,
-				requested_base_sha: None, target_commit_sha: "base", generation_id: Some(11), effective_policy: &snapshot,
+				requested_base_sha: None, target_commit_sha: &crate::test_support::db_text("base").unwrap(), generation_id: Some(11), effective_policy: crate::campaigns::CampaignPolicyInput::Submitted(&snapshot),
 				deadline_at: None, root_campaign_id: None, continuation_of_campaign_id: None,
 			}, 102)?;
 			let recipe = recipe();
 			let mut new = survey(&recipe);
 			new.campaign_id = campaign;
-			new.kind = JobKind::Drilldown;
+			new.kind = JobKind::<loupe_provenance::Agent>::Drilldown;
 			new.assigned_lead_id = Some(11);
 			enqueue_phase(tx, &new, 102)?;
 			Ok(())
@@ -413,8 +422,23 @@ fn an_unreadable_campaign_snapshot_never_blocks_legacy_reaping() {
 		assert_eq!(jobs::get(conn, legacy)?.unwrap().state, JobState::Queued);
 		let stuck = jobs::get(conn, 101)?.unwrap();
 		assert_eq!(stuck.state, JobState::Failed);
-		assert!(stuck.error.as_deref().is_some_and(|e| e.contains("CampaignPolicy")), "{:?}", stuck.error);
+		assert!(stuck.error.as_ref().map(loupe_core::text::BoundedText::expose).is_some_and(|e| e.contains("CampaignPolicy")), "{:?}", stuck.error);
 		assert_eq!(jobs::reap_stale_leases(conn, 102)?, 0);
 		Ok(())
 	}).unwrap();
+}
+
+#[test]
+fn closed_survey_recipe_preserves_payload_canonical_bytes() {
+	for (recipe, name) in [
+		(SurveyRecipe::Bootstrap, "bootstrap"),
+		(SurveyRecipe::Incremental, "incremental"),
+		(SurveyRecipe::Reconciliation, "reconciliation"),
+		(SurveyRecipe::Coverage, "coverage"),
+	] {
+		let old = crate::test_support::json::<Payload>(&serde_json::json!({"version":1,"phase":"survey","recipe":name,"assignment_key":"ordinary"}).to_string()).unwrap();
+		let current = PhaseRecipeInput::<Db>::Survey(recipe).canonical();
+		assert_eq!(current, old.expose());
+		assert_eq!(loupe_core::canonical::digest(current.as_bytes()), *old.digest());
+	}
 }

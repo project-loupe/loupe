@@ -69,42 +69,22 @@ async fn missing_or_unavailable_revision_emits_terminal_verdict_then_successful_
 	let runner = Runner::new(client, cache, Vec::new());
 	let absent_oid = "1111111111111111111111111111111111111111";
 	for revision in [None, Some(" \t"), Some("base"), Some(absent_oid)] {
-		let env = LeaseEnvelope {
-			protocol_version: PROTOCOL_VERSION,
-			job_id: 7,
-			job_capability: JobCapability::from_secret("fixture-capability"),
-			repo_id: 9,
-			repo: loupe_core::RepoSpec {
-				host: "local".into(),
-				owner: "owner".into(),
-				repo: "repo".into(),
-				clone_url: clone_url.clone(),
-				branch: Some("main".into()),
-			},
-			head_branch: Some("main".into()),
-			lease_expires_at: i64::MAX,
-			scanner_config: serde_json::Value::Null,
-			github_pat: None,
-			payload: LeasePayload::Verify {
-				finding_id: 3,
-				finding: Box::new(loupe_core::Finding {
-					scanner_id: "test".into(),
-					severity: loupe_core::Severity::Low,
-					title: "unverified".into(),
-					description: "unverified finding".into(),
-					file_path: None,
-					line_start: None,
-					line_end: None,
-					cwe: None,
-					patch_unified: None,
-					poc_unified: None,
-					fingerprint: "test".into(),
-				}),
-				reviewed_sha: revision.map(str::to_owned),
-			},
-		};
-		*leased.lock().unwrap() =
-			Some(serde_json::to_value(LeaseResponse::Lease(Box::new(env))).unwrap());
+		// Original response bytes are admitted by the actual HTTP lease decoder.
+		let mut env = serde_json::json!({
+			"kind": "lease", "protocol_version": PROTOCOL_VERSION,
+			"job_id": 7, "job_capability": "fixture-capability", "repo_id": 9,
+			"repo": {"host": "local", "owner": "owner", "repo": "repo",
+				"clone_url": clone_url, "branch": "main"},
+			"head_branch": "main", "lease_expires_at": i64::MAX,
+			"scanner_config": null,
+			"payload": {"kind": "verify", "finding_id": 3,
+				"finding": {"scanner_id": "test", "severity": "low", "title": "unverified",
+					"description": "unverified finding", "fingerprint": "test"}}
+		});
+		if let Some(revision) = revision {
+			env["payload"]["reviewed_sha"] = serde_json::json!(revision);
+		}
+		*leased.lock().unwrap() = Some(env);
 		let outcome = runner.step(&CancellationToken::new()).await;
 		assert!(
 			matches!(outcome, Ok(true)),
@@ -154,7 +134,7 @@ async fn revision_checkout_rejects_a_branch_name_that_latest_checkout_accepts() 
 	let bare = cache.path().join("repo.git");
 	clone_bare(remote.path(), &bare);
 	let (workdir, observed) = checkout_latest(&bare, Some("base")).await.unwrap();
-	assert_eq!(observed, commit);
+	assert_eq!(observed.expose(), commit);
 	assert_eq!(std::fs::read(workdir.path().join("file.txt")).unwrap(), b"original\n");
 	let error = checkout_revision(&bare, "base").await.unwrap_err();
 	assert_eq!(error.to_string(), "parsing reviewed revision base");

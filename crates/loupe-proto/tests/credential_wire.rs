@@ -1,8 +1,18 @@
 //! Compatibility controls for the closed credential-bearing wire DTOs.
 
+use loupe_core::{Finding, RepoSpec, Severity};
 use loupe_proto::*;
+use loupe_provenance::{Secret, Server};
 use serde::Serialize;
 use serde_json::{json, Value};
+
+#[path = "support/fixtures.rs"]
+#[allow(dead_code)] // Each integration test uses a subset of the shared fixtures.
+mod fixtures;
+use fixtures::{scanner, text};
+type LeaseResponse = loupe_proto::LeaseResponse<Server, Server>;
+type RegisterRepoRequest = loupe_proto::RegisterRepoRequest<Server>;
+type SetRepoGithubReportingRequest = loupe_proto::SetRepoGithubReportingRequest<Server>;
 
 trait TestWire {
 	fn wire(&self) -> loupe_provenance::Secret<Vec<u8>>;
@@ -46,17 +56,31 @@ fn credential_requests_preserve_escaped_values_and_optional_fields() {
 			reporting["github_pat"] = pat.into();
 		}
 		check(
-			&serde_json::from_value::<SetRepoGithubReportingRequest>(reporting.clone()).unwrap(),
+			&SetRepoGithubReportingRequest {
+				protocol_version: 2,
+				target_owner: text("acme"),
+				target_repo: text("issues"),
+				github_pat: pat.map(|p| Secret::new(p.to_owned())),
+			},
 			&reporting,
 		);
 		reporting.as_object_mut().unwrap().remove("protocol_version");
 		reporting["kind"] = "github_issue".into();
 		let repo = json!({"protocol_version": 2, "clone_url": "https://example.test/repo", "reporting": reporting});
-		check(&serde_json::from_value::<RegisterRepoRequest>(repo.clone()).unwrap(), &repo);
+		let request = RegisterRepoRequest::new(
+			text("https://example.test/repo"),
+			ReportingSetup::GithubIssue {
+				target_owner: text("acme"),
+				target_repo: text("issues"),
+				github_pat: pat.map(|p| Secret::new(p.to_owned())),
+			},
+			Some(scanner(Value::Null)),
+		);
+		check(&request, &repo);
 	}
 	let manual =
 		json!({"protocol_version": 2, "clone_url": "local", "reporting": {"kind":"manual"}});
-	check(&serde_json::from_value::<RegisterRepoRequest>(manual.clone()).unwrap(), &manual);
+	check(&RegisterRepoRequest::new(text("local"), ReportingSetup::Manual, None), &manual);
 }
 
 #[test]
@@ -74,26 +98,60 @@ fn worker_bundle_preserves_compact_and_pretty_pem_bytes() {
 #[test]
 fn lease_variants_preserve_capability_pat_and_payload() {
 	let empty = json!({"kind":"empty", "protocol_version":2});
-	check(&serde_json::from_value::<LeaseResponse>(empty.clone()).unwrap(), &empty);
-	for payload in [
-		json!({"kind":"scan"}),
-		json!({"kind":"scan", "since_sha":"abc"}),
-		json!({"kind":"verify", "finding_id":3, "finding": {
-			"scanner_id":"regex-secrets", "severity":"high", "title":"fixture",
-			"description":"fixture description", "fingerprint":"fp"
-		}}),
+	check(&LeaseResponse::Empty { protocol_version: 2 }, &empty);
+	for (payload, expected_payload) in [
+		(LeasePayload::Scan { since_sha: None }, json!({"kind":"scan"})),
+		(
+			LeasePayload::Scan { since_sha: Some(text("abc")) },
+			json!({"kind":"scan", "since_sha":"abc"}),
+		),
+		(
+			LeasePayload::Verify {
+				finding_id: 3,
+				reviewed_sha: None,
+				finding: Box::new(Finding {
+					scanner_id: text("regex-secrets"),
+					severity: Severity::High,
+					title: text("fixture"),
+					description: text("fixture description"),
+					fingerprint: text("fp"),
+					file_path: None,
+					line_start: None,
+					line_end: None,
+					cwe: None,
+					patch_unified: None,
+					poc_unified: None,
+				}),
+			},
+			json!({"kind":"verify", "finding_id":3, "finding": {
+				"scanner_id":"regex-secrets", "severity":"high", "title":"fixture",
+				"description":"fixture description", "fingerprint":"fp"
+			}}),
+		),
 	] {
 		let wire = json!({"kind":"lease", "protocol_version":2, "job_id":1,
 			"job_capability":"FAKE_CAP_\"\\\né", "repo_id":2,
-			"repo":{"host":"example.test","owner":"acme","repo":"repo","clone_url":"local","branch":null},
+			"repo":{"host":"example.test","owner":"acme","repo":"repo","clone_url":"local"},
 			"head_branch":null,"lease_expires_at":10,"scanner_config":null,
-			"github_pat":"FAKE_PAT_\"\\\né", "payload":payload});
-		let value = serde_json::from_value::<LeaseResponse>(wire.clone()).unwrap();
-		// Finding has legacy default fields; pin its canonical DTO form too.
-		let canonical = serde_json::to_value(&value).unwrap();
-		check(&value, &canonical);
-		assert_eq!(canonical["job_capability"], wire["job_capability"]);
-		assert_eq!(canonical["github_pat"], wire["github_pat"]);
-		assert_eq!(canonical["payload"]["kind"], wire["payload"]["kind"]);
+			"github_pat":"FAKE_PAT_\"\\\né", "payload":expected_payload});
+		let value = LeaseResponse::Lease(Box::new(LeaseEnvelope {
+			protocol_version: 2,
+			job_id: 1,
+			job_capability: JobCapability::from_secret("FAKE_CAP_\"\\\né"),
+			repo_id: 2,
+			repo: RepoSpec {
+				host: text("example.test"),
+				owner: text("acme"),
+				repo: text("repo"),
+				clone_url: text("local"),
+				branch: None,
+			},
+			head_branch: None,
+			lease_expires_at: 10,
+			scanner_config: scanner(Value::Null),
+			github_pat: Some(Secret::new("FAKE_PAT_\"\\\né".into())),
+			payload,
+		}));
+		check(&value, &wire);
 	}
 }

@@ -1,5 +1,3 @@
-use loupe_core::text::{Anchor, BoundedText, Identifier};
-
 use crate::identity::Identity;
 use crate::review_tests::{fixture, payload, reason};
 use crate::scope_tests::findings;
@@ -9,8 +7,8 @@ use crate::{finding_details as f, proofs as p, transaction, Conflict, Error, Own
 fn finding_identity_conflicts_report_the_canonical_finding() {
 	let db = fixture();
 	db.with_conn(|conn|transaction::immediate(conn,|tx|{
-  findings(tx)?;let identity=Identity{family:Identifier::new("auth-bypass").unwrap(),anchor:Anchor::new("token refresh").unwrap(),instance:None};let argument=BoundedText::new("Source-backed reasoning").unwrap();let data=payload();
-  let mut new=f::NewReview{finding_id:11,repo_id:1,workflow_contract_version:1,profile_version:1,profile_digest:None,reviewed_commit_sha:"base",identity:&identity,l2_argument:&data,counterevidence:&argument,assumptions_gaps:&argument,confidence:f::Confidence::High,submitted_rung:f::SubmittedRung::L2,origin_lead:None};
+  findings(tx)?;let identity=Identity{family:crate::test_support::identifier("auth-bypass").unwrap(),anchor:crate::test_support::anchor("token refresh").unwrap(),instance:None};let argument=crate::test_support::text("Source-backed reasoning").unwrap();let data=payload();
+  let mut new=f::NewReview{finding_id:11,repo_id:1,workflow_contract_version:1,profile_version:1,profile_digest:None,reviewed_commit_sha: &crate::test_support::db_text("base").unwrap(),identity:&identity,l2_argument:&data,counterevidence:&argument,assumptions_gaps:&argument,confidence:f::Confidence::High,submitted_rung:f::SubmittedRung::L2,origin_lead:None};
   f::insert_review_details(tx,&new,0).expect("store canonical review details");
   new.finding_id=12;
   assert!(matches!(f::insert_review_details(tx,&new,1),Err(Error::Conflict(Conflict::FindingIdentity(11)))));
@@ -28,10 +26,10 @@ fn proof_rows_derive_blob_metadata_and_check_every_project_link() {
 	let db = fixture();
 	db.with_conn(|conn|transaction::immediate(conn,|tx|{
   findings(tx)?;
-  let a=p::insert_blob(tx,1,b"proof",0).expect("persist a project blob");
-  assert_eq!(p::insert_blob(tx,1,b"proof",1)?,a);
-  let b=p::insert_blob(tx,2,b"proof",0)?;assert_ne!(a,b);
-  let media=BoundedText::new("text/plain").unwrap();let name=BoundedText::new("proof.txt").unwrap();let label=Identifier::new("Reproducer").unwrap();
+  let a=p::insert_blob(tx,1,&crate::test_support::artifact_bytes(b"proof"),0).expect("persist a project blob");
+  assert_eq!(p::insert_blob(tx,1,&crate::test_support::artifact_bytes(b"proof"),1)?,a);
+  let b=p::insert_blob(tx,2,&crate::test_support::artifact_bytes(b"proof"),0)?;assert_ne!(a,b);
+  let media=crate::test_support::text("text/plain").unwrap();let name=crate::test_support::text("proof.txt").unwrap();let label=crate::test_support::identifier("Reproducer").unwrap();
   let mut artifact=p::NewArtifact{repo_id:1,blob_id:b,role:p::Role::ReproducerSource,media_type:&media,label:Some(&label),original_name:&name,produced_by_job:Some(101)};
   assert!(matches!(p::insert_artifact(tx,&artifact,0),Err(Error::Ownership(Ownership::ArtifactBlob))));
   artifact.blob_id=a;artifact.produced_by_job=Some(201);
@@ -49,26 +47,26 @@ fn proof_rows_derive_blob_metadata_and_check_every_project_link() {
   let foreign_staged=p::insert_staged_artifact(tx,&staged,0)?;
   staged.repo_id=1;staged.job_id=102;staged.blob_id=a;
   let other_job_staged=p::insert_staged_artifact(tx,&staged,0)?;
-  let data=payload();let argv="[\"test\"]".parse().unwrap();let root=p::WorkingDirectory::Root;
-  let mut execution=p::NewExecution{repo_id:1,produced_by_job:201,target_commit_sha:"base",clean_tree:true,argv:&argv,working_dir:&root,env_names:&data,fixture_artifact_ids:None,network_policy:p::NetworkPolicy::Isolated,limits:&data,timeout_seconds:10,started_at:0,duration_ms:1,exit_status:Some(0),term_signal:None,stdout_artifact:None,stderr_artifact:None,output_truncated:false};
+  let data=payload();let argv=crate::test_support::json("[\"test\"]").unwrap();let root=p::WorkingDirectory::Root;
+  let mut execution=p::NewExecution{repo_id:1,produced_by_job:201,target_commit_sha: &crate::test_support::db_text("base").unwrap(),clean_tree:true,argv:&argv,working_dir:&root,env_names:&data,fixture_artifact_ids:None,network_policy:p::NetworkPolicy::Isolated,limits:&data,timeout_seconds:10,started_at:0,duration_ms:1,exit_status:Some(0),term_signal:None,stdout_artifact:None,stderr_artifact:None,output_truncated:false};
   assert!(matches!(p::insert_execution(tx,&execution,0),Err(Error::Ownership(Ownership::ExecutionJob))));
   execution.produced_by_job=101;execution.stdout_artifact=Some(foreign);
   assert!(matches!(p::insert_execution(tx,&execution,0),Err(Error::Ownership(Ownership::ExecutionArtifact))));
   execution.stdout_artifact=None;execution.stderr_artifact=Some(foreign);
   assert!(matches!(p::insert_execution(tx,&execution,0),Err(Error::Ownership(Ownership::ExecutionArtifact))));
   execution.stderr_artifact=Some(canonical);
-  let foreign_refs=format!("[{foreign_staged}]").parse().unwrap();
-  let other_job_refs=format!("[{other_job_staged}]").parse().unwrap();
+  let foreign_refs=crate::test_support::json(&format!("[{foreign_staged}]")).unwrap();
+  let other_job_refs=crate::test_support::json(&format!("[{other_job_staged}]")).unwrap();
   for refs in [&foreign_refs,&other_job_refs]{
    execution.fixture_artifact_ids=Some(refs);
    assert!(matches!(p::insert_execution(tx,&execution,0),Err(Error::Ownership(Ownership::ExecutionArtifact))));
   }
-  let own_refs=format!("[{staged_id}]").parse().unwrap();
+  let own_refs=crate::test_support::json(&format!("[{staged_id}]")).unwrap();
   execution.fixture_artifact_ids=Some(&own_refs);
   let run=p::insert_execution(tx,&execution,0)?;
   let stored_dir:String=tx.query_row("SELECT working_dir FROM proof_executions WHERE proof_execution_id=?1",[run],|r|r.get(0))?;assert_eq!(stored_dir,".");
   execution.repo_id=2;execution.produced_by_job=201;execution.stderr_artifact=Some(foreign);execution.fixture_artifact_ids=None;let foreign_run=p::insert_execution(tx,&execution,0)?;
-  let mut proof=p::NewProof{repo_id:1,finding_id:21,verification_id:21,rung:p::Rung::L3,pinned_commit_sha:"base",manifest:&data};
+  let mut proof=p::NewProof{repo_id:1,finding_id:21,verification_id:21,rung:p::Rung::L3,pinned_commit_sha: &crate::test_support::db_text("base").unwrap(),manifest:&data};
   assert!(matches!(p::insert_proof(tx,&proof,0),Err(Error::Ownership(Ownership::ProofFinding))));
   proof.finding_id=11;proof.verification_id=12;
   assert!(matches!(p::insert_proof(tx,&proof,0),Err(Error::Ownership(Ownership::ProofVerification))));
@@ -80,7 +78,7 @@ fn proof_rows_derive_blob_metadata_and_check_every_project_link() {
   assert!(matches!(p::link_execution(tx,1,foreign_proof,run),Err(Error::Ownership(Ownership::ProofExecution))));
   p::link_artifact(tx,1,proof_id,canonical)?;p::link_execution(tx,1,proof_id,run)?;
   let why=reason();
-  let mut attempt=f::NewAttempt{verification_id:11,repo_id:2,workflow_contract_version:1,checkout_commit_sha:"base",established_rung:Some(f::EstablishedRung::L3),e2e_applicability:f::Applicability::NotApplicable,e2e_rationale:Some(&why),blocker:None,retry_condition:None,verification_proof:Some(proof_id),terminal_digest:&[1;32]};
+  let mut attempt=f::NewAttempt{verification_id:11,repo_id:2,workflow_contract_version:1,checkout_commit_sha: &crate::test_support::db_text("base").unwrap(),established_rung:Some(f::EstablishedRung::L3),e2e_applicability:f::Applicability::NotApplicable,e2e_rationale:Some(&why),blocker:None,retry_condition:None,verification_proof:Some(proof_id),terminal_digest:&[1;32]};
   assert!(matches!(f::insert_attempt_details(tx,&attempt,0),Err(Error::Ownership(Ownership::Verification))));
   attempt.repo_id=1;attempt.verification_proof=Some(foreign_proof);
   assert!(matches!(f::insert_attempt_details(tx,&attempt,0),Err(Error::Ownership(Ownership::VerificationProof))));
@@ -101,16 +99,16 @@ fn repeated_detail_rows_are_conflicts_not_internal_errors() {
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			findings(tx)?;
-			let argument = BoundedText::new("Source-backed reasoning").unwrap();
+			let argument = crate::test_support::text("Source-backed reasoning").unwrap();
 			let data = payload();
 			let first = Identity {
-				family: Identifier::new("auth-bypass").unwrap(),
-				anchor: Anchor::new("token refresh").unwrap(),
+				family: crate::test_support::identifier("auth-bypass").unwrap(),
+				anchor: crate::test_support::anchor("token refresh").unwrap(),
 				instance: None,
 			};
 			let second = Identity {
-				family: Identifier::new("auth-bypass").unwrap(),
-				anchor: Anchor::new("session cookie").unwrap(),
+				family: crate::test_support::identifier("auth-bypass").unwrap(),
+				anchor: crate::test_support::anchor("session cookie").unwrap(),
 				instance: None,
 			};
 			let mut review = f::NewReview {
@@ -119,7 +117,7 @@ fn repeated_detail_rows_are_conflicts_not_internal_errors() {
 				workflow_contract_version: 1,
 				profile_version: 1,
 				profile_digest: None,
-				reviewed_commit_sha: "base",
+				reviewed_commit_sha: &crate::test_support::db_text("base").unwrap(),
 				identity: &first,
 				l2_argument: &data,
 				counterevidence: &argument,
@@ -142,7 +140,7 @@ fn repeated_detail_rows_are_conflicts_not_internal_errors() {
 				verification_id: 11,
 				repo_id: 1,
 				workflow_contract_version: 1,
-				checkout_commit_sha: "base",
+				checkout_commit_sha: &crate::test_support::db_text("base").unwrap(),
 				established_rung: None,
 				e2e_applicability: f::Applicability::NotApplicable,
 				e2e_rationale: Some(&why),
@@ -167,8 +165,11 @@ fn repeated_detail_rows_are_conflicts_not_internal_errors() {
 
 #[test]
 fn proof_display_fields_are_bound_to_their_own_policies() {
-	assert!(BoundedText::<p::MediaType>::new(&"a".repeat(101)).is_err());
-	assert!(BoundedText::<p::OriginalName>::new(&"x".repeat(513)).is_err());
-	assert!(BoundedText::<p::OriginalName>::new("bad\nname").is_err());
-	assert_eq!(p::WorkingDirectory::Directory("tests".parse().unwrap()).expose(), "tests");
+	assert!(crate::test_support::text::<p::MediaType>(&"a".repeat(101)).is_err());
+	assert!(crate::test_support::text::<p::OriginalName>(&"x".repeat(513)).is_err());
+	assert!(crate::test_support::text::<p::OriginalName>("bad\nname").is_err());
+	assert_eq!(
+		p::WorkingDirectory::Directory(crate::test_support::path("tests").unwrap()).expose(),
+		"tests"
+	);
 }

@@ -38,6 +38,13 @@ pub enum MigrationReason {
 	IntegrityViolation,
 	ForeignKeySetting,
 	InvalidData,
+	TextPolicy(loupe_core::text::Rule),
+	SqlType,
+	Scalar,
+	Source,
+	CampaignPolicy,
+	Entropy,
+	IdentityBackfill,
 }
 
 /// Safe to log through Display, Debug, or an error source chain. SQLite's
@@ -50,6 +57,7 @@ pub struct MigrationFailure {
 	pub stage: MigrationStage,
 	pub table: Option<&'static str>,
 	pub column: Option<&'static str>,
+	pub field: Option<&'static str>,
 	pub rowid: Option<i64>,
 	pub reason: MigrationReason,
 	pub sqlite_code: Option<i32>,
@@ -63,6 +71,7 @@ impl MigrationFailure {
 			stage,
 			table: None,
 			column: None,
+			field: None,
 			rowid: None,
 			reason,
 			sqlite_code: None,
@@ -117,6 +126,9 @@ impl fmt::Display for MigrationFailure {
 		}
 		if let Some(rowid) = self.rowid {
 			write!(f, "; rowid={rowid}")?;
+		}
+		if let Some(field) = self.field {
+			write!(f, "; field={field}")?;
 		}
 		if let Some(code) = self.sqlite_code {
 			write!(f, "; sqlite_code={code}")?;

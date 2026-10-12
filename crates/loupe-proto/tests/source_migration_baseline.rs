@@ -1,9 +1,10 @@
-//! Existing DTO behavior, before the staged original-token decoder exists.
+//! Independent serde oracle controls for the source-aware comparison.
 #[path = "support/verdict_cases.rs"]
 mod cases;
+#[path = "support/legacy_verdict.rs"]
+mod legacy;
 
-use loupe_core::Verdict;
-use loupe_proto::VerdictSubmission;
+use legacy::{Verdict, VerdictSubmission};
 
 #[test]
 fn legacy_verdict_schema_keeps_each_variant_options_unknowns_and_duplicate_rules() {

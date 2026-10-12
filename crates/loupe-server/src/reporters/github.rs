@@ -9,6 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use loupe_core::report_limits::GITHUB_ISSUE_BODY_MAX_CHARS;
 use loupe_core::{format_finding_id, Finding, ReportingDestination, Severity};
+use loupe_provenance::Agent;
 use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
@@ -181,7 +182,7 @@ impl Reporter for GithubReporter {
 	) -> Result<DispatchReceipt> {
 		let (target_owner, target_repo) = match &repo.reporting {
 			ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
-				(target_owner.as_str(), target_repo.as_str())
+				(target_owner.expose(), target_repo.expose())
 			},
 			_ => anyhow::bail!("GithubReporter dispatched against a non-github destination"),
 		};
@@ -274,18 +275,23 @@ impl GithubReporter {
 }
 
 /// Decode an issue receipt while keeping provider content out of diagnostics.
+#[cfg(any(test, fuzzing))]
 pub fn parse_issue_response(status: StatusCode, body: &[u8]) -> Result<Option<String>> {
 	if !status.is_success() {
 		anyhow::bail!("github returned {status} when opening issue");
 	}
-	let json: serde_json::Value = github_app::decode_body(body, "parsing issue response")?;
-	Ok(json.get("number").and_then(|value| value.as_i64()).map(|number| number.to_string()))
+	Ok(super::ingress::fixture_input(body)
+		.validate(super::ingress::IssueReceiptDecoder)?
+		.map(|number| number.to_string()))
 }
 
 /// The existing label is success only for GitHub's 422/already_exists case.
+#[cfg(any(test, fuzzing))]
 pub fn check_label_response(status: StatusCode, body: &str, name: &str) -> Result<()> {
 	if status.is_success()
-		|| (status == StatusCode::UNPROCESSABLE_ENTITY && body.contains("already_exists"))
+		|| (status == StatusCode::UNPROCESSABLE_ENTITY
+			&& super::ingress::fixture_input(body.as_bytes())
+				.validate(super::ingress::LabelResponseDecoder)?)
 	{
 		return Ok(());
 	}
@@ -320,8 +326,8 @@ fn severity_label(severity: Severity) -> LabelSpec {
 	}
 }
 
-pub fn render_title(finding: &Finding) -> String {
-	compact_title(&finding.title)
+pub(crate) fn render_title(finding: &Finding<Agent>) -> String {
+	compact_title(finding.title.expose())
 }
 
 fn compact_title(raw: &str) -> String {
@@ -365,38 +371,43 @@ pub fn validate_body(body: &str) -> Result<(), String> {
 	Ok(())
 }
 
-pub fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
+pub(crate) fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
 	let finding = &report_finding.finding;
 	let mut out = String::new();
 	out.push_str(&format!("## Finding {}\n\n", format_finding_id(report_finding.id)));
-	out.push_str(&format!("- repo: `{}/{}` (`{}`)\n", repo.owner, repo.repo, repo.clone_url));
+	out.push_str(&format!(
+		"- repo: `{}/{}` (`{}`)\n",
+		repo.owner.expose(),
+		repo.repo.expose(),
+		repo.clone_url.expose()
+	));
 	match &report_finding.reviewed_revision {
-		Some(revision) => out.push_str(&format!("- reviewed revision: `{revision}`\n")),
+		Some(revision) => out.push_str(&format!("- reviewed revision: `{}`\n", revision.expose())),
 		None => out.push_str("- reviewed revision: _not recorded_\n"),
 	}
-	out.push_str(&format!("- title: {}\n", finding.title));
+	out.push_str(&format!("- title: {}\n", finding.title.expose()));
 	out.push_str(&format!("- severity: `{}`\n", finding.severity));
 	if let Some(location) = render_location(finding) {
 		out.push_str(&format!("- location: {location}\n"));
 	}
 	if let Some(cwe) = &finding.cwe {
-		out.push_str(&format!("- cwe: {cwe}\n"));
+		out.push_str(&format!("- cwe: {}\n", cwe.expose()));
 	}
-	out.push_str(&format!("- fingerprint: `{}`\n\n", finding.fingerprint));
+	out.push_str(&format!("- fingerprint: `{}`\n\n", finding.fingerprint.expose()));
 
 	out.push_str("## Description\n\n");
-	out.push_str(&finding.description);
+	out.push_str(finding.description.expose());
 	out.push_str("\n\n");
 
 	if let Some(poc) = &finding.poc_unified {
 		out.push_str("## Proof of Concept\n\n```diff\n");
-		out.push_str(poc);
+		out.push_str(poc.expose());
 		out.push_str("\n```\n\n");
 	}
 
 	if let Some(patch) = &finding.patch_unified {
 		out.push_str("## Suggested Fix\n\n```diff\n");
-		out.push_str(patch);
+		out.push_str(patch.expose());
 		out.push_str("\n```\n\n");
 	}
 
@@ -407,59 +418,54 @@ pub fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
 	out
 }
 
-fn render_location(finding: &Finding) -> Option<String> {
+/// Observe the concrete issue sinks without adding a normal raw renderer API.
+#[cfg(fuzzing)]
+pub fn fuzz_render_title(finding: &Finding<Agent>) -> String {
+	render_title(finding)
+}
+
+#[cfg(fuzzing)]
+pub fn fuzz_render_body(repo: &RepoRow, finding: &ReportFinding) -> String {
+	render_body(repo, finding)
+}
+
+fn render_location(finding: &Finding<Agent>) -> Option<String> {
 	let path = finding.file_path.as_ref()?;
 	let suffix = match (finding.line_start, finding.line_end) {
 		(Some(start), Some(end)) if end != start => format!(":{start}-{end}"),
 		(Some(start), _) => format!(":{start}"),
 		_ => String::new(),
 	};
-	Some(format!("`{path}{suffix}`"))
+	Some(format!("`{}{suffix}`", path.expose()))
 }
 
 #[cfg(test)]
 mod tests {
 	use loupe_core::Severity;
 
+	use super::super::fixtures::{path, revision, text};
 	use super::*;
 
 	fn repo() -> RepoRow {
-		RepoRow {
-			id: 1,
-			clone_url: "https://github.com/acme/widget.git".into(),
-			host: "github.com".into(),
-			owner: "acme".into(),
-			repo: "widget".into(),
-			default_branch: None,
-			scan_interval_seconds: None,
-			scanner_config: serde_json::Value::Null,
-			reporting: ReportingDestination::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "tracker".into(),
-				pat_secret_id: Some(7),
-			},
-			verification_enabled: false,
-			require_approval: None,
-			last_scanned_sha: None,
-			last_scanned_at: None,
-			created_at: 0,
-			disabled_at: None,
-		}
+		super::super::fixtures::repo(serde_json::json!({
+			"kind":"github_issue", "target_owner":"acme", "target_repo":"tracker", "pat_secret_id":7
+		}))
+		.unwrap()
 	}
 
-	fn finding() -> Finding {
+	fn finding() -> Finding<Agent> {
 		Finding {
-			scanner_id: "llm-code-review".into(),
+			scanner_id: text("llm-code-review"),
 			severity: Severity::High,
-			title: "Out-of-bounds index in idx".into(),
-			description: "The idx helper indexes without checking bounds.".into(),
-			file_path: Some("src/lib.rs".into()),
+			title: text("Out-of-bounds index in idx"),
+			description: text("The idx helper indexes without checking bounds."),
+			file_path: Some(path("src/lib.rs")),
 			line_start: Some(4),
 			line_end: Some(6),
-			cwe: Some("CWE-129".into()),
-			patch_unified: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n".into()),
-			poc_unified: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n".into()),
-			fingerprint: "fp".into(),
+			cwe: Some(text("CWE-129")),
+			patch_unified: Some(text("--- a/src/lib.rs\n+++ b/src/lib.rs\n")),
+			poc_unified: Some(text("--- a/src/lib.rs\n+++ b/src/lib.rs\n")),
+			fingerprint: text("fp"),
 		}
 	}
 
@@ -503,11 +509,14 @@ mod tests {
 			GithubReporter::with_base(&format!("http://{}", listener.local_addr().unwrap()))
 				.unwrap();
 		let stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-		let mut report =
-			ReportFinding { id: 1234, finding: finding(), reviewed_revision: Some("a".repeat(40)) };
-		report.finding.description.clear();
+		let mut report = ReportFinding {
+			id: 1234,
+			finding: finding(),
+			reviewed_revision: Some(revision(&"a".repeat(40))),
+		};
+		report.finding.description = text("");
 		let overhead = render_body(&repo(), &report).chars().count();
-		report.finding.description = "é".repeat(65_536 - overhead);
+		report.finding.description = text(&"é".repeat(65_536 - overhead));
 		assert!(
 			render_body(&repo(), &report).len() > 65_536,
 			"Unicode bytes must not set the limit"
@@ -521,7 +530,7 @@ mod tests {
 			.await
 			.expect("exact character limit is accepted");
 		assert_eq!(requests.load(Ordering::SeqCst), 2);
-		report.finding.description.push('é');
+		report.finding.description = text(&format!("{}é", report.finding.description.expose()));
 		let error = reporter
 			.dispatch(
 				&repo(),
@@ -551,7 +560,7 @@ mod tests {
 			&ReportFinding {
 				id: 1234,
 				finding: finding(),
-				reviewed_revision: Some("abc123".into()),
+				reviewed_revision: Some(revision("abc123")),
 			},
 		);
 		assert!(body.starts_with("## Finding LUP-1234\n\n"), "body: {body}");
@@ -675,11 +684,10 @@ mod tests {
 
 	fn app_mode_repo() -> RepoRow {
 		let mut repo = repo();
-		repo.reporting = ReportingDestination::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "tracker".into(),
-			pat_secret_id: None,
+		let ReportingDestination::GithubIssue { pat_secret_id, .. } = &mut repo.reporting else {
+			unreachable!()
 		};
+		*pat_secret_id = None;
 		repo
 	}
 

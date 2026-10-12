@@ -2,8 +2,7 @@
 
 use crate::{initial_job_state, JobState, JobTransition};
 
-// invariant: I5. Bound: all nine transition variants; no input is omitted.
-// This first proof also checks the verifier against the real core crate.
+// Bound: all nine transition variants; no input is omitted.
 // ci: fast
 #[kani::proof]
 fn initial_job_state_requires_enqueue() {
@@ -60,7 +59,7 @@ fn finding_state() -> crate::FindingState {
 	}
 }
 
-// invariant: I5. All three terminal job states and all nine transitions;
+// Bound: All three terminal job states and all nine transitions;
 // no is_terminal oracle, because Failed deliberately permits recovery.
 // ci: fast
 #[kani::proof]
@@ -87,7 +86,7 @@ fn terminal_job_states_exit_only_by_operator_recovery() {
 	kani::cover!(choice == 2 && result.is_err(), "failed rejects other transitions");
 }
 
-// invariant: I5. Both terminal finding states and all twelve transitions.
+// Bound: Both terminal finding states and all twelve transitions.
 // ci: fast
 #[kani::proof]
 fn terminal_finding_states_exit_only_by_operator_recovery() {
@@ -123,7 +122,7 @@ fn terminal_finding_states_exit_only_by_operator_recovery() {
 	kani::cover!(dismissed && result.is_err(), "dismissed rejects other transitions");
 }
 
-// invariant: I5. Six finding states times every combination of four booleans.
+// Bound: Six finding states times every combination of four booleans.
 // The table is the specification, independent of transition implementation.
 // ci: fast
 #[kani::proof]
@@ -161,7 +160,7 @@ fn verdict_rollup_matches_the_precedence_table() {
 	kani::cover!(state != FindingState::Validating && expected.is_none(), "other states unchanged");
 }
 
-// invariant: I6. Eight arbitrary bytes reach dot, parent, leading/trailing and
+// Bound: Eight arbitrary bytes reach dot, parent, leading/trailing and
 // repeated separators. Structural checks intentionally do not decode UTF-8.
 #[kani::proof]
 #[kani::unwind(10)]
@@ -207,7 +206,7 @@ fn repo_path_core_never_panics_and_rejects_dot_components() {
 	kani::cover!(path == b"a//b" && !accepted, "empty component");
 }
 
-// invariant: I6. All Unicode scalar values, including every forbidden category.
+// Bound: All Unicode scalar values, including every forbidden category.
 // The dependency's category table is used as an independent category oracle;
 // noncharacters are specified separately by Unicode's code-point ranges.
 #[kani::proof]
@@ -251,7 +250,7 @@ fn normalization_must_not_run(_: &str) -> String {
 	panic!("normalization entered before rejecting the oversized raw input")
 }
 
-// invariant: I6. Lengths 9..=17 cover every over-cap input in this bounded
+// Bound: Lengths 9..=17 cover every over-cap input in this bounded
 // buffer for a two-byte policy (raw cap eight). A panic stub detects any entry
 // into normalization, even if a reordered constructor would still return Bytes.
 #[kani::proof]
@@ -261,7 +260,7 @@ fn bounded_text_caps_raw_input_before_normalization() {
 	let len: usize = kani::any();
 	kani::assume((9..=17).contains(&len));
 	let raw = &"aaaaaaaaaaaaaaaaa"[..len];
-	let result = crate::text::BoundedText::<TinyText>::new(raw);
+	let result = crate::text::checked::text::<TinyText>(raw);
 	assert!(matches!(result, Err(error) if error.rule == crate::text::Rule::Bytes));
 	kani::cover!(len == 9, "first byte beyond raw cap");
 	kani::cover!(len == 17, "longer oversized input");
@@ -280,23 +279,23 @@ fn symbolic_normalized(_: &str) -> String {
 	.into()
 }
 
-// invariant: I6. Five normalization outputs reach acceptance, Unicode byte
-// expansion, the character cap and empty rejection. This proves constructor
+// Bound: Five normalization outputs reach acceptance, Unicode byte
+// expansion, the character cap and empty rejection. This proves the production field-check
 // wiring; the arbitrary eight-byte proof below proves the shared limit core.
 #[kani::proof]
 #[kani::unwind(6)]
 #[kani::stub(crate::text::normalized, symbolic_normalized)]
 fn bounded_text_checks_normalized_output_caps() {
-	let result = crate::text::BoundedText::<TinyText>::new("a");
+	let result = crate::text::checked::text::<TinyText>("a");
 	if let Ok(text) = &result {
 		let mut characters = 0;
-		for _ in text.expose().chars() {
+		for _ in text.as_str().chars() {
 			characters += 1;
 		}
 		assert!(characters <= 1);
-		assert!(text.expose().len() <= 2);
+		assert!(text.as_str().len() <= 2);
 	}
-	kani::cover!(result.as_ref().is_ok_and(|text| text.expose() == "é"), "Unicode output accepted");
+	kani::cover!(result.as_ref().is_ok_and(|text| text.as_str() == "é"), "Unicode output accepted");
 	kani::cover!(
 		matches!(&result, Err(error) if error.rule == crate::text::Rule::Chars),
 		"normalized character cap"
@@ -316,20 +315,20 @@ impl crate::text::IdentPolicy for TinyIdentifier {
 	}
 }
 
-// invariant: I6. Lengths three through nine exceed the exact two-byte cap;
+// Bound: Lengths three through nine exceed the exact two-byte cap;
 // the panic predicate detects a validation callback before that cap.
 #[kani::proof]
 #[kani::unwind(11)]
 fn identifier_checks_exact_cap_before_predicate() {
 	let len: usize = kani::any();
 	kani::assume((3..=9).contains(&len));
-	let result = crate::text::Identifier::<TinyIdentifier>::new(&"aaaaaaaaa"[..len]);
+	let result = crate::text::checked::identifier::<TinyIdentifier>(&"aaaaaaaaa"[..len]);
 	assert!(matches!(result, Err(error) if error.rule == crate::text::Rule::Bytes));
 	kani::cover!(len == 3, "first byte beyond identifier cap");
 	kani::cover!(len == 9, "larger identifier rejected");
 }
 
-// invariant: I6. Up to eight bytes of valid UTF-8, arbitrary usize limits.
+// Bound: Up to eight bytes of valid UTF-8, arbitrary usize limits.
 // The independent char iterator checks the byte-level production count core,
 // called by both BoundedText and Anchor after their respective normalization.
 #[kani::proof]
@@ -363,7 +362,7 @@ fn normalized_text_caps_count_characters_and_bytes() {
 	kani::cover!(result == Err(crate::text::Rule::Bytes), "byte cap rejects");
 }
 
-// invariant: I6. Full usize aggregate character count. The production caller
+// Bound: Full usize aggregate character count. The production caller
 // sums description/PoC/patch .chars().count(); fuzz exercises those strings.
 // ci: fast
 #[kani::proof]
@@ -379,10 +378,10 @@ fn validate_report_content_matches_the_github_cap() {
 	kani::cover!(characters == 60_001 && !accepted, "first character beyond cap");
 }
 
-// invariant: I7. Three distinct keys in every insertion permutation and three
+// Bound: Three distinct keys in every insertion permutation and three
 // symbolic boolean values. This proves Ordered's actual sorting core preserves
 // associations and sorts keys. JSON parsing/recursive round trips are fuzzed by
-// core_canonical: even a scalar Value round trip exceeded the proof cost limit.
+// core_canonical; those parser operations are outside this proof's bound.
 // Four loop iterations cover three entries plus termination. Temporary maps
 // are forgotten after checking them; collection destruction is outside this
 // ordering property and otherwise dominates symbolic execution.
@@ -415,7 +414,7 @@ fn canonical_object_keys_are_sorted() {
 	std::mem::forget(fields);
 }
 
-// invariant: I6. Actual no-allocation JSON-string preflight on at most eight
+// Bound: Actual no-allocation JSON-string preflight on at most eight
 // arbitrary valid UTF-8 bytes, with full usize byte/scalar caps. This bounded
 // proof covers malformed/short escapes, admission/count boundaries and direct
 // UTF-8 counts; it does not claim induction over longer tokens or serde parity.
@@ -459,7 +458,7 @@ fn json_string_preflight_counts_bounded_tokens() {
 	);
 }
 
-// invariant: I6. Every valid high/low surrogate pair, actual preflight, full
+// Bound: Every valid high/low surrogate pair, actual preflight, full
 // usize caps. The 14-byte encoded token must decode to exactly four UTF-8 bytes
 // and one scalar. This supplements, rather than shrinks, the arbitrary-token
 // bound above. No allocation or external parser is stubbed.

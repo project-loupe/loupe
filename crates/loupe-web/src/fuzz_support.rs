@@ -4,8 +4,7 @@ use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::path::Path;
 
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::TextPolicy;
+use loupe_core::text::{BoundedText, TextPolicy};
 use loupe_provenance::Browser;
 
 /// Named implementation entries, recorded inside the real validators.

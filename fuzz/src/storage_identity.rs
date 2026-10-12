@@ -3,7 +3,7 @@
 //! and compare BLAKE3 results, without assuming hashes never collide.
 
 use loupe_core::text::policy::{AnchorText, Family, InstanceKey};
-use loupe_core::text::{Anchor, AnchorPolicy, Identifier, Rule};
+use loupe_core::text::{Anchor, AnchorPolicy, Rule};
 use loupe_storage::identity::{fingerprint, Identity};
 use serde::Deserialize;
 use unicode_general_category::{get_general_category, GeneralCategory};
@@ -87,9 +87,9 @@ fn expected_anchor<P: AnchorPolicy>(raw: &str) -> Option<String> {
 	(!transient_id(&text)).then_some(text)
 }
 
-fn check_anchor<P: AnchorPolicy>(raw: &str) -> Option<Anchor<P>> {
+fn check_anchor<P: AnchorPolicy>(raw: &str) -> Option<Anchor<P, loupe_provenance::Agent>> {
 	let expected = expected_anchor::<P>(raw);
-	let result = Anchor::<P>::new(raw);
+	let result = crate::fixtures::anchor::<P>(raw);
 	assert_eq!(result.is_ok(), expected.is_some(), "anchor acceptance disagrees with recognizer");
 	match result {
 		Ok(anchor) => {
@@ -99,10 +99,7 @@ fn check_anchor<P: AnchorPolicy>(raw: &str) -> Option<Anchor<P>> {
 				"anchor normalization disagrees"
 			);
 			assert!(is_nfc(anchor.expose()));
-			assert_eq!(
-				format!("{anchor:?}"),
-				format!("Anchor<{}>(len={})", P::FIELD, anchor.expose().len())
-			);
+			assert_eq!(format!("{anchor:?}"), format!("Anchor<{}, agent>([redacted])", P::FIELD));
 			let variant = format!(
 				"  {}  ",
 				anchor
@@ -112,7 +109,7 @@ fn check_anchor<P: AnchorPolicy>(raw: &str) -> Option<Anchor<P>> {
 					.collect::<Vec<_>>()
 					.join("\u{a0}   ")
 			);
-			let equivalent = Anchor::<P>::new(&variant).unwrap_or_else(|_| {
+			let equivalent = crate::fixtures::anchor::<P>(&variant).unwrap_or_else(|_| {
 				panic!("equivalent anchor spacing and ASCII case must be accepted")
 			});
 			assert_eq!(
@@ -164,7 +161,7 @@ pub fn do_test(data: &[u8]) {
 	let Ok(input) = serde_json::from_slice::<Input>(data) else { return };
 	let anchor = check_anchor::<AnchorText>(&input.anchor);
 	let instance = input.instance.as_deref().map(check_anchor::<InstanceKey>);
-	let Ok(family) = Identifier::<Family>::new(&input.family) else { return };
+	let Ok(family) = crate::fixtures::identifier::<Family>(&input.family) else { return };
 	let Some(anchor) = anchor else { return };
 	let instance = match instance {
 		None => None,
@@ -177,13 +174,15 @@ pub fn do_test(data: &[u8]) {
 	let identity =
 		Identity { family: family.clone(), anchor: anchor.clone(), instance: instance.clone() };
 	assert_eq!(identity.fingerprint(), actual);
-	let variant =
-		Anchor::<AnchorText>::new(&format!("  {}  ", anchor.expose().to_ascii_uppercase()))
-			.unwrap_or_else(|_| panic!("case-equivalent anchor must be accepted"));
+	let variant = crate::fixtures::anchor::<AnchorText>(&format!(
+		"  {}  ",
+		anchor.expose().to_ascii_uppercase()
+	))
+	.unwrap_or_else(|_| panic!("case-equivalent anchor must be accepted"));
 	assert_eq!(fingerprint(&family, &variant, instance.as_ref()), actual);
 	let other = if family.expose() == "other-family" { "another-family" } else { "other-family" };
-	let other =
-		Identifier::<Family>::new(other).unwrap_or_else(|_| panic!("fixed family must be valid"));
+	let other = crate::fixtures::identifier::<Family>(other)
+		.unwrap_or_else(|_| panic!("fixed family must be valid"));
 	let other_bytes = frame(other.expose(), anchor.expose(), instance.as_ref().map(Anchor::expose));
 	assert_ne!(other_bytes, bytes, "different families must have different identity encodings");
 	assert_eq!(

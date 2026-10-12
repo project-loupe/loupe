@@ -7,9 +7,12 @@
 
 use std::sync::LazyLock;
 
+use loupe_core::text::policy::{JobDiagnostic, RevisionText};
+use loupe_core::text::BoundedText;
 use loupe_core::{
 	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
 };
+use loupe_provenance::{Db as DbSource, Source};
 use rusqlite::types::Value;
 use rusqlite::{
 	params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
@@ -27,7 +30,7 @@ pub const JOB_CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by admin";
 pub const LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR: &str = "lease expired after max attempts";
 
 /// Widen only when the runtime can authorize and finish the added kinds.
-pub const RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
+pub const RUNTIME_KINDS: &[JobKind<DbSource>] = &[JobKind::Scan, JobKind::Verify];
 
 fn runtime_kinds_sql() -> &'static str {
 	static SQL: LazyLock<String> = LazyLock::new(|| {
@@ -51,11 +54,11 @@ pub(crate) const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, sin
 pub struct JobRow {
 	pub id: i64,
 	pub repo_id: i64,
-	pub kind: JobKind,
+	pub kind: JobKind<DbSource>,
 	pub state: JobState,
 	pub incremental: bool,
-	pub since_sha: Option<String>,
-	pub head_sha: Option<String>,
+	pub since_sha: Option<BoundedText<RevisionText, DbSource>>,
+	pub head_sha: Option<BoundedText<RevisionText, DbSource>>,
 	pub parent_job_id: Option<i64>,
 	pub target_finding_id: Option<i64>,
 	pub worker_id: Option<i64>,
@@ -64,7 +67,7 @@ pub struct JobRow {
 	pub enqueued_at: i64,
 	pub started_at: Option<i64>,
 	pub finished_at: Option<i64>,
-	pub error: Option<String>,
+	pub error: Option<BoundedText<JobDiagnostic, DbSource>>,
 	pub campaign_id: Option<i64>,
 	pub generation_id: Option<i64>,
 	pub assigned_lead_id: Option<i64>,
@@ -76,7 +79,7 @@ pub struct JobRow {
 	pub hard_deadline_at: Option<i64>,
 	pub submit_by: Option<i64>,
 	pub token_budget: Option<u64>,
-	pub recipe: Option<loupe_core::text::BoundedJson<loupe_core::text::policy::Payload>>,
+	pub recipe: Option<loupe_core::text::BoundedJson<loupe_core::text::policy::Payload, DbSource>>,
 	pub workflow_contract_version: Option<i64>,
 }
 
@@ -93,14 +96,27 @@ pub struct ActiveLease<'a> {
 	pub now: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct NewJob {
+#[derive(Debug)]
+pub struct NewJob<S: Source> {
 	pub repo_id: i64,
-	pub kind: JobKind,
+	pub kind: JobKind<S>,
 	pub incremental: bool,
-	pub since_sha: Option<String>,
+	pub since_sha: Option<BoundedText<RevisionText, S>>,
 	pub parent_job_id: Option<i64>,
 	pub target_finding_id: Option<i64>,
+}
+
+impl<S: Source> Clone for NewJob<S> {
+	fn clone(&self) -> Self {
+		Self {
+			repo_id: self.repo_id,
+			kind: self.kind.clone(),
+			incremental: self.incremental,
+			since_sha: self.since_sha.clone(),
+			parent_job_id: self.parent_job_id,
+			target_finding_id: self.target_finding_id,
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,10 +136,10 @@ pub enum RetryOutcome {
 }
 
 /// Insert a `queued` job, returning the new id.
-pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> {
+pub fn enqueue<S: Source>(conn: &Connection, new: &NewJob<S>, now: i64) -> crate::Result<i64> {
 	// NewJob is also the public legacy input, so enforce this at runtime.
 	// Match the enum, not its text: Unknown("scan") is still unknown.
-	if !RUNTIME_KINDS.contains(&new.kind) {
+	if !matches!(new.kind, JobKind::Scan | JobKind::Verify) {
 		return Err(
 			loupe_core::text::Error::new("job_kind", loupe_core::text::Rule::Identifier).into()
 		);
@@ -140,7 +156,7 @@ pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> 
 			new.kind.as_str(),
 			initial_state.as_str(),
 			new.incremental as i64,
-			new.since_sha,
+			new.since_sha.as_ref().map(BoundedText::expose),
 			new.parent_job_id,
 			new.target_finding_id,
 			now,
@@ -176,9 +192,10 @@ pub fn heartbeat(
 
 /// Mark a leased job as complete. Caller picks the new state
 /// (`succeeded` or `failed`).
-pub fn complete(
-	conn: &Connection, lease: LeaseIdentity<'_>, new_state: JobState, head_sha: Option<&str>,
-	error: Option<&str>, now: i64,
+pub fn complete<RevisionS: Source, DiagnosticS: Source>(
+	conn: &Connection, lease: LeaseIdentity<'_>, new_state: JobState,
+	head_sha: Option<&BoundedText<RevisionText, RevisionS>>,
+	error: Option<&BoundedText<JobDiagnostic, DiagnosticS>>, now: i64,
 ) -> rusqlite::Result<bool> {
 	let transition = match new_state {
 		JobState::Succeeded => JobTransition::CompleteSucceeded,
@@ -208,8 +225,8 @@ pub fn complete(
 		),
 		params![
 			target_state.as_str(),
-			head_sha,
-			error,
+			head_sha.map(BoundedText::expose),
+			error.map(BoundedText::expose),
 			now,
 			lease.job_id,
 			JobState::Leased.as_str(),
@@ -276,7 +293,7 @@ pub fn enqueue_verify_jobs_for_scan(
 		   AND EXISTS (SELECT 1 FROM jobs WHERE id = ?4 AND repo_id = ?1 AND kind = 'scan')",
 		params![
 			repo_id,
-			JobKind::Verify.as_str(),
+			JobKind::<DbSource>::Verify.as_str(),
 			initial_state.as_str(),
 			scan_job_id,
 			now,
@@ -405,12 +422,22 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 /// grouping for an operator is "finished", which spans three states.
 /// Asking for them together is one query against the shared connection
 /// instead of three.
-#[derive(Debug, Clone, Default)]
-pub struct JobFilter {
+#[derive(Debug)]
+pub struct JobFilter<S: Source> {
 	/// Empty means "any state".
 	pub states: Vec<JobState>,
-	pub kind: Option<JobKind>,
+	pub kind: Option<JobKind<S>>,
 	pub limit: Option<i64>,
+}
+impl<S: Source> Clone for JobFilter<S> {
+	fn clone(&self) -> Self {
+		Self { states: self.states.clone(), kind: self.kind.clone(), limit: self.limit }
+	}
+}
+impl<S: Source> Default for JobFilter<S> {
+	fn default() -> Self {
+		Self { states: Vec::new(), kind: None, limit: None }
+	}
 }
 
 /// Resolve an opaque capability to its one exact, live lease.
@@ -459,7 +486,7 @@ pub fn with_active_lease_transaction<T>(
 	Ok(Some(value))
 }
 
-pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRow>> {
+pub fn list<S: Source>(conn: &Connection, filter: &JobFilter<S>) -> rusqlite::Result<Vec<JobRow>> {
 	let mut clauses: Vec<String> = Vec::new();
 	let mut args: Vec<Value> = Vec::new();
 
@@ -552,13 +579,17 @@ pub fn reap_stale_leases(conn: &mut Connection, now: i64) -> crate::Result<usize
 		)?
 		.query_map([now], |r| r.get::<_, i64>(0))?
 		.collect::<rusqlite::Result<Vec<_>>>()?;
-	let error = loupe_core::text::BoundedText::new(LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR)?;
 	let mut reaped = legacy;
 	for id in campaign_jobs {
 		// One transaction per job so a single undecidable row (for example a
 		// policy snapshot this binary cannot read) cannot stall the others.
 		let outcome = crate::transaction::immediate(conn, |tx| {
-			crate::scheduler::retry_or_fail(tx, id, now, &error)
+			crate::scheduler::retry_or_fail(
+				tx,
+				id,
+				now,
+				crate::scheduler::FailureReason::<DbSource>::LeaseExpired,
+			)
 		});
 		match outcome {
 			Ok(_) => reaped += 1,
@@ -643,7 +674,7 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 }
 
 pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
-	let kind = crate::ingress::job_kind_legacy(row, 2)?;
+	let kind = crate::ingress::job_kind(row, 2)?;
 	let state = crate::review::parsed(row, 3)?;
 	Ok(JobRow {
 		id: row.get(0)?,
@@ -651,8 +682,8 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		kind,
 		state,
 		incremental: row.get::<_, i64>(4)? != 0,
-		since_sha: crate::ingress::optional_revision_legacy(row, 5)?,
-		head_sha: crate::ingress::optional_revision_legacy(row, 6)?,
+		since_sha: crate::ingress::optional_revision(row, 5)?,
+		head_sha: crate::ingress::optional_revision(row, 6)?,
 		parent_job_id: row.get(7)?,
 		target_finding_id: row.get(8)?,
 		worker_id: row.get(9)?,
@@ -661,7 +692,7 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		enqueued_at: row.get(12)?,
 		started_at: row.get(13)?,
 		finished_at: row.get(14)?,
-		error: crate::ingress::optional_diagnostic_legacy(row, 15)?,
+		error: crate::ingress::optional_diagnostic(row, 15)?,
 		campaign_id: row.get(16)?,
 		generation_id: row.get(17)?,
 		assigned_lead_id: row.get(18)?,
@@ -673,8 +704,23 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		hard_deadline_at: row.get(24)?,
 		submit_by: row.get(25)?,
 		token_budget: row.get(26)?,
-		recipe: crate::ingress::optional_db_payload_legacy(row, 27)?,
+		recipe: crate::ingress::optional_db_payload(row, 27)?,
 		workflow_contract_version: row.get(28)?,
+	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(conn, "jobs", JOB_COLUMNS, |row| {
+		let job = row_to_job(row)?;
+		// Campaign summaries consume kinds as JSON leaves, including registered
+		// future kinds. Use the same projection instead of a closed kind list.
+		if job.campaign_id.is_some() {
+			crate::ingress::count_json_leaf(row, 2)?;
+		}
+		Ok::<_, rusqlite::Error>(())
+	})?;
+	crate::migrations::admission::scan(conn, "jobs", "job_capability_hash", |_| {
+		Ok::<_, rusqlite::Error>(())
 	})
 }
 
@@ -692,14 +738,57 @@ mod tests {
 
 	static NEXT_TEST_CAPABILITY: AtomicU64 = AtomicU64::new(1);
 
+	#[test]
+	fn new_job_clone_needs_only_source_and_preserves_all_fields() {
+		fn cloned<S: Source>(value: &NewJob<S>) -> NewJob<S> {
+			value.clone()
+		}
+
+		let original = NewJob {
+			repo_id: 7,
+			kind: JobKind::Unknown(crate::test_support::text("future-job").unwrap()),
+			incremental: true,
+			since_sha: Some(crate::test_support::text("base-revision").unwrap()),
+			parent_job_id: Some(11),
+			target_finding_id: Some(13),
+		};
+		let copy = cloned(&original);
+		assert_eq!(copy.repo_id, original.repo_id);
+		assert_eq!(copy.kind, original.kind);
+		assert_eq!(copy.incremental, original.incremental);
+		assert_eq!(copy.since_sha, original.since_sha);
+		assert_eq!(copy.parent_job_id, original.parent_job_id);
+		assert_eq!(copy.target_finding_id, original.target_finding_id);
+	}
+
+	#[test]
+	fn job_filter_clone_needs_only_source_and_preserves_all_fields() {
+		fn cloned<S: Source>(value: &JobFilter<S>) -> JobFilter<S> {
+			value.clone()
+		}
+
+		let original = JobFilter {
+			states: vec![JobState::Failed, JobState::Succeeded],
+			kind: Some(JobKind::Unknown(crate::test_support::text("future-filter").unwrap())),
+			limit: Some(17),
+		};
+		let copy = cloned(&original);
+		assert_eq!(copy.states, original.states);
+		assert_eq!(copy.kind, original.kind);
+		assert_eq!(copy.limit, original.limit);
+	}
+
 	fn lease(
 		conn: &mut Connection, worker_id: i64, accepts_verify: bool, now: i64, lease_seconds: i64,
 	) -> crate::Result<Option<JobRow>> {
 		let mut hash = [0u8; 32];
 		hash[..8]
 			.copy_from_slice(&NEXT_TEST_CAPABILITY.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-		let kinds =
-			if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
+		let kinds = if accepts_verify {
+			vec![JobKind::<loupe_provenance::Db>::Scan, JobKind::<loupe_provenance::Db>::Verify]
+		} else {
+			vec![JobKind::<loupe_provenance::Db>::Scan]
+		};
 		crate::transaction::immediate(conn, |tx| {
 			crate::scheduler::claim(
 				tx,
@@ -734,12 +823,14 @@ mod tests {
 		head_sha: Option<&str>, error: Option<&str>, now: i64,
 	) -> rusqlite::Result<bool> {
 		let hash = active_capability_hash(conn, job_id)?;
-		super::complete(
+		let head_sha = head_sha.map(|raw| crate::test_support::text(raw).unwrap());
+		let error = error.map(|raw| crate::test_support::text(raw).unwrap());
+		super::complete::<loupe_provenance::Agent, loupe_provenance::Agent>(
 			conn,
 			LeaseIdentity { job_id, worker_id, capability_hash: &hash },
 			new_state,
-			head_sha,
-			error,
+			head_sha.as_ref(),
+			error.as_ref(),
 			now,
 		)
 	}
@@ -753,16 +844,17 @@ mod tests {
 				Ok(repos::insert(
 					c,
 					&NewRepo {
-						clone_url: "https://github.com/a/b.git".into(),
-						host: "github.com".into(),
-						owner: "a".into(),
-						repo: "b".into(),
+						clone_url: crate::test_support::db_text("https://github.com/a/b.git")
+							.unwrap(),
+						host: crate::test_support::db_text("github.com").unwrap(),
+						owner: crate::test_support::db_text("a").unwrap(),
+						repo: crate::test_support::db_text("b").unwrap(),
 						default_branch: None,
 						scan_interval_seconds: None,
-						scanner_config: serde_json::Value::Null,
+						scanner_config: crate::test_support::scanner(serde_json::Value::Null),
 						reporting: ReportingDestination::GithubIssue {
-							target_owner: "a".into(),
-							target_repo: "t".into(),
+							target_owner: crate::test_support::db_text("a").unwrap(),
+							target_repo: crate::test_support::db_text("t").unwrap(),
 							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
@@ -773,12 +865,20 @@ mod tests {
 			})
 			.unwrap();
 		let worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w1", WorkerKind::Worker, &[1u8; 32], 0)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w1").unwrap(),
+					WorkerKind::Worker,
+					&[1u8; 32],
+					0,
+				)?)
+			})
 			.unwrap();
 		(db, repo_id, worker_id)
 	}
 
-	fn enqueue_job(db: &Db, repo_id: i64, kind: JobKind, at: i64) -> i64 {
+	fn enqueue_job(db: &Db, repo_id: i64, kind: JobKind<loupe_provenance::Db>, at: i64) -> i64 {
 		db.with_conn(|c| {
 			enqueue(
 				c,
@@ -796,7 +896,9 @@ mod tests {
 		.unwrap()
 	}
 
-	fn listed(db: &Db, filter: &JobFilter) -> Vec<(i64, JobState, JobKind)> {
+	fn listed(
+		db: &Db, filter: &JobFilter<loupe_provenance::Db>,
+	) -> Vec<(i64, JobState, JobKind<loupe_provenance::Db>)> {
 		db.with_conn(|c| Ok(list(c, filter)?))
 			.unwrap()
 			.into_iter()
@@ -807,18 +909,18 @@ mod tests {
 	#[test]
 	fn future_kind_is_readable_without_breaking_other_jobs() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
-		enqueue_job(&db, repo_id, JobKind::Scan, 1);
+		enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 1);
 		db.with_conn(|c| {
 			c.execute("INSERT INTO job_kinds VALUES ('future', 0)", [])?;
 			c.execute("INSERT INTO jobs (repo_id, kind, state, enqueued_at) VALUES (?1, 'future', 'queued', 2)", [repo_id])?;
-			let rows = list(c, &JobFilter::default());
+			let rows = list(c, &JobFilter::<loupe_provenance::Db>::default());
 			assert!(rows.is_ok(), "one future kind must not break listing: {rows:?}");
 			let rows = rows.unwrap();
 			assert_eq!(rows.len(), 2);
 			assert_eq!(rows[0].kind.as_str(), "future");
 			assert_eq!(get(c, rows[0].id)?.unwrap(), rows[0]);
-			assert_eq!(rows[1].kind, JobKind::Scan);
-			assert_eq!(lease(c, worker_id, true, 10, 100)?.unwrap().kind, JobKind::Scan);
+			assert_eq!(rows[1].kind, JobKind::<loupe_provenance::Db>::Scan);
+			assert_eq!(lease(c, worker_id, true, 10, 100)?.unwrap().kind, JobKind::<loupe_provenance::Db>::Scan);
 			assert!(lease(c, worker_id, true, 10, 100)?.is_none());
 			Ok(())
 		}).unwrap();
@@ -831,7 +933,9 @@ mod tests {
 			for raw in ["future", "scan", "verify", "survey", "drilldown"] {
 				let new = NewJob {
 					repo_id,
-					kind: JobKind::Unknown(raw.into()),
+					kind: JobKind::<loupe_provenance::Db>::Unknown(
+						crate::test_support::db_text(raw).unwrap(),
+					),
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -843,7 +947,7 @@ mod tests {
 					"unsupported kinds are validation errors"
 				);
 			}
-			assert!(list(c, &JobFilter::default())?.is_empty());
+			assert!(list(c, &JobFilter::<loupe_provenance::Db>::default())?.is_empty());
 			Ok(())
 		})
 		.unwrap();
@@ -889,7 +993,10 @@ mod tests {
 	fn unsupported_phase_kinds_cannot_be_enqueued() {
 		let (db, repo_id, _) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			for kind in [JobKind::Survey, JobKind::Drilldown] {
+			for kind in [
+				JobKind::<loupe_provenance::Db>::Survey,
+				JobKind::<loupe_provenance::Db>::Drilldown,
+			] {
 				let new = NewJob {
 					repo_id,
 					kind,
@@ -993,7 +1100,7 @@ mod tests {
 		let (db, _, worker, id) = future_leased_fixture();
 		db.with_conn(|c| {
 			assert!(
-				!super::complete(
+				!super::complete::<loupe_provenance::Agent, loupe_provenance::Agent>(
 					c,
 					LeaseIdentity { job_id: id, worker_id: worker, capability_hash: &[0; 32] },
 					JobState::Succeeded,
@@ -1071,44 +1178,63 @@ mod tests {
 	#[test]
 	fn list_filters_by_state_and_kind() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
-		let queued_scan = enqueue_job(&db, repo_id, JobKind::Scan, 100);
-		let queued_verify = enqueue_job(&db, repo_id, JobKind::Verify, 200);
-		let leased_scan = enqueue_job(&db, repo_id, JobKind::Scan, 300);
+		let queued_scan = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 100);
+		let queued_verify = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Verify, 200);
+		let leased_scan = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 300);
 
 		// Verify jobs are leased first, so ask twice to move the scan too.
 		for _ in 0..2 {
 			db.with_conn(|c| lease(c, worker_id, true, 400, DEFAULT_LEASE_SECONDS)).unwrap();
 		}
 		// Of the three, the verify job and the *oldest* scan got leased.
-		let all = listed(&db, &JobFilter::default());
+		let all = listed(&db, &JobFilter::<loupe_provenance::Db>::default());
 		assert_eq!(all.len(), 3, "default filter returns everything: {all:?}");
 
 		let queued =
 			listed(&db, &JobFilter { states: vec![JobState::Queued], ..Default::default() });
-		assert_eq!(queued, vec![(leased_scan, JobState::Queued, JobKind::Scan)]);
+		assert_eq!(
+			queued,
+			vec![(leased_scan, JobState::Queued, JobKind::<loupe_provenance::Db>::Scan)]
+		);
 
 		let leased =
 			listed(&db, &JobFilter { states: vec![JobState::Leased], ..Default::default() });
 		assert_eq!(leased.len(), 2, "two jobs were leased: {leased:?}");
 		assert!(leased.iter().all(|(_, s, _)| *s == JobState::Leased));
 
-		let verify = listed(&db, &JobFilter { kind: Some(JobKind::Verify), ..Default::default() });
-		assert_eq!(verify, vec![(queued_verify, JobState::Leased, JobKind::Verify)]);
+		let verify = listed(
+			&db,
+			&JobFilter {
+				kind: Some(JobKind::<loupe_provenance::Db>::Verify),
+				..Default::default()
+			},
+		);
+		assert_eq!(
+			verify,
+			vec![(queued_verify, JobState::Leased, JobKind::<loupe_provenance::Db>::Verify)]
+		);
 
 		// state and kind compose as AND.
 		let leased_scans = listed(
 			&db,
-			&JobFilter { states: vec![JobState::Leased], kind: Some(JobKind::Scan), limit: None },
+			&JobFilter {
+				states: vec![JobState::Leased],
+				kind: Some(JobKind::<loupe_provenance::Db>::Scan),
+				limit: None,
+			},
 		);
-		assert_eq!(leased_scans, vec![(queued_scan, JobState::Leased, JobKind::Scan)]);
+		assert_eq!(
+			leased_scans,
+			vec![(queued_scan, JobState::Leased, JobKind::<loupe_provenance::Db>::Scan)]
+		);
 	}
 
 	#[test]
 	fn list_accepts_a_set_of_states() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
-		let to_succeed = enqueue_job(&db, repo_id, JobKind::Scan, 100);
-		let to_fail = enqueue_job(&db, repo_id, JobKind::Scan, 200);
-		let stays_queued = enqueue_job(&db, repo_id, JobKind::Scan, 300);
+		let to_succeed = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 100);
+		let to_fail = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 200);
+		let stays_queued = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 300);
 
 		for (job_id, outcome) in [(to_succeed, JobState::Succeeded), (to_fail, JobState::Failed)] {
 			db.with_conn(|c| lease(c, worker_id, false, 400, DEFAULT_LEASE_SECONDS))
@@ -1139,7 +1265,7 @@ mod tests {
 	fn list_applies_limit_alongside_filters() {
 		let (db, repo_id, _worker_id) = db_with_repo_and_worker();
 		for at in [100, 200, 300] {
-			enqueue_job(&db, repo_id, JobKind::Scan, at);
+			enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, at);
 		}
 		let limited =
 			listed(&db, &JobFilter { states: vec![JobState::Queued], kind: None, limit: Some(2) });
@@ -1155,7 +1281,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1185,7 +1311,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1213,7 +1339,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1228,7 +1354,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Verify,
+					kind: JobKind::<loupe_provenance::Db>::Verify,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1242,13 +1368,19 @@ mod tests {
 		// Worker that does NOT accept verify: leases scan, then sees
 		// the queue as empty (verify is gated).
 		let first = db.with_conn(|c| lease(c, worker_id, false, 200, 60)).unwrap();
-		assert!(matches!(first.as_ref().map(|r| &r.kind), Some(JobKind::Scan)));
+		assert!(matches!(
+			first.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Scan)
+		));
 		let second = db.with_conn(|c| lease(c, worker_id, false, 201, 60)).unwrap();
 		assert!(second.is_none(), "verify job must be invisible to non-verify workers");
 
 		// A verify-capable worker DOES pick it up.
 		let third = db.with_conn(|c| lease(c, worker_id, true, 202, 60)).unwrap();
-		assert!(matches!(third.as_ref().map(|r| &r.kind), Some(JobKind::Verify)));
+		assert!(matches!(
+			third.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Verify)
+		));
 	}
 
 	#[test]
@@ -1260,7 +1392,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1276,7 +1408,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Verify,
+						kind: JobKind::<loupe_provenance::Db>::Verify,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: Some(scan_id),
@@ -1289,11 +1421,17 @@ mod tests {
 
 		let first = db.with_conn(|c| lease(c, worker_id, true, 300, 60)).unwrap();
 		assert_eq!(first.as_ref().map(|r| r.id), Some(verify_id));
-		assert!(matches!(first.as_ref().map(|r| &r.kind), Some(JobKind::Verify)));
+		assert!(matches!(
+			first.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Verify)
+		));
 
 		let second = db.with_conn(|c| lease(c, worker_id, true, 301, 60)).unwrap();
 		assert_eq!(second.as_ref().map(|r| r.id), Some(scan_id));
-		assert!(matches!(second.as_ref().map(|r| &r.kind), Some(JobKind::Scan)));
+		assert!(matches!(
+			second.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Scan)
+		));
 	}
 
 	#[test]
@@ -1311,7 +1449,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1334,7 +1472,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1365,7 +1503,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1377,7 +1515,15 @@ mod tests {
 		.unwrap();
 		let leased = db.with_conn(|c| lease(c, worker_id, false, 100, 60)).unwrap().unwrap();
 		let other_worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w2", WorkerKind::Worker, &[2u8; 32], 0)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w2").unwrap(),
+					WorkerKind::Worker,
+					&[2u8; 32],
+					0,
+				)?)
+			})
 			.unwrap();
 		let res = db.with_conn(|c| Ok(heartbeat(c, leased.id, other_worker_id, 150, 60)?)).unwrap();
 		assert_eq!(res, None, "stranger heartbeat must not extend the lease");
@@ -1391,7 +1537,7 @@ mod tests {
 				conn,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1403,7 +1549,13 @@ mod tests {
 			assert_eq!(leased.id, job_id);
 			let hash = active_capability_hash(conn, job_id)?;
 			let identity = LeaseIdentity { job_id, worker_id, capability_hash: &hash };
-			let other_worker = workers::insert(conn, "other", WorkerKind::Worker, &[91; 32], 0)?;
+			let other_worker = workers::insert(
+				conn,
+				&crate::test_support::text("other").unwrap(),
+				WorkerKind::Worker,
+				&[91; 32],
+				0,
+			)?;
 			let mut wrong_hash = hash.clone();
 			wrong_hash[0] ^= 1;
 			assert!(
@@ -1451,7 +1603,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1465,7 +1617,15 @@ mod tests {
 		assert_eq!(leased.as_ref().map(|j| j.id), Some(job_id));
 
 		let other_worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w3", WorkerKind::Worker, &[9u8; 32], 100)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w3").unwrap(),
+					WorkerKind::Worker,
+					&[9u8; 32],
+					100,
+				)?)
+			})
 			.unwrap();
 		assert!(db
 			.with_conn(|c| Ok(worker_has_active_lease_for_repo(c, worker_id, repo_id, 250)?))
@@ -1492,7 +1652,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1543,7 +1703,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1562,7 +1722,7 @@ mod tests {
 		assert!(ok);
 		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
 		assert_eq!(row.state, JobState::Succeeded);
-		assert_eq!(row.head_sha.as_deref(), Some("abc"));
+		assert_eq!(row.head_sha.as_ref().map(loupe_core::text::BoundedText::expose), Some("abc"));
 		assert_eq!(row.finished_at, Some(150));
 	}
 
@@ -1574,7 +1734,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1608,7 +1768,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1623,7 +1783,10 @@ mod tests {
 		let CancelOutcome::Cancelled(row) = outcome else { panic!("expected cancelled outcome") };
 		assert_eq!(row.state, JobState::Cancelled);
 		assert_eq!(row.finished_at, Some(200));
-		assert_eq!(row.error.as_deref(), Some(JOB_CANCELLED_BY_ADMIN_ERROR));
+		assert_eq!(
+			row.error.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some(JOB_CANCELLED_BY_ADMIN_ERROR)
+		);
 		assert!(row.worker_id.is_none());
 		assert!(row.lease_expires_at.is_none());
 
@@ -1641,7 +1804,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1658,17 +1821,18 @@ mod tests {
 				repo_id,
 				leased.id,
 				&Finding {
-					scanner_id: "regex".into(),
+					scanner_id: crate::test_support::text("regex").unwrap(),
 					severity: Severity::High,
-					title: "Cancelled finding".into(),
-					description: "submitted before cancellation".into(),
-					file_path: Some("src/x.rs".into()),
+					title: crate::test_support::text("Cancelled finding").unwrap(),
+					description: crate::test_support::text("submitted before cancellation")
+						.unwrap(),
+					file_path: Some(crate::test_support::path("src/x.rs").unwrap()),
 					line_start: Some(1),
 					line_end: Some(1),
 					cwe: None,
 					patch_unified: None,
 					poc_unified: None,
-					fingerprint: "fp-cancelled".into(),
+					fingerprint: crate::test_support::text("fp-cancelled").unwrap(),
 				},
 				true,
 				210,
@@ -1701,7 +1865,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1715,7 +1879,11 @@ mod tests {
 		db.with_conn(|c| lease(c, worker_id, false, 100, 10)).unwrap();
 		let n = db.with_conn(|c| reap_stale_leases(c, 200)).unwrap();
 		assert_eq!(n, 1);
-		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
+		let row = db
+			.with_conn(|c| Ok(list(c, &JobFilter::<loupe_provenance::Db>::default())?))
+			.unwrap()
+			.pop()
+			.unwrap();
 		assert_eq!(row.state, JobState::Queued);
 		assert_eq!(row.attempts, 1, "reap doesn't reset attempts");
 	}
@@ -1729,7 +1897,7 @@ mod tests {
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1776,7 +1944,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1797,7 +1965,11 @@ mod tests {
 		// to failed.
 		db.with_conn(|c| lease(c, worker_id, false, 999, 10)).unwrap();
 		db.with_conn(|c| reap_stale_leases(c, 9_999)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
+		let row = db
+			.with_conn(|c| Ok(list(c, &JobFilter::<loupe_provenance::Db>::default())?))
+			.unwrap()
+			.pop()
+			.unwrap();
 		assert_eq!(row.state, JobState::Failed);
 	}
 
@@ -1809,7 +1981,7 @@ mod tests {
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1826,17 +1998,18 @@ mod tests {
 				repo_id,
 				leased.id,
 				&Finding {
-					scanner_id: "regex".into(),
+					scanner_id: crate::test_support::text("regex").unwrap(),
 					severity: Severity::High,
-					title: "Partial scan finding".into(),
-					description: "submitted before lease expiry".into(),
-					file_path: Some("src/x.rs".into()),
+					title: crate::test_support::text("Partial scan finding").unwrap(),
+					description: crate::test_support::text("submitted before lease expiry")
+						.unwrap(),
+					file_path: Some(crate::test_support::path("src/x.rs").unwrap()),
 					line_start: Some(1),
 					line_end: Some(1),
 					cwe: None,
 					patch_unified: None,
 					poc_unified: None,
-					fingerprint: "fp-reaped".into(),
+					fingerprint: crate::test_support::text("fp-reaped").unwrap(),
 				},
 				true,
 				1_000,
@@ -1855,7 +2028,11 @@ mod tests {
 		.unwrap();
 
 		db.with_conn(|c| reap_stale_leases(c, 9_999)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
+		let row = db
+			.with_conn(|c| Ok(list(c, &JobFilter::<loupe_provenance::Db>::default())?))
+			.unwrap()
+			.pop()
+			.unwrap();
 		assert_eq!(row.state, JobState::Failed);
 		let pending_findings: i64 = db
 			.with_conn(|c| {

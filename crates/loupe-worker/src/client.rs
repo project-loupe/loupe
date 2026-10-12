@@ -7,16 +7,20 @@ use bytes::Bytes;
 use loupe_http::read_response_bytes;
 use loupe_proto::{
 	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
-	JobCapability, LeaseRequest, LeaseResponse, ListFindingsResponse, LlmFindingSubmission,
-	VerdictSubmission, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+	JobCapability, LeaseResponse, ListFindingsResponse, VerdictSubmission, JOB_CAPABILITY_HEADER,
+	PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
-use loupe_provenance::{Ingress, Server, Untrusted};
+use loupe_provenance::{Agent, Ingress, Repo, Server, Source, Untrusted};
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use reqwest::Url;
 
 mod ingress;
 #[cfg(fuzzing)]
 pub use ingress::fuzz_support;
+#[cfg(test)]
+pub(crate) use ingress::fuzz_support::lease_fixture as test_lease;
+#[cfg(any(test, fuzzing))]
+pub(crate) use ingress::fuzz_support::scanner_patch_fixture as test_scanner_patch;
 
 /// Named authentication handoff: Bytes keeps this shared secret owner alive
 /// through header clones. HTTP/TLS encoding and kernel copies are not covered
@@ -45,8 +49,9 @@ pub struct ServerClient {
 }
 
 pub(crate) struct LeaseReceipt {
-	pub(crate) response: LeaseResponse,
+	pub(crate) response: LeaseResponse<Agent, Server>,
 	pub(crate) reviewed_revision: crate::host_outcome::ReviewedRevisionFact,
+	pub(crate) scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 }
 
 impl ServerClient {
@@ -70,15 +75,23 @@ impl ServerClient {
 	}
 
 	pub async fn lease(
-		&self, capabilities: Vec<String>, wait_seconds: u32,
-	) -> Result<LeaseResponse> {
+		&self, capabilities: Vec<&'static str>, wait_seconds: u32,
+	) -> Result<LeaseResponse<Agent, Server>> {
 		Ok(self.lease_for_runner(capabilities, wait_seconds).await?.response)
 	}
 	pub(crate) async fn lease_for_runner(
-		&self, capabilities: Vec<String>, wait_seconds: u32,
+		&self, capabilities: Vec<&'static str>, wait_seconds: u32,
 	) -> Result<LeaseReceipt> {
 		let url = self.url("/v1/jobs/lease");
-		let req = LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
+		// Scanner capabilities are closed static declarations, not Config input.
+		#[derive(serde::Serialize)]
+		struct BuiltinLeaseRequest {
+			protocol_version: u16,
+			capabilities: Vec<&'static str>,
+			wait_seconds: u32,
+		}
+		let req =
+			BuiltinLeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
 		let resp = self
 			.with_protocol(self.http.post(url))
 			.json(&req)
@@ -105,7 +118,7 @@ impl ServerClient {
 	}
 
 	pub async fn submit_findings(
-		&self, job_id: i64, job_capability: &JobCapability, batch: &FindingsBatch,
+		&self, job_id: i64, job_capability: &JobCapability, batch: &FindingsBatch<Repo>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/findings"));
 		let resp = self
@@ -117,8 +130,9 @@ impl ServerClient {
 		ensure_ok(resp).await.map(ingress::submission)
 	}
 
-	pub async fn submit_llm_finding(
-		&self, job_id: i64, job_capability: &JobCapability, finding: &LlmFindingSubmission,
+	pub(crate) async fn submit_llm_finding(
+		&self, job_id: i64, job_capability: &JobCapability,
+		finding: &crate::mcp::McpFindingSubmission,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/llm-findings"));
 		let resp = self
@@ -130,8 +144,9 @@ impl ServerClient {
 		ensure_ok(resp).await.map(ingress::submission)
 	}
 
-	pub async fn complete(
-		&self, job_id: i64, job_capability: &JobCapability, req: &CompleteRequest,
+	pub async fn complete<RevisionS: Source, DiagnosticS: Source>(
+		&self, job_id: i64, job_capability: &JobCapability,
+		req: &CompleteRequest<RevisionS, DiagnosticS>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
 		let resp = self
@@ -144,7 +159,7 @@ impl ServerClient {
 	}
 
 	pub async fn submit_verdict(
-		&self, job_id: i64, job_capability: &JobCapability, req: &VerdictSubmission,
+		&self, job_id: i64, job_capability: &JobCapability, req: &VerdictSubmission<Agent>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
 		let resp = self
@@ -156,16 +171,44 @@ impl ServerClient {
 		ensure_ok(resp).await.map(ingress::submission)
 	}
 
+	pub(crate) async fn complete_runner(
+		&self, job_id: i64, job_capability: &JobCapability, req: &crate::runner::RunnerCompletion,
+	) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
+		let resp = self
+			.with_job_capability(self.http.post(url), job_capability)
+			.json(req)
+			.send()
+			.await
+			.context("complete request")?;
+		ensure_ok(resp).await.map(ingress::submission)
+	}
+
+	pub(crate) async fn submit_host_verdict(
+		&self, job_id: i64, job_capability: &JobCapability,
+		reason: crate::host_outcome::HostVerifyReason,
+	) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
+		let resp = self
+			.with_job_capability(self.http.post(url), job_capability)
+			.json(&reason.into_submission())
+			.send()
+			.await
+			.context("verdict request")?;
+		ensure_ok(resp).await.map(ingress::submission)
+	}
+
 	/// FTS keyword search over a repo's accumulated findings. The
 	/// MCP server's `query_prior_findings` tool calls this. `query`
 	/// is free-form keywords; the server sanitises them.
 	pub async fn search_findings(
-		&self, repo_id: i64, job_capability: &JobCapability, query: &str, limit: i64,
-	) -> Result<ListFindingsResponse> {
+		&self, repo_id: i64, job_capability: &JobCapability,
+		query: &loupe_core::text::BoundedText<crate::mcp::QueryText, Agent>, limit: i64,
+	) -> Result<ListFindingsResponse<Agent, Server>> {
 		let url = self.url(&format!("/v1/repos/{repo_id}/findings/search"));
 		let resp = self
 			.with_job_capability(
-				self.http.get(url).query(&[("q", query), ("limit", &limit.to_string())]),
+				self.http.get(url).query(&[("q", query.expose()), ("limit", &limit.to_string())]),
 				job_capability,
 			)
 			.send()
@@ -181,7 +224,7 @@ impl ServerClient {
 	/// `query_prior_findings` (a summary-only listing) returned.
 	pub async fn get_finding(
 		&self, id: i64, job_capability: &JobCapability,
-	) -> Result<FindingDetail> {
+	) -> Result<FindingDetail<Agent, Server>> {
 		let url = self.url(&format!("/v1/findings/{id}"));
 		let resp = self
 			.with_job_capability(self.http.get(url), job_capability)
@@ -218,17 +261,30 @@ async fn read_server_response(
 	Ok(Untrusted::new(bytes, unsafe { Ingress::<Server>::new() }))
 }
 
+#[derive(Debug)]
+struct ServerResponseError {
+	status: reqwest::StatusCode,
+	body: ingress::ServerDiagnostic,
+}
+impl std::fmt::Display for ServerResponseError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "server returned {}", self.status)?;
+		let body = self.body.for_diagnostic();
+		if !body.is_empty() {
+			write!(f, ": {body}")?;
+		}
+		Ok(())
+	}
+}
+impl std::error::Error for ServerResponseError {}
+
 async fn ensure_ok(resp: reqwest::Response) -> Result<Untrusted<Bytes, Server>> {
 	if !resp.status().is_success() {
 		let status = resp.status();
 		let bytes = read_server_response(resp)
 			.await
 			.map_err(|error| anyhow!("server returned {status}: {error}"))?;
-		let body = ingress::error(&bytes);
-		if body.is_empty() {
-			return Err(anyhow!("server returned {status}"));
-		}
-		return Err(anyhow!("server returned {status}: {body}"));
+		return Err(ServerResponseError { status, body: ingress::error(&bytes) }.into());
 	}
 	let header = resp
 		.headers()
@@ -332,7 +388,7 @@ mod tests {
 			.complete(
 				1513,
 				&job_capability,
-				&CompleteRequest {
+				&CompleteRequest::<loupe_provenance::Repo, loupe_provenance::Server> {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Succeeded,
 					head_sha: None,

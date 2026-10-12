@@ -46,16 +46,18 @@ pub fn observe_repo(case: RepoCase<'_>) -> RepoObservation {
 			// SAFETY: original cfg-only Repo window-source file bytes.
 			let original = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
 			match original.validate(FingerprintWindow { file, line_start: start, line_end: end }) {
-				Ok(hash) => RepoObservation::Fingerprint(hash.legacy_digest()),
+				Ok(hash) => RepoObservation::Fingerprint(hash.for_submission().to_owned()),
 				Err(_) => RepoObservation::InvalidUtf8,
 			}
 		},
 		RepoCase::GitOutput(output) => {
 			// SAFETY: original cfg-only Git command Output fixture before diagnostic decoding.
 			let original = Untrusted::new(output, unsafe { Ingress::<Repo>::new() });
-			match original.validate(RepoDiffCheckDecoder).unwrap().legacy_tool_diagnostic() {
+			match original.validate(RepoDiffCheckDecoder).unwrap().into_outcome() {
 				super::super::DiffCheck::Applies => RepoObservation::Applies,
-				super::super::DiffCheck::Rejects { stderr } => RepoObservation::Rejects(stderr),
+				super::super::DiffCheck::Rejects { stderr } => {
+					RepoObservation::Rejects(stderr.for_tool_response().to_owned())
+				},
 			}
 		},
 	}

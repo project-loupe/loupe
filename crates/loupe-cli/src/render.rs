@@ -17,7 +17,20 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use loupe_core::{FindingState, Severity};
-use loupe_proto::{FindingDetail, FindingSummary};
+use loupe_provenance::{Agent, Server};
+type FindingDetail = loupe_proto::FindingDetail<Agent, Server>;
+type FindingSummary = loupe_proto::FindingSummary<Agent, Server>;
+
+/// Preserve the CLI's historical kind spelling at its explicit terminal sink.
+pub fn job_kind(kind: &loupe_core::JobKind<Server>) -> String {
+	match kind {
+		loupe_core::JobKind::Scan => "Scan".into(),
+		loupe_core::JobKind::Verify => "Verify".into(),
+		loupe_core::JobKind::Survey => "Survey".into(),
+		loupe_core::JobKind::Drilldown => "Drilldown".into(),
+		loupe_core::JobKind::Unknown(text) => format!("Unknown({:?})", text.expose()),
+	}
+}
 
 /// Whether to emit ANSI escape sequences. Detected once per call by
 /// [`Style::detect`], threaded through the renderer so callers can
@@ -82,11 +95,11 @@ pub fn finding_list_row(f: &FindingSummary) -> String {
 		f.id,
 		f.job_id,
 		f.severity,
-		TerminalText(&f.scanner_id),
+		TerminalText(f.scanner_id.expose()),
 		f.state,
 		f.verification_required,
 		TerminalText(&summary_location(f)),
-		TerminalText(&f.title)
+		TerminalText(f.title.expose())
 	)
 }
 
@@ -96,29 +109,29 @@ pub fn finding_search_row(f: &FindingSummary) -> String {
 		"{:>5}\t{:?}\t{}\tstate={}\t{}\t{}",
 		f.id,
 		f.severity,
-		TerminalText(&f.scanner_id),
+		TerminalText(f.scanner_id.expose()),
 		f.state,
 		TerminalText(&summary_location(f)),
-		TerminalText(&f.title)
+		TerminalText(f.title.expose())
 	)
 }
 
 fn summary_location(f: &FindingSummary) -> String {
-	match (f.file_path.as_deref(), f.line_start) {
+	match (f.file_path.as_ref().map(|path| path.expose()), f.line_start) {
 		(Some(path), Some(line)) => format!("{path}:{line}"),
 		(Some(path), None) => path.to_owned(),
 		_ => "-".into(),
 	}
 }
 
-/// Render a [`FindingDetail`] as multi-line plain text.
+/// Render a [`loupe_proto::FindingDetail`] as multi-line plain text.
 pub fn finding(f: &FindingDetail, style: Style) -> String {
 	let mut out = String::with_capacity(1024);
 	header(&mut out, f, style);
 	metadata(&mut out, f, style);
-	if !f.description.trim().is_empty() {
+	if !f.description.expose().trim().is_empty() {
 		section(&mut out, "Description", style);
-		for line in f.description.lines() {
+		for line in f.description.expose().lines() {
 			let _ = writeln!(out, "  {}", TerminalText(line));
 		}
 		out.push('\n');
@@ -137,14 +150,15 @@ fn header(out: &mut String, f: &FindingDetail, style: Style) {
 		"{} {} — {}",
 		style.paint(BOLD, &format!("Finding #{}", f.id)),
 		style.paint(sev_color, &format!("[{sev_label}]")),
-		style.paint(BOLD, &f.title),
+		style.paint(BOLD, f.title.expose()),
 	);
 	let bar = "─".repeat(60);
 	let _ = writeln!(out, "{}", style.paint(DIM, &bar));
 }
 
 fn metadata(out: &mut String, f: &FindingDetail, style: Style) {
-	let location = match (f.file_path.as_deref(), f.line_start, f.line_end) {
+	let location = match (f.file_path.as_ref().map(|path| path.expose()), f.line_start, f.line_end)
+	{
 		(Some(p), Some(start), Some(end)) if end > start => format!("{p}:{start}-{end}"),
 		(Some(p), Some(start), _) => format!("{p}:{start}"),
 		(Some(p), None, _) => p.to_string(),
@@ -153,15 +167,24 @@ fn metadata(out: &mut String, f: &FindingDetail, style: Style) {
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Location:"), TerminalText(&location));
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Repo:    "), f.repo_id);
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Job:     "), f.job_id);
-	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Scanner: "), TerminalText(&f.scanner_id));
+	let _ = writeln!(
+		out,
+		"  {} {}",
+		style.paint(DIM, "Scanner: "),
+		TerminalText(f.scanner_id.expose())
+	);
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "State:   "), state_painted(&f.state, style));
 	if let Some(cwe) = &f.cwe {
-		let _ = writeln!(out, "  {} {}", style.paint(DIM, "CWE:     "), TerminalText(cwe));
+		let _ = writeln!(out, "  {} {}", style.paint(DIM, "CWE:     "), TerminalText(cwe.expose()));
 	}
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Created: "), format_unix(f.created_at));
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Verify:  "), f.verification_required);
-	let _ =
-		writeln!(out, "  {} {}", style.paint(DIM, "FP:      "), style.paint(DIM, &f.fingerprint),);
+	let _ = writeln!(
+		out,
+		"  {} {}",
+		style.paint(DIM, "FP:      "),
+		style.paint(DIM, f.fingerprint.expose()),
+	);
 	out.push('\n');
 }
 
@@ -172,7 +195,7 @@ fn poc(out: &mut String, f: &FindingDetail, style: Style) {
 		return;
 	};
 	section(out, "Proof of concept (regression test, fails on HEAD)", style);
-	render_unified_diff(out, diff, style);
+	render_unified_diff(out, diff.expose(), style);
 	out.push('\n');
 }
 
@@ -181,7 +204,7 @@ fn patch(out: &mut String, f: &FindingDetail, style: Style) {
 		return;
 	};
 	section(out, "Suggested fix", style);
-	render_unified_diff(out, diff, style);
+	render_unified_diff(out, diff.expose(), style);
 	out.push('\n');
 }
 
@@ -190,7 +213,9 @@ fn audit(out: &mut String, f: &FindingDetail, style: Style) {
 		return;
 	}
 	section(out, "Audit", style);
-	if let (Some(at), Some(by)) = (f.approved_at, f.approved_by_cn.as_deref()) {
+	if let (Some(at), Some(by)) =
+		(f.approved_at, f.approved_by_cn.as_ref().map(|text| text.expose()))
+	{
 		let _ = writeln!(
 			out,
 			"  {} {} by {}",
@@ -199,7 +224,9 @@ fn audit(out: &mut String, f: &FindingDetail, style: Style) {
 			TerminalText(by)
 		);
 	}
-	if let (Some(at), Some(by)) = (f.rejected_at, f.rejected_by_cn.as_deref()) {
+	if let (Some(at), Some(by)) =
+		(f.rejected_at, f.rejected_by_cn.as_ref().map(|text| text.expose()))
+	{
 		let _ = writeln!(
 			out,
 			"  {} {} by {}",
@@ -304,6 +331,18 @@ mod tests {
 	use loupe_proto::PROTOCOL_VERSION;
 
 	use super::*;
+	use crate::legacy_responses::FindingDetail;
+
+	// Rendering fixtures enter through the actual response owner. There is
+	// no unchecked constructor capable of labelling invalid test strings.
+	fn render(input: &FindingDetail, style: Style) -> anyhow::Result<String> {
+		let raw = serde_json::to_vec(input).unwrap();
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let received = crate::ingress::test_support::received(&raw).await;
+			let finding = crate::ingress::get_finding(received)?;
+			Ok(super::finding(&finding, style))
+		})
+	}
 
 	fn sample() -> FindingDetail {
 		FindingDetail {
@@ -341,7 +380,7 @@ mod tests {
 	}
 
 	#[test]
-	fn untrusted_fields_cannot_control_the_terminal() {
+	fn invalid_controls_cannot_reach_typed_finding_renderers() {
 		let payload: String = (0..=159)
 			.filter_map(char::from_u32)
 			.filter(|c| c.is_control() && !matches!(c, '\n' | '\r'))
@@ -367,29 +406,33 @@ mod tests {
 				},
 			}
 			for style in [Style::Plain, Style::Color] {
-				let mut rendered = finding(&f, style);
-				for code in ["0", BOLD, DIM, RED, GREEN, YELLOW, CYAN] {
-					rendered = rendered.replace(&format!("\x1b[{code}m"), "");
-				}
-				assert!(
-					!rendered.chars().any(|c| c.is_control() && c != '\n'),
-					"field {field} leaked a terminal control in {style:?}"
-				);
-				for c in payload.chars() {
-					assert!(
-						rendered.contains(&c.escape_default().to_string()),
-						"field {field} lost the visible spelling of {c:?}"
-					);
-				}
+				assert!(render(&f, style).is_err(), "field {field} reached typed renderer");
 			}
 		}
 	}
 
 	#[test]
-	fn title_newlines_are_visible_without_forging_rows() {
+	fn terminal_data_controls_keep_their_visible_spelling() {
+		let payload: String =
+			(0..=159).filter_map(char::from_u32).filter(|c| c.is_control()).collect();
+		for style in [Style::Plain, Style::Color] {
+			let mut rendered = style.paint(BOLD, &payload);
+			for code in ["0", BOLD] {
+				rendered = rendered.replace(&format!("\x1b[{code}m"), "");
+			}
+			assert!(!rendered.chars().any(char::is_control));
+			for c in payload.chars() {
+				assert!(rendered.contains(&c.escape_default().to_string()), "lost {c:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn title_newlines_cannot_enter_the_typed_renderer() {
 		let mut f = sample();
 		f.title = "safe\r\nforged".into();
-		assert!(finding(&f, Style::Plain).contains("safe\\r\\nforged"));
+		assert!(render(&f, Style::Plain).is_err());
+		assert_eq!(TerminalText("safe\r\nforged").to_string(), "safe\\r\\nforged");
 	}
 
 	#[test]
@@ -403,7 +446,7 @@ mod tests {
 
 	#[test]
 	fn plain_render_carries_all_review_critical_fields() {
-		let out = finding(&sample(), Style::Plain);
+		let out = render(&sample(), Style::Plain).unwrap();
 		assert!(out.contains("Finding #42"));
 		assert!(out.contains("[high]"));
 		assert!(out.contains("AWS access key in source"));
@@ -419,7 +462,7 @@ mod tests {
 
 	#[test]
 	fn color_render_emits_ansi_for_severity_and_diff_lines() {
-		let out = finding(&sample(), Style::Color);
+		let out = render(&sample(), Style::Color).unwrap();
 		// Header severity tag is colored.
 		assert!(out.contains("\x1b[31m[high]\x1b[0m"), "expected red severity in: {out:?}");
 		// `+` lines green, `-` lines red.
@@ -433,7 +476,7 @@ mod tests {
 	fn missing_poc_renders_explicit_placeholder() {
 		let mut f = sample();
 		f.poc_unified = None;
-		let out = finding(&f, Style::Plain);
+		let out = render(&f, Style::Plain).unwrap();
 		assert!(out.contains("Proof of concept"));
 		assert!(out.contains("(none"));
 	}
@@ -441,10 +484,10 @@ mod tests {
 	#[test]
 	fn audit_section_only_renders_when_a_decision_was_recorded() {
 		let mut f = sample();
-		assert!(!finding(&f, Style::Plain).contains("Audit"));
+		assert!(!render(&f, Style::Plain).unwrap().contains("Audit"));
 		f.approved_at = Some(1_756_000_001);
 		f.approved_by_cn = Some("admin".into());
-		assert!(finding(&f, Style::Plain).contains("approved"));
+		assert!(render(&f, Style::Plain).unwrap().contains("approved"));
 	}
 
 	#[test]

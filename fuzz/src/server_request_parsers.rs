@@ -2,7 +2,7 @@
 use http::HeaderValue;
 use loupe_proto::PROTOCOL_VERSION;
 use loupe_server::router::request_protocol_error;
-use loupe_server::routes::{jobs, repos};
+use loupe_server::routes::jobs;
 
 use crate::utils::test_logger;
 
@@ -81,7 +81,7 @@ pub fn do_test(data: &[u8]) {
 			}
 		},
 		3 => {
-			let parsed = repos::parse_github_clone_url(&text);
+			let parsed = loupe_server::fuzz_support::legacy_clone_url(&text);
 			assert_eq!(parsed, clone_url_shape(&text), "clone URL grammar differs");
 			if let Some((host, owner, repo)) = parsed {
 				assert!(!owner.is_empty() && !repo.is_empty());
@@ -91,7 +91,10 @@ pub fn do_test(data: &[u8]) {
 					assert!(text.starts_with(&format!("https://{host}/")));
 				}
 				let canonical = format!("https://{host}/{owner}/{repo}.git");
-				assert_eq!(repos::parse_github_clone_url(&canonical), Some((host, owner, repo)));
+				assert_eq!(
+					loupe_server::fuzz_support::legacy_clone_url(&canonical),
+					Some((host, owner, repo))
+				);
 			}
 		},
 		_ => {

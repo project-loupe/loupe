@@ -1,117 +1,106 @@
-# Server ingress during source migration (I)
+# Server input ownership
 
-This is staged adoption, before the atomic source-bearing API migration (M).
-Private validators establish actual input sources; the named legacy exits below
-are temporary, explicit conversions to existing unlabelled DTO/DAO consumers.
-They are not evidence that those consumers already retain provenance. The
-`source-migration` feature and these exits must disappear at M.
+The server retains source labels through its request DTOs, storage calls and
+reporter inputs. The staging feature and named legacy conversion methods have
+been removed. Source-bearing DTOs serialize deliberately but do not implement
+arbitrary Deserialize; private named decoders own each actual boundary.
 
-## Actual owners and authority
+## Authority and body capture
 
-`auth::mtls_auth` alone creates Worker or Operator authority, after the current
-certificate fingerprint resolves to an active database row. `AuthedWorker` has
-private row/authority fields; its read-only metadata and Clone cannot change the
-role. No row conversion, Default, public token getter or generic source choice
-exists. Debug contains only id and closed role metadata. Revocation is checked
-again on each request.
+`auth::mtls_auth` alone creates Worker or Operator request authority, after the
+current certificate fingerprint resolves to an active database row. The stored
+worker name remains Db. `AuthedWorker` has private row/authority fields and no
+public authority getter or source selection. Revocation is checked per request.
 
 Worker middleware charges request/lease budgets, then actual chunks before its
 2 MiB cap. It collects once into `RequestBuffer`, puts shared guarded `Bytes`
-behind a private Worker capture, and consumes that capture in the typed
-extractor. Operator JSON routes collect with the matching authority and the
-same cap. Operator no-body routes still ignore bodies; workers still collect
-ignored bodies. Growth allocates before copying and wipes the old live capacity;
-error, cancellation and final shared-owner Drop wipe collected storage. OS,
-HTTP transport chunks and parser scratch are dependency-owned copies.
+behind a private Worker capture, and consumes that capture in the extractor.
+Operator JSON routes collect under the authenticated Operator authority and the
+same cap. Operator no-body routes ignore bodies; workers collect even ignored
+bodies. Growth allocates before copying and wipes old live capacity; errors,
+cancellation and final shared-owner Drop wipe collected storage. OS, HTTP
+transport chunks and parser scratch remain dependency-owned copies.
 
 Order remains authentication/worker budgets, protocol header, role, media/body
 extraction, body version, job capability and operation checks. Empty heartbeat
-still requires no media header; its nonempty body uses its custom 400 error.
-Application/json and application/*+json MIME grammar are unchanged. Errors keep
-closed syntax/data/policy categories and static reasons, never serde/TOML input
-or hidden parser sources. Response version headers remain outermost.
+requires no media header; its nonempty body uses its custom 400 error.
+Application/json and application/*+json admission are unchanged. Closed errors
+retain syntax/data/policy categories and static reasons, never supplied parser
+text or hidden serde/TOML sources. Response version headers remain outermost.
 
-One bounded compatibility exception is intentional: malformed object/array
-values in a string field now receive syntax 400 after RawValue finishes scanning,
-where legacy serde could stop at the opening type with 422. Well-formed wrong
-types remain 422; scalar numeric overflow remains syntax 400. Ignored outer
-fields retain their old admission. Internally tagged reporting/verdict content
-uses an envelope-shaped post-validation pass to preserve recursion budgets.
-Registration returns scanner_config Value from that one pass, without a second
-standalone parse or a whole-document Value/serialization prepass.
+One bounded compatibility exception remains: malformed objects/arrays in a
+string field receive syntax 400 after RawValue scans the value, where legacy
+serde could stop at its opening type with 422. Well-formed wrong types remain
+422; scalar numeric overflow remains 400. Ignored outer fields retain their
+admission. Tagged reporting/verdict content uses an envelope-shaped validation
+pass to retain the original recursion budget. Registration moves the parsed
+scanner document from that pass into the opaque `ScannerDocument<Operator>`;
+it has no generic Value extraction or labelled Deserialize API.
 
-## Fixed schemas and temporary exits
+## Request and stored content
 
-All request validators are private `ingress` schemas. Operator owns repository
+Private `ingress` decoders return final source-bearing DTOs. Operator owns repo
 registration/update/reporting, worker registration, App setup, scan enqueue and
-retry-verification requests. Worker owns lease, heartbeat and completion.
-Finding/LLM/verdict validators carry only designated RawValue token subslices
-from the original Worker body to Agent, before string decoding. Pointer/range
-checks and the primitive carry contract reject reconstructed external tokens.
-Scalar metadata never gains an artificial Agent label.
+retry-verification inputs. Worker owns lease, heartbeat and completion content.
+Finding, LLM and verdict decoders carry designated original RawValue token
+subranges from Worker to Agent before string decoding. Pointer/range checks
+reject reconstructed tokens; equal decoded text does not select a span.
 
-The exact exit inventory is:
+The LLM decoder attaches only its fixed scanner literal as protocol metadata
+under the same live Agent mark. It does not accept a caller-selected override.
+Strict title/description checks use a trimmed view, while original admitted
+bytes reach SQL and HTTP output. Queries retain Worker or Operator through
+search; closed job kind/state and scalar limits remain metadata. FTS sanitation
+occurs at the actual search operation. Shared exact policy names come from core;
+`json_text` supports exact policies and cannot stand in for semantic policies'
+pre-normalization margins.
 
-- `registry::{RegisterRepoDecoder, UpdateRepoDecoder, EnqueueScanDecoder,
-  RetryVerifyDecoder, RegisterWorkerDecoder, RotateRepoPatDecoder,
-  SetGithubAppDecoder, SetRepoGithubReportingDecoder}::decode_legacy`.
-- `jobs::{LeaseRequestDecoder, HeartbeatDecoder, CompleteDecoder,
-  FindingsBatchDecoder, LlmFindingDecoder, VerdictSubmissionDecoder}::decode_legacy`.
-- `query::SearchQueryDecoder::{worker_legacy, operator_legacy}`. Actual role
-  selects one concrete source. JobListQueryDecoder returns closed states/kind
-  and scalar limit, with fixed errors. FTS sanitization stays at the operation.
-- `config::ServerFileConfigDecoder::decode_legacy`; paths retain native PathBuf
-  and relative resolution, allowed owners retain exact Config spelling.
-- Binary `ServerHostPathDecoder::decode_legacy` and
-  `ServerTlsPemEgress::move_legacy`. The latter is a named forward-payload
-  admission, not a PEM syntax/trust validator: it borrows existing guarded UTF-8
-  PEM and moves the original Secret to the existing TLS constructor. Mixed
-  bundles, allocation identity, raw/base64/file precedence and grammar remain.
-- `reporters::ingress::AppMetadataDecoder::decode_legacy` for id/marked Reporter
-  slug. InstallationDecoder and IssueReceiptDecoder return scalars;
-  LabelResponseDecoder preserves the closed acceptance decision.
+Storage reads establish Db for ordinary metadata and carry designated original
+stored content to Agent. Historical `source = agent` is conservative content
+classification, not authorship or request authority. Reporter input therefore
+combines an Agent finding with its Db revision and typed destination settings.
+Host deadline reasons, policy defaults, phase recipes, counts and pending follow
+ups use their named closed compositions; they do not mint a source for generated
+text or allow arbitrary host JSON construction.
 
-`ServerMasterKeyDecoder` and `ServerBase64PemDecoder` consume actual Config
-captures and return the existing concrete guarded key/PEM outputs. Capture
-occurs before hex/base64 decoding. File/CLI path selection remains in the
-process owner. There is no new whole-config, host-path or PEM cap. Init's closed
-certificate generation and explicit export remain existing behavior; M must
-inventory its actual dynamic hostnames/data-dir inputs separately rather than
-claiming this Serve/config-reader join already migrates them.
+## Configuration and secrets
 
-Local exact policies `RevisionText`, `JobDiagnostic` and `SearchText` need
-canonical owner coordination at M. Shared WorkerName, LeaseCapabilityName and
-GithubAppSlug policies come from core. `json_text` currently supports exact
-policies only: semantic future uses require the accepted decoded-raw margin
-before normalization/final caps. Paths use RepoPath where appropriate; scanner
-configuration uses its named Operator forward-document owner, not Payload
-normalization. LLM title/description still require trim-view minima, but the
-original admitted bytes now reach SQL and HTTP output unchanged.
+`ServerFileConfigDecoder` validates original Config file bytes. Actual native
+Clap parsers retain `ConfiguredPath`, `ConfiguredHostname` and guarded PEM input
+owners; selected PEM remains `ConfiguredPem` through the TLS operation. There
+is no public post-hoc string constructor. Relative paths retain native PathBuf
+semantics and raw/base64/file precedence is unchanged. Mixed certificate inputs
+remain guarded. Public test setup uses these actual parsers/readers.
 
-## Reporter responses
+`ServerMasterKeyDecoder` validates original Config before hex decoding into the
+existing opaque key. Init's dynamic hostnames and data directory use the same
+Config owners; generation and explicit credential export retain their closed
+interfaces. Secret values are borrowed only at their concrete crypto, transport
+or storage operation. Source ownership does not imply that opaque dependencies
+or operating-system buffers can be wiped by Loupe.
 
-Actual metadata, installation, issue and unsuccessful-label readers now use
-loupe-http's guarded 16 MiB collector before named Reporter validation. This is
-a newly applied Reporter ceiling. The existing token reader retains its separate
-256 KiB ceiling and guarded mutable scratch. Token output remains Secret and
-existing Arc cache/Bearer ownership, expiry/revoke/retry behavior is unchanged.
-Successful label statuses ignore their bodies. Status 422 plus the ASCII
-already_exists byte substring remains accepted even for malformed/non-JSON or
-invalid-UTF8 label bodies, matching the prior lossy-text decision.
+## Reporter responses and sinks
 
-Existing public pure compatibility/fuzz adapters remain temporary unlabelled
-entry points: github_app::{parse_app_response, parse_installation_response,
-parse_access_token_response} and github::parse_issue_response. Actual HTTP
-readers no longer use them as provenance validators. M must close or replace
-these public legacy entries; a generic serde helper must never become an
-arbitrary labelled decode escape.
+Actual metadata, installation, issue and unsuccessful-label responses use the
+16 MiB guarded HTTP collector before named Reporter validation. Tokens retain
+the separate 256 KiB cap and guarded scratch. App slugs remain Reporter through
+storage; cache and dispatch share the existing guarded token owner. Successful
+label statuses ignore bodies. Status 422 plus the ASCII already_exists byte
+substring remains accepted for malformed or invalid-UTF8 bodies, preserving the
+old lossy-text decision. App retry, PAT dispatch and cache behavior are unchanged.
 
-## Evidence interpretation
+Pure compatibility helpers and synthetic owner observations are available only
+under test/fuzz cfg. They do not provide normal-build arbitrary labelled decode
+APIs. Reporter render entry points require the final typed finding/destination
+owners. Full later report containment, prompt framing and scope/canary work are
+separate obligations; typed sink inputs alone do not claim those properties.
 
-Runtime red/green controls cover reflected JSON, heartbeat, TOML and query
-errors, original LLM bytes and uncapped Reporter bodies. Original passing
-compatibility controls remain. Numeric and envelope-depth controls distinguish
-the earlier candidate from the repaired one. Authority compile-negative checks
-are API evidence (pre-change public mutation compiled), while new source-type,
-allocation identity and live cleanup tests are acceptance evidence, not claims
-of earlier runtime disclosure or observation of freed memory.
+## Evidence boundaries
+
+The original runtime red/green controls cover reflected errors, original LLM
+bytes and bounded Reporter bodies. Numeric and depth controls preserve their
+proven compatibility domains. Authority/source compile probes are API evidence;
+live wipe observations are not freed-memory inspection. Direct decoder fuzzing
+uses actual private production validators, independently retained wire schemas
+and original-span ledgers. Transport targets separately exercise collection,
+authentication and byte charging; pure DTO fixtures do not claim HTTP coverage.

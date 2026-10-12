@@ -1,15 +1,14 @@
 use std::fmt;
 use std::marker::PhantomData;
-use std::str::FromStr;
 
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
 use super::policy::{JsonKey, JsonLeaf};
 use super::{checked, Error, JsonPolicy, Rule};
 
-/// Private checked payload shared by legacy and marked wrappers.
+/// Private checked payload for source-retaining JSON values.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CheckedJson {
 	value: Value,
@@ -55,56 +54,28 @@ impl Serialize for CheckedJson {
 	}
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct BoundedJson<P: JsonPolicy> {
-	data: CheckedJson,
-	policy: PhantomData<P>,
+// Exercise the parser's actual serde visitor paths without restoring a public
+// Deserialize implementation for a source-bearing value. The final raw entry
+// point additionally checks the original document cap before this traversal.
+#[cfg(test)]
+pub(super) fn visitor_fixture<'de, P: JsonPolicy, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<String, D::Error> {
+	let mut state = State::<P> { nodes: 0, bytes: 0, error: None, policy: PhantomData };
+	let value = Node { state: &mut state, depth: 1 }.deserialize(deserializer)?;
+	let data = CheckedJson::finish::<P>(value).map_err(serde::de::Error::custom)?;
+	Ok(data.expose().to_owned())
 }
-impl<P: JsonPolicy> BoundedJson<P> {
-	/// Bound raw JSON before parsing. Embedded Deserialize additionally
-	/// requires a bounded request body at the protocol boundary.
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		Ok(Self { data: CheckedJson::parse::<P>(raw)?, policy: PhantomData })
-	}
-	pub fn expose(&self) -> &str {
-		self.data.expose()
-	}
-	pub fn canonical(&self) -> &[u8] {
-		self.data.canonical()
-	}
-	pub fn digest(&self) -> &[u8; 32] {
-		self.data.digest()
-	}
-}
-impl<P: JsonPolicy> fmt::Debug for BoundedJson<P> {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "BoundedJson<{}>(len={})", P::FIELD, self.canonical().len())
-	}
-}
-impl<P: JsonPolicy> FromStr for BoundedJson<P> {
-	type Err = Error;
-	fn from_str(raw: &str) -> Result<Self, Error> {
-		Self::new(raw)
-	}
-}
-impl<P: JsonPolicy> TryFrom<String> for BoundedJson<P> {
-	type Error = Error;
-	fn try_from(raw: String) -> Result<Self, Error> {
-		Self::new(&raw)
-	}
-}
-impl<P: JsonPolicy> Serialize for BoundedJson<P> {
-	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-		self.data.serialize(s)
-	}
-}
-impl<'de, P: JsonPolicy> Deserialize<'de> for BoundedJson<P> {
-	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-		let mut state = State::<P> { nodes: 0, bytes: 0, error: None, policy: PhantomData };
-		let value = Node { state: &mut state, depth: 1 }.deserialize(d)?;
-		let data = CheckedJson::finish::<P>(value).map_err(serde::de::Error::custom)?;
-		Ok(Self { data, policy: PhantomData })
-	}
+
+#[cfg(fuzzing)]
+pub(super) fn payload_visitor_observation(raw: &str) -> Option<(String, [u8; 32])> {
+	let mut state =
+		State::<super::policy::Payload> { nodes: 0, bytes: 0, error: None, policy: PhantomData };
+	let mut decoder = serde_json::Deserializer::from_str(raw);
+	let value = Node { state: &mut state, depth: 1 }.deserialize(&mut decoder).ok()?;
+	decoder.end().ok()?;
+	let data = CheckedJson::finish::<super::policy::Payload>(value).ok()?;
+	Some((data.expose().to_owned(), *data.digest()))
 }
 
 struct State<P> {

@@ -1,26 +1,29 @@
 //! DAO for the `registered_repos` table.
 
-use loupe_core::ReportingDestination;
+use loupe_core::text::policy::*;
+use loupe_core::text::BoundedText;
+use loupe_core::{ReportingDestination, ScannerDocument};
+use loupe_provenance::{Db, Source};
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRow {
 	pub id: i64,
-	pub clone_url: String,
-	pub host: String,
-	pub owner: String,
-	pub repo: String,
-	pub default_branch: Option<String>,
+	pub clone_url: BoundedText<CloneUrl, Db>,
+	pub host: BoundedText<RepoHost, Db>,
+	pub owner: BoundedText<RepoOwner, Db>,
+	pub repo: BoundedText<RepoName, Db>,
+	pub default_branch: Option<BoundedText<GitBranch, Db>>,
 	pub scan_interval_seconds: Option<i64>,
-	pub scanner_config: serde_json::Value,
-	pub reporting: ReportingDestination,
+	pub scanner_config: ScannerDocument<Db>,
+	pub reporting: ReportingDestination<Db>,
 	pub verification_enabled: bool,
 	/// Tri-state per-repo override of the human-in-the-loop approval
 	/// gate. `None` → fall back to the server-level default
 	/// (`require_approval_default`); `Some(true)`/`Some(false)` →
 	/// pin the value for this repo regardless of the server default.
 	pub require_approval: Option<bool>,
-	pub last_scanned_sha: Option<String>,
+	pub last_scanned_sha: Option<BoundedText<RevisionText, Db>>,
 	pub last_scanned_at: Option<i64>,
 	pub created_at: i64,
 	pub disabled_at: Option<i64>,
@@ -34,34 +37,51 @@ impl RepoRow {
 	}
 }
 
-#[derive(Debug, Clone)]
-pub struct NewRepo {
-	pub clone_url: String,
-	pub host: String,
-	pub owner: String,
-	pub repo: String,
-	pub default_branch: Option<String>,
+#[derive(Debug)]
+pub struct NewRepo<S: Source> {
+	pub clone_url: BoundedText<CloneUrl, S>,
+	pub host: BoundedText<RepoHost, S>,
+	pub owner: BoundedText<RepoOwner, S>,
+	pub repo: BoundedText<RepoName, S>,
+	pub default_branch: Option<BoundedText<GitBranch, S>>,
 	pub scan_interval_seconds: Option<i64>,
-	pub scanner_config: serde_json::Value,
-	pub reporting: ReportingDestination,
+	pub scanner_config: ScannerDocument<S>,
+	pub reporting: ReportingDestination<S>,
 	pub verification_enabled: bool,
 	/// `None` lets the server default decide; `Some(_)` pins the per-repo
 	/// override on insert.
 	pub require_approval: Option<bool>,
 }
 
-pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i64> {
+impl<S: Source> Clone for NewRepo<S> {
+	fn clone(&self) -> Self {
+		Self {
+			clone_url: self.clone_url.clone(),
+			host: self.host.clone(),
+			owner: self.owner.clone(),
+			repo: self.repo.clone(),
+			default_branch: self.default_branch.clone(),
+			scan_interval_seconds: self.scan_interval_seconds,
+			scanner_config: self.scanner_config.clone(),
+			reporting: self.reporting.clone(),
+			verification_enabled: self.verification_enabled,
+			require_approval: self.require_approval,
+		}
+	}
+}
+
+pub fn insert<S: Source>(conn: &Connection, new: &NewRepo<S>, now: i64) -> rusqlite::Result<i64> {
 	conn.execute(
 		"INSERT INTO registered_repos
 		   (clone_url, host, owner, repo, default_branch, scan_interval_seconds,
 		    scanner_config, reporting, verification_enabled, require_approval, created_at)
 		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
 		params![
-			new.clone_url,
-			new.host,
-			new.owner,
-			new.repo,
-			new.default_branch,
+			new.clone_url.expose(),
+			new.host.expose(),
+			new.owner.expose(),
+			new.repo.expose(),
+			new.default_branch.as_ref().map(BoundedText::expose),
 			new.scan_interval_seconds,
 			serde_json::to_string(&new.scanner_config).unwrap_or_else(|_| "{}".into()),
 			serde_json::to_string(&new.reporting).expect("reporting is always serialisable"),
@@ -75,18 +95,20 @@ pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i6
 
 pub fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<RepoRow>> {
 	let Some(limit) = limit else {
-		let mut stmt = conn.prepare(SELECT_REPO_COLUMNS)?;
+		let mut stmt = conn.prepare(&format!("SELECT {REPO_COLUMNS} FROM registered_repos"))?;
 		let rows = stmt.query_map([], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
 		return Ok(rows);
 	};
-	let mut stmt = conn.prepare(&format!("{SELECT_REPO_COLUMNS} LIMIT ?1"))?;
+	let mut stmt =
+		conn.prepare(&format!("SELECT {REPO_COLUMNS} FROM registered_repos LIMIT ?1"))?;
 	let rows =
 		stmt.query_map(params![limit], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
 	Ok(rows)
 }
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<RepoRow>> {
-	let mut stmt = conn.prepare(&format!("{SELECT_REPO_COLUMNS} WHERE id = ?1"))?;
+	let mut stmt =
+		conn.prepare(&format!("SELECT {REPO_COLUMNS} FROM registered_repos WHERE id = ?1"))?;
 	stmt.query_row(params![id], row_to_repo).optional()
 }
 
@@ -95,8 +117,8 @@ pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	Ok(n > 0)
 }
 
-pub fn update_reporting(
-	conn: &Connection, id: i64, reporting: &ReportingDestination,
+pub fn update_reporting<S: Source>(
+	conn: &Connection, id: i64, reporting: &ReportingDestination<S>,
 ) -> rusqlite::Result<bool> {
 	let n = conn.execute(
 		"UPDATE registered_repos SET reporting = ?1 WHERE id = ?2",
@@ -120,7 +142,7 @@ fn count_github_destinations(
 	conn: &Connection, matches: impl Fn(Option<i64>) -> bool,
 ) -> rusqlite::Result<usize> {
 	let mut stmt = conn.prepare("SELECT reporting FROM registered_repos")?;
-	let rows = stmt.query_map([], |row| crate::ingress::reporting_legacy(row, 0))?;
+	let rows = stmt.query_map([], |row| crate::ingress::reporting(row, 0))?;
 	let mut count = 0usize;
 	for row in rows {
 		let reporting = row?;
@@ -196,7 +218,7 @@ pub fn update(conn: &Connection, id: i64, patch: &RepoUpdate, now: i64) -> rusql
 /// pass `since_sha` for incremental.
 pub fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<RepoRow>> {
 	let mut stmt = conn.prepare(&format!(
-		"{SELECT_REPO_COLUMNS}
+		"SELECT {REPO_COLUMNS} FROM registered_repos
 		 WHERE scan_interval_seconds IS NOT NULL
 		   AND disabled_at IS NULL
 		   AND (last_scanned_at IS NULL OR last_scanned_at + scan_interval_seconds < ?1)"
@@ -205,33 +227,36 @@ pub fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Re
 	Ok(rows)
 }
 
-const SELECT_REPO_COLUMNS: &str = r#"
-SELECT id, clone_url, host, owner, repo, default_branch, scan_interval_seconds,
+const REPO_COLUMNS: &str = r#"
+       id, clone_url, host, owner, repo, default_branch, scan_interval_seconds,
        scanner_config, reporting, verification_enabled, require_approval,
        last_scanned_sha, last_scanned_at, created_at, disabled_at
-FROM registered_repos
 "#;
 
 fn row_to_repo(row: &rusqlite::Row) -> rusqlite::Result<RepoRow> {
-	let scanner_config = crate::ingress::scanner_document_legacy(row, 7)?;
-	let reporting = crate::ingress::reporting_legacy(row, 8)?;
+	let scanner_config = crate::ingress::scanner_document(row, 7)?;
+	let reporting = crate::ingress::reporting(row, 8)?;
 	Ok(RepoRow {
 		id: row.get(0)?,
-		clone_url: crate::ingress::clone_url_legacy(row, 1)?,
-		host: crate::ingress::repo_host_legacy(row, 2)?,
-		owner: crate::ingress::repo_owner_legacy(row, 3)?,
-		repo: crate::ingress::repo_name_legacy(row, 4)?,
-		default_branch: crate::ingress::optional_branch_legacy(row, 5)?,
+		clone_url: crate::ingress::clone_url(row, 1)?,
+		host: crate::ingress::repo_host(row, 2)?,
+		owner: crate::ingress::repo_owner(row, 3)?,
+		repo: crate::ingress::repo_name(row, 4)?,
+		default_branch: crate::ingress::optional_branch(row, 5)?,
 		scan_interval_seconds: row.get(6)?,
 		scanner_config,
 		reporting,
 		verification_enabled: row.get::<_, i64>(9)? != 0,
 		require_approval: row.get::<_, Option<i64>>(10)?.map(|v| v != 0),
-		last_scanned_sha: crate::ingress::optional_revision_legacy(row, 11)?,
+		last_scanned_sha: crate::ingress::optional_revision(row, 11)?,
 		last_scanned_at: row.get(12)?,
 		created_at: row.get(13)?,
 		disabled_at: row.get(14)?,
 	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(conn, "registered_repos", REPO_COLUMNS, row_to_repo)
 }
 
 #[cfg(test)]
@@ -242,23 +267,47 @@ mod tests {
 	use crate::secrets::{self, SecretKind};
 	use crate::Db;
 
-	fn fake_repo(secret_id: i64) -> NewRepo {
+	fn fake_repo(secret_id: i64) -> NewRepo<loupe_provenance::Db> {
 		NewRepo {
-			clone_url: "https://github.com/acme/widget.git".into(),
-			host: "github.com".into(),
-			owner: "acme".into(),
-			repo: "widget".into(),
-			default_branch: Some("main".into()),
+			clone_url: crate::test_support::db_text("https://github.com/acme/widget.git").unwrap(),
+			host: crate::test_support::db_text("github.com").unwrap(),
+			owner: crate::test_support::db_text("acme").unwrap(),
+			repo: crate::test_support::db_text("widget").unwrap(),
+			default_branch: Some(crate::test_support::db_text("main").unwrap()),
 			scan_interval_seconds: Some(3600),
-			scanner_config: serde_json::json!({"regex": {"enabled": true}}),
+			scanner_config: crate::test_support::scanner(
+				serde_json::json!({"regex": {"enabled": true}}),
+			),
 			reporting: ReportingDestination::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "tracker".into(),
+				target_owner: crate::test_support::db_text("acme").unwrap(),
+				target_repo: crate::test_support::db_text("tracker").unwrap(),
 				pat_secret_id: Some(secret_id),
 			},
 			verification_enabled: false,
 			require_approval: None,
 		}
+	}
+
+	#[test]
+	fn clone_needs_only_source_and_preserves_all_fields() {
+		fn cloned<S: Source>(value: &NewRepo<S>) -> NewRepo<S> {
+			value.clone()
+		}
+
+		let mut original = fake_repo(7);
+		original.verification_enabled = true;
+		original.require_approval = Some(false);
+		let copy = cloned(&original);
+		assert_eq!(copy.clone_url, original.clone_url);
+		assert_eq!(copy.host, original.host);
+		assert_eq!(copy.owner, original.owner);
+		assert_eq!(copy.repo, original.repo);
+		assert_eq!(copy.default_branch, original.default_branch);
+		assert_eq!(copy.scan_interval_seconds, original.scan_interval_seconds);
+		assert_eq!(copy.scanner_config, original.scanner_config);
+		assert_eq!(copy.reporting, original.reporting);
+		assert_eq!(copy.verification_enabled, original.verification_enabled);
+		assert_eq!(copy.require_approval, original.require_approval);
 	}
 
 	#[test]
@@ -272,7 +321,7 @@ mod tests {
 		let listed = db.with_conn(|c| Ok(list(c, None)?)).unwrap();
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, id);
-		assert_eq!(listed[0].clone_url, "https://github.com/acme/widget.git");
+		assert_eq!(listed[0].clone_url.expose(), "https://github.com/acme/widget.git");
 
 		let one = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
 		assert_eq!(one.scan_interval_seconds, Some(3600));
@@ -313,16 +362,16 @@ mod tests {
 			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		// Repo A: never scanned, interval=60. Due immediately.
 		let a = NewRepo {
-			clone_url: "https://github.com/a/a.git".into(),
-			host: "github.com".into(),
-			owner: "a".into(),
-			repo: "a".into(),
+			clone_url: crate::test_support::db_text("https://github.com/a/a.git").unwrap(),
+			host: crate::test_support::db_text("github.com").unwrap(),
+			owner: crate::test_support::db_text("a").unwrap(),
+			repo: crate::test_support::db_text("a").unwrap(),
 			default_branch: None,
 			scan_interval_seconds: Some(60),
-			scanner_config: serde_json::Value::Null,
+			scanner_config: crate::test_support::scanner(serde_json::Value::Null),
 			reporting: ReportingDestination::GithubIssue {
-				target_owner: "x".into(),
-				target_repo: "y".into(),
+				target_owner: crate::test_support::db_text("x").unwrap(),
+				target_repo: crate::test_support::db_text("y").unwrap(),
 				pat_secret_id: Some(sid),
 			},
 			verification_enabled: false,
@@ -330,14 +379,14 @@ mod tests {
 		};
 		// Repo B: scanned at t=1000, interval=60. Due at t=1060.
 		let b = NewRepo {
-			clone_url: "https://github.com/a/b.git".into(),
-			repo: "b".into(),
+			clone_url: crate::test_support::db_text("https://github.com/a/b.git").unwrap(),
+			repo: crate::test_support::db_text("b").unwrap(),
 			..a.clone()
 		};
 		// Repo C: no interval — never picked up.
 		let no_interval = NewRepo {
-			clone_url: "https://github.com/a/c.git".into(),
-			repo: "c".into(),
+			clone_url: crate::test_support::db_text("https://github.com/a/c.git").unwrap(),
+			repo: crate::test_support::db_text("c").unwrap(),
 			scan_interval_seconds: None,
 			..a.clone()
 		};
@@ -356,12 +405,12 @@ mod tests {
 
 		// At t=500: A is due (never scanned), B is not (1000+60>500), C never.
 		let due = db.with_conn(|c| Ok(list_due_for_scan(c, 500)?)).unwrap();
-		let names: Vec<&str> = due.iter().map(|r| r.repo.as_str()).collect();
+		let names: Vec<&str> = due.iter().map(|r| r.repo.expose()).collect();
 		assert_eq!(names, vec!["a"]);
 
 		// At t=2000: A and B both due, C still skipped.
 		let due = db.with_conn(|c| Ok(list_due_for_scan(c, 2000)?)).unwrap();
-		let mut names: Vec<&str> = due.iter().map(|r| r.repo.as_str()).collect();
+		let mut names: Vec<&str> = due.iter().map(|r| r.repo.expose()).collect();
 		names.sort();
 		assert_eq!(names, vec!["a", "b"]);
 	}
@@ -440,8 +489,8 @@ mod tests {
 				c,
 				id,
 				&ReportingDestination::GithubIssue {
-					target_owner: "acme".into(),
-					target_repo: "tracker".into(),
+					target_owner: crate::test_support::db_text("acme").unwrap(),
+					target_repo: crate::test_support::db_text("tracker").unwrap(),
 					pat_secret_id: Some(new_sid),
 				},
 			)?)
@@ -468,11 +517,11 @@ mod tests {
 			.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "shared", b"x", 0)?))
 			.unwrap();
 		let mut a = fake_repo(sid);
-		a.clone_url = "https://github.com/acme/a.git".into();
-		a.repo = "a".into();
+		a.clone_url = crate::test_support::db_text("https://github.com/acme/a.git").unwrap();
+		a.repo = crate::test_support::db_text("a").unwrap();
 		let mut b = fake_repo(sid);
-		b.clone_url = "https://github.com/acme/b.git".into();
-		b.repo = "b".into();
+		b.clone_url = crate::test_support::db_text("https://github.com/acme/b.git").unwrap();
+		b.repo = crate::test_support::db_text("b").unwrap();
 		db.with_conn(|c| Ok(insert(c, &a, 0)?)).unwrap();
 		db.with_conn(|c| Ok(insert(c, &b, 0)?)).unwrap();
 
@@ -486,16 +535,18 @@ mod tests {
 			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
 		let pat_repo = fake_repo(sid);
 		let mut app_repo = fake_repo(sid);
-		app_repo.clone_url = "https://github.com/acme/app.git".into();
-		app_repo.repo = "app".into();
+		app_repo.clone_url =
+			crate::test_support::db_text("https://github.com/acme/app.git").unwrap();
+		app_repo.repo = crate::test_support::db_text("app").unwrap();
 		app_repo.reporting = ReportingDestination::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "tracker".into(),
+			target_owner: crate::test_support::db_text("acme").unwrap(),
+			target_repo: crate::test_support::db_text("tracker").unwrap(),
 			pat_secret_id: None,
 		};
 		let mut manual_repo = fake_repo(sid);
-		manual_repo.clone_url = "https://github.com/acme/manual.git".into();
-		manual_repo.repo = "manual".into();
+		manual_repo.clone_url =
+			crate::test_support::db_text("https://github.com/acme/manual.git").unwrap();
+		manual_repo.repo = crate::test_support::db_text("manual").unwrap();
 		manual_repo.reporting = ReportingDestination::Manual;
 		for repo in [&pat_repo, &app_repo, &manual_repo] {
 			db.with_conn(|c| Ok(insert(c, repo, 0)?)).unwrap();

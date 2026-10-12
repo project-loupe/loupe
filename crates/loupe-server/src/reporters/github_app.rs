@@ -20,6 +20,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
+use loupe_core::text::policy::GithubAppSlug;
+use loupe_core::text::BoundedText;
 use loupe_provenance::{
 	Ingress, Mark, Reporter as ReporterSource, Secret, Untrusted, Unvalidated, Validate,
 };
@@ -154,10 +156,15 @@ fn now_unix() -> i64 {
 }
 
 /// What `GET /app` reports about the app the key belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GithubAppInfo {
 	pub id: u64,
-	pub slug: String,
+	pub slug: BoundedText<GithubAppSlug, ReporterSource>,
+}
+impl std::fmt::Debug for GithubAppInfo {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("GithubAppInfo").field("id", &self.id).field("slug", &"[redacted]").finish()
+	}
 }
 
 /// Fetch the app's own metadata. Doubles as a credential check: a wrong
@@ -176,23 +183,16 @@ pub async fn fetch_app(
 	if !status.is_success() {
 		bail!("github returned {status} when fetching app {}", key.app_id());
 	}
-	super::ingress::AppMetadataDecoder::decode_legacy(body)
+	Ok(body.as_bytes().validate(super::ingress::AppMetadataDecoder)?)
 }
 
 /// Decode app metadata without reflecting response content into diagnostics.
+#[cfg(any(test, fuzzing))]
 pub fn parse_app_response(status: StatusCode, body: &[u8], app_id: u64) -> Result<GithubAppInfo> {
 	if !status.is_success() {
 		bail!("github returned {status} when fetching app {app_id}");
 	}
-	decode_body(body, "parsing GitHub App metadata")
-}
-
-/// Serde errors can quote a provider-controlled string value. Keep those
-/// values out of the entire error chain, including alternate Display/Debug.
-pub(super) fn decode_body<T: serde::de::DeserializeOwned>(
-	body: &[u8], operation: &'static str,
-) -> Result<T> {
-	serde_json::from_slice(body).map_err(|_| anyhow!("{operation}: invalid response body"))
+	Ok(super::ingress::fixture_input(body).validate(super::ingress::AppMetadataDecoder)?)
 }
 
 /// Stamp the headers every GitHub API call carries. Shared with the
@@ -249,11 +249,6 @@ struct CachedToken {
 #[derive(Default)]
 pub struct InstallationTokens {
 	cache: Mutex<HashMap<TokenKey, CachedToken>>,
-}
-
-#[derive(Deserialize)]
-struct InstallationBody {
-	id: u64,
 }
 
 #[derive(Serialize)]
@@ -328,12 +323,12 @@ async fn lookup_installation(
 }
 
 /// Decode an installation lookup; owner/repo are configured request metadata.
+#[cfg(any(test, fuzzing))]
 pub fn parse_installation_response(
 	status: StatusCode, body: &[u8], owner: &str, repo: &str,
 ) -> Result<u64> {
 	check_installation_status(status, owner, repo)?;
-	let body: InstallationBody = decode_body(body, "parsing installation response")?;
-	Ok(body.id)
+	Ok(super::ingress::fixture_input(body).validate(super::ingress::InstallationDecoder)?)
 }
 
 fn check_installation_status(status: StatusCode, owner: &str, repo: &str) -> Result<()> {
@@ -419,12 +414,12 @@ pub fn fuzz_access_token(body: &[u8]) -> std::result::Result<Secret<String>, Str
 }
 
 /// Decode an installation token; response bodies never become error text.
+#[cfg(any(test, fuzzing))]
 pub fn parse_access_token_response(
 	status: StatusCode, body: &[u8], installation_id: u64,
 ) -> Result<Secret<String>> {
 	check_access_token_status(status, installation_id)?;
-	let body: AccessTokenBody = decode_body(body, "parsing installation token")?;
-	Ok(body.token)
+	Ok(super::ingress::fixture_input(body).validate(AccessTokenDecoder)?)
 }
 
 fn check_access_token_status(status: StatusCode, installation_id: u64) -> Result<()> {

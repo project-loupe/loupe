@@ -7,6 +7,7 @@ pub use claim::{claim, ClaimRequest, Claimed};
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
+use loupe_provenance::{Db, Source};
 pub use policy::{CampaignPolicy, PhasePolicy};
 use rusqlite::{params, Connection, Transaction};
 
@@ -30,9 +31,46 @@ pub fn ensure_state(conn: &Connection) -> Result<()> {
 	Ok(())
 }
 
-pub struct NewPhaseJob<'a> {
+/// Host survey recipes have a closed shape and vocabulary.
+#[derive(Debug, Clone, Copy)]
+pub enum SurveyRecipe {
+	Bootstrap,
+	Incremental,
+	Reconciliation,
+	Coverage,
+}
+impl SurveyRecipe {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Bootstrap => "bootstrap",
+			Self::Incremental => "incremental",
+			Self::Reconciliation => "reconciliation",
+			Self::Coverage => "coverage",
+		}
+	}
+}
+pub enum PhaseRecipeInput<'a, S: Source> {
+	Submitted(&'a BoundedJson<Payload, S>),
+	Survey(SurveyRecipe),
+}
+impl<S: Source> PhaseRecipeInput<'_, S> {
+	fn canonical(&self) -> String {
+		match self {
+			Self::Submitted(value) => value.expose().to_owned(),
+			Self::Survey(recipe) => {
+				String::from_utf8(loupe_core::canonical::canonical_bytes(&serde_json::json!({
+					"version": 1, "phase": "survey", "recipe": recipe.as_str(),
+					"assignment_key": "ordinary"
+				})))
+				.expect("fixed survey recipe is UTF-8")
+			},
+		}
+	}
+}
+
+pub struct NewPhaseJob<'a, S: Source> {
 	pub repo_id: i64,
-	pub kind: JobKind,
+	pub kind: JobKind<S>,
 	pub campaign_id: i64,
 	pub generation_id: Option<i64>,
 	pub assigned_lead_id: Option<i64>,
@@ -42,12 +80,14 @@ pub struct NewPhaseJob<'a> {
 	pub effective_priority: u32,
 	pub eligible_at: i64,
 	pub token_budget: Option<u64>,
-	pub recipe: &'a BoundedJson<Payload>,
+	pub recipe: PhaseRecipeInput<'a, S>,
 	pub handoff: bool,
 }
 
 /// Caller owns the transaction; shape and scope checks precede insertion.
-pub fn enqueue_phase(tx: &Transaction<'_>, new: &NewPhaseJob<'_>, now: i64) -> Result<i64> {
+pub fn enqueue_phase<S: Source>(
+	tx: &Transaction<'_>, new: &NewPhaseJob<'_, S>, now: i64,
+) -> Result<i64> {
 	if !matches!(new.kind, JobKind::Survey | JobKind::Drilldown | JobKind::Verify) {
 		return Err(invalid("job_kind"));
 	}
@@ -104,7 +144,7 @@ pub fn enqueue_phase(tx: &Transaction<'_>, new: &NewPhaseJob<'_>, now: i64) -> R
 		return Err(Error::Conflict(Conflict::CampaignBudget));
 	}
 	tx.execute("INSERT INTO jobs (repo_id,kind,state,enqueued_at,campaign_id,generation_id,assigned_lead_id,target_finding_id,continuation_of_job_id,scheduling_band,effective_priority,eligible_at,token_budget,recipe,workflow_contract_version)
-	VALUES (?1,?2,'queued',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![new.repo_id,new.kind.as_str(),now,new.campaign_id,new.generation_id,new.assigned_lead_id,new.target_finding_id,new.continuation_of_job_id,new.band.as_str(),new.effective_priority.min(PRIORITY_MAX),new.eligible_at,new.token_budget.map(|n|n as i64),new.recipe.expose(),WORKFLOW_CONTRACT_VERSION])
+	VALUES (?1,?2,'queued',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![new.repo_id,new.kind.as_str(),now,new.campaign_id,new.generation_id,new.assigned_lead_id,new.target_finding_id,new.continuation_of_job_id,new.band.as_str(),new.effective_priority.min(PRIORITY_MAX),new.eligible_at,new.token_budget.map(|n|n as i64),new.recipe.canonical(),WORKFLOW_CONTRACT_VERSION])
 	.map_err(|error| {
 		if is_unique(&error, "jobs.assigned_lead_id") { Error::Conflict(Conflict::ActiveDrilldown) }
 		else if is_unique(&error, "jobs.target_finding_id") { Error::Conflict(Conflict::ActiveVerify) }
@@ -120,8 +160,20 @@ pub enum RetryOutcome {
 }
 
 /// Retry infrastructure failure without resurrecting inactive campaign work.
-pub fn retry_or_fail(
-	tx: &Transaction<'_>, job_id: i64, now: i64, error: &BoundedText<Reason>,
+pub enum FailureReason<'a, S: Source> {
+	Submitted(&'a BoundedText<Reason, S>),
+	LeaseExpired,
+}
+impl<S: Source> FailureReason<'_, S> {
+	fn expose(&self) -> &str {
+		match self {
+			Self::Submitted(reason) => reason.expose(),
+			Self::LeaseExpired => jobs::LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR,
+		}
+	}
+}
+pub fn retry_or_fail<S: Source>(
+	tx: &Transaction<'_>, job_id: i64, now: i64, error: FailureReason<'_, S>,
 ) -> Result<RetryOutcome> {
 	let job = jobs::get(tx, job_id)?.ok_or(Error::NotFound(Entity::Job, job_id))?;
 	if job.state != JobState::Leased
@@ -152,10 +204,15 @@ pub fn retry_or_fail(
 	Ok(RetryOutcome::Failed)
 }
 
-pub fn cancel_queued_children(
-	tx: &Transaction<'_>, campaign_id: i64, now: i64, reason: &BoundedText<Reason>,
+pub fn cancel_queued_children<S: Source>(
+	tx: &Transaction<'_>, campaign_id: i64, now: i64, reason: &BoundedText<Reason, S>,
 ) -> Result<usize> {
 	Ok(tx.execute("UPDATE jobs SET state='cancelled',error=?2,finished_at=?3,job_capability_hash=NULL WHERE campaign_id=?1 AND state='queued'", params![campaign_id,reason.expose(),now])?)
+}
+pub fn cancel_queued_at_deadline(
+	tx: &Transaction<'_>, campaign_id: i64, now: i64,
+) -> Result<usize> {
+	Ok(tx.execute("UPDATE jobs SET state='cancelled',error='campaign deadline',finished_at=?2,job_capability_hash=NULL WHERE campaign_id=?1 AND state='queued'", params![campaign_id,now])?)
 }
 #[cfg(test)]
 mod tests;
@@ -164,7 +221,7 @@ pub use crate::review_units::Priority as Band;
 /// Campaign job kinds this binary can lease *and finish through the phase
 /// endpoints*. Empty until B4 lands those endpoints; widen it together with
 /// `jobs::RUNTIME_KINDS` and the handlers, never ahead of them.
-pub const PHASE_RUNTIME_KINDS: &[JobKind] = &[];
+pub const PHASE_RUNTIME_KINDS: &[JobKind<Db>] = &[];
 
 pub const PRIORITY_MAX: u32 = 1000;
 

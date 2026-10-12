@@ -3,7 +3,6 @@
 //! retry delays. Additional fixed attempts pin every overflow boundary.
 
 use loupe_core::text::policy::Payload;
-use loupe_core::text::BoundedJson;
 use loupe_core::JobKind;
 use loupe_storage::scheduler::CampaignPolicy;
 
@@ -14,7 +13,7 @@ pub fn do_test(data: &[u8]) {
 	let mut input = ByteSource::new(data);
 	let Some(attempts) = input.u32() else { return };
 	let Ok(raw) = std::str::from_utf8(input.rest()) else { return };
-	let Ok(snapshot) = BoundedJson::<Payload>::new(raw) else { return };
+	let Ok(snapshot) = crate::fixtures::json::<Payload>(raw) else { return };
 	let decoded = serde_json::from_str::<CampaignPolicy>(snapshot.expose());
 	let expected = decoded.as_ref().is_ok_and(valid_policy);
 	let result = CampaignPolicy::from_snapshot(&snapshot);
@@ -42,7 +41,7 @@ pub fn do_test(data: &[u8]) {
 	}
 	for (kind, deadline, margin, tokens) in [
 		(
-			JobKind::Survey,
+			JobKind::<loupe_provenance::Agent>::Survey,
 			policy.survey_deadline_seconds,
 			policy.survey_submit_margin_seconds,
 			policy.survey_token_budget,
@@ -66,9 +65,11 @@ pub fn do_test(data: &[u8]) {
 			(deadline, margin, tokens)
 		);
 	}
-	for kind in
-		[JobKind::Scan, JobKind::Unknown("future".into()), JobKind::Unknown("survey".into())]
-	{
+	for kind in [
+		JobKind::Scan,
+		JobKind::Unknown(crate::fixtures::text("future").unwrap_or_else(|_| panic!("fixed kind"))),
+		JobKind::Unknown(crate::fixtures::text("survey").unwrap_or_else(|_| panic!("fixed kind"))),
+	] {
 		assert!(policy.phase(&kind).is_err(), "non-phase job must not acquire phase policy");
 	}
 }

@@ -16,11 +16,16 @@ pub(crate) struct CapturedOutput {
 	capacity: usize,
 }
 
-pub(crate) struct CliOutputText(String);
+#[derive(Clone)]
+pub struct CliOutputText(String);
+impl std::fmt::Debug for CliOutputText {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("CliOutputText<Sandbox>([redacted])")
+	}
+}
 impl CliOutputText {
-	/// Temporary private backend result exit until the prompt/log consumers migrate.
-	pub(crate) fn into_legacy(self) -> String {
-		self.0
+	pub fn for_log(&self) -> &str {
+		&self.0
 	}
 }
 struct CliOutputDecoder;
@@ -33,11 +38,52 @@ impl Validate<&[u8], Sandbox> for CliOutputDecoder {
 		Ok(CliOutputText(std::str::from_utf8(u.get())?.to_owned()))
 	}
 }
+
+/// Explicit synthetic response fixture authority, absent from the default
+/// library. This does not call or claim the actual subprocess pipe collector.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn synthetic_output(text: String) -> Result<CliOutputText, std::str::Utf8Error> {
+	// SAFETY: this crate's unit tests or the explicitly enabled test-support
+	// feature authorize original synthetic Sandbox response fixtures. These
+	// bytes come from the stub closure, not from a live subprocess pipe.
+	#[allow(unsafe_code)]
+	let fixture = Untrusted::new(text.into_bytes(), unsafe { Ingress::<Sandbox>::new() });
+	fixture.as_bytes().validate(CliOutputDecoder)
+}
+
 pub(crate) struct CliFailureDiagnostic(String);
+impl std::fmt::Debug for CliFailureDiagnostic {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("CliFailureDiagnostic<Sandbox>([redacted])")
+	}
+}
+
+#[derive(Debug)]
+pub(crate) struct CliProcessFailure {
+	pub backend: &'static str,
+	pub status: std::process::ExitStatus,
+	pub stderr: CliFailureDiagnostic,
+	pub stdout: CliFailureDiagnostic,
+	pub max_chars: usize,
+}
+impl std::fmt::Display for CliProcessFailure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"{} CLI exited with {}: stderr(chars={})=`{}` stdout(chars={})=`{}`",
+			self.backend,
+			self.status,
+			self.stderr.for_log().chars().count(),
+			super::summarize_cli_stream_for_error(self.stderr.for_log(), self.max_chars),
+			self.stdout.for_log().chars().count(),
+			super::summarize_cli_stream_for_error(self.stdout.for_log(), self.max_chars)
+		)
+	}
+}
+impl std::error::Error for CliProcessFailure {}
 impl CliFailureDiagnostic {
-	/// Temporary diagnostic exit; these Sandbox bytes are not Agent findings.
-	pub(crate) fn into_legacy(self) -> String {
-		self.0
+	pub(crate) fn for_log(&self) -> &str {
+		&self.0
 	}
 }
 struct CliFailureDecoder;
@@ -134,6 +180,14 @@ pub(crate) async fn collect_cli_output(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn synthetic_response_preserves_text_and_redacts_debug() {
+		let original = "synthetic stdout\r\n\t\u{1}\u{85} cafe\u{301}";
+		let output = synthetic_output(original.to_owned()).unwrap();
+		assert_eq!(output.for_log(), original);
+		assert_eq!(format!("{output:?}"), "CliOutputText<Sandbox>([redacted])");
+	}
 
 	#[tokio::test]
 	async fn exact_budget_is_retained_and_not_marked_truncated() {

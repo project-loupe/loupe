@@ -1,9 +1,8 @@
-//! Closed Operator request schemas. Every legacy projection here is temporary
-//! until M moves the route/storage consumers to these source-bearing outputs.
+//! Closed Operator request schemas retaining their source through route and
+//! storage operations.
 use axum::http::StatusCode;
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::source_migration::{RepoSpec, ReportingDestination};
-use loupe_core::text::policy;
+use loupe_core::text::{policy, BoundedText};
+use loupe_core::{RepoSpec, ReportingDestination};
 use loupe_provenance::{Mark, Operator, Secret, Unvalidated, Validate};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -14,15 +13,6 @@ use super::{DecodeError, OperatorJson};
 #[cfg(fuzzing)]
 #[path = "registry_fuzz.rs"]
 pub(crate) mod fuzz;
-
-// No general Serialize/Deserialize/Debug or public Value escape. This exact
-// forward document deliberately does not apply semantic Payload normalization.
-struct OperatorScannerConfig(serde_json::Value);
-impl OperatorScannerConfig {
-	fn new(_: &Mark<'_, Operator>, value: serde_json::Value) -> Self {
-		Self(value)
-	}
-}
 
 #[derive(Deserialize)]
 struct RawRegisterRepo<'a> {
@@ -45,9 +35,9 @@ struct RawRegisterRepo<'a> {
 
 pub(crate) struct RegisterRepoDecoder;
 
-// Retain the original envelope depth, duplicate/unknown rules and forward
+// Retain the envelope depth, duplicate/unknown rules and forward
 // document semantics. Marked fields are validated before this pass; it returns
-// the one scanner Value that the legacy route persists, not a second copy.
+// the one scanner Value that the route persists, not a second copy.
 #[derive(Deserialize)]
 struct RegisterContent<'a> {
 	#[serde(rename = "protocol_version")]
@@ -75,7 +65,7 @@ pub(crate) struct RegisterRepoInput {
 	scan_interval_seconds: Option<u64>,
 	reporting: ReportingDestination<Operator>,
 	pat: Option<Secret<String>>,
-	scanner_config: OperatorScannerConfig,
+	scanner_config: loupe_core::ScannerDocument<Operator>,
 	verification_enabled: Option<bool>,
 	require_approval: Option<bool>,
 }
@@ -166,7 +156,7 @@ fn reporting(
 		},
 		ReportingKind::Manual => {
 			// Unit variants reject surplus sequence elements, while maps ignore
-			// unknown fields as before.
+			// unknown fields.
 			let _: RawReportingTag<'_> =
 				serde_json::from_str(token.get()).map_err(DecodeError::json)?;
 			(ReportingDestination::Manual, None)
@@ -186,7 +176,7 @@ impl Validate<&[u8], Operator> for RegisterRepoDecoder {
 		let clone_url = json_text::<policy::CloneUrl, _>(&mark, raw.clone_url)?;
 		let branch =
 			raw.branch.map(|token| json_text::<policy::GitBranch, _>(&mark, token)).transpose()?;
-		// This is the unchanged permissive route parser. Derivatives are marked
+		// The permissive route parser's derivatives are marked
 		// here, within the original Operator validation call; URL rejection stays
 		// after the route's body-version check through the optional result.
 		let derived = crate::routes::repos::parse_github_clone_url(clone_url.expose())
@@ -211,54 +201,42 @@ impl Validate<&[u8], Operator> for RegisterRepoDecoder {
 			scan_interval_seconds: raw.scan_interval_seconds,
 			reporting,
 			pat,
-			scanner_config: OperatorScannerConfig::new(&mark, content.scanner_config),
+			scanner_config: loupe_core::ScannerDocument::registered(&mark, content.scanner_config),
 			verification_enabled: raw.verification_enabled,
 			require_approval: raw.require_approval,
 		})
 	}
 }
 
-pub(crate) struct LegacyRegisteredRepo {
-	pub request: loupe_proto::RegisterRepoRequest,
-	pub derived: Option<(String, String, String)>,
+pub(crate) struct RegisteredRepo {
+	pub request: loupe_proto::RegisterRepoRequest<Operator>,
+	pub derived: Option<RepoSpec<Operator>>,
 }
 impl RegisterRepoDecoder {
-	pub(crate) fn decode_legacy(
-		body: OperatorJson,
-	) -> Result<LegacyRegisteredRepo, (StatusCode, String)> {
+	pub(crate) fn decode(body: OperatorJson) -> Result<RegisteredRepo, (StatusCode, String)> {
 		let input = body.0.as_bytes().validate(Self).map_err(DecodeError::response)?;
 		let reporting = match input.reporting {
 			ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
 				loupe_proto::ReportingSetup::GithubIssue {
-					target_owner: target_owner.expose().to_owned(),
-					target_repo: target_repo.expose().to_owned(),
+					target_owner,
+					target_repo,
 					github_pat: input.pat,
 				}
 			},
 			ReportingDestination::Email { to, from, subject_prefix } => {
-				loupe_proto::ReportingSetup::Email {
-					to: to.iter().map(|value| value.expose().to_owned()).collect(),
-					from: from.map(|value| value.expose().to_owned()),
-					subject_prefix: subject_prefix.map(|value| value.expose().to_owned()),
-				}
+				loupe_proto::ReportingSetup::Email { to, from, subject_prefix }
 			},
 			ReportingDestination::Manual => loupe_proto::ReportingSetup::Manual,
 		};
-		Ok(LegacyRegisteredRepo {
-			derived: input.derived.map(|repo| {
-				(
-					repo.host.expose().to_owned(),
-					repo.owner.expose().to_owned(),
-					repo.repo.expose().to_owned(),
-				)
-			}),
+		Ok(RegisteredRepo {
+			derived: input.derived,
 			request: loupe_proto::RegisterRepoRequest {
 				protocol_version: input.protocol_version,
-				clone_url: input.clone_url.expose().to_owned(),
-				branch: input.branch.map(|value| value.expose().to_owned()),
+				clone_url: input.clone_url,
+				branch: input.branch,
 				scan_interval_seconds: input.scan_interval_seconds,
 				reporting,
-				scanner_config: input.scanner_config.0,
+				scanner_config: Some(input.scanner_config),
 				verification_enabled: input.verification_enabled,
 				require_approval: input.require_approval,
 			},
@@ -280,7 +258,7 @@ macro_rules! scalar_request {
 			}
 		}
 		impl $decoder {
-			pub(crate) fn decode_legacy(body: OperatorJson) -> Result<$dto, (StatusCode, String)> {
+			pub(crate) fn decode(body: OperatorJson) -> Result<$dto, (StatusCode, String)> {
 				body.0.as_bytes().validate(Self).map_err(DecodeError::response)
 			}
 		}
@@ -308,12 +286,12 @@ impl Validate<&[u8], Operator> for RegisterWorkerDecoder {
 	}
 }
 impl RegisterWorkerDecoder {
-	pub(crate) fn decode_legacy(
+	pub(crate) fn decode(
 		body: OperatorJson,
-	) -> Result<loupe_proto::RegisterWorkerRequest, (StatusCode, String)> {
+	) -> Result<loupe_proto::RegisterWorkerRequest<Operator>, (StatusCode, String)> {
 		let (protocol_version, name) =
 			body.0.as_bytes().validate(Self).map_err(DecodeError::response)?;
-		Ok(loupe_proto::RegisterWorkerRequest { protocol_version, name: name.expose().to_owned() })
+		Ok(loupe_proto::RegisterWorkerRequest { protocol_version, name })
 	}
 }
 
@@ -338,7 +316,7 @@ impl Validate<&[u8], Operator> for RotateRepoPatDecoder {
 	}
 }
 impl RotateRepoPatDecoder {
-	pub(crate) fn decode_legacy(
+	pub(crate) fn decode(
 		body: OperatorJson,
 	) -> Result<loupe_proto::RotateRepoPatRequest, (StatusCode, String)> {
 		body.0.as_bytes().validate(Self).map_err(DecodeError::response)
@@ -368,7 +346,7 @@ impl Validate<&[u8], Operator> for SetGithubAppDecoder {
 	}
 }
 impl SetGithubAppDecoder {
-	pub(crate) fn decode_legacy(
+	pub(crate) fn decode(
 		body: OperatorJson,
 	) -> Result<loupe_proto::SetGithubAppRequest, (StatusCode, String)> {
 		body.0.as_bytes().validate(Self).map_err(DecodeError::response)
@@ -400,23 +378,27 @@ impl Validate<&[u8], Operator> for SetRepoGithubReportingDecoder {
 	) -> Result<Self::Output, Self::Error> {
 		let raw: RawSetReporting<'_> =
 			serde_json::from_slice(input.get()).map_err(DecodeError::json)?;
+		// This endpoint trims after exact admission while its Operator Mark
+		// remains live; registration does not trim.
+		let owner = json_text::<policy::RepoOwner, _>(&mark, raw.target_owner)?;
+		let repo = json_text::<policy::RepoName, _>(&mark, raw.target_repo)?;
 		Ok(SetReportingInput {
 			protocol_version: raw.protocol_version,
-			owner: json_text(&mark, raw.target_owner)?,
-			repo: json_text(&mark, raw.target_repo)?,
+			owner: BoundedText::new(&mark, owner.expose().trim())?,
+			repo: BoundedText::new(&mark, repo.expose().trim())?,
 			pat: raw.github_pat.map(json_secret).transpose()?,
 		})
 	}
 }
 impl SetRepoGithubReportingDecoder {
-	pub(crate) fn decode_legacy(
+	pub(crate) fn decode(
 		body: OperatorJson,
-	) -> Result<loupe_proto::SetRepoGithubReportingRequest, (StatusCode, String)> {
+	) -> Result<loupe_proto::SetRepoGithubReportingRequest<Operator>, (StatusCode, String)> {
 		let input = body.0.as_bytes().validate(Self).map_err(DecodeError::response)?;
 		Ok(loupe_proto::SetRepoGithubReportingRequest {
 			protocol_version: input.protocol_version,
-			target_owner: input.owner.expose().to_owned(),
-			target_repo: input.repo.expose().to_owned(),
+			target_owner: input.owner,
+			target_repo: input.repo,
 			github_pat: input.pat,
 		})
 	}

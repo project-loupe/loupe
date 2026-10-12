@@ -47,10 +47,10 @@ use crate::sandbox::{SandboxNetworkConfig, SandboxNetworkMode};
 const ANTHROPIC_UPSTREAM_URL: &str = "https://api.anthropic.com";
 const OPENAI_UPSTREAM_URL: &str = "https://api.openai.com";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CliModelConfig {
-	pub model: String,
-	pub effort: String,
+	pub model: crate::config::ConfiguredText,
+	pub effort: crate::config::ConfiguredText,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +149,7 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 ///
 /// Retained legacy helper with no production caller. Discovery findings and
 /// verification verdicts currently arrive through MCP tools instead of stdout.
+#[cfg(any(test, fuzzing))]
 pub fn extract_json_object(text: &str) -> Option<String> {
 	let bytes = text.as_bytes();
 	let start = bytes.iter().position(|b| *b == b'{')?;
@@ -183,7 +184,7 @@ pub fn extract_json_object(text: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
-	pub prompt: String,
+	pub prompt: prompts::Prompt,
 	/// Read-only working directory the backend may inspect (e.g. the
 	/// scanned worktree).
 	pub workdir: PathBuf,
@@ -212,8 +213,9 @@ pub struct LlmRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "test-support"), doc = include_str!("../../tests/ui/raw_stub.md"))]
 pub struct LlmResponse {
-	pub text: String,
+	pub text: cli_output::CliOutputText,
 	pub backend_id: &'static str,
 }
 
@@ -412,8 +414,8 @@ pub fn build_scan_backend(
 	match selection {
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
-				model = %claude_agent.model,
-				effort = %claude_agent.effort,
+				model = %claude_agent.model.for_operation(),
+				effort = %claude_agent.effort.for_operation(),
 				"scan backend: claude (auto)"
 			);
 			Ok(Some(build_claude_backend(
@@ -433,8 +435,8 @@ pub fn build_scan_backend(
 		JobAgent::Claude => {
 			require_agent_ready("scan", JobAgent::Claude, claude_ready)?;
 			tracing::info!(
-				model = %claude_agent.model,
-				effort = %claude_agent.effort,
+				model = %claude_agent.model.for_operation(),
+				effort = %claude_agent.effort.for_operation(),
 				"scan backend: claude (configured)"
 			);
 			Ok(Some(build_claude_backend(
@@ -448,8 +450,8 @@ pub fn build_scan_backend(
 		JobAgent::Codex => {
 			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
 			tracing::info!(
-				model = %codex_agent.model,
-				effort = %codex_agent.effort,
+				model = %codex_agent.model.for_operation(),
+				effort = %codex_agent.effort.for_operation(),
 				"scan backend: codex (configured)"
 			);
 			Ok(Some(build_codex_backend(
@@ -485,16 +487,16 @@ pub fn build_verifier_backend(
 	match selection {
 		JobAgent::Auto if codex_ready => {
 			tracing::info!(
-				model = %codex_agent.model,
-				effort = %codex_agent.effort,
+				model = %codex_agent.model.for_operation(),
+				effort = %codex_agent.effort.for_operation(),
 				"verifier backend: codex (auto)"
 			);
 			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
 		},
 		JobAgent::Auto if claude_ready => {
 			tracing::info!(
-				model = %claude_agent.model,
-				effort = %claude_agent.effort,
+				model = %claude_agent.model.for_operation(),
+				effort = %claude_agent.effort.for_operation(),
 				"verifier backend: claude (auto, codex unavailable)"
 			);
 			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker)?)
@@ -503,8 +505,8 @@ pub fn build_verifier_backend(
 		JobAgent::Claude => {
 			require_agent_ready("verify", JobAgent::Claude, claude_ready)?;
 			tracing::info!(
-				model = %claude_agent.model,
-				effort = %claude_agent.effort,
+				model = %claude_agent.model.for_operation(),
+				effort = %claude_agent.effort.for_operation(),
 				"verifier backend: claude (configured)"
 			);
 			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker)?)
@@ -512,8 +514,8 @@ pub fn build_verifier_backend(
 		JobAgent::Codex => {
 			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
 			tracing::info!(
-				model = %codex_agent.model,
-				effort = %codex_agent.effort,
+				model = %codex_agent.model.for_operation(),
+				effort = %codex_agent.effort.for_operation(),
 				"verifier backend: codex (configured)"
 			);
 			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
@@ -678,7 +680,7 @@ mod tests {
 		assert!(sandbox_requires_egress_setup(
 			&SandboxNetworkConfig {
 				mode: SandboxNetworkMode::Allowlist,
-				allowlist: vec!["docs.example".into()],
+				allowlist: vec![crate::config::ConfiguredText::Builtin("docs.example")],
 			},
 			&[],
 		));
@@ -687,8 +689,14 @@ mod tests {
 
 	#[test]
 	fn scan_backend_auto_preserves_claude_only_discovery_default() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("gpt-test"),
+			effort: crate::config::ConfiguredText::Builtin("xhigh"),
+		};
+		let claude = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("max"),
+		};
 
 		let backend = build_scan_backend(
 			None,
@@ -721,8 +729,14 @@ mod tests {
 
 	#[test]
 	fn scan_backend_allows_explicit_codex_and_fails_when_unavailable() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("gpt-test"),
+			effort: crate::config::ConfiguredText::Builtin("xhigh"),
+		};
+		let claude = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("max"),
+		};
 
 		let backend = build_scan_backend(
 			None,
@@ -754,8 +768,14 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_auto_prefers_codex_then_claude() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("gpt-test"),
+			effort: crate::config::ConfiguredText::Builtin("xhigh"),
+		};
+		let claude = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("max"),
+		};
 		let backend = build_verifier_backend(
 			None,
 			JobAgent::Auto,
@@ -797,8 +817,14 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_honors_explicit_selection() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let codex = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("gpt-test"),
+			effort: crate::config::ConfiguredText::Builtin("xhigh"),
+		};
+		let claude = CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("max"),
+		};
 
 		let backend = build_verifier_backend(
 			None,
@@ -828,14 +854,18 @@ mod tests {
 	}
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod testing {
 	//! Stub backend for testing scanners without invoking a real LLM
 	//! CLI / API. Tests pass a closure that produces canned responses
 	//! based on the request's prompt or workdir.
 	//!
-	//! Lives outside `#[cfg(test)]` so integration tests in sibling
-	//! crates (e.g. `loupe-server/tests/llm_dispatch.rs`) can reach it.
-	//! Not intended for production wiring.
+	//! Available to this crate's unit tests and through the non-default
+	//! `test-support` feature for sibling integration tests. Enabling that
+	//! feature explicitly grants synthetic Sandbox fixture authority; Cargo
+	//! features do not enforce that the caller is a test. Normal dependencies
+	//! must leave it disabled. These responses are synthetic fixtures, not
+	//! evidence of an actual CLI pipe read.
 	//!
 	//! Two constructors:
 	//! - [`StubLlmBackend::new`] takes a sync closure — simplest for
@@ -902,6 +932,7 @@ pub mod testing {
 
 		async fn run(&self, req: LlmRequest) -> Result<LlmResponse> {
 			let text = (self.f)(req).await?;
+			let text = super::cli_output::synthetic_output(text)?;
 			Ok(LlmResponse { text, backend_id: self.id })
 		}
 	}

@@ -13,7 +13,7 @@ use std::fmt;
 
 #[cfg(doctest)]
 mod contract;
-#[cfg(all(doctest, feature = "source-migration"))]
+#[cfg(doctest)]
 mod labelled_contract;
 
 /// IDs actually resolved or already held by the emitting host owner.

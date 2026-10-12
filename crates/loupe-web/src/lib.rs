@@ -38,6 +38,11 @@
 //! ```compile_fail,E0432
 //! use loupe_web::fuzz_support;
 //! ```
+//!
+//! Browser query text has no ordinary public serde admission bypass:
+//! ```compile_fail,E0432
+//! use loupe_web::routes::api::{JobsQuery, SearchQuery, LimitQuery};
+//! ```
 
 pub mod client;
 pub mod config;
@@ -133,3 +138,6 @@ pub async fn serve(bind: SocketAddr, state: WebState) -> Result<ServeHandle> {
 	});
 	Ok(ServeHandle { local_addr, join })
 }
+
+#[cfg(test)]
+mod test_support;

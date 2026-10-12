@@ -1,27 +1,200 @@
-//! Byte zero selects one of 36 public DTO types; the rest is raw JSON.
+//! Byte zero selects one of 36 DTO contexts; the rest is raw JSON.
 //! Inputs are capped at 512 KiB, allowing report-budget and PoC boundaries.
 //! Credential equality uses subtle; other fields retain explicit comparisons
 //! when their enclosing DTO no longer derives PartialEq.
+//! Source-bearing DTOs enter through their actual named consumer. Standalone
+//! fragments are put in a fixed synthetic enclosing message before admission;
+//! this is not a public generic Deserialize path or an HTTP coverage claim.
 
 use std::fmt::Debug;
 
 use loupe_proto::*;
-use loupe_provenance::Secret;
-use serde::de::DeserializeOwned;
+use loupe_provenance::{Agent, Operator, Secret, Server, Worker};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::utils::test_logger;
 
-fn decode<T: DeserializeOwned + Serialize>(raw: &[u8]) -> Option<(T, T)> {
-	let value: T = serde_json::from_slice(raw).ok()?;
+type LeaseRequest = loupe_proto::LeaseRequest<Worker>;
+type LeaseResponse = loupe_proto::LeaseResponse<Agent, Server>;
+type LeaseEnvelope = loupe_proto::LeaseEnvelope<Agent, Server>;
+type LeasePayload = loupe_proto::LeasePayload<Agent, Server>;
+type FindingsBatch = loupe_proto::FindingsBatch<Agent>;
+type LlmFindingSubmission = loupe_proto::LlmFindingSubmission<Agent>;
+type VerdictSubmission = loupe_proto::VerdictSubmission<Agent>;
+type CompleteRequest = loupe_proto::CompleteRequest<Worker, Worker>;
+type JobInfo = loupe_proto::JobInfo<Server>;
+type ReportingSetup = loupe_proto::ReportingSetup<Operator>;
+type RegisterRepoRequest = loupe_proto::RegisterRepoRequest<Operator>;
+type SetRepoGithubReportingRequest = loupe_proto::SetRepoGithubReportingRequest<Operator>;
+type GithubAppSummary = loupe_proto::GithubAppSummary<Server>;
+type GithubAppResponse = loupe_proto::GithubAppResponse<Server>;
+type ListReposResponse = loupe_proto::ListReposResponse<Server>;
+type ReportingSummary = loupe_proto::ReportingSummary<Server>;
+type RepoSummary = loupe_proto::RepoSummary<Server>;
+type RegisterWorkerRequest = loupe_proto::RegisterWorkerRequest<Operator>;
+type ListFindingsResponse = loupe_proto::ListFindingsResponse<Agent, Server>;
+type FindingSummary = loupe_proto::FindingSummary<Agent, Server>;
+type FindingDetail = loupe_proto::FindingDetail<Agent, Server>;
+
+trait NamedDecode: Sized {
+	fn decode(raw: &[u8]) -> Option<Self>;
+}
+macro_rules! scalar_decoder {
+	($($ty:ty),+ $(,)?) => { $(impl NamedDecode for $ty {
+		fn decode(raw: &[u8]) -> Option<Self> { serde_json::from_slice(raw).ok() }
+	})+ };
+}
+scalar_decoder!(
+	HeartbeatRequest,
+	HeartbeatResponse,
+	ScanRequest,
+	ScanResponse,
+	RegisterRepoResponse,
+	RotateRepoPatRequest,
+	SetGithubAppRequest,
+	UpdateRepoRequest,
+	GithubReportingAuth,
+	RegisterWorkerResponse,
+	RetryVerifyRequest,
+	RetryVerifyResponse,
+	CompleteOutcome,
+	JobCapability,
+	ProtocolMismatch
+);
+macro_rules! worker_decoder {
+	($ty:ty, $case:ident, $variant:ident) => {
+		impl NamedDecode for $ty {
+			fn decode(raw: &[u8]) -> Option<Self> {
+				use loupe_server::fuzz_support::{worker_value, WorkerRequest, WorkerValue};
+				match worker_value(WorkerRequest::$case, raw)? {
+					WorkerValue::$variant(value) => Some(value),
+					_ => None,
+				}
+			}
+		}
+	};
+}
+worker_decoder!(LeaseRequest, Lease, Lease);
+worker_decoder!(FindingsBatch, Findings, Findings);
+worker_decoder!(LlmFindingSubmission, LlmFinding, Llm);
+worker_decoder!(VerdictSubmission, Verdict, Verdict);
+worker_decoder!(CompleteRequest, Complete, Complete);
+macro_rules! operator_decoder {
+	($ty:ty, $case:ident, $variant:ident) => {
+		impl NamedDecode for $ty {
+			fn decode(raw: &[u8]) -> Option<Self> {
+				use loupe_server::fuzz_support::{operator_value, OperatorRequest, OperatorValue};
+				match operator_value(OperatorRequest::$case, raw)? {
+					OperatorValue::$variant(value) => Some(value),
+					_ => None,
+				}
+			}
+		}
+	};
+}
+operator_decoder!(RegisterRepoRequest, RegisterRepo, Register);
+operator_decoder!(SetRepoGithubReportingRequest, SetReporting, Reporting);
+operator_decoder!(RegisterWorkerRequest, RegisterWorker, Worker);
+macro_rules! cli_decoder {
+	($ty:ty, $case:ident, $variant:ident) => {
+		impl NamedDecode for $ty {
+			fn decode(raw: &[u8]) -> Option<Self> {
+				use loupe_cli::fuzz_support::{observe_response, ResponseCase, ResponseValue};
+				match observe_response(ResponseCase::$case, raw).result.ok()? {
+					ResponseValue::$variant(value) => Some(value),
+					_ => None,
+				}
+			}
+		}
+	};
+}
+cli_decoder!(JobInfo, GetJob, Job);
+cli_decoder!(GithubAppResponse, ShowApp, App);
+cli_decoder!(ListReposResponse, ListRepos, Repos);
+cli_decoder!(ListFindingsResponse, ListFindings, Findings);
+cli_decoder!(FindingDetail, GetFinding, Finding);
+impl NamedDecode for LeaseResponse {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		loupe_worker::client::fuzz_support::lease_response(raw)
+	}
+}
+fn enclosure(prefix: &str, raw: &[u8], suffix: &str) -> Option<Vec<u8>> {
+	let raw = std::str::from_utf8(raw).ok()?;
+	Some(format!("{prefix}{raw}{suffix}").into_bytes())
+}
+impl NamedDecode for LeaseEnvelope {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let raw = std::str::from_utf8(raw).ok()?.trim_start();
+		let body = if let Some(tail) = raw.strip_prefix('{') {
+			format!(r#"{{"kind":"lease",{tail}"#)
+		} else {
+			let tail = raw.strip_prefix('[')?;
+			format!(r#"["lease",{tail}"#)
+		};
+		match LeaseResponse::decode(body.as_bytes())? {
+			LeaseResponse::Lease(value) => Some(*value),
+			_ => None,
+		}
+	}
+}
+impl NamedDecode for LeasePayload {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let body = enclosure(
+			r#"{"protocol_version":2,"job_id":1,"repo_id":1,"job_capability":"fixture","repo":{"host":"example.org","owner":"org","repo":"repo","clone_url":"https://example.org/org/repo"},"scanner_config":null,"lease_expires_at":300,"payload":"#,
+			raw,
+			"}",
+		)?;
+		Some(LeaseEnvelope::decode(&body)?.payload)
+	}
+}
+impl NamedDecode for ReportingSetup {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let body = enclosure(
+			r#"{"protocol_version":2,"clone_url":"https://example.org/org/repo","reporting":"#,
+			raw,
+			"}",
+		)?;
+		Some(RegisterRepoRequest::decode(&body)?.reporting)
+	}
+}
+impl NamedDecode for GithubAppSummary {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let body = enclosure(r#"{"protocol_version":2,"app":"#, raw, "}")?;
+		GithubAppResponse::decode(&body)?.app
+	}
+}
+impl NamedDecode for RepoSummary {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let body = enclosure(r#"{"protocol_version":2,"repos":["#, raw, "]}")?;
+		ListReposResponse::decode(&body)?.repos.into_iter().next()
+	}
+}
+impl NamedDecode for ReportingSummary {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let body = enclosure(
+			r#"{"id":1,"clone_url":"https://example.org/org/repo","host":"example.org","owner":"org","repo":"repo","verification_enabled":false,"created_at":0,"reporting":"#,
+			raw,
+			"}",
+		)?;
+		RepoSummary::decode(&body)?.reporting
+	}
+}
+impl NamedDecode for FindingSummary {
+	fn decode(raw: &[u8]) -> Option<Self> {
+		let body = enclosure(r#"{"protocol_version":2,"findings":["#, raw, "]}")?;
+		ListFindingsResponse::decode(&body)?.findings.into_iter().next()
+	}
+}
+
+fn decode<T: NamedDecode + Serialize>(raw: &[u8]) -> Option<(T, T)> {
+	let value = T::decode(raw)?;
 	let encoded = serde_json::to_vec(&value).unwrap_or_else(|_| panic!("DTO serialization failed"));
-	let back: T = serde_json::from_slice(&encoded)
-		.unwrap_or_else(|_| panic!("serialized DTO could not be decoded"));
+	let back = T::decode(&encoded).unwrap_or_else(|| panic!("serialized DTO could not be decoded"));
 	Some((value, back))
 }
 
-fn roundtrip<T: DeserializeOwned + Serialize + PartialEq + Debug>(raw: &[u8]) {
+fn roundtrip<T: NamedDecode + Serialize + PartialEq + Debug>(raw: &[u8]) {
 	if let Some((value, back)) = decode::<T>(raw) {
 		assert_eq!(value, back, "DTO round trip changed a field");
 	}
@@ -266,26 +439,28 @@ pub fn do_test(data: &[u8]) {
 }
 
 fn submission_allowed(value: &LlmFindingSubmission) -> bool {
-	let title_chars = value.title.trim().chars().count();
-	let description_chars = value.description.trim().chars().count();
-	let content_chars = value.description.chars().count() + value.poc_unified.chars().count();
+	let title_chars = value.title.expose().trim().chars().count();
+	let description_chars = value.description.expose().trim().chars().count();
+	let content_chars =
+		value.description.expose().chars().count() + value.poc_unified.expose().chars().count();
 	let cwe_valid = value.cwe.as_ref().is_none_or(|cwe| {
+		let cwe = cwe.expose();
 		cwe.as_bytes().starts_with(b"CWE-")
 			&& cwe.len() > 4
 			&& cwe.as_bytes().iter().skip(4).all(u8::is_ascii_digit)
 	});
-	let fingerprint_valid = value.fingerprint.len() == 64
-		&& value.fingerprint.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+	let fingerprint_valid = value.fingerprint.expose().len() == 64
+		&& value.fingerprint.expose().bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
 	(8..=100).contains(&title_chars)
 		&& (80..=16_384).contains(&description_chars)
 		&& content_chars <= 60_000
 		&& value.line_start > 0
 		&& value.line_end >= value.line_start
-		&& relative_path_allowed(&value.file_path)
+		&& relative_path_allowed(value.file_path.expose())
 		&& cwe_valid
 		&& fingerprint_valid
-		&& value.poc_unified.len() <= 262_144
-		&& diff_allowed(&value.poc_unified)
+		&& value.poc_unified.expose().len() <= 262_144
+		&& diff_allowed(value.poc_unified.expose())
 }
 
 // Independent lexical recognizer for the Unix Path::components behavior the
@@ -333,4 +508,112 @@ pub fn proto_dto_test<Out: test_logger::Output>(data: &[u8], _out: Out) {
 pub unsafe extern "C" fn proto_dto_run(data: *const u8, datalen: usize) {
 	// SAFETY: the caller provides readable bytes for the duration of this call.
 	do_test(unsafe { std::slice::from_raw_parts(data, datalen) });
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::{json, Value};
+
+	use super::*;
+
+	fn admitted<T: NamedDecode + Serialize>(raw: Value) -> Value {
+		let bytes = serde_json::to_vec(&raw).unwrap_or_else(|e| panic!("fixture JSON: {e}"));
+		let (value, back) = decode::<T>(&bytes).unwrap_or_else(|| {
+			panic!("named DTO fixture rejected: {}", std::any::type_name::<T>())
+		});
+		let actual = serde_json::to_value(value).unwrap_or_else(|e| panic!("DTO encoding: {e}"));
+		assert_eq!(
+			actual,
+			serde_json::to_value(back).unwrap_or_else(|e| panic!("DTO re-encoding: {e}"))
+		);
+		assert!(T::decode(b"{").is_none(), "malformed JSON unexpectedly admitted");
+		assert!(T::decode(b"null").is_none(), "wrong top-level type unexpectedly admitted");
+		actual
+	}
+
+	fn finding() -> Value {
+		json!({"scanner_id":"scanner", "severity":"high", "title":"Exact e\u{301} title",
+			"description":"First line\nSecond line", "fingerprint":"fingerprint",
+			"file_path":"src/lib.rs", "line_start":1, "line_end":2})
+	}
+
+	fn summary() -> Value {
+		let mut value = finding();
+		let fields =
+			value.as_object_mut().unwrap_or_else(|| panic!("finding fixture is not an object"));
+		fields.remove("description");
+		fields.remove("line_end");
+		for (field, scalar) in [("id", 1), ("repo_id", 2), ("job_id", 3), ("created_at", 4)] {
+			value[field] = json!(scalar);
+		}
+		value["state"] = json!("pending");
+		value["verification_required"] = json!(true);
+		value["approved_by_cn"] = json!("operator");
+		value
+	}
+
+	#[test]
+	fn named_request_decoders_are_reached_with_nonempty_fields() {
+		let lease = admitted::<LeaseRequest>(
+			json!({"protocol_version":2,"capabilities":["scan","verify:llm-review"],"wait_seconds":4}),
+		);
+		assert_eq!(lease["capabilities"], json!(["scan", "verify:llm-review"]));
+		let batch = admitted::<FindingsBatch>(json!({"protocol_version":2,"findings":[finding()]}));
+		assert_eq!(batch["findings"][0], finding());
+		let submission = json!({"protocol_version":2,"severity":"high","title":"A sufficiently long title",
+			"description":"An attacker-controlled index reaches an unchecked operation and reliably terminates the service process.",
+			"file_path":"src/lib.rs","line_start":1,"line_end":2,"cwe":"CWE-129",
+			"poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n old\n+added\n",
+			"fingerprint":"a".repeat(64)});
+		assert_eq!(admitted::<LlmFindingSubmission>(submission.clone()), submission);
+		let verdict = json!({"protocol_version":2,"verdict":{"outcome":"confirmed","notes":"exact\nnotes","patch":{"patch_unified":"diff\n","notes":"patch notes"}}});
+		assert_eq!(admitted::<VerdictSubmission>(verdict.clone()), verdict);
+		let complete = json!({"protocol_version":2,"outcome":"failed","head_sha":"original revision","error":"exact\ndiagnostic"});
+		assert_eq!(admitted::<CompleteRequest>(complete.clone()), complete);
+		let reporting = json!({"kind":"github_issue","target_owner":"org","target_repo":"repo","github_pat":"fake escaped\nPAT"});
+		assert_eq!(admitted::<ReportingSetup>(reporting.clone()), reporting);
+		let register = json!({"protocol_version":2,"clone_url":"https://example.org/org/repo","reporting":reporting,"scanner_config":{"unknown":[true,null]}});
+		assert_eq!(admitted::<RegisterRepoRequest>(register.clone()), register);
+		let update = json!({"protocol_version":2,"target_owner":"org","target_repo":"repo","github_pat":"fake PAT"});
+		assert_eq!(admitted::<SetRepoGithubReportingRequest>(update.clone()), update);
+		let worker = json!({"protocol_version":2,"name":"worker fixture"});
+		assert_eq!(admitted::<RegisterWorkerRequest>(worker.clone()), worker);
+	}
+
+	#[test]
+	fn named_response_and_fragment_decoders_are_reached() {
+		let repo = json!({"id":1,"clone_url":"https://example.org/org/repo","host":"example.org","owner":"org","repo":"repo","verification_enabled":false,"created_at":0,
+			"reporting":{"kind":"github_issue","target_owner":"org","target_repo":"repo","auth":"pat"}});
+		assert_eq!(admitted::<RepoSummary>(repo.clone()), repo);
+		assert_eq!(admitted::<ReportingSummary>(repo["reporting"].clone()), repo["reporting"]);
+		let repos = json!({"protocol_version":2,"repos":[repo]});
+		assert_eq!(admitted::<ListReposResponse>(repos.clone()), repos);
+		let app = json!({"app_id":42,"slug":"app-slug"});
+		assert_eq!(admitted::<GithubAppSummary>(app.clone()), app);
+		let response = json!({"protocol_version":2,"app":app});
+		assert_eq!(admitted::<GithubAppResponse>(response.clone()), response);
+		let job = admitted::<JobInfo>(
+			json!({"job_id":1,"repo_id":2,"kind":"scan","state":"queued","incremental":false,"attempts":0,"enqueued_at":1700000000}),
+		);
+		assert_eq!(job["kind"], "scan");
+		assert_eq!(job["job_id"], 1);
+		let summary = summary();
+		assert_eq!(admitted::<FindingSummary>(summary.clone()), summary);
+		let findings = json!({"protocol_version":2,"findings":[summary.clone()]});
+		assert_eq!(admitted::<ListFindingsResponse>(findings.clone()), findings);
+		let mut detail = summary;
+		detail["protocol_version"] = json!(2);
+		detail["description"] = finding()["description"].clone();
+		detail["line_end"] = json!(2);
+		assert_eq!(admitted::<FindingDetail>(detail.clone()), detail);
+		let payload = json!({"kind":"verify","finding_id":1,"finding":finding(),"reviewed_sha":"exact revision"});
+		assert_eq!(admitted::<LeasePayload>(payload.clone()), payload);
+		let lease = json!({"protocol_version":2,"job_id":1,"repo_id":1,"job_capability":"fake capability",
+			"repo":{"host":"example.org","owner":"org","repo":"repo","clone_url":"https://example.org/org/repo"},
+			"head_branch":null,"scanner_config":null,"lease_expires_at":300,"github_pat":"fake PAT","payload":payload});
+		assert_eq!(admitted::<LeaseEnvelope>(lease.clone()), lease);
+		let mut response = lease;
+		response["kind"] = json!("lease");
+		assert_eq!(admitted::<LeaseResponse>(response.clone()), response);
+	}
 }

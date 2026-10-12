@@ -1,15 +1,15 @@
 //! Domain contract tests use real encrypted databases and enabled foreign keys.
-use loupe_core::text::{Anchor, BoundedText, Identifier, RepoPath, SourceRef};
+use loupe_core::text::SourceRef;
 use rusqlite::{params, Transaction};
 
 use crate::identity::Identity;
 use crate::review_tests::{fixture, payload, reason};
 use crate::{transaction, Conflict, Error, Ownership};
 
-fn identity() -> Identity {
+fn identity() -> Identity<loupe_provenance::Agent> {
 	Identity {
-		family: Identifier::new("auth-bypass").unwrap(),
-		anchor: Anchor::new("token refresh handler").unwrap(),
+		family: crate::test_support::identifier("auth-bypass").unwrap(),
+		anchor: crate::test_support::anchor("token refresh handler").unwrap(),
 		instance: None,
 	}
 }
@@ -37,7 +37,7 @@ fn concurrent_lead_submission_creates_once_and_attaches_once() {
 					unit_id: None,
 					identity: &identity,
 					payload: &data,
-					commit_sha: "base",
+					commit_sha: &crate::test_support::db_text("base").unwrap(),
 					priority: Priority::Normal,
 					priority_proposal: None,
 					supersedes: None,
@@ -85,19 +85,18 @@ pub(crate) fn findings(tx: &Transaction<'_>) -> crate::Result<()> {
 }
 #[test]
 fn references_preserve_paths_and_enforce_field_specific_count_caps() {
-	use crate::source_refs::{InspectedRefs, UnitRefs};
 	let reference = SourceRef {
-		path: RepoPath::new("cafe\u{301}.rs").unwrap(),
-		symbol: Some(BoundedText::new("cafe\u{301}").unwrap()),
+		path: crate::test_support::path("cafe\u{301}.rs").unwrap(),
+		symbol: Some(crate::test_support::text("cafe\u{301}").unwrap()),
 	};
-	let refs =
-		UnitRefs::new(vec![reference.clone()]).expect("a valid source reference must be accepted");
+	let refs = crate::test_support::refs::<32>(vec![reference.clone()])
+		.expect("a valid source reference must be accepted");
 	assert!(refs.expose().contains("cafe\u{301}.rs"));
 	assert!(refs.expose().contains("café"));
-	assert_eq!(refs.expose().parse::<UnitRefs>().unwrap(), refs);
-	assert!(UnitRefs::new(vec![reference.clone(); 33]).is_err());
-	assert!(InspectedRefs::new(vec![reference; 33]).is_ok());
-	assert!("[]".repeat(65537).parse::<UnitRefs>().is_err());
+	assert_eq!(crate::test_support::read_unit_refs(refs.expose()).unwrap(), refs);
+	assert!(crate::test_support::refs::<32>(vec![reference.clone(); 33]).is_err());
+	assert!(crate::test_support::refs::<64>(vec![reference; 33]).is_ok());
+	assert!(crate::test_support::read_unit_refs(&"[]".repeat(65537)).is_err());
 	assert!(!format!("{refs:?}").contains("cafe"));
 }
 #[test]
@@ -106,10 +105,10 @@ fn unit_creation_transitions_and_carry_forward() {
 	let db = fixture();
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
-			let key = Identifier::new("scope").unwrap();
-			let title = BoundedText::new("Authentication").unwrap();
-			let objective = BoundedText::new("Review token refresh").unwrap();
-			let refs = crate::source_refs::UnitRefs::new(vec![]).unwrap();
+			let key = crate::test_support::identifier("scope").unwrap();
+			let title = crate::test_support::text("Authentication").unwrap();
+			let objective = crate::test_support::text("Review token refresh").unwrap();
+			let refs = crate::test_support::refs::<32>(vec![]).unwrap();
 			let new = u::NewUnit {
 				generation_id: 11,
 				client_key: &key,
@@ -154,10 +153,10 @@ fn units_reject_foreign_and_other_generation_jobs() {
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
 			units(tx)?;
-			let key = Identifier::new("scope").unwrap();
-			let title = BoundedText::new("title").unwrap();
-			let objective = BoundedText::new("objective").unwrap();
-			let refs = crate::source_refs::UnitRefs::new(vec![]).unwrap();
+			let key = crate::test_support::identifier("scope").unwrap();
+			let title = crate::test_support::text("title").unwrap();
+			let objective = crate::test_support::text("objective").unwrap();
+			let refs = crate::test_support::refs::<32>(vec![]).unwrap();
 			let mut new = u::NewUnit {
 				generation_id: 11,
 				client_key: &key,
@@ -289,8 +288,8 @@ fn unit_results_check_all_corroboration_and_job_relations() {
 	use crate::review_unit_results as r;
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx|{
- units(tx)?;let refs=crate::source_refs::InspectedRefs::new(vec![]).unwrap();let data=payload();
- let mut new=r::NewResult{generation_id:11,unit_id:11,produced_by_job:Some(101),commit_sha:"base",profile_version:1,disposition:r::Disposition::NoLeadFound,inspected_refs:&refs,counterevidence:None,proof_gaps:None,payload:&data,corroborates_result:None,corroborates_exclusion:None};
+ units(tx)?;let refs=crate::test_support::refs::<64>(vec![]).unwrap();let data=payload();
+ let mut new=r::NewResult{generation_id:11,unit_id:11,produced_by_job:Some(101),commit_sha: &crate::test_support::db_text("base").unwrap(),profile_version:1,disposition:r::Disposition::NoLeadFound,inspected_refs:&refs,counterevidence:None,proof_gaps:None,payload:&data,corroborates_result:None,corroborates_exclusion:None};
  let id=r::insert(tx,&new,0).expect("append a unit result");
  for job in [102,201] {new.produced_by_job=Some(job);assert!(matches!(r::insert(tx,&new,0),Err(Error::Ownership(Ownership::ResultJob))));}
  new.produced_by_job=Some(101);new.unit_id=12;
@@ -329,7 +328,7 @@ fn every_identity_collision_preserves_the_observation() {
 					unit_id: None,
 					identity: &identity,
 					payload: &data,
-					commit_sha: "base",
+					commit_sha: &crate::test_support::db_text("base").unwrap(),
 					priority: Priority::Normal,
 					priority_proposal: None,
 					supersedes: None,
@@ -403,7 +402,7 @@ fn leads_and_observations_reject_every_wrong_scope() {
 				unit_id: None,
 				identity: &identity,
 				payload: &data,
-				commit_sha: "base",
+				commit_sha: &crate::test_support::db_text("base").unwrap(),
 				priority: Priority::Normal,
 				priority_proposal: None,
 				supersedes: None,
@@ -434,7 +433,7 @@ fn leads_and_observations_reject_every_wrong_scope() {
 							lead_id: id,
 							submitted_by_job: Some(job),
 							payload: &data,
-							commit_sha: "base"
+							commit_sha: &crate::test_support::db_text("base").unwrap()
 						},
 						1
 					),
@@ -486,7 +485,7 @@ fn explicit_supersedes_requires_a_stale_closed_lead() {
 					unit_id: None,
 					identity: &first,
 					payload: &data,
-					commit_sha: "base",
+					commit_sha: &crate::test_support::db_text("base").unwrap(),
 					priority: Priority::Normal,
 					priority_proposal: None,
 					supersedes: None,
@@ -498,8 +497,8 @@ fn explicit_supersedes_requires_a_stale_closed_lead() {
 				panic!("fresh identity")
 			};
 			let other = Identity {
-				family: Identifier::new("auth-bypass").unwrap(),
-				anchor: Anchor::new("session cookie handler").unwrap(),
+				family: crate::test_support::identifier("auth-bypass").unwrap(),
+				anchor: crate::test_support::anchor("session cookie handler").unwrap(),
 				instance: None,
 			};
 			let mut new = l::NewLead {
@@ -507,7 +506,7 @@ fn explicit_supersedes_requires_a_stale_closed_lead() {
 				unit_id: None,
 				identity: &other,
 				payload: &data,
-				commit_sha: "base",
+				commit_sha: &crate::test_support::db_text("base").unwrap(),
 				priority: Priority::Normal,
 				priority_proposal: None,
 				supersedes: Some(open),
@@ -546,7 +545,7 @@ fn stale_close_refuses_active_jobs_and_unrelated_failures_stay_sqlite() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx|{
  let identity=identity();let data=payload();
- let new=l::NewLead{generation_id:11,unit_id:None,identity:&identity,payload:&data,commit_sha:"base",priority:Priority::Normal,priority_proposal:None,supersedes:None,created_by_job:Some(101)};
+ let new=l::NewLead{generation_id:11,unit_id:None,identity:&identity,payload:&data,commit_sha: &crate::test_support::db_text("base").unwrap(),priority:Priority::Normal,priority_proposal:None,supersedes:None,created_by_job:Some(101)};
  let l::Submitted::Created(id)=l::submit(tx,&new,0)? else{panic!()};
  tx.execute("UPDATE jobs SET assigned_lead_id=?1 WHERE id=101",[id])?;
  assert!(matches!(l::close(tx,id,&l::Closure::Stale,1),Err(Error::Conflict(Conflict::LeadState))));

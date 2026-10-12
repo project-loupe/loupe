@@ -7,21 +7,23 @@
 //! and the private key PEM; SQLCipher seals the whole file, so the PEM
 //! is stored as-is like a PAT would be.
 
-use loupe_provenance::Secret;
+use loupe_core::text::policy::GithubAppSlug;
+use loupe_core::text::BoundedText;
+use loupe_provenance::{Db, Secret, Source};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::secrets::SecretKind;
 
 const LABEL: &str = "server";
 
-pub struct StoredGithubApp {
+pub struct StoredGithubApp<S: Source> {
 	pub app_id: u64,
-	pub slug: String,
+	pub slug: BoundedText<GithubAppSlug, S>,
 	pub private_key_pem: Secret<String>,
 }
 
-impl std::fmt::Debug for StoredGithubApp {
+impl<S: Source> std::fmt::Debug for StoredGithubApp<S> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("StoredGithubApp")
 			.field("app_id", &self.app_id)
@@ -32,10 +34,9 @@ impl std::fmt::Debug for StoredGithubApp {
 }
 
 /// Metadata decoded without materializing the private PEM field.
-#[derive(Deserialize)]
 pub struct StoredGithubAppSummary {
 	pub app_id: u64,
-	pub slug: String,
+	pub slug: BoundedText<GithubAppSlug, Db>,
 }
 
 #[derive(Serialize)]
@@ -46,10 +47,12 @@ struct StoredAppWrite<'a> {
 }
 
 /// Store (or replace) the credential.
-pub fn set(conn: &Connection, app: &StoredGithubApp, now: i64) -> rusqlite::Result<()> {
+pub fn set<S: Source>(
+	conn: &Connection, app: &StoredGithubApp<S>, now: i64,
+) -> rusqlite::Result<()> {
 	let record = StoredAppWrite {
 		app_id: app.app_id,
-		slug: &app.slug,
+		slug: app.slug.expose(),
 		private_key_pem: app.private_key_pem.expose(),
 	};
 	let value = Secret::new(serde_json::to_vec(&record).map_err(|_| {
@@ -68,11 +71,11 @@ pub fn set(conn: &Connection, app: &StoredGithubApp, now: i64) -> rusqlite::Resu
 }
 
 /// Read the credential. `Ok(None)` when no app has been configured.
-pub fn get(conn: &Connection) -> rusqlite::Result<Option<StoredGithubApp>> {
+pub fn get(conn: &Connection) -> rusqlite::Result<Option<StoredGithubApp<Db>>> {
 	conn.query_row(
 		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
 		params![SecretKind::GithubApp.as_str(), LABEL],
-		crate::ingress::app_legacy,
+		crate::ingress::app,
 	)
 	.optional()
 }
@@ -83,7 +86,7 @@ pub fn summary(conn: &Connection) -> rusqlite::Result<Option<StoredGithubAppSumm
 	conn.query_row(
 		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
 		params![SecretKind::GithubApp.as_str(), LABEL],
-		crate::ingress::app_summary_legacy,
+		crate::ingress::app_summary,
 	)
 	.optional()
 }
@@ -130,10 +133,10 @@ mod tests {
 		}
 	}
 
-	fn app(app_id: u64) -> StoredGithubApp {
+	fn app(app_id: u64) -> StoredGithubApp<loupe_provenance::Agent> {
 		StoredGithubApp {
 			app_id,
-			slug: format!("loupe-{app_id}"),
+			slug: crate::test_support::text(&format!("loupe-{app_id}")).unwrap(),
 			private_key_pem: Secret::new(
 				"-----BEGIN RSA PRIVATE KEY-----\nxx\n-----END RSA PRIVATE KEY-----\n".into(),
 			),
@@ -165,14 +168,14 @@ mod tests {
 		assert_eq!(rows, 1, "set must replace, not accumulate");
 	}
 
-	fn assert_stored_app(db: &Db, expected: &StoredGithubApp) {
+	fn assert_stored_app(db: &Db, expected: &StoredGithubApp<loupe_provenance::Agent>) {
 		let actual = db.with_conn(|c| Ok(get(c)?)).unwrap().unwrap();
 		assert_eq!(actual.app_id, expected.app_id);
-		assert_eq!(actual.slug, expected.slug);
+		assert_eq!(actual.slug.expose(), expected.slug.expose());
 		assert_eq!(actual.private_key_pem.expose(), expected.private_key_pem.expose());
 		let metadata = db.with_conn(|c| Ok(summary(c)?)).unwrap().unwrap();
 		assert_eq!(metadata.app_id, expected.app_id);
-		assert_eq!(metadata.slug, expected.slug);
+		assert_eq!(metadata.slug.expose(), expected.slug.expose());
 	}
 
 	#[test]

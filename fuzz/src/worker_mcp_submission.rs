@@ -50,12 +50,13 @@ pub fn do_test(data: &[u8]) {
 			let _ = std::fs::write(&candidate, contents);
 		}
 		let normalized = fuzz_support::normalize(workdir.path(), path);
+		let first_admitted = crate::worker_mcp_ingress::oracle::normalized_path(path).is_ok();
 		if candidate.exists() {
 			let canonical = candidate.canonicalize().unwrap_or_else(|e| panic!("candidate: {e}"));
 			let root = workdir.path().canonicalize().unwrap_or_else(|e| panic!("root: {e}"));
-			assert_eq!(normalized.is_ok(), canonical.starts_with(root));
+			assert_eq!(normalized.is_ok(), first_admitted && canonical.starts_with(root));
 		} else {
-			assert!(normalized.is_ok());
+			assert_eq!(normalized.is_ok(), first_admitted);
 		}
 		if let Ok(relative) = normalized {
 			let fingerprint = fuzz_support::fingerprint(workdir.path(), &relative, start, end);
@@ -83,24 +84,35 @@ pub fn do_test(data: &[u8]) {
 			let args = serde_json::json!({"severity":"high","title":"title","file":path,
 				"line_start":start,"line_end":end,"description":"description","poc_unified":"diff"});
 			let finding = fuzz_support::finding(workdir.path(), &args);
-			// This fixture includes into_legacy_submission: after the first
-			// path owner admits a whitespace basename, that temporary exit
-			// refuses it. This is not a general repeated-normalization rule.
-			// M must rebind this check when it removes the legacy exit; the
-			// complete submission must still reject a whitespace-only path.
-			let admitted = crate::worker_mcp_ingress::oracle::normalized_path(path)
-				.is_ok_and(|normalized| !normalized.trim().is_empty());
-			assert_eq!(finding.is_ok(), admitted, "actual original MCP finding admission differs");
+			// The first owner retains its normalized path. Strict protocol refusal
+			// is a separate boundary, without repeating path normalization.
+			assert_eq!(
+				finding.is_ok(),
+				first_admitted,
+				"actual original MCP finding admission differs"
+			);
 			if let Ok(finding) = finding {
 				assert_eq!(finding.file_path, relative);
 				assert_eq!(finding.line_start, start);
 				assert_eq!(finding.line_end, end);
 				assert_eq!(finding.fingerprint, fingerprint);
 			}
+			let strict = fuzz_support::validate_finding(workdir.path(), &strict_args(path));
+			assert_eq!(
+				strict.is_ok(),
+				!relative.trim().is_empty(),
+				"final strict path refusal differs"
+			);
 		}
 	}
 	#[cfg(unix)]
 	assert!(fuzz_support::normalize(workdir.path(), "escape/file").is_err());
+}
+
+fn strict_args(path: &str) -> serde_json::Value {
+	serde_json::json!({"severity":"high","title":"A valid example title","file":path,
+		"line_start":1,"line_end":1,"description":"description ".repeat(10),
+		"poc_unified":"--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-old\n+new\n"})
 }
 
 fn independent_fingerprint(file: &str, window: &str) -> String {
@@ -149,34 +161,45 @@ mod tests {
 		input
 	}
 
-	fn check_path(path: &str, expected_first: Option<&str>, projection_admitted: bool) {
+	fn check_path(path: &str, expected_first: Option<&str>, strict_admitted: bool) {
 		let first = crate::worker_mcp_ingress::oracle::normalized_path(path);
 		assert_eq!(first.as_deref().ok(), expected_first, "first path owner changed");
 		let workdir = tempfile::tempdir().unwrap_or_else(|e| panic!("worktree: {e}"));
 		let args = serde_json::json!({"severity":"high","title":"title","file":path,
 			"line_start":1,"line_end":1,"description":"description","poc_unified":"diff"});
 		let finding = fuzz_support::finding(workdir.path(), &args);
-		assert_eq!(finding.is_ok(), projection_admitted, "actual legacy projection changed");
+		assert_eq!(finding.is_ok(), expected_first.is_some(), "actual first owner changed");
 		if let Ok(finding) = finding {
 			assert_eq!(Some(finding.file_path.as_str()), expected_first);
+		}
+		let strict = fuzz_support::validate_finding(workdir.path(), &strict_args(path));
+		assert_eq!(strict.is_ok(), strict_admitted, "actual final strict view changed");
+		if expected_first.is_some_and(|path| path.trim().is_empty()) {
+			let Err(error) = strict else {
+				panic!("whitespace path unexpectedly passed strict validation")
+			};
+			assert!(
+				error.to_string().contains("file_path"),
+				"whitespace refusal must come from the final strict path predicate"
+			);
 		}
 		do_test(&path_input(path));
 	}
 
 	#[test]
-	fn captured_whitespace_path_reaches_legacy_refusal() {
+	fn captured_whitespace_path_reaches_final_strict_refusal() {
 		do_test(include_bytes!(
 			"../test_cases/worker_mcp_submission/whitespace-projection-captured"
 		));
 	}
 
 	#[test]
-	fn space_slash_reaches_legacy_refusal() {
+	fn space_slash_reaches_final_strict_refusal() {
 		check_path(" /", Some(" "), false);
 	}
 
 	#[test]
-	fn space_curdir_reaches_legacy_refusal() {
+	fn space_curdir_reaches_final_strict_refusal() {
 		check_path(" /./", Some(" "), false);
 	}
 

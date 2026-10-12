@@ -28,10 +28,4 @@ pub mod optional {
 	) -> Result<S::Ok, S::Error> {
 		value.as_ref().map(Secret::expose).serialize(serializer)
 	}
-
-	pub fn deserialize<'de, D: Deserializer<'de>>(
-		deserializer: D,
-	) -> Result<Option<Secret<String>>, D::Error> {
-		Option::<String>::deserialize(deserializer).map(|value| value.map(Secret::new))
-	}
 }

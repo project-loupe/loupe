@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use loupe_core::text::policy::{GitBranch, LeaseCapabilityName, RevisionText};
+use loupe_core::text::BoundedText;
 use loupe_core::{Finding, RepoSpec};
-use loupe_provenance::Secret;
+use loupe_provenance::{Secret, Source};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Opaque, single-lease capability issued by loupe-server.
@@ -74,22 +76,24 @@ impl<'de> Deserialize<'de> for JobCapability {
 /// empty, the server holds the connection up to that many seconds
 /// waiting for a job. Default `0` keeps immediate empty-queue responses
 /// available for callers that prefer explicit polling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LeaseRequest {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct LeaseRequest<S: Source> {
 	pub protocol_version: u16,
-	pub capabilities: Vec<String>,
+	pub capabilities: Vec<BoundedText<LeaseCapabilityName, S>>,
 	#[serde(default)]
 	pub wait_seconds: u32,
 }
+record_impls!(LeaseRequest<S> { protocol_version, capabilities, wait_seconds });
 
 /// Response body. Either a job is handed out (`Lease(LeaseEnvelope)`) or
 /// the queue is empty / no job matches the worker's capabilities (`Empty`).
 /// We carry the variant inside the body rather than relying on HTTP status
 /// codes because intermediaries strip / mangle them often enough.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LeaseResponse {
-	Lease(Box<LeaseEnvelope>),
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
+pub enum LeaseResponse<ContentS: Source, MetaS: Source> {
+	Lease(Box<LeaseEnvelope<ContentS, MetaS>>),
 	Empty { protocol_version: u16 },
 }
 
@@ -98,8 +102,9 @@ pub enum LeaseResponse {
 /// `payload` discriminates between scan and verify so that, for verify
 /// jobs, the target finding travels alongside the repo spec without
 /// inflating every scan-job response with optional finding fields.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LeaseEnvelope {
+#[derive(Debug, Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct LeaseEnvelope<ContentS: Source, MetaS: Source> {
 	pub protocol_version: u16,
 	pub job_id: i64,
 	pub job_capability: JobCapability,
@@ -109,116 +114,138 @@ pub struct LeaseEnvelope {
 	/// (e.g. `query_prior_findings`) to the repo currently under
 	/// scan without piecing it together from `(host, owner, repo)`.
 	pub repo_id: i64,
-	pub repo: RepoSpec,
-	pub head_branch: Option<String>,
+	pub repo: RepoSpec<MetaS>,
+	pub head_branch: Option<BoundedText<GitBranch, MetaS>>,
 	/// Lease expiry as epoch seconds. Worker must heartbeat or complete
 	/// before this point or the server reaper will reclaim the job.
 	pub lease_expires_at: i64,
-	pub scanner_config: serde_json::Value,
+	pub scanner_config: crate::ScannerDocument<MetaS>,
 	#[serde(
 		default,
 		skip_serializing_if = "Option::is_none",
 		with = "crate::secret_serde::optional"
 	)]
 	pub github_pat: Option<Secret<String>>,
-	pub payload: LeasePayload,
+	pub payload: LeasePayload<ContentS, MetaS>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LeasePayload {
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
+pub enum LeasePayload<ContentS: Source, MetaS: Source> {
 	Scan {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		since_sha: Option<String>,
+		since_sha: Option<BoundedText<RevisionText, MetaS>>,
 	},
 	Verify {
 		finding_id: i64,
-		finding: Box<Finding>,
+		finding: Box<Finding<ContentS>>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		reviewed_sha: Option<String>,
+		reviewed_sha: Option<BoundedText<RevisionText, MetaS>>,
 	},
 }
+impl<ContentS: Source, MetaS: Source> Clone for LeasePayload<ContentS, MetaS> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Scan { since_sha } => Self::Scan { since_sha: since_sha.clone() },
+			Self::Verify { finding_id, finding, reviewed_sha } => Self::Verify {
+				finding_id: *finding_id,
+				finding: finding.clone(),
+				reviewed_sha: reviewed_sha.clone(),
+			},
+		}
+	}
+}
+impl<ContentS: Source, MetaS: Source> PartialEq for LeasePayload<ContentS, MetaS> {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Self::Scan { since_sha: a }, Self::Scan { since_sha: b }) => a == b,
+			(
+				Self::Verify { finding_id: a, finding: b, reviewed_sha: c },
+				Self::Verify { finding_id: x, finding: y, reviewed_sha: z },
+			) => a == x && b == y && c == z,
+			_ => false,
+		}
+	}
+}
+impl<ContentS: Source, MetaS: Source> Eq for LeasePayload<ContentS, MetaS> {}
 
 #[cfg(test)]
 mod tests {
 	use loupe_core::{Finding, RepoSpec, Severity};
+	use loupe_provenance::Server;
 	use serde_json::json;
 
 	use super::*;
+	use crate::test_support::{path, scanner, text};
 	use crate::version::PROTOCOL_VERSION;
+	type LeaseResponse = super::LeaseResponse<Server, Server>;
+	type LeaseEnvelope = super::LeaseEnvelope<Server, Server>;
 
-	fn sample_repo() -> RepoSpec {
+	fn sample_repo() -> RepoSpec<Server> {
 		RepoSpec {
-			host: "github.com".into(),
-			owner: "acme".into(),
-			repo: "widget".into(),
-			clone_url: "https://github.com/acme/widget.git".into(),
-			branch: Some("main".into()),
+			host: text("github.com"),
+			owner: text("acme"),
+			repo: text("widget"),
+			clone_url: text("https://github.com/acme/widget.git"),
+			branch: Some(text("main")),
 		}
 	}
 
-	fn assert_same_lease(expected: &LeaseEnvelope, actual: &LeaseEnvelope) {
-		assert_eq!(expected.protocol_version, actual.protocol_version);
-		assert_eq!(expected.job_id, actual.job_id);
-		assert_eq!(expected.job_capability.expose_secret(), actual.job_capability.expose_secret());
-		assert_eq!(expected.repo_id, actual.repo_id);
-		assert_eq!(expected.repo, actual.repo);
-		assert_eq!(expected.head_branch, actual.head_branch);
-		assert_eq!(expected.lease_expires_at, actual.lease_expires_at);
-		assert_eq!(expected.scanner_config, actual.scanner_config);
-		assert_eq!(
-			expected.github_pat.as_ref().map(Secret::expose),
-			actual.github_pat.as_ref().map(Secret::expose),
-		);
-		assert_eq!(expected.payload, actual.payload);
-	}
-
 	#[test]
-	fn empty_response_round_trips() {
+	fn empty_response_preserves_wire_fields() {
 		let r = LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION };
 		let s = serde_json::to_string(&r).unwrap();
 		assert!(s.contains(r#""kind":"empty""#));
-		let back: LeaseResponse = serde_json::from_str(&s).unwrap();
-		assert!(matches!(back, LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({"kind":"empty", "protocol_version":PROTOCOL_VERSION})
+		);
 	}
 
 	#[test]
-	fn scan_lease_round_trips() {
-		let env = LeaseEnvelope {
+	fn scan_lease_preserves_every_wire_field() {
+		let env: LeaseEnvelope = LeaseEnvelope {
 			protocol_version: PROTOCOL_VERSION,
 			job_id: 1,
 			job_capability: JobCapability::from_secret("scan-capability"),
 			repo_id: 9,
 			repo: sample_repo(),
-			head_branch: Some("main".into()),
+			head_branch: Some(text("main")),
 			lease_expires_at: 1_700_000_600,
-			scanner_config: json!({"regex": {"enabled": true}}),
+			scanner_config: scanner(json!({"regex": {"enabled": true}})),
 			github_pat: None,
-			payload: LeasePayload::Scan { since_sha: Some("abc123".into()) },
+			payload: LeasePayload::Scan { since_sha: Some(text("abc123")) },
 		};
 		let r = LeaseResponse::Lease(Box::new(env));
 		let s = serde_json::to_string(&r).unwrap();
-		let back: LeaseResponse = serde_json::from_str(&s).unwrap();
-		let (LeaseResponse::Lease(expected), LeaseResponse::Lease(actual)) = (&r, &back) else {
-			panic!("expected scan leases");
-		};
-		assert_same_lease(expected, actual);
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"kind":"lease", "protocol_version":PROTOCOL_VERSION, "job_id":1,
+				"job_capability":"scan-capability", "repo_id":9,
+				"repo":{"host":"github.com","owner":"acme","repo":"widget",
+					"clone_url":"https://github.com/acme/widget.git","branch":"main"},
+				"head_branch":"main", "lease_expires_at":1700000600,
+				"scanner_config":{"regex":{"enabled":true}},
+				"payload":{"kind":"scan","since_sha":"abc123"}
+			})
+		);
 	}
 
 	#[test]
 	fn verify_lease_carries_finding() {
 		let finding = Finding {
-			scanner_id: "regex-secrets".into(),
+			scanner_id: text("regex-secrets"),
 			severity: Severity::High,
-			title: "AWS access key".into(),
-			description: "Found AKIA-prefixed token".into(),
-			file_path: Some("src/x.rs".into()),
+			title: text("AWS access key"),
+			description: text("Found AKIA-prefixed token"),
+			file_path: Some(path("src/x.rs")),
 			line_start: Some(1),
 			line_end: Some(1),
 			cwe: None,
 			patch_unified: None,
 			poc_unified: None,
-			fingerprint: "fp1".into(),
+			fingerprint: text("fp1"),
 		};
 		let env = LeaseEnvelope {
 			protocol_version: PROTOCOL_VERSION,
@@ -228,30 +255,42 @@ mod tests {
 			repo: sample_repo(),
 			head_branch: None,
 			lease_expires_at: 1_700_000_800,
-			scanner_config: serde_json::Value::Null,
+			scanner_config: scanner(serde_json::Value::Null),
 			github_pat: None,
 			payload: LeasePayload::Verify {
 				finding_id: 42,
 				finding: Box::new(finding.clone()),
-				reviewed_sha: Some("abc123".into()),
+				reviewed_sha: Some(text("abc123")),
 			},
 		};
 		let s = serde_json::to_string(&env).unwrap();
-		let back: LeaseEnvelope = serde_json::from_str(&s).unwrap();
-		assert_same_lease(&env, &back);
-		// Sanity-check the discriminator is the verify kind.
-		match back.payload {
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"protocol_version":PROTOCOL_VERSION, "job_id":7, "job_capability":"verify-capability",
+				"repo_id":11, "repo":{"host":"github.com","owner":"acme","repo":"widget",
+					"clone_url":"https://github.com/acme/widget.git","branch":"main"},
+				"head_branch":null, "lease_expires_at":1700000800,"scanner_config":null,
+				"payload":{"kind":"verify","finding_id":42,"reviewed_sha":"abc123",
+					"finding":{"scanner_id":"regex-secrets","severity":"high","title":"AWS access key",
+						"description":"Found AKIA-prefixed token","file_path":"src/x.rs",
+						"line_start":1,"line_end":1,"fingerprint":"fp1"}}
+			})
+		);
+		match env.payload {
 			LeasePayload::Verify { finding_id, finding: f, reviewed_sha } => {
 				assert_eq!(finding_id, 42);
 				assert_eq!(*f, finding);
-				assert_eq!(reviewed_sha.as_deref(), Some("abc123"));
+				assert_eq!(reviewed_sha.as_ref().map(|sha| sha.expose()), Some("abc123"));
 			},
 			LeasePayload::Scan { .. } => panic!("expected Verify payload"),
 		}
 	}
 
 	#[test]
-	fn verify_lease_defaults_reviewed_sha_when_omitted() {
+	fn verify_lease_omits_unset_reviewed_sha() {
+		// Missing-field input admission is checked by the worker's named lease
+		// decoder; this retains the exact old wire fixture as an output oracle.
 		let raw = r#"{
 			"protocol_version":2,
 			"job_id":7,
@@ -279,10 +318,37 @@ mod tests {
 				}
 			}
 		}"#;
-		let env: LeaseEnvelope = serde_json::from_str(raw).unwrap();
-		match env.payload {
-			LeasePayload::Verify { reviewed_sha, .. } => assert!(reviewed_sha.is_none()),
-			LeasePayload::Scan { .. } => panic!("expected Verify payload"),
-		}
+		let env = LeaseEnvelope {
+			protocol_version: 2,
+			job_id: 7,
+			job_capability: JobCapability::from_secret("test-capability"),
+			repo_id: 11,
+			repo: sample_repo(),
+			head_branch: None,
+			lease_expires_at: 1700000800,
+			scanner_config: scanner(serde_json::Value::Null),
+			github_pat: None,
+			payload: LeasePayload::Verify {
+				finding_id: 42,
+				reviewed_sha: None,
+				finding: Box::new(Finding {
+					scanner_id: text("regex-secrets"),
+					severity: Severity::High,
+					title: text("AWS access key"),
+					description: text("Found AKIA-prefixed token"),
+					fingerprint: text("fp1"),
+					file_path: None,
+					line_start: None,
+					line_end: None,
+					cwe: None,
+					patch_unified: None,
+					poc_unified: None,
+				}),
+			},
+		};
+		assert_eq!(
+			serde_json::to_value(env).unwrap(),
+			serde_json::from_str::<serde_json::Value>(raw).unwrap()
+		);
 	}
 }

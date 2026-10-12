@@ -35,7 +35,7 @@ use super::mcp::{
 use super::model_broker::{
 	bind_model_into_sandbox, ModelBrokerBackend, ModelBrokerContext, SANDBOX_MODEL_SOCKET,
 };
-use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
+use super::{CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
 
 const BACKEND_ID: &str = "codex-cli";
@@ -98,8 +98,8 @@ impl CodexCliBackend {
 		Self {
 			bin: CODEX_BIN.to_owned(),
 			agent: CliModelConfig {
-				model: DEFAULT_CODEX_MODEL.to_owned(),
-				effort: DEFAULT_CODEX_EFFORT.to_owned(),
+				model: crate::config::ConfiguredText::Builtin(DEFAULT_CODEX_MODEL),
+				effort: crate::config::ConfiguredText::Builtin(DEFAULT_CODEX_EFFORT),
 			},
 			mcp: None,
 			model_broker: None,
@@ -174,9 +174,9 @@ impl LlmBackend for CodexCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			workdir = %req.workdir.display(),
-			model = %self.agent.model,
-			effort = %self.agent.effort,
-			prompt_chars = req.prompt.chars().count(),
+			model = %self.agent.model.for_operation(),
+			effort = %self.agent.effort.for_operation(),
+			prompt_chars = req.prompt.for_cli_argument().chars().count(),
 			timeout_ms = req.timeout.as_millis() as u64,
 			"codex-cli: invoking",
 		);
@@ -213,7 +213,7 @@ impl LlmBackend for CodexCliBackend {
 				.mcp
 				.as_ref()
 				.filter(|ctx| ctx.bkb_mcp_path.is_some())
-				.map(|ctx| ctx.bkb_api_url.as_str());
+				.map(|ctx| ctx.bkb_api_url.for_operation());
 			let required_hosts = super::required_network_hosts(bkb_api_url)?;
 			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
 				sandbox_builder
@@ -273,7 +273,7 @@ impl LlmBackend for CodexCliBackend {
 						.push("mcp_servers.bkb.default_tools_approval_mode=\"approve\"".to_owned());
 					overrides.push(format!(
 						"mcp_servers.bkb.env={{ BKB_API_URL = {} }}",
-						toml_string_literal(&ctx.bkb_api_url)
+						toml_string_literal(ctx.bkb_api_url.for_operation())
 					));
 				}
 				mcp_broker = Some(broker);
@@ -289,7 +289,8 @@ impl LlmBackend for CodexCliBackend {
 			_ => Vec::new(),
 		};
 
-		let agent_args = codex_invocation_args(&self.agent, &mcp_overrides, &req.prompt);
+		let agent_args =
+			codex_invocation_args(&self.agent, &mcp_overrides, req.prompt.for_cli_argument());
 		#[cfg(test)]
 		let mut cmd = if self.disable_sandbox {
 			let mut cmd = sandbox.build(&self.bin);
@@ -377,8 +378,8 @@ impl LlmBackend for CodexCliBackend {
 
 		let output_truncated = stdout.truncated || stderr.truncated;
 		if !status.success() {
-			let stderr_text = stderr.diagnostic().into_legacy();
-			let stdout_text = stdout.diagnostic().into_legacy();
+			let stderr_text = stderr.diagnostic();
+			let stdout_text = stdout.diagnostic();
 			tracing::debug!(
 				backend = BACKEND_ID,
 				exit = ?status.code(),
@@ -387,14 +388,14 @@ impl LlmBackend for CodexCliBackend {
 				elapsed_ms = started.elapsed().as_millis() as u64,
 				"codex-cli: subprocess failed",
 			);
-			let combined = format!(
-				"stderr(chars={})=`{}` stdout(chars={})=`{}`",
-				stderr_text.chars().count(),
-				summarize_cli_stream_for_error(&stderr_text, MAX_CLI_DIAGNOSTIC_CHARS),
-				stdout_text.chars().count(),
-				summarize_cli_stream_for_error(&stdout_text, MAX_CLI_DIAGNOSTIC_CHARS),
-			);
-			return Err(anyhow!("codex CLI exited with {}: {}", status, combined));
+			return Err(super::cli_output::CliProcessFailure {
+				backend: "codex",
+				status,
+				stderr: stderr_text,
+				stdout: stdout_text,
+				max_chars: MAX_CLI_DIAGNOSTIC_CHARS,
+			}
+			.into());
 		}
 		// Reported last: a CLI failure explains a broker failure, so the
 		// CLI diagnostic is the more useful error to surface.
@@ -406,21 +407,18 @@ impl LlmBackend for CodexCliBackend {
 				"codex CLI output exceeds {MAX_CLI_OUTPUT_BYTES} bytes per stream"
 			));
 		}
-		let text = stdout
-			.text()
-			.map_err(|e| anyhow!("codex CLI stdout was not UTF-8: {e}"))?
-			.into_legacy();
+		let text = stdout.text().map_err(|e| anyhow!("codex CLI stdout was not UTF-8: {e}"))?;
 		if self.log_agent_output {
 			tracing::info!(
 				backend = BACKEND_ID,
-				agent_stdout = %text,
+				agent_stdout = %text.for_log(),
 				"codex-cli: agent stdout (full)"
 			);
 			if !stderr.is_empty() {
-				let stderr_text = stderr.diagnostic().into_legacy();
+				let stderr_text = stderr.diagnostic();
 				tracing::info!(
 					backend = BACKEND_ID,
-					agent_stderr = %stderr_text,
+					agent_stderr = %stderr_text.for_log(),
 					"codex-cli: agent stderr (full)"
 				);
 			}
@@ -428,7 +426,7 @@ impl LlmBackend for CodexCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			elapsed_ms = started.elapsed().as_millis() as u64,
-			stdout_chars = text.chars().count(),
+			stdout_chars = text.for_log().chars().count(),
 			stderr_chars = stderr.len(),
 			"codex-cli: subprocess succeeded",
 		);
@@ -482,9 +480,9 @@ fn codex_invocation_args(
 		"--ephemeral".to_owned(),
 		"--ignore-user-config".to_owned(),
 		"--model".to_owned(),
-		agent.model.clone(),
+		agent.model.for_operation().to_owned(),
 		"-c".to_owned(),
-		format!("model_reasoning_effort={}", toml_string_literal(&agent.effort)),
+		format!("model_reasoning_effort={}", toml_string_literal(agent.effort.for_operation())),
 	];
 	for ov in codex_permission_overrides().into_iter().chain(codex_model_provider_overrides()) {
 		args.push("-c".to_owned());
@@ -519,7 +517,7 @@ mod tests {
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let result = backend
 			.run(LlmRequest {
-				prompt: "fixture".into(),
+				prompt: crate::llm::prompts::Prompt::instruction("fixture"),
 				workdir: workdir.path().to_owned(),
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
@@ -686,7 +684,7 @@ mod tests {
 			.with_model_broker_context(test_model_broker(proxy_path));
 		let response = backend
 			.run(LlmRequest {
-				prompt: "irrelevant".into(),
+				prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 				workdir: workdir.path().to_path_buf(),
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
@@ -697,7 +695,7 @@ mod tests {
 			})
 			.await
 			.expect("fake Codex CLI should run through the credential-free adapter");
-		assert_eq!(response.text.trim(), "SAFE");
+		assert_eq!(response.text.for_log().trim(), "SAFE");
 	}
 
 	#[cfg(unix)]
@@ -755,7 +753,7 @@ mod tests {
 		let backend = CodexCliBackend::with_bin("loupe-worker-no-such-bin")
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -791,7 +789,7 @@ mod tests {
 			.with_sandbox_disabled_for_tests()
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_millis(500),
 			cancel: CancellationToken::new(),
@@ -860,7 +858,10 @@ mod tests {
 	#[test]
 	fn invocation_enforces_bounded_permissions_without_approvals() {
 		let args = codex_invocation_args(
-			&CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() },
+			&CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
 			&[],
 			"hello",
 		);
@@ -900,7 +901,10 @@ mod tests {
 	#[test]
 	fn invocation_args_include_configured_model_and_effort() {
 		let args = codex_invocation_args(
-			&CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() },
+			&CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
 			&["mcp_servers.loupe.env={}".to_owned()],
 			"hello",
 		);

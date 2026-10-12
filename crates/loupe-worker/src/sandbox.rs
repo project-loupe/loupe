@@ -65,10 +65,10 @@ impl std::fmt::Display for SandboxNetworkMode {
 	}
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct SandboxNetworkConfig {
 	pub mode: SandboxNetworkMode,
-	pub allowlist: Vec<String>,
+	pub allowlist: Vec<crate::config::ConfiguredText>,
 }
 
 pub fn validate_network_host(host: &str) -> Result<()> {
@@ -383,7 +383,7 @@ impl SandboxBuilder {
 				argv.extend([OsString::from("--required-host"), OsString::from(host)]);
 			}
 			for host in &network.config.allowlist {
-				argv.extend([OsString::from("--allow-host"), OsString::from(host)]);
+				argv.extend([OsString::from("--allow-host"), OsString::from(host.for_operation())]);
 			}
 			argv.extend(["--", BWRAP_BIN].map(OsString::from));
 		}

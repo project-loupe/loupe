@@ -4,9 +4,8 @@
 use std::fmt;
 use std::ops::Range;
 
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::source_migration::{Verdict, VerdictPatch};
-use loupe_core::text::{decode_json_string_bounded, policy, Error, Rule, TextPolicy};
+use loupe_core::text::{decode_json_string_bounded, policy, BoundedText, Error, Rule, TextPolicy};
+use loupe_core::{Verdict, VerdictPatch};
 use loupe_provenance::{
 	Agent, Ingress, Mark, Untrusted, Unvalidated, Validate, ValidateCarrying, Worker,
 };
@@ -14,8 +13,8 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
-// This fixture supplies a bounded message. The I/M HTTP owner retains its
-// route's actual body admission/budget; this is not a new production DTO cap.
+// This fixture bounds its own message; production HTTP routes apply their
+// own body budgets.
 pub const BODY_CAP: usize = 2 * 1024 * 1024;
 
 // debug-ok: fixed diagnostic with no message content.
@@ -43,7 +42,7 @@ pub struct Submission {
 }
 pub fn read(bytes: &[u8]) -> Result<Submission, ReadError> {
 	// SAFETY: this private test entry point labels only the immutable original
-	// message supplied by the fixture. Production authentication remains in I.
+	// message supplied by the fixture. Production routes authenticate separately.
 	let ingress = unsafe { Ingress::<Worker>::new() };
 	Untrusted::new(bytes, ingress).validate_carrying(WorkerVerdict).map_err(|_| ReadError)
 }
@@ -76,7 +75,7 @@ impl<'de> Deserialize<'de> for Outcome {
 				}
 			}
 		}
-		// Match the internally tagged legacy enum's identifier admission.
+		// Match the internally tagged reference enum's identifier admission.
 		// A derived external enum would additionally accept {"confirmed":null}.
 		d.deserialize_identifier(Identifier)
 	}
@@ -211,7 +210,7 @@ impl<'a> ValidateCarrying<&'a [u8], Worker> for WorkerVerdict {
 				}
 			},
 		};
-		// Internally tagged legacy Verdict buffers every inner value as serde
+		// The internally tagged reference Verdict buffers every inner value as serde
 		// content, rejecting invalid Unicode/overflow even in ignored fields.
 		// Reuse serde's validation without retaining values. This runs AFTER
 		// every designated field's carry and bounded decode, never before it.
@@ -251,7 +250,7 @@ agent_field!(AgentPatchNotes, policy::PatchNotes);
 // numbers. No map, array, string, or dynamic value is retained by this visitor.
 struct DiscardContent;
 // Retain the envelope level (and its permissive unknown-field behavior) so
-// serde's recursion boundary is the same as the original DTO's boundary.
+// serde's recursion boundary matches the reference DTO's boundary.
 #[derive(Deserialize)]
 struct ContentEnvelope {
 	#[serde(rename = "protocol_version")]

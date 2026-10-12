@@ -1,4 +1,4 @@
-//! Target 25 / invariant I6: exercise the actual worker HTTP decode paths.
+//! Actual worker HTTP decode paths under chunked and oversized responses.
 //!
 //! Byte 0 selects lease, heartbeat, search, finding detail, or an error.
 //! Byte 1 controls the chunk size. Byte 2 selects an ordinary response,
@@ -78,7 +78,7 @@ pub fn do_test(data: &[u8]) {
 			let result = match kind {
 				0 => client.lease(Vec::new(), 0).await.map(serde_json::to_value),
 				1 | 4 => client.heartbeat(1, &capability).await.map(serde_json::to_value),
-				2 => client.search_findings(1, &capability, "", 100).await.map(serde_json::to_value),
+				2 => client.search_findings(1, &capability, &crate::fixtures::text("").unwrap_or_else(|_| panic!("empty query")), 100).await.map(serde_json::to_value),
 				_ => client.get_finding(1, &capability).await.map(serde_json::to_value),
 			};
 			// Rejecting an oversized body can close the socket before the

@@ -31,9 +31,9 @@ use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
 mod config_arguments;
-mod config_value_parsers;
 use config_arguments::WorkerOverridesDecoder;
 use config_value_parsers::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
+use loupe_worker::config_value_parsers;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe scan/verify worker")]
@@ -284,14 +284,14 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		tls.ca_cert_pem.expose(),
 		tls.cert_pem.expose(),
 		tls.key_pem.expose(),
-		server_url.clone(),
+		server_url.for_http().clone(),
 	)?);
 	// The persistent client owns its signer; retire controllable PEM now.
 	drop(tls);
 	let worker_binary =
 		std::env::current_exe().context("resolving the loupe-worker binary path")?;
 	let cache = Arc::new(RepoCache::new(
-		cache_dir.clone(),
+		cache_dir.for_filesystem().to_path_buf(),
 		cfg.cache.max_gb * 1_073_741_824,
 		Some(worker_binary.clone()),
 	)?);
@@ -337,7 +337,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// missing binary or attempted bypass is a startup error.
 	sandbox::probe_at_startup(cfg.runtime.disable_sandbox)
 		.context("LLM scanner requires bubblewrap")?;
-	sandbox::smoketest(&cache_dir, cfg.sandbox.clone())
+	sandbox::smoketest(cache_dir.for_filesystem(), cfg.sandbox.clone())
 		.context("bubblewrap sandbox smoketest failed")?;
 	tracing::info!(
 		network = %cfg.sandbox.mode,
@@ -521,8 +521,8 @@ fn replace_model_base_url(argument: OsString, base_url: &str) -> OsString {
 
 fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 	WorkerConfig::load(
-		args.config.as_ref().map(ConfiguredPath::as_path),
-		WorkerOverridesDecoder::into_legacy(args),
+		args.config.as_ref().map(ConfiguredPath::for_filesystem),
+		WorkerOverridesDecoder::decode(args),
 	)
 }
 
@@ -537,7 +537,7 @@ fn read_worker_tls(
 	ca_cert_pem: Option<loupe_tls::PemInput>, ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 	cert_pem: Option<loupe_tls::PemInput>, cert_pem_b64: Option<loupe_tls::PemInput>,
 	key_pem: Option<loupe_tls::PemInput>, key_pem_b64: Option<loupe_tls::PemInput>,
-	ca_cert: Option<PathBuf>, cert: Option<PathBuf>, key: Option<PathBuf>,
+	ca_cert: Option<ConfiguredPath>, cert: Option<ConfiguredPath>, key: Option<ConfiguredPath>,
 ) -> Result<WorkerTls> {
 	let env_pem_present = has_value(&ca_cert_pem)
 		|| has_value(&ca_cert_pem_b64)
@@ -574,12 +574,12 @@ fn read_worker_tls(
 		cert.context("--cert / LOUPE_WORKER_CERT is required unless LOUPE_WORKER_CERT_PEM is set")?;
 	let key =
 		key.context("--key / LOUPE_WORKER_KEY is required unless LOUPE_WORKER_KEY_PEM is set")?;
-	let ca_cert_pem = loupe_tls::read_pem_file(&ca_cert)
-		.with_context(|| format!("reading CA cert at {}", ca_cert.display()))?;
-	let cert_pem = loupe_tls::read_pem_file(&cert)
-		.with_context(|| format!("reading worker cert at {}", cert.display()))?;
-	let key_pem = loupe_tls::read_pem_file(&key)
-		.with_context(|| format!("reading worker key at {}", key.display()))?;
+	let ca_cert_pem = loupe_tls::read_pem_file(ca_cert.for_filesystem())
+		.with_context(|| format!("reading CA cert at {}", ca_cert.for_filesystem().display()))?;
+	let cert_pem = loupe_tls::read_pem_file(cert.for_filesystem())
+		.with_context(|| format!("reading worker cert at {}", cert.for_filesystem().display()))?;
+	let key_pem = loupe_tls::read_pem_file(key.for_filesystem())
+		.with_context(|| format!("reading worker key at {}", key.for_filesystem().display()))?;
 	Ok(WorkerTls { ca_cert_pem, cert_pem, key_pem })
 }
 
@@ -615,7 +615,7 @@ fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<loupe_provenance::Secret
 /// (also stderr by `tracing_subscriber` default).
 fn init_tracing(logging: &LoggingConfig) {
 	let env_filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
-		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&logging.level));
+		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(logging.level.for_operation()));
 	if logging.json {
 		tracing_subscriber::fmt()
 			.json()
@@ -629,7 +629,7 @@ fn init_tracing(logging: &LoggingConfig) {
 
 fn init_tracing_from_env() {
 	let logging = LoggingConfig {
-		level: "info".to_owned(),
+		level: loupe_worker::config::ConfiguredText::Builtin("info"),
 		json: bool_env("LOUPE_LOG_JSON").unwrap_or(false),
 		agent_output: false,
 	};
@@ -724,7 +724,7 @@ mod tests {
 				.sandbox_allowlist
 				.unwrap()
 				.iter()
-				.map(ConfiguredText::legacy_override)
+				.map(ConfiguredText::for_operation)
 				.collect::<Vec<_>>(),
 			["example.com", "203.0.113.9"]
 		);
@@ -760,7 +760,7 @@ mod tests {
 		])
 		.unwrap();
 		let cfg = load_worker_config(&cli.run).unwrap();
-		assert_eq!(cfg.agents.codex.model, " Env-Cafe\u{301} ");
+		assert_eq!(cfg.agents.codex.model.for_operation(), " Env-Cafe\u{301} ");
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 23);
 		let cli = Cli::try_parse_from([
 			OsStr::new("loupe-worker"),
@@ -773,7 +773,7 @@ mod tests {
 		])
 		.unwrap();
 		let cfg = load_worker_config(&cli.run).unwrap();
-		assert_eq!(cfg.agents.codex.model, " Flag-Cafe\u{301} ");
+		assert_eq!(cfg.agents.codex.model.for_operation(), " Flag-Cafe\u{301} ");
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 31);
 	}
 
@@ -890,6 +890,13 @@ mod tls_consumer_tests {
 		for (path, value) in [(&ca, "FILE_CA"), (&cert, "FILE_CERT"), (&key, "FILE_KEY")] {
 			std::fs::write(path, value).unwrap();
 		}
+		use clap::builder::TypedValueParser;
+		let command = clap::Command::new("worker-test");
+		let parse = |path: &std::path::Path| {
+			config_value_parsers::ConfiguredPathParser
+				.parse_ref(&command, None, path.as_os_str())
+				.unwrap()
+		};
 		let tls = read_worker_tls(
 			Some(String::new().into()),
 			None,
@@ -897,9 +904,9 @@ mod tls_consumer_tests {
 			Some(String::new().into()),
 			None,
 			None,
-			Some(ca.clone()),
-			Some(cert.clone()),
-			Some(key.clone()),
+			Some(parse(&ca)),
+			Some(parse(&cert)),
+			Some(parse(&key)),
 		)
 		.unwrap();
 		assert_eq!(
@@ -914,9 +921,9 @@ mod tls_consumer_tests {
 				None,
 				None,
 				None,
-				Some(ca.clone()),
-				Some(cert.clone()),
-				Some(key.clone())
+				Some(parse(&ca)),
+				Some(parse(&cert)),
+				Some(parse(&key))
 			)
 			.is_err(),
 			"partial env must not mix with complete files"
@@ -928,9 +935,9 @@ mod tls_consumer_tests {
 			Some("invalid%%%".into()),
 			Some("RAW_KEY".into()),
 			Some("invalid%%%".into()),
-			Some(ca.clone()),
-			Some(cert.clone()),
-			Some(key.clone()),
+			Some(parse(&ca)),
+			Some(parse(&cert)),
+			Some(parse(&key)),
 		)
 		.unwrap();
 		assert_eq!(
@@ -945,9 +952,9 @@ mod tls_consumer_tests {
 			None,
 			None,
 			None,
-			Some(ca),
-			Some(cert),
-			Some(key)
+			Some(parse(&ca)),
+			Some(parse(&cert)),
+			Some(parse(&key))
 		)
 		.is_err());
 	}
@@ -981,7 +988,7 @@ mod config_admission_tests {
 		}
 		let cli = Cli::try_parse_from(["loupe-worker"]).unwrap();
 		let cfg = load_worker_config(&cli.run).unwrap();
-		assert_eq!(cfg.cache.dir.as_os_str().as_bytes(), native.as_bytes());
+		assert_eq!(cfg.cache.dir.for_filesystem().as_os_str().as_bytes(), native.as_bytes());
 		let flag = OsString::from_vec(b"../flag-\xfe-cache".to_vec());
 		let cli = Cli::try_parse_from([
 			OsString::from("loupe-worker"),
@@ -990,6 +997,6 @@ mod config_admission_tests {
 		])
 		.unwrap();
 		let cfg = load_worker_config(&cli.run).unwrap();
-		assert_eq!(cfg.cache.dir.as_os_str().as_bytes(), flag.as_bytes());
+		assert_eq!(cfg.cache.dir.for_filesystem().as_os_str().as_bytes(), flag.as_bytes());
 	}
 }

@@ -1,74 +1,110 @@
-use serde::{Deserialize, Serialize};
+use loupe_provenance::Source;
+use serde::Serialize;
 
-/// Candidate fix attached to a `Verdict::Confirmed`. Carries the
-/// unified diff plus a short rationale from the verifier.
-///
-/// Patches only ride on confirmed verdicts — by construction.
-/// Dismissed and inconclusive verdicts have no place to attach a
-/// fix, and the type system pins that down by living only on the
-/// `Confirmed` variant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerdictPatch {
-	/// Unified diff of the proposed fix. Must apply cleanly against
-	/// the worktree the verifier was reasoning over (the MCP-side
-	/// `validate_patch` tool runs `git apply --check` before this
-	/// reaches the server).
-	pub patch_unified: String,
-	/// One- or two-sentence rationale from the verifier: what the
-	/// fix does and why this is the minimal correct change. Surfaced
-	/// to human reviewers via `loupectl finding show`.
-	pub notes: String,
+use super::text::BoundedText;
+use crate::text::policy::{PatchNotes, PatchUnified, VerdictNotes, VerdictReason};
+
+/// Exact candidate fix and rationale. Applicability belongs to the Git check.
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct VerdictPatch<S: Source> {
+	pub patch_unified: BoundedText<PatchUnified, S>,
+	pub notes: BoundedText<PatchNotes, S>,
 }
+record_impls!(VerdictPatch { patch_unified, notes });
 
-/// Outcome of a verification job — a verifier's vote on whether a finding
-/// from a prior scan is real, false-positive, or undecidable.
-///
-/// The server's rollup policy aggregates one or more `Verdict`s into the
-/// finding's `state` (`confirmed` / `dismissed` / stays `validating`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum Verdict {
+/// A verifier's vote, with source-retaining explanations and optional fix.
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", bound(serialize = ""))]
+pub enum Verdict<S: Source> {
 	Confirmed {
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		notes: Option<String>,
-		/// Optional candidate fix. Omitted when the verifier confirms
-		/// the finding without proposing a patch.
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		patch: Option<VerdictPatch>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		notes: Option<BoundedText<VerdictNotes, S>>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		patch: Option<VerdictPatch<S>>,
 	},
 	Dismissed {
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		notes: Option<String>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		notes: Option<BoundedText<VerdictNotes, S>>,
 	},
 	Inconclusive {
-		reason: String,
-		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		reason: BoundedText<VerdictReason, S>,
+		#[serde(skip_serializing_if = "std::ops::Not::not")]
 		terminal: bool,
 	},
 }
-
+impl<S: Source> Clone for Verdict<S> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Confirmed { notes, patch } => {
+				Self::Confirmed { notes: notes.clone(), patch: patch.clone() }
+			},
+			Self::Dismissed { notes } => Self::Dismissed { notes: notes.clone() },
+			Self::Inconclusive { reason, terminal } => {
+				Self::Inconclusive { reason: reason.clone(), terminal: *terminal }
+			},
+		}
+	}
+}
+impl<S: Source> PartialEq for Verdict<S> {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Self::Confirmed { notes: a, patch: p }, Self::Confirmed { notes: b, patch: q }) => {
+				a == b && p == q
+			},
+			(Self::Dismissed { notes: a }, Self::Dismissed { notes: b }) => a == b,
+			(
+				Self::Inconclusive { reason: a, terminal: x },
+				Self::Inconclusive { reason: b, terminal: y },
+			) => a == b && x == y,
+			_ => false,
+		}
+	}
+}
+impl<S: Source> Eq for Verdict<S> {}
+impl<S: Source> std::fmt::Debug for Verdict<S> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Verdict<{}>([redacted])", S::NAME)
+	}
+}
 #[cfg(test)]
 mod tests {
+	use loupe_provenance::Agent;
+
 	use super::*;
+	use crate::test_support::text;
+	type Verdict = super::Verdict<Agent>;
 
 	#[test]
 	fn round_trips_each_variant() {
 		let cases = [
-			Verdict::Confirmed { notes: Some("matched second scanner".into()), patch: None },
 			Verdict::Confirmed {
-				notes: Some("real bug".into()),
+				notes: Some(text("matched second scanner").unwrap()),
+				patch: None,
+			},
+			Verdict::Confirmed {
+				notes: Some(text("real bug").unwrap()),
 				patch: Some(VerdictPatch {
-					patch_unified: "--- a/x\n+++ b/x\n@@\n-old\n+new\n".into(),
-					notes: "swap the comparison operator".into(),
+					patch_unified: text("--- a/x\n+++ b/x\n@@\n-old\n+new\n").unwrap(),
+					notes: text("swap the comparison operator").unwrap(),
 				}),
 			},
 			Verdict::Dismissed { notes: None },
-			Verdict::Inconclusive { reason: "scanner does not verify".into(), terminal: false },
+			Verdict::Inconclusive {
+				reason: text("scanner does not verify").unwrap(),
+				terminal: false,
+			},
 		];
-		for v in cases {
+		let expected = [
+			serde_json::json!({"outcome":"confirmed","notes":"matched second scanner"}),
+			serde_json::json!({"outcome":"confirmed","notes":"real bug","patch":{"patch_unified":"--- a/x\n+++ b/x\n@@\n-old\n+new\n","notes":"swap the comparison operator"}}),
+			serde_json::json!({"outcome":"dismissed"}),
+			serde_json::json!({"outcome":"inconclusive","reason":"scanner does not verify"}),
+		];
+		for (v, expected) in cases.into_iter().zip(expected) {
 			let s = serde_json::to_string(&v).unwrap();
-			let back: Verdict = serde_json::from_str(&s).unwrap();
-			assert_eq!(v, back);
+			let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+			assert_eq!(back, expected);
 		}
 	}
 
@@ -81,33 +117,36 @@ mod tests {
 
 	#[test]
 	fn confirmed_without_patch_omits_field_on_wire() {
-		// `skip_serializing_if = Option::is_none` is what keeps an
-		// older verifier worker (or any caller that doesn't propose a
-		// patch) from polluting the wire shape with a `"patch":null`
-		// noise field. If this regresses, every Confirmed verdict
-		// suddenly grows a null field — visible to operators
-		// inspecting raw JSON, and a needless wire-shape diff.
-		let v = Verdict::Confirmed { notes: Some("real bug".into()), patch: None };
+		// An absent patch is omitted rather than serialized as null.
+		let v = Verdict::Confirmed { notes: Some(text("real bug").unwrap()), patch: None };
 		let s = serde_json::to_string(&v).unwrap();
 		assert!(!s.contains("patch"), "got: {s}");
 	}
 
 	#[test]
 	fn inconclusive_omits_nonterminal_flag() {
-		let v = Verdict::Inconclusive { reason: "not enough context".into(), terminal: false };
+		let v =
+			Verdict::Inconclusive { reason: text("not enough context").unwrap(), terminal: false };
 		let s = serde_json::to_string(&v).unwrap();
 		assert!(!s.contains("terminal"), "got: {s}");
-		let back: Verdict = serde_json::from_str(&s).unwrap();
-		assert_eq!(back, v);
+		let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+		assert_eq!(
+			back,
+			serde_json::json!({"outcome":"inconclusive","reason":"not enough context"})
+		);
 	}
 
 	#[test]
-	fn inconclusive_defaults_terminal_false() {
+	fn inconclusive_default_wire_shape_remains_compatible() {
 		let raw = r#"{"outcome":"inconclusive","reason":"not enough context"}"#;
-		let back: Verdict = serde_json::from_str(raw).unwrap();
+		let back: serde_json::Value = serde_json::from_str(raw).unwrap();
 		assert_eq!(
 			back,
-			Verdict::Inconclusive { reason: "not enough context".into(), terminal: false }
+			serde_json::to_value(Verdict::Inconclusive {
+				reason: text("not enough context").unwrap(),
+				terminal: false
+			})
+			.unwrap()
 		);
 	}
 }

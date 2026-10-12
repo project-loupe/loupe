@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use clap::builder::TypedValueParser;
 use loupe_worker::sandbox::{SandboxBuilder, SandboxNetworkConfig, SandboxNetworkMode};
 use serde::Deserialize;
 
@@ -36,12 +37,26 @@ pub fn do_test(data: &[u8]) {
 	if network != 0 {
 		let mode =
 			if network == 1 { SandboxNetworkMode::Allowlist } else { SandboxNetworkMode::Public };
+		let allowlist =
+			input
+				.hosts
+				.iter()
+				.take(16)
+				.map(|host| {
+					let admitted = loupe_worker::config_value_parsers::ConfiguredTextParser
+						.parse_ref(&clap::Command::new("sandbox-fixture"), None, host.as_ref());
+					assert_eq!(
+						admitted.is_ok(),
+						crate::worker_client_ingress::oracle::text(host, false),
+						"actual Config host argument admission differs"
+					);
+					admitted.ok()
+				})
+				.collect::<Option<Vec<_>>>();
+		let Some(allowlist) = allowlist else { return };
 		builder = builder
 			.with_network(
-				SandboxNetworkConfig {
-					mode,
-					allowlist: input.hosts.iter().take(16).cloned().collect(),
-				},
+				SandboxNetworkConfig { mode, allowlist },
 				input.required.iter().take(16).cloned().collect(),
 			)
 			.with_network_supervisor("/trusted/worker");

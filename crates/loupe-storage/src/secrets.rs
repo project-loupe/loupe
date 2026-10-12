@@ -135,6 +135,19 @@ pub fn read(conn: &Connection, id: i64) -> rusqlite::Result<Option<Secret<Vec<u8
 	.optional()
 }
 
+pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
+	// app() expects its credential BLOB at column zero and guards every
+	// owned allocation. Generic secrets stay opaque borrowed BLOBs.
+	crate::migrations::admission::scan(conn, "secrets", "value,id,kind,label,created_at", |row| {
+		if matches!(row.get_ref(2)?, rusqlite::types::ValueRef::Text(b"github_app"))
+			&& matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Text(b"server"))
+		{
+			crate::ingress::app(row)?;
+		}
+		Ok::<_, rusqlite::Error>(())
+	})
+}
+
 pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	let n = conn.execute("DELETE FROM secrets WHERE id = ?1", params![id])?;
 	Ok(n > 0)

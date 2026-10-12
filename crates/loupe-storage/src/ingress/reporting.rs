@@ -1,10 +1,8 @@
 //! Original reporting JSON tokens and the distinct scanner fallback contract.
 use std::fmt;
-use std::marker::PhantomData;
 
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::source_migration::ReportingDestination;
-use loupe_core::text::{decode_json_string_bounded, policy, TextPolicy};
+use loupe_core::text::{decode_json_string_bounded, policy, BoundedText, TextPolicy};
+use loupe_core::ReportingDestination;
 use loupe_provenance::{Db, Mark, Unvalidated, Validate};
 use rusqlite::Row;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -141,61 +139,41 @@ impl Validate<&[u8], Db> for StoredReporting {
 			},
 			Kind::Manual => {
 				// Unit variants reject additional sequence members; maps keep
-				// the existing permissive unknown-member semantics.
+				// permissive unknown-member semantics.
 				serde_json::from_str::<Tag>(raw).map_err(|_| ReadError::Syntax)?;
 				ReportingDestination::Manual
 			},
 		};
 		// Match serde's internally tagged content validation, including invalid
 		// ignored Unicode/numbers, without retaining a second dynamic tree.
-		// The SQL document itself has no newly invented aggregate limit.
+		// The SQL document itself has no aggregate size limit.
 		serde_json::from_str::<DiscardContent>(raw).map_err(|_| ReadError::Syntax)?;
 		Ok(reporting)
 	}
 }
-pub(crate) fn reporting_legacy(
-	row: &Row<'_>, index: usize,
-) -> rusqlite::Result<loupe_core::ReportingDestination> {
-	let value = column(row, index)?.validate(StoredReporting).map_err(|e| sql_error(index, e))?;
-	Ok(match value {
-		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
-			loupe_core::ReportingDestination::GithubIssue {
-				target_owner: target_owner.expose().to_owned(),
-				target_repo: target_repo.expose().to_owned(),
-				pat_secret_id,
-			}
-		},
-		ReportingDestination::Email { to, from, subject_prefix } => {
-			loupe_core::ReportingDestination::Email {
-				to: to.into_iter().map(|s| s.expose().to_owned()).collect(),
-				from: from.map(|s| s.expose().to_owned()),
-				subject_prefix: subject_prefix.map(|s| s.expose().to_owned()),
-			}
-		},
-		ReportingDestination::Manual => loupe_core::ReportingDestination::Manual,
-	})
+pub(crate) fn reporting(row: &Row<'_>, index: usize) -> rusqlite::Result<ReportingDestination<Db>> {
+	column(row, index)?.validate(StoredReporting).map_err(|e| sql_error(index, e))
 }
-struct ScannerDocument(serde_json::Value, PhantomData<Db>);
 struct StoredScanner;
 impl Validate<&[u8], Db> for StoredScanner {
-	type Output = ScannerDocument;
+	type Output = loupe_core::ScannerDocument<Db>;
 	type Error = ReadError;
 	fn validate<'v>(
-		self, u: Unvalidated<'v, &[u8]>, _mark: Mark<'v, Db>,
+		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Db>,
 	) -> Result<Self::Output, ReadError> {
-		// Invalid UTF-8 was a SQL conversion failure, whereas syntactically
-		// invalid UTF-8 JSON text was historically the null scanner fallback.
+		// Invalid UTF-8 is a SQL conversion failure; valid UTF-8 containing
+		// malformed JSON falls back to null scanner configuration.
 		let raw = utf8(u.get()).map_err(ReadError::existing)?;
-		Ok(ScannerDocument(
+		Ok(loupe_core::ScannerDocument::stored(
+			&mark,
 			serde_json::from_str(raw).unwrap_or(serde_json::Value::Null),
-			PhantomData,
 		))
 	}
 }
-pub(crate) fn scanner_document_legacy(
+pub(crate) fn scanner_document(
 	row: &Row<'_>, index: usize,
-) -> rusqlite::Result<serde_json::Value> {
-	Ok(column(row, index)?.validate(StoredScanner).map_err(|e| sql_error(index, e))?.0)
+) -> rusqlite::Result<loupe_core::ScannerDocument<Db>> {
+	column(row, index)?.validate(StoredScanner).map_err(|e| sql_error(index, e))
 }
 struct DiscardContent;
 impl<'de> Deserialize<'de> for DiscardContent {

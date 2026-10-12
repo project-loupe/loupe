@@ -1,6 +1,6 @@
+mod support;
 use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
-use loupe_web::client::AdminClient;
-use reqwest::{Method, StatusCode};
+use reqwest::StatusCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUDGET: usize = 16 * 1024 * 1024;
@@ -38,48 +38,48 @@ async fn response(status: &str, body: &str, padding: usize) -> reqwest::Url {
 #[tokio::test]
 async fn web_rejects_chunked_json_one_byte_over_budget() {
 	let base = response("200 OK", "{}", BUDGET - 1).await;
-	let client = AdminClient::from_parts(reqwest::Client::new(), base);
-	let result = client.call(Method::GET, "/v1/health", &[], None).await;
-	assert!(result.is_err(), "web accepted valid chunked JSON exceeding response budget");
-	assert!(result.unwrap_err().message.contains("response body exceeds"));
+	let client = support::client(reqwest::Client::new(), base);
+	let (status, body) = support::health(client).await;
+	assert_eq!(
+		status,
+		StatusCode::BAD_GATEWAY,
+		"web accepted valid chunked JSON exceeding response budget"
+	);
+	assert!(body.unwrap()["error"].as_str().unwrap().contains("response body exceeds"));
 }
 
 #[tokio::test]
 async fn web_accepts_chunked_json_exactly_at_budget() {
 	let base = response("200 OK", "{}", BUDGET - 2).await;
-	let client = AdminClient::from_parts(reqwest::Client::new(), base);
-	assert_eq!(
-		client.call(Method::GET, "/v1/health", &[], None).await.unwrap(),
-		(StatusCode::OK, Some(serde_json::json!({})))
-	);
+	let client = support::client(reqwest::Client::new(), base);
+	assert_eq!(support::health(client).await, (StatusCode::OK, Some(serde_json::json!({}))));
 }
 
 #[tokio::test]
 async fn web_error_body_is_bounded_and_keeps_status() {
 	let base = response("409 Conflict", "diagnostic", BUDGET).await;
-	let client = AdminClient::from_parts(reqwest::Client::new(), base);
-	let error = client.call(Method::GET, "/v1/health", &[], None).await.unwrap_err();
-	assert_eq!(error.status, Some(StatusCode::CONFLICT));
-	assert!(error.message.contains("response body exceeds"));
-	assert!(error.message.len() < 512);
-	assert!(!error.message.contains("diagnostic"));
+	let client = support::client(reqwest::Client::new(), base);
+	let (status, body) = support::health(client).await;
+	assert_eq!(status, StatusCode::CONFLICT);
+	let body = body.unwrap();
+	let error = body["error"].as_str().unwrap();
+	assert!(error.contains("response body exceeds"));
+	assert!(error.len() < 512);
+	assert!(!error.contains("diagnostic"));
 }
 
 #[tokio::test]
 async fn web_error_retains_short_diagnostic() {
 	let base = response("409 Conflict", "diagnostic", 0).await;
-	let client = AdminClient::from_parts(reqwest::Client::new(), base);
-	let error = client.call(Method::GET, "/v1/health", &[], None).await.unwrap_err();
-	assert_eq!(error.status, Some(StatusCode::CONFLICT));
-	assert_eq!(error.message, "diagnostic");
+	let client = support::client(reqwest::Client::new(), base);
+	let (status, body) = support::health(client).await;
+	assert_eq!(status, StatusCode::CONFLICT);
+	assert_eq!(body.unwrap()["error"], "diagnostic");
 }
 
 #[tokio::test]
 async fn web_no_content_is_empty_success() {
 	let base = response("204 No Content", "", 0).await;
-	let client = AdminClient::from_parts(reqwest::Client::new(), base);
-	assert_eq!(
-		client.call(Method::GET, "/v1/health", &[], None).await.unwrap(),
-		(StatusCode::NO_CONTENT, None)
-	);
+	let client = support::client(reqwest::Client::new(), base);
+	assert_eq!(support::health(client).await, (StatusCode::NO_CONTENT, None));
 }

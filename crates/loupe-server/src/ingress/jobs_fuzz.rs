@@ -1,4 +1,4 @@
-//! Exact observations before the production Worker-to-legacy DTO projections.
+//! Exact observations from the final typed Worker request owners.
 use loupe_provenance::{Ingress, Untrusted};
 use serde_json::{json, Value};
 
@@ -13,6 +13,49 @@ pub enum WorkerRequest {
 	LlmFinding,
 	Verdict,
 	Lease,
+}
+
+/// Concrete final DTOs produced by the same named Worker decoders. This lets
+/// the DTO harness exercise their real Serialize implementations without
+/// restoring a normal-build Deserialize or choosing a source parameter.
+pub enum WorkerValue {
+	Lease(loupe_proto::LeaseRequest<Worker>),
+	Complete(loupe_proto::CompleteRequest<Worker, Worker>),
+	Findings(loupe_proto::FindingsBatch<Agent>),
+	Llm(loupe_proto::LlmFindingSubmission<Agent>),
+	Verdict(loupe_proto::VerdictSubmission<Agent>),
+}
+
+pub fn worker_value(kind: WorkerRequest, bytes: &[u8]) -> Option<WorkerValue> {
+	let input = original(bytes);
+	Some(match kind {
+		WorkerRequest::Lease => WorkerValue::Lease(input.validate(LeaseRequestDecoder).ok()?),
+		WorkerRequest::Complete => WorkerValue::Complete(input.validate(CompleteDecoder).ok()?),
+		WorkerRequest::Findings => {
+			WorkerValue::Findings(input.validate_carrying(FindingsBatchDecoder).ok()?)
+		},
+		WorkerRequest::LlmFinding => {
+			let value = input.validate_carrying(LlmFindingDecoder).ok()?;
+			WorkerValue::Llm(loupe_proto::LlmFindingSubmission {
+				protocol_version: value.protocol_version,
+				severity: value.severity,
+				title: value.title,
+				description: value.description,
+				file_path: value.file_path,
+				line_start: value.line_start,
+				line_end: value.line_end,
+				cwe: value.cwe,
+				poc_unified: value.poc_unified,
+				fingerprint: value.fingerprint,
+			})
+		},
+		WorkerRequest::Verdict => {
+			let (protocol_version, verdict) =
+				input.validate_carrying(VerdictSubmissionDecoder).ok()?;
+			WorkerValue::Verdict(loupe_proto::VerdictSubmission { protocol_version, verdict })
+		},
+		WorkerRequest::Heartbeat => return None,
+	})
 }
 
 fn original(bytes: &[u8]) -> Untrusted<&[u8], Worker> {
@@ -47,8 +90,8 @@ fn decode(kind: WorkerRequest, bytes: &[u8]) -> Result<Value, DecodeError> {
 		},
 		WorkerRequest::Complete => {
 			let value = input.validate(CompleteDecoder)?;
-			let head: &Option<BoundedText<RevisionText, Worker>> = &value.head_sha;
-			let diagnostic: &Option<BoundedText<JobDiagnostic, Worker>> = &value.error;
+			let head: &Option<BoundedText<policy::RevisionText, Worker>> = &value.head_sha;
+			let diagnostic: &Option<BoundedText<policy::JobDiagnostic, Worker>> = &value.error;
 			json!({"protocol_version": value.protocol_version, "outcome": value.outcome,
 				"head_sha": head.as_ref().map(BoundedText::expose),
 				"error": diagnostic.as_ref().map(BoundedText::expose)})
@@ -74,7 +117,7 @@ fn decode(kind: WorkerRequest, bytes: &[u8]) -> Result<Value, DecodeError> {
 				"poc_unified": poc.expose(), "fingerprint": fingerprint.expose()})
 		},
 		WorkerRequest::Verdict => {
-			use loupe_core::source_migration::Verdict;
+			use loupe_core::Verdict;
 			let (version, value): (u16, Verdict<Agent>) =
 				input.validate_carrying(VerdictSubmissionDecoder)?;
 			let verdict = match value {

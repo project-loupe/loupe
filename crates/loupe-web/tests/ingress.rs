@@ -1,4 +1,5 @@
-//! Real-router admission/forwarding and client baseline controls.
+//! Real-router admission, forwarding and client compatibility checks.
+mod support;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
 use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
-use loupe_web::{AdminClient, Token, WebState};
+use loupe_web::{Token, WebState};
 use serde_json::{json, Value};
 
 struct Harness {
@@ -56,10 +57,8 @@ impl Harness {
 		let addr = listener.local_addr().unwrap();
 		let token = Token::generate();
 		let reveal = token.reveal().to_owned();
-		let client = AdminClient::from_parts(
-			reqwest::Client::new(),
-			format!("http://{up}/").parse().unwrap(),
-		);
+		let client =
+			support::client(reqwest::Client::new(), format!("http://{up}/").parse().unwrap());
 		let app = loupe_web::router(WebState::new(client, token, addr, 5));
 		let web = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 		Self { base: format!("http://{addr}"), token: reveal, calls, tasks: vec![up_task, web] }
@@ -122,16 +121,13 @@ async fn transport_errors_do_not_retain_request_query() {
 	drop(reserved);
 	let http =
 		reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap();
-	let client = AdminClient::from_parts(http, format!("http://{addr}/").parse().unwrap());
-	let err = client
-		.call(
-			reqwest::Method::GET,
-			"/v1/repos",
-			&[("q", "FAKE_TRANSPORT_QUERY_SENTINEL".into())],
-			None,
-		)
-		.await
-		.unwrap_err();
+	let client = support::client(http, format!("http://{addr}/").parse().unwrap());
+	let (status, value) =
+		support::forward(client, "/api/repos/1/findings/search?q=FAKE_TRANSPORT_QUERY_SENTINEL")
+			.await;
+	assert_eq!(status, StatusCode::BAD_GATEWAY);
+	let err = value.unwrap();
+	assert_eq!(err["error"], "upstream request failed");
 	for rendered in [format!("{err}"), format!("{err:?}")] {
 		assert!(
 			!rendered.contains("FAKE_TRANSPORT_QUERY_SENTINEL"),
@@ -203,6 +199,8 @@ async fn optional_body_and_forwarding_grammar_controls() {
 async fn path_and_query_forwarding_controls() {
 	let h = Harness::new().await;
 	for (path, expected) in [
+		("/api/repos", "/v1/repos"),
+		("/api/repos?limit=50", "/v1/repos?limit=50"),
 		("/api/jobs/%2B0007", "/v1/jobs/7"),
 		("/api/jobs/-9223372036854775808", "/v1/jobs/-9223372036854775808"),
 		("/api/jobs?state=&kind=%20%20&limit=-2&unknown=ignored", "/v1/jobs?limit=-2&kind=++"),

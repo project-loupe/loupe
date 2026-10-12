@@ -2,8 +2,8 @@
 //! Ordinary responses use the existing guarded 16 MiB HTTP collector; the
 //! confidential token endpoint keeps its separate 256 KiB collector.
 use bytes::Bytes;
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::policy::GithubAppSlug;
+#[cfg(fuzzing)]
+use loupe_core::text::{policy::GithubAppSlug, BoundedText};
 use loupe_provenance::{Ingress, Mark, Reporter, Untrusted, Unvalidated, Validate};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -36,13 +36,9 @@ struct RawApp<'a> {
 	#[serde(borrow)]
 	slug: &'a RawValue,
 }
-pub(super) struct AppMetadata {
-	id: u64,
-	slug: BoundedText<GithubAppSlug, Reporter>,
-}
 pub(super) struct AppMetadataDecoder;
 impl Validate<&[u8], Reporter> for AppMetadataDecoder {
-	type Output = AppMetadata;
+	type Output = super::github_app::GithubAppInfo;
 	type Error = ReporterDecodeError;
 	fn validate<'view>(
 		self, input: Unvalidated<'view, &[u8]>, mark: Mark<'view, Reporter>,
@@ -51,17 +47,15 @@ impl Validate<&[u8], Reporter> for AppMetadataDecoder {
 			.map_err(|_| ReporterDecodeError("parsing GitHub App metadata"))?;
 		let slug = crate::ingress::text::json_text(&mark, raw.slug)
 			.map_err(|_| ReporterDecodeError("parsing GitHub App metadata"))?;
-		Ok(AppMetadata { id: raw.id, slug })
+		Ok(super::github_app::GithubAppInfo { id: raw.id, slug })
 	}
 }
-impl AppMetadataDecoder {
-	/// Named temporary I exit; M retains Reporter slug through the API owner.
-	pub(super) fn decode_legacy(
-		body: Untrusted<Bytes, Reporter>,
-	) -> anyhow::Result<super::github_app::GithubAppInfo> {
-		let value = body.as_bytes().validate(Self)?;
-		Ok(super::github_app::GithubAppInfo { id: value.id, slug: value.slug.expose().to_owned() })
-	}
+
+#[cfg(any(test, fuzzing))]
+#[allow(unsafe_code)]
+pub(super) fn fixture_input(body: &[u8]) -> Untrusted<&[u8], Reporter> {
+	// SAFETY: only the test's synthetic original response bytes are labelled.
+	Untrusted::new(body, unsafe { Ingress::<Reporter>::new() })
 }
 
 #[derive(Deserialize)]
@@ -115,10 +109,8 @@ impl Validate<&[u8], Reporter> for LabelResponseDecoder {
 pub(crate) mod fuzz_support {
 	use super::*;
 
-	#[allow(unsafe_code)]
 	pub(in crate::reporters) fn original(body: &[u8]) -> Untrusted<&[u8], Reporter> {
-		// SAFETY: the fuzzer supplied this synthetic Reporter response body.
-		Untrusted::new(body, unsafe { Ingress::<Reporter>::new() })
+		fixture_input(body)
 	}
 
 	pub(in crate::reporters) fn diagnostic(error: ReporterDecodeError) -> String {

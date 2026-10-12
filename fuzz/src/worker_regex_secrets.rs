@@ -77,15 +77,18 @@ pub fn do_test(data: &[u8]) {
 	assert_eq!(findings.len(), typed.len(), "typed Repo findings were lost at projection");
 	for (finding, typed) in findings.iter().zip(typed) {
 		let line = finding.line_start.unwrap_or_else(|| panic!("finding without source line"));
-		let path =
-			finding.file_path.as_deref().unwrap_or_else(|| panic!("finding without source path"));
-		actual.push((path.to_owned(), line, finding.fingerprint.clone()));
-		assert_eq!(finding.scanner_id, "regex-secrets");
+		let path = finding
+			.file_path
+			.as_ref()
+			.map(|path| path.expose())
+			.unwrap_or_else(|| panic!("finding without source path"));
+		actual.push((path.to_owned(), line, finding.fingerprint.expose().to_owned()));
+		assert_eq!(finding.scanner_id.expose(), "regex-secrets");
 		assert_eq!(finding.severity, Severity::High);
 		assert_eq!(finding.line_end, Some(line), "finding ends at wrong source line");
-		assert_eq!(finding.title, "Possible AWS access key id");
-		assert_eq!(finding.cwe.as_deref(), Some("CWE-798"));
-		assert_eq!(finding.description, format!("Found a string matching the AWS access key id pattern (`AKIA…`) at {path}:{line}. Treat as a potential secret leak — confirm against the AWS account before reporting."));
+		assert_eq!(finding.title.expose(), "Possible AWS access key id");
+		assert_eq!(finding.cwe.as_ref().map(|cwe| cwe.expose()), Some("CWE-798"));
+		assert_eq!(finding.description.expose(), format!("Found a string matching the AWS access key id pattern (`AKIA…`) at {path}:{line}. Treat as a potential secret leak — confirm against the AWS account before reporting."));
 		assert_eq!(
 			(
 				typed.scanner,
@@ -98,19 +101,19 @@ pub fn do_test(data: &[u8]) {
 				typed.fingerprint
 			),
 			(
-				finding.scanner_id.clone(),
-				finding.title.clone(),
-				finding.description.clone(),
-				finding.file_path.clone(),
+				finding.scanner_id.expose().to_owned(),
+				finding.title.expose().to_owned(),
+				finding.description.expose().to_owned(),
+				finding.file_path.as_ref().map(|path| path.expose().to_owned()),
 				finding.line_start,
 				finding.line_end,
-				finding.cwe.clone(),
-				finding.fingerprint.clone()
+				finding.cwe.as_ref().map(|cwe| cwe.expose().to_owned()),
+				finding.fingerprint.expose().to_owned()
 			),
-			"actual pre-exit Repo output changed at projection"
+			"actual typed Repo output differs from its field observations"
 		);
 		let baseline = Redaction::baseline(format!(
-			"Finding {{ severity: High, line_start: Some({line}), line_end: Some({line}), .. }}"
+			"Finding {{ source: \"repo\", severity: High, line_start: Some({line}), line_end: Some({line}), content: \"[redacted]\", .. }}"
 		));
 		assert_redacted(&format!("{finding:?}"), &content, &baseline);
 	}

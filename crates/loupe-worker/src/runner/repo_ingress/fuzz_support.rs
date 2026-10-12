@@ -9,7 +9,7 @@ pub fn revision(original: &[u8]) -> Result<String, String> {
 	let original = Untrusted::new(original, unsafe { Ingress::<Repo>::new() });
 	original
 		.validate(CheckedOutRevisionDecoder)
-		.map(CheckedOutRevision::legacy_revision)
+		.map(|v| v.into_revision().expose().to_owned())
 		.map_err(|e| e.to_string())
 }
 #[derive(Debug, PartialEq, Eq)]

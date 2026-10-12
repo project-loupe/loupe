@@ -11,10 +11,6 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
-[features]
-# Removed with the legacy API at the atomic source-adoption commit.
-source-migration = []
-
 [dependencies]
 blake3 = { workspace = true }
 loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }

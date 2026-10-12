@@ -8,6 +8,9 @@ use loupe_worker::mcp::{run_stream_server, McpSessionContext};
 use loupe_worker::ServerClient;
 use serde_json::{json, Value};
 
+#[path = "support/legacy_lease.rs"]
+mod legacy_lease;
+
 const RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[test]
@@ -20,7 +23,8 @@ fn worker_file_admission_errors_discard_source_document() {
 		"[agents.codex]\nmodel = 'private_config_sentinel\n",
 	] {
 		std::fs::write(&path, document).unwrap();
-		let error = loupe_worker::config::FileConfig::load(&path).unwrap_err();
+		let error =
+			loupe_worker::config::WorkerConfig::load(Some(&path), Default::default()).unwrap_err();
 		assert!(
 			!format!("{error:#}").contains("private_config_sentinel"),
 			"Config admission error retained source text"
@@ -36,8 +40,13 @@ fn worker_file_admission_errors_discard_source_document() {
 	}
 	std::fs::write(&path, "[agents.codex]\nmodel = 'private_config_sentinel'\n").unwrap();
 	assert_eq!(
-		loupe_worker::config::FileConfig::load(&path).unwrap().agents.codex.model.as_deref(),
-		Some("private_config_sentinel")
+		loupe_worker::config::WorkerConfig::load(Some(&path), Default::default())
+			.unwrap()
+			.agents
+			.codex
+			.model
+			.for_operation(),
+		"private_config_sentinel"
 	);
 }
 
@@ -314,11 +323,11 @@ async fn client_preserves_exact_finding_and_audit_fields() {
 	let (client, task) = response(finding(description)).await;
 	let result = client.get_finding(1, &JobCapability::from_secret("test")).await.unwrap();
 	task.abort();
-	assert_eq!(result.description, description);
-	assert_eq!(result.title, " title ");
-	assert_eq!(result.file_path.as_deref(), Some("src/cafe\u{301}.rs"));
-	assert_eq!(result.poc_unified.as_deref(), Some("\r\n\t patch \n"));
-	assert_eq!(result.approved_by_cn.as_deref(), Some(" Audit Name "));
+	assert_eq!(result.description.expose(), description);
+	assert_eq!(result.title.expose(), " title ");
+	assert_eq!(result.file_path.as_ref().map(|v| v.expose()), Some("src/cafe\u{301}.rs"));
+	assert_eq!(result.poc_unified.as_ref().map(|v| v.expose()), Some("\r\n\t patch \n"));
+	assert_eq!(result.approved_by_cn.as_ref().map(|v| v.expose()), Some(" Audit Name "));
 }
 
 fn lease(config: Value) -> Value {
@@ -328,6 +337,63 @@ fn lease(config: Value) -> Value {
 		"repo":{"host":"local","owner":"owner","repo":"repo","clone_url":"file:///tmp/repo"},
 		"head_branch":null,"scanner_config":config,"payload":{"kind":"scan"}
 	})
+}
+
+#[tokio::test]
+async fn actual_lease_owner_preserves_missing_null_and_populated_optionals() {
+	for explicit_null in [false, true] {
+		let mut body = lease(Value::Null);
+		body["payload"] = json!({"kind":"verify","finding_id":42,"finding":finding("description")});
+		if explicit_null {
+			body["github_pat"] = Value::Null;
+			body["repo"]["branch"] = Value::Null;
+			body["payload"]["reviewed_sha"] = Value::Null;
+		}
+		let (client, task) = response(body).await;
+		let result = client.lease(Vec::new(), 0).await.unwrap();
+		task.abort();
+		let loupe_proto::LeaseResponse::Lease(env) = result else { panic!("lease") };
+		assert_eq!(env.job_id, 1);
+		assert_eq!(env.repo_id, 2);
+		assert_eq!(env.job_capability.expose_secret(), "lease-capability");
+		assert!(env.repo.branch.is_none());
+		assert!(env.github_pat.is_none());
+		let loupe_proto::LeasePayload::Verify { finding_id, finding, reviewed_sha } = env.payload
+		else {
+			panic!("verify")
+		};
+		assert_eq!(finding_id, 42);
+		assert_eq!(serde_json::to_value(finding).unwrap()["description"], "description");
+		assert!(reviewed_sha.is_none());
+	}
+	let revision = " exact-e\u{301}-\\\"revision ";
+	let pat = "test-pat-\\\"-e\u{301}\r\n\t";
+	let mut body = lease(Value::Null);
+	body["github_pat"] = json!(pat);
+	body["repo"]["branch"] = json!(" exact branch ");
+	body["payload"] = json!({"kind":"verify","finding_id":42,"finding":finding("description"),"reviewed_sha":revision});
+	let (client, task) = response(body).await;
+	let result = client.lease(Vec::new(), 0).await.unwrap();
+	task.abort();
+	let loupe_proto::LeaseResponse::Lease(env) = result else { panic!("lease") };
+	assert_eq!(env.github_pat.as_ref().unwrap().expose(), pat);
+	let encoded = serde_json::to_value(&env).unwrap();
+	assert_eq!(encoded["repo"]["branch"], " exact branch ");
+	assert_eq!(encoded["payload"]["reviewed_sha"], revision);
+	assert_eq!(encoded["github_pat"], pat);
+	assert!(!format!("{env:?}").contains("test-pat"));
+
+	for explicit_null in [false, true] {
+		let mut body = lease(Value::Null);
+		if explicit_null {
+			body["payload"]["since_sha"] = Value::Null;
+		}
+		let (client, task) = response(body).await;
+		let result = client.lease(Vec::new(), 0).await.unwrap();
+		task.abort();
+		let loupe_proto::LeaseResponse::Lease(env) = result else { panic!("lease") };
+		assert_eq!(serde_json::to_value(env.payload).unwrap(), json!({"kind":"scan"}));
+	}
 }
 
 #[tokio::test]
@@ -348,7 +414,7 @@ async fn reviewed_revision_keeps_nonempty_exact_text_and_bounds_missing_fact() {
 			let loupe_proto::LeasePayload::Verify { reviewed_sha, .. } = env.payload else {
 				panic!("verify")
 			};
-			assert_eq!(reviewed_sha.as_deref(), Some(revision.as_str()));
+			assert_eq!(reviewed_sha.as_ref().map(|v| v.expose()), Some(revision.as_str()));
 		}
 	}
 }
@@ -373,7 +439,7 @@ async fn lease_keeps_old_ignored_scanner_shapes_and_unknown_values() {
 		let result = client.lease(Vec::new(), 0).await.unwrap();
 		task.abort();
 		let loupe_proto::LeaseResponse::Lease(result) = result else { panic!("lease") };
-		assert_eq!(result.scanner_config, config);
+		assert_eq!(serde_json::to_value(&result.scanner_config).unwrap(), config);
 	}
 }
 
@@ -386,8 +452,8 @@ async fn client_exact_field_and_path_caps_are_admitted() {
 	let (client, task) = response(body).await;
 	let result = client.get_finding(1, &JobCapability::from_secret("test")).await.unwrap();
 	task.abort();
-	assert_eq!(result.description, description);
-	assert_eq!(result.file_path.as_deref(), Some(path.as_str()));
+	assert_eq!(result.description.expose(), description);
+	assert_eq!(result.file_path.as_ref().map(|v| v.expose()), Some(path.as_str()));
 }
 
 #[tokio::test]
@@ -405,10 +471,10 @@ async fn lease_selected_scanner_tokens_preserve_last_wins() {
 		let (client, task) = response_encoded(raw.clone()).await;
 		let result = client.lease(Vec::new(), 0).await.unwrap();
 		task.abort();
-		let expected: loupe_proto::LeaseResponse = serde_json::from_str(&raw).unwrap();
-		let loupe_proto::LeaseResponse::Lease(expected) = expected else { panic!("lease") };
+		let expected: legacy_lease::LeaseResponse = serde_json::from_str(&raw).unwrap();
+		let legacy_lease::LeaseResponse::Lease(expected) = expected else { panic!("lease") };
 		let loupe_proto::LeaseResponse::Lease(result) = result else { panic!("lease") };
-		assert_eq!(result.scanner_config, expected.scanner_config);
+		assert_eq!(serde_json::to_value(&result.scanner_config).unwrap(), expected.scanner_config);
 	}
 }
 
@@ -438,7 +504,7 @@ async fn lease_parser_matches_legacy_shapes_tags_and_depth() {
 		));
 	}
 	for raw in cases {
-		let expected = serde_json::from_str::<loupe_proto::LeaseResponse>(&raw);
+		let expected = serde_json::from_str::<legacy_lease::LeaseResponse>(&raw);
 		let (client, task) = response_encoded(raw.clone()).await;
 		let result = client.lease(Vec::new(), 0).await;
 		task.abort();
@@ -454,5 +520,40 @@ async fn lease_parser_matches_legacy_shapes_tags_and_depth() {
 				"lease value changed for {raw}"
 			);
 		}
+	}
+}
+
+#[tokio::test]
+async fn r2_whitespace_paths_keep_full_request_refusal() {
+	let workdir = tempfile::tempdir().unwrap();
+	for file in
+		[format!("{}{}", " ".repeat(50), "/".repeat(17)), " /".into(), " /./".into(), " ".into()]
+	{
+		let request = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 17, "method": "tools/call",
+            "params": {"name": "submit_finding", "arguments": {
+                "protocol_version": 1, "severity": "high",
+                "title": "Unchecked operation terminates the service",
+                "description": "An attacker-controlled request reaches the vulnerable operation without validation and can reliably terminate the service process.",
+                "file": file, "line_start": 1, "line_end": 1, "cwe": "CWE-20",
+                "poc_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn vulnerable() {}\n+#[test] fn demonstrates_failure() {}\n"
+            }}
+        })).unwrap();
+		let mut session = context();
+		session.workdir = workdir.path().to_owned();
+		let mut output = Vec::new();
+		run_stream_server(session, request.as_slice(), &mut output).await.unwrap();
+		let reply: Value = serde_json::from_slice(&output).unwrap();
+		assert_eq!(reply["jsonrpc"], "2.0");
+		assert_eq!(reply["id"], 17, "path refusal must preserve the request id");
+		assert_eq!(
+			reply["result"]["isError"], true,
+			"whitespace path must fail the full submission"
+		);
+		let diagnostic = reply["result"]["content"][0]["text"].as_str().unwrap();
+		assert!(
+			diagnostic.contains("file_path") || diagnostic.contains("`file`"),
+			"a later filesystem/PoC failure must not mask the path refusal: {diagnostic}"
+		);
 	}
 }

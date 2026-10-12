@@ -8,7 +8,8 @@ use crate::auth::AuthedWorker;
 #[derive(Serialize)]
 pub struct WhoamiResponse {
 	pub worker_id: i64,
-	pub name: String,
+	pub name:
+		loupe_core::text::BoundedText<loupe_core::text::policy::WorkerName, loupe_provenance::Db>,
 	pub kind: &'static str,
 }
 

@@ -44,22 +44,34 @@ pub struct AppState {
 	/// tightening the list later also stops repos registered before the
 	/// change. PAT destinations are not restricted — the PAT already
 	/// scopes them.
-	pub github_app_allowed_owners: Option<Vec<String>>,
+	pub github_app_allowed_owners: Option<
+		Vec<
+			loupe_core::text::BoundedText<
+				loupe_core::text::policy::RepoOwner,
+				loupe_provenance::Config,
+			>,
+		>,
+	>,
 }
 
 impl AppState {
 	/// Apply `github_app_allowed_owners` to one app-mode tracker owner.
 	/// The error text names the owner and the list so both registration
 	/// (as a 400) and dispatch (as a failed report) can surface it as-is.
-	pub fn check_github_app_target_owner(&self, target_owner: &str) -> Result<(), String> {
+	pub fn check_github_app_target_owner<S: loupe_provenance::Source>(
+		&self, target_owner: &loupe_core::text::BoundedText<loupe_core::text::policy::RepoOwner, S>,
+	) -> Result<(), String> {
+		let target_owner = target_owner.expose();
 		match &self.github_app_allowed_owners {
 			Some(allowed)
-				if !allowed.iter().any(|owner| owner.eq_ignore_ascii_case(target_owner)) =>
+				if !allowed
+					.iter()
+					.any(|owner| owner.expose().eq_ignore_ascii_case(target_owner)) =>
 			{
 				Err(format!(
 					"GitHub App reporting is restricted to tracker owners {}; {target_owner} is \
 					 not allowed (pass a PAT to report elsewhere)",
-					allowed.join(", ")
+					allowed.iter().map(|owner| owner.expose()).collect::<Vec<_>>().join(", ")
 				))
 			},
 			_ => Ok(()),
@@ -88,7 +100,17 @@ impl AppState {
 		}
 	}
 
-	pub fn with_github_app_allowed_owners(mut self, owners: Option<Vec<String>>) -> Self {
+	pub fn with_github_app_allowed_owners(
+		mut self,
+		owners: Option<
+			Vec<
+				loupe_core::text::BoundedText<
+					loupe_core::text::policy::RepoOwner,
+					loupe_provenance::Config,
+				>,
+			>,
+		>,
+	) -> Self {
 		self.github_app_allowed_owners = owners;
 		self
 	}

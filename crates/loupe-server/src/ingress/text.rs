@@ -1,5 +1,4 @@
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::{decode_json_string_bounded, TextPolicy};
+use loupe_core::text::{decode_json_string_bounded, BoundedText, TextPolicy};
 use loupe_provenance::{Mark, Source};
 use serde_json::value::RawValue;
 
@@ -11,16 +10,14 @@ pub(super) fn json_secret(
 	require_json_string(token.get())?;
 	let decoded =
 		decode_json_string_bounded(token.get(), "credential", super::BODY_CAP, super::BODY_CAP)?;
-	// Own the bounded decoded allocation immediately; no source-generic secret
-	// adapter or String extraction from an existing Secret is introduced.
+	// Own the bounded decoded allocation immediately so errors also wipe it.
 	Ok(loupe_provenance::Secret::new(decoded.into_owned()))
 }
 
 /// Source-preserving field mechanics; callers supply their current source mark
 /// and a token from their own concrete schema. No ingress or carry occurs here.
-/// This helper is for the current exact policies only. A future semantic policy
-/// must first admit its specified decoded-raw margin, then apply final caps;
-/// using P::MAX_* as that raw admission would incorrectly reject normalization.
+/// This helper accepts exact policies only: applying P::MAX_* before
+/// normalization would incorrectly reject text that contracts to fit the cap.
 pub(crate) fn json_text<P: TextPolicy, S: Source>(
 	mark: &Mark<'_, S>, token: &RawValue,
 ) -> Result<BoundedText<P, S>, DecodeError> {
@@ -33,10 +30,10 @@ pub(super) fn require_json_string(token: &str) -> Result<(), DecodeError> {
 	if token.starts_with('"') {
 		return Ok(());
 	}
-	// RawValue preserves number lexemes without converting them. The legacy
+	// RawValue preserves number lexemes without converting them. The serde
 	// String visitor first parses a numeric scalar, so overflow is Syntax/400
 	// while a finite wrong-type scalar is Data/422. Do not recursively inspect
-	// objects/arrays: the legacy string visitor rejects their type immediately.
+	// objects/arrays: the string visitor rejects their type immediately.
 	if token.as_bytes().first().is_some_and(|byte| matches!(byte, b'-' | b'0'..=b'9')) {
 		let _: serde_json::Number = serde_json::from_str(token).map_err(DecodeError::json)?;
 	}
@@ -89,7 +86,7 @@ impl<'de> serde::Deserialize<'de> for DiscardContent {
 	}
 }
 
-// Internally tagged legacy enums also accept sequences, with the tag first.
+// Internally tagged serde enums also accept sequences, with the tag first.
 // Probe it while retaining all actual field tokens for the concrete decoder.
 pub(super) struct SequenceTag<'a>(pub(super) &'a RawValue);
 impl<'de> serde::Deserialize<'de> for SequenceTag<'de> {

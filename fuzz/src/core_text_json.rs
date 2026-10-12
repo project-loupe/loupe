@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use loupe_core::text::policy::{JsonKey, JsonLeaf, Payload};
-use loupe_core::text::{BoundedJson, BoundedText, Identifier, JsonPolicy, Rule};
+use loupe_core::text::{JsonPolicy, Rule};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{Number, Value};
@@ -87,7 +87,7 @@ fn normalize(tree: &Raw, depth: usize, budget: &mut Budget) -> Option<Value> {
 		Raw::Scalar(value) => value.clone(),
 		Raw::Text(raw) => {
 			budget.text_bytes += raw.len();
-			Value::String(BoundedText::<JsonLeaf>::new(raw).ok()?.expose().to_owned())
+			Value::String(crate::fixtures::text::<JsonLeaf>(raw).ok()?.expose().to_owned())
 		},
 		Raw::Array(items) => Value::Array(
 			items.iter().map(|item| normalize(item, depth + 1, budget)).collect::<Option<_>>()?,
@@ -96,7 +96,7 @@ fn normalize(tree: &Raw, depth: usize, budget: &mut Budget) -> Option<Value> {
 			let mut seen = BTreeSet::new();
 			for (key, _) in entries {
 				budget.text_bytes += key.len();
-				Identifier::<JsonKey>::new(key).ok()?;
+				crate::fixtures::identifier::<JsonKey>(key).ok()?;
 				if !seen.insert(key) {
 					return None;
 				}
@@ -124,30 +124,42 @@ pub fn do_test(data: &[u8]) {
 		.and_then(|tree| normalize(&tree, 1, &mut Budget::default()))
 		.and_then(|value| serde_json::to_vec(&value).ok())
 		.filter(|bytes| bytes.len() <= Payload::MAX_BYTES);
-	let direct = BoundedJson::<Payload>::new(raw);
-	let embedded = serde_json::from_str::<BoundedJson<Payload>>(raw);
+	let direct = crate::fixtures::json::<Payload>(raw);
+	let embedded = loupe_core::text::fuzz_payload_visitor(raw);
 	assert_eq!(
 		direct.is_ok(),
 		expected.is_some() && raw.len() <= Payload::MAX_BYTES,
 		"raw bounded JSON acceptance disagrees with independent tree walk"
 	);
 	assert_eq!(
-		embedded.is_ok(),
+		embedded.is_some(),
 		expected.is_some(),
 		"embedded bounded JSON acceptance disagrees with independent tree walk"
 	);
 	if raw.len() <= Payload::MAX_BYTES {
-		assert_eq!(direct.as_ref().ok(), embedded.as_ref().ok(), "JSON entry points must agree");
+		assert_eq!(
+			direct.as_ref().ok().map(|value| (value.expose(), *value.digest())),
+			embedded.as_ref().map(|(text, digest)| (text.as_str(), *digest)),
+			"JSON entry points must agree"
+		);
 	}
-	for accepted in [direct.as_ref().ok(), embedded.as_ref().ok()].into_iter().flatten() {
+	if let Some((canonical, digest)) = &embedded {
+		assert_eq!(Some(canonical.as_bytes()), expected.as_deref());
+		assert_eq!(digest, blake3::hash(canonical.as_bytes()).as_bytes());
+		assert_eq!(loupe_core::text::fuzz_payload_visitor(canonical).as_ref(), embedded.as_ref());
+	}
+	if let Ok(accepted) = &direct {
 		assert_eq!(Some(accepted.canonical()), expected.as_deref());
 		assert_eq!(accepted.expose().as_bytes(), accepted.canonical());
 		assert_eq!(accepted.digest(), blake3::hash(accepted.canonical()).as_bytes());
 		assert_eq!(
 			format!("{accepted:?}"),
-			format!("BoundedJson<payload>(len={})", accepted.canonical().len())
+			format!("BoundedJson<payload, agent>(len={}, [redacted])", accepted.canonical().len())
 		);
-		assert_eq!(BoundedJson::<Payload>::new(accepted.expose()).as_ref().ok(), Some(accepted));
+		assert_eq!(
+			crate::fixtures::json::<Payload>(accepted.expose()).as_ref().ok(),
+			Some(accepted)
+		);
 	}
 	if let Err(error) = direct {
 		assert!(matches!(error.field, "payload" | "json_leaf" | "json_key"));

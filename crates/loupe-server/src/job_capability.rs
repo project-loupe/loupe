@@ -74,7 +74,7 @@ pub(crate) fn capability_admits(
 		&& row.lease_expires_at.is_some_and(|expiry| now <= expiry)
 }
 
-pub(crate) fn legacy_kind(kind: &JobKind) -> bool {
+pub(crate) fn legacy_kind<S: loupe_provenance::Source>(kind: &JobKind<S>) -> bool {
 	matches!(kind, JobKind::Scan | JobKind::Verify)
 }
 
@@ -194,7 +194,7 @@ mod decision_tests {
 			(JobKind::Verify, true),
 			(JobKind::Survey, false),
 			(JobKind::Drilldown, false),
-			(JobKind::Unknown("scan".into()), false),
+			(JobKind::Unknown(crate::test_support::text("scan")), false),
 		] {
 			assert_eq!(legacy_kind(&kind), expected);
 		}

@@ -51,15 +51,36 @@ impl FuzzSession {
 }
 
 pub fn normalize(workdir: &Path, file: &str) -> Result<String> {
-	normalize_submitted_file(workdir, file)
+	let args = json!({"severity":"high","title":"title","file":file,"line_start":1,"line_end":1,"description":"description","poc_unified":"diff"});
+	Ok(ingress::fuzz_support::finding_fixture(workdir, &args)?.file_path.expose().to_owned())
 }
 
 pub fn fingerprint(workdir: &Path, file: &str, start: u32, end: u32) -> String {
-	fingerprint_for(workdir, file, start, end)
+	fingerprint_for(workdir, file, start, end).for_submission().to_owned()
 }
 
-pub fn finding(workdir: &Path, args: &Value) -> Result<LlmFindingSubmission> {
-	ingress::fuzz_support::finding_fixture(workdir, args)
+#[derive(Debug)]
+pub struct FindingObservation {
+	pub file_path: String,
+	pub line_start: u32,
+	pub line_end: u32,
+	pub fingerprint: String,
+}
+/// Original MCP admission and mixed-source submission construction, before
+/// the final strict protocol validator. No temporary projection remains.
+pub fn finding(workdir: &Path, args: &Value) -> Result<FindingObservation> {
+	let finding = ingress::fuzz_support::finding_fixture(workdir, args)?;
+	Ok(FindingObservation {
+		file_path: finding.file_path.expose().to_owned(),
+		line_start: finding.line_start,
+		line_end: finding.line_end,
+		fingerprint: finding.fingerprint.for_submission().to_owned(),
+	})
+}
+
+/// The exact final strict validator used before local file/PoC checks.
+pub fn validate_finding(workdir: &Path, args: &Value) -> Result<()> {
+	ingress::fuzz_support::finding_fixture(workdir, args)?.validate().map_err(anyhow::Error::msg)
 }
 
 pub fn catalogue(verify: bool) -> Value {

@@ -9,6 +9,7 @@ use loupe_core::ReportingDestination;
 use loupe_proto::{
 	ListReposResponse, RegisterRepoResponse, RepoSummary, ReportingSetup, PROTOCOL_VERSION,
 };
+use loupe_provenance::Db;
 use loupe_storage::github_app;
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
@@ -16,7 +17,7 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 
-fn row_to_summary(r: RepoRow) -> RepoSummary {
+fn row_to_summary(r: RepoRow) -> RepoSummary<Db> {
 	RepoSummary {
 		reporting: Some((&r.reporting).into()),
 		id: r.id,
@@ -55,8 +56,10 @@ fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String
 /// what it can reach. Whether a GitHub App is actually configured is
 /// checked inside the writing transaction (see [`NO_APP_CONFIGURED`]),
 /// so a concurrent `DELETE /v1/github-app` cannot slip in between.
-fn check_github_credential(
-	state: &AppState, target_owner: &str, github_pat: Option<&str>,
+fn check_github_credential<S: loupe_provenance::Source>(
+	state: &AppState,
+	target_owner: &loupe_core::text::BoundedText<loupe_core::text::policy::RepoOwner, S>,
+	github_pat: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
 	match github_pat {
 		Some(pat) if pat.trim().is_empty() => {
@@ -87,7 +90,7 @@ enum ReportingWrite<T> {
 pub async fn create(
 	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<(StatusCode, Json<RegisterRepoResponse>), (StatusCode, String)> {
-	let input = crate::ingress::registry::RegisterRepoDecoder::decode_legacy(body)?;
+	let input = crate::ingress::registry::RegisterRepoDecoder::decode(body)?;
 	let req = input.request;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
@@ -117,8 +120,12 @@ pub async fn create(
 				ReportingSetup::GithubIssue { target_owner, target_repo, github_pat } => {
 					let pat_secret_id = match github_pat {
 						Some(github_pat) => {
-							let secret_label =
-								format!("pat:{}:{}/{}", parsed.0, target_owner, target_repo);
+							let secret_label = format!(
+								"pat:{}:{}/{}",
+								parsed.host.expose(),
+								target_owner.expose(),
+								target_repo.expose()
+							);
 							Some(secrets::insert(
 								&tx,
 								SecretKind::GithubPat,
@@ -151,12 +158,15 @@ pub async fn create(
 				&tx,
 				&NewRepo {
 					clone_url: req.clone_url.clone(),
-					host: parsed.0.clone(),
-					owner: parsed.1.clone(),
-					repo: parsed.2.clone(),
+					host: parsed.host.clone(),
+					owner: parsed.owner.clone(),
+					repo: parsed.repo.clone(),
 					default_branch: req.branch.clone(),
 					scan_interval_seconds: req.scan_interval_seconds.map(|v| v as i64),
-					scanner_config: req.scanner_config.clone(),
+					scanner_config: req
+						.scanner_config
+						.clone()
+						.expect("registration decoder always retains the scanner document"),
 					reporting,
 					verification_enabled: req
 						.verification_enabled
@@ -186,7 +196,7 @@ pub async fn create(
 /// `pat_secret_id` does not.
 pub async fn list(
 	State(state): State<AppState>, Query(qp): Query<ListQuery>,
-) -> Result<Json<ListReposResponse>, (StatusCode, String)> {
+) -> Result<Json<ListReposResponse<Db>>, (StatusCode, String)> {
 	let limit = positive_limit(qp.limit)?;
 	let rows = state
 		.db
@@ -207,7 +217,7 @@ pub async fn list(
 pub async fn update(
 	State(state): State<AppState>, Path(id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let req = crate::ingress::registry::UpdateRepoDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::UpdateRepoDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -248,7 +258,7 @@ pub async fn update(
 pub async fn rotate_github_pat(
 	State(state): State<AppState>, Path(id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let req = crate::ingress::registry::RotateRepoPatDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::RotateRepoPatDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -289,8 +299,12 @@ pub async fn rotate_github_pat(
 	};
 
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	let secret_label =
-		format!("pat:{host}:{target_owner}/{target_repo}:repo:{id}:replaces:{old_secret_id}");
+	let secret_label = format!(
+		"pat:{}:{}/{}:repo:{id}:replaces:{old_secret_id}",
+		host.expose(),
+		target_owner.expose(),
+		target_repo.expose()
+	);
 	let rotated = state
 		.db
 		.with_conn(|c| {
@@ -332,19 +346,19 @@ pub async fn rotate_github_pat(
 pub async fn set_github_reporting(
 	State(state): State<AppState>, Path(id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
-	let req = crate::ingress::registry::SetRepoGithubReportingDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::SetRepoGithubReportingDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
 			format!("unsupported protocol_version {}", req.protocol_version),
 		));
 	}
-	let target_owner = req.target_owner.trim().to_owned();
-	let target_repo = req.target_repo.trim().to_owned();
-	if target_owner.is_empty() {
+	let target_owner = req.target_owner;
+	let target_repo = req.target_repo;
+	if target_owner.expose().is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "target_owner must not be empty".into()));
 	}
-	if target_repo.is_empty() {
+	if target_repo.expose().is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "target_repo must not be empty".into()));
 	}
 	check_github_credential(
@@ -374,8 +388,11 @@ pub async fn set_github_reporting(
 			let new_secret_id = match &req.github_pat {
 				Some(github_pat) => {
 					let secret_label = format!(
-						"pat:{host}:{target_owner}/{target_repo}:repo:{id}:replaces:\
+						"pat:{}:{}/{}:repo:{id}:replaces:\
 						 {old_label_id}:at:{}",
+						host.expose(),
+						target_owner.expose(),
+						target_repo.expose(),
 						now.as_nanos(),
 					);
 					Some(secrets::insert(
@@ -444,7 +461,7 @@ pub async fn delete(
 /// URLs the host/owner triple is synthesized as
 /// `("local", "local", <last-path-component>)` so the rest of the
 /// schema (which requires non-empty values) stays happy.
-pub fn parse_github_clone_url(url: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_github_clone_url(url: &str) -> Option<(String, String, String)> {
 	if let Some(path) = url.strip_prefix("file://") {
 		let trimmed = path.trim_end_matches('/');
 		let last = trimmed.rsplit('/').find(|s| !s.is_empty())?;

@@ -50,7 +50,8 @@
 //! The domain JobKind enum is text-bearing through Unknown:
 //! ```compile_fail,E0308
 //! use loupe_core::{JobKind, security_event::emit};
-//! emit(JobKind::Unknown(String::from("untrusted-kind")));
+//! use loupe_provenance::Db;
+//! fn wrong(kind: JobKind<Db>) { emit(kind); }
 //! ```
 //! Arbitrary errors and callbacks are not a logging interface:
 //! ```compile_fail,E0308

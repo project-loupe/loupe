@@ -24,6 +24,7 @@ use loupe_core::{FindingState, JobKind, ReportingDestination};
 use loupe_proto::{
 	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyResponse, PROTOCOL_VERSION,
 };
+use loupe_provenance::{Agent, Db};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
 use loupe_storage::jobs::NewJob;
 use loupe_storage::{jobs, repos};
@@ -72,7 +73,7 @@ fn authorize_prior_finding_repo(
 
 pub async fn list_for_repo(
 	State(state): State<AppState>, Path(repo_id): Path<i64>, Query(qp): Query<ListQuery>,
-) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
+) -> Result<Json<ListFindingsResponse<Agent, Db>>, (StatusCode, String)> {
 	let limit = positive_limit(qp.limit)?.unwrap_or(LIST_DEFAULT_LIMIT);
 	let rows = state
 		.db
@@ -110,10 +111,10 @@ pub use crate::ingress::query::SearchQuery;
 pub async fn search(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>,
 	Path(repo_id): Path<i64>, qp: SearchQuery, headers: HeaderMap,
-) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
+) -> Result<Json<ListFindingsResponse<Agent, Db>>, (StatusCode, String)> {
 	authorize_prior_finding_repo(&state, &authed, &headers, repo_id)?;
 	let limit = qp.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
-	let sanitized = findings::sanitize_fts_query(&qp.q);
+	let sanitized = qp.q;
 	if sanitized.is_empty() {
 		// No usable terms — return empty rather than running an
 		// invalid FTS5 query that errors out.
@@ -124,7 +125,7 @@ pub async fn search(
 	}
 	let rows = state
 		.db
-		.with_conn(|c| Ok(findings::search(c, repo_id, &sanitized, limit)?))
+		.with_conn(|c| Ok(sanitized.search(c, repo_id, limit)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("searching findings: {e}")))?;
 	Ok(Json(ListFindingsResponse {
 		protocol_version: PROTOCOL_VERSION,
@@ -135,7 +136,7 @@ pub async fn search(
 pub async fn get(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
 	headers: HeaderMap,
-) -> Result<Json<FindingDetail>, (StatusCode, String)> {
+) -> Result<Json<FindingDetail<Agent, Db>>, (StatusCode, String)> {
 	let authorized_repo = if authed.is_admin() {
 		None
 	} else {
@@ -176,7 +177,7 @@ pub async fn get(
 pub async fn retry_verify(
 	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<Json<RetryVerifyResponse>, (StatusCode, String)> {
-	let req = crate::ingress::registry::RetryVerifyDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::RetryVerifyDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -316,7 +317,7 @@ pub async fn retry_verify(
 								&tx,
 								&NewJob {
 									repo_id: candidate.repo_id,
-									kind: JobKind::Verify,
+									kind: JobKind::<Db>::Verify,
 									incremental: false,
 									since_sha: None,
 									parent_job_id: Some(candidate.parent_job_id),
@@ -455,7 +456,7 @@ pub async fn reject(
 	}
 }
 
-fn row_to_summary(r: FindingRow) -> FindingSummary {
+fn row_to_summary(r: FindingRow) -> FindingSummary<Agent, Db> {
 	FindingSummary {
 		id: r.id,
 		repo_id: r.repo_id,
@@ -476,7 +477,7 @@ fn row_to_summary(r: FindingRow) -> FindingSummary {
 	}
 }
 
-fn row_to_detail(r: FindingRow) -> FindingDetail {
+fn row_to_detail(r: FindingRow) -> FindingDetail<Agent, Db> {
 	FindingDetail {
 		protocol_version: PROTOCOL_VERSION,
 		id: r.id,

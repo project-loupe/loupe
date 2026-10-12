@@ -5,7 +5,7 @@
 //! A 64 KiB input cap bounds filesystem churn, not the product parser's policy.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use loupe_worker::scanners::fuzz_source_discovery;
 
@@ -108,10 +108,16 @@ pub fn do_test(data: &[u8]) {
 	}
 	let excludes: Vec<_> =
 		(!exclude.is_empty()).then(|| exclude.into_owned()).into_iter().collect();
-	let selected = fuzz_source_discovery::walk(&root, &excludes);
+	let Ok(selected) = checked_walk(&root, &excludes) else { return };
 	#[cfg(unix)]
-	if manifest == PACKAGE && member == PACKAGE && excludes.is_empty() {
-		let mut expected = vec![root.join("modules/member/src/lib.rs")];
+	if manifest == PACKAGE
+		&& member == PACKAGE
+		&& (excludes.is_empty() || matches!(excludes.as_slice(), [value] if value == "dir:modules"))
+	{
+		let mut expected = Vec::new();
+		if excludes.is_empty() {
+			expected.push(root.join("modules/member/src/lib.rs"));
+		}
 		if mode & 1 == 0 {
 			expected.push(root.join("src/lib.rs"));
 		} else if mode & 4 != 0 {
@@ -135,15 +141,27 @@ pub fn do_test(data: &[u8]) {
 	assert!(selected.windows(2).all(|pair| pair[0] < pair[1]), "sources must be sorted and unique");
 	assert_eq!(
 		selected,
-		fuzz_source_discovery::walk(&root, &excludes),
+		checked_walk(&root, &excludes)
+			.unwrap_or_else(|_| panic!("repeat rejected admitted discovery fixture")),
 		"discovery must be deterministic"
 	);
+}
+
+fn checked_walk(root: &Path, excludes: &[String]) -> Result<Vec<PathBuf>, String> {
+	let selected = fuzz_source_discovery::walk(root, excludes);
+	let expected =
+		excludes.iter().all(|value| crate::worker_client_ingress::oracle::text(value, false));
+	assert_eq!(
+		selected.is_ok(),
+		expected,
+		"scanner exclusion admission differs from independent text policy"
+	);
+	selected
 }
 
 fn toml_values_equal(left: &toml::Value, right: &toml::Value) -> bool {
 	match (left, right) {
 		// TOML permits NaN, whose ordinary float equality is not reflexive.
-		// All other floats retain their existing equality semantics.
 		(toml::Value::Float(left), toml::Value::Float(right)) => {
 			left == right || (left.is_nan() && right.is_nan())
 		},
@@ -179,7 +197,7 @@ fn native_names() {
 		fs::create_dir_all(path.parent().unwrap_or(root))
 			.unwrap_or_else(|_| panic!("native parent"));
 		write(&path, b"fn selected() {}\n");
-		// Existing extension selection requires a UTF-8 leaf. A non-UTF-8
+		// Extension selection requires a UTF-8 leaf. A non-UTF-8
 		// directory with a representable leaf remains a native selected path.
 		if path.file_name().and_then(|name| name.to_str()).is_some() {
 			expected.push(path);
@@ -199,7 +217,8 @@ fn native_names() {
 	}
 	expected.sort();
 	assert_eq!(
-		fuzz_source_discovery::walk(root, &[]),
+		checked_walk(root, &[])
+			.unwrap_or_else(|_| panic!("native fixture rejected empty exclusions")),
 		expected,
 		"native source names acquired lossy aliases, cap or spelling changes"
 	);
@@ -224,6 +243,67 @@ pub unsafe extern "C" fn worker_source_discovery_run(data: *const u8, datalen: u
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn discovery_rejects_backspace_exclusion_without_panicking() {
+		super::do_test(include_bytes!(
+			"../test_cases/worker_source_discovery/rejected-exclude-backspace"
+		));
+	}
+
+	#[test]
+	fn discovery_rejects_other_forbidden_exclusions_without_panicking() {
+		for exclude in ["\u{1}", "\u{fdd0}"] {
+			let mut input = vec![0, 0, 0];
+			input.extend_from_slice(exclude.as_bytes());
+			super::do_test(&input);
+		}
+	}
+
+	#[test]
+	fn discovery_without_exclusions_preserves_every_source() {
+		for mode in 0..8 {
+			super::do_test(&fixture_input(mode, ""));
+		}
+	}
+
+	#[test]
+	fn discovery_filters_valid_exclusions_without_losing_siblings() {
+		for mode in 0..8 {
+			super::do_test(&fixture_input(mode, "dir:modules"));
+		}
+	}
+
+	#[test]
+	fn discovery_preserves_unicode_and_spaces_in_exclusions() {
+		let temp = tempfile::tempdir().unwrap_or_else(|_| panic!("unicode exclusion fixture"));
+		let root = temp.path();
+		super::write(&root.join("Cargo.toml"), super::PACKAGE);
+		std::fs::create_dir(root.join("src")).unwrap_or_else(|_| panic!("unicode source dir"));
+		for name in ["kept.rs", "spaced-é.rs", " spaced-é .rs"] {
+			super::write(&root.join("src").join(name), b"fn source() {}\n");
+		}
+		let excludes = [" spaced-é ".to_owned()];
+		let expected = vec![root.join("src/kept.rs"), root.join("src/spaced-é.rs")];
+		for _ in 0..2 {
+			let selected = super::checked_walk(root, &excludes)
+				.unwrap_or_else(|_| panic!("valid Unicode and space exclusion rejected"));
+			assert_eq!(
+				selected, expected,
+				"exclusion spelling changed or valid siblings were lost"
+			);
+		}
+	}
+
+	fn fixture_input(mode: u8, exclude: &str) -> Vec<u8> {
+		let mut input = vec![mode];
+		input.extend_from_slice(super::PACKAGE);
+		input.push(0);
+		input.extend_from_slice(super::PACKAGE);
+		input.push(0);
+		input.extend_from_slice(exclude.as_bytes());
+		input
+	}
+
 	#[test]
 	fn discovery_accepts_member_nan_manifest() {
 		super::do_test(include_bytes!("../test_cases/worker_source_discovery/member-nan"));

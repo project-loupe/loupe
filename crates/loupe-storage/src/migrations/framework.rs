@@ -77,14 +77,7 @@ fn validate_foreign_keys(conn: &Connection) -> MigrationResult {
 		let mut failure = Failure::new(Stage::ForeignKeyCheck, Reason::ForeignKeyViolation);
 		// Only code-owned names are diagnostic metadata. Unrecognized schema
 		// identifiers are untrusted text and must not reach Display or Debug.
-		failure.table = match table.as_str() {
-			"jobs" => Some("jobs"),
-			"findings" => Some("findings"),
-			"finding_verifications" => Some("finding_verifications"),
-			"scan_history" => Some("scan_history"),
-			"registered_repos" => Some("registered_repos"),
-			_ => None,
-		};
+		failure.table = super::admission::known_table(&table);
 		failure.rowid = rowid;
 		return Err(failure);
 	}

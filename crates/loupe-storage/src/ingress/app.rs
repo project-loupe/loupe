@@ -53,7 +53,7 @@ impl Validate<&[u8], Db> for App {
 			serde_json::from_slice(bytes.expose()).map_err(|_| ReadError::Syntax)?;
 		let slug = slug(&mark, raw.slug)?;
 		// Named intentional credential decode, guarded immediately. PEM
-		// syntax/authentication remain with the existing credential consumer.
+		// syntax/authentication remain with the credential consumer.
 		let private_key_pem = serde_json::from_str::<String>(raw.private_key_pem.get())
 			.map(Secret::new)
 			.map_err(|_| ReadError::Syntax)?;
@@ -76,20 +76,17 @@ impl Validate<&[u8], Db> for Summary {
 fn app_error(error: ReadError) -> rusqlite::Error {
 	rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(error))
 }
-pub(crate) fn app_legacy(row: &Row<'_>) -> rusqlite::Result<crate::github_app::StoredGithubApp> {
+pub(crate) fn app(row: &Row<'_>) -> rusqlite::Result<crate::github_app::StoredGithubApp<Db>> {
 	let marked = blob(row, 0)?.validate(App).map_err(app_error)?;
 	Ok(crate::github_app::StoredGithubApp {
 		app_id: marked.app_id,
-		slug: marked.slug.expose().to_owned(),
+		slug: marked.slug,
 		private_key_pem: marked.private_key_pem,
 	})
 }
-pub(crate) fn app_summary_legacy(
+pub(crate) fn app_summary(
 	row: &Row<'_>,
 ) -> rusqlite::Result<crate::github_app::StoredGithubAppSummary> {
 	let marked = blob(row, 0)?.validate(Summary).map_err(app_error)?;
-	Ok(crate::github_app::StoredGithubAppSummary {
-		app_id: marked.app_id,
-		slug: marked.slug.expose().to_owned(),
-	})
+	Ok(crate::github_app::StoredGithubAppSummary { app_id: marked.app_id, slug: marked.slug })
 }

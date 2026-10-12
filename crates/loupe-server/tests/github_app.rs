@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
-use loupe_proto::{
+use common::wire::{
 	GithubAppResponse, RegisterWorkerRequest, RegisterWorkerResponse, SetGithubAppRequest,
 	PROTOCOL_VERSION,
 };
@@ -87,28 +87,27 @@ impl Fixture {
 async fn bring_up(stub_app_id: u64) -> Fixture {
 	let (stub_addr, stub) = spawn_app_stub(stub_app_id).await;
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(tmp.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_cert).unwrap(),
-		),
-		server_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_key).unwrap(),
-		),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.ca_key).unwrap(),
-		),
+		server_cert_pem: init.layout.server_cert.read_tls_pem().unwrap(),
+		server_key_pem: init.layout.server_key.read_tls_pem().unwrap(),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: init.layout.ca_key.read_tls_pem().unwrap(),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&format!("http://{stub_addr}")).unwrap());
 	let state = AppState::new(db, Arc::new(ca), reporter);
 	let handle = serve(cfg, state).await.unwrap();
@@ -119,7 +118,7 @@ async fn bring_up(stub_app_id: u64) -> Fixture {
 		.use_rustls_tls()
 		.build()
 		.unwrap();
-	let db_path = init.layout.db_path.clone();
+	let db_path = init.layout.db_path.as_path().to_path_buf();
 	std::mem::forget(tmp);
 	Fixture { handle, admin, ca_cert_pem, db_path, stub }
 }

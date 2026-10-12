@@ -14,4 +14,7 @@ pub use regex_secrets::RegexSecretsScanner;
 
 #[cfg(fuzzing)]
 pub use crate::source_discovery::fuzz_support as fuzz_source_discovery;
-pub use crate::source_discovery::ScannerConfig as LlmScannerConfig;
+pub use crate::source_discovery::{
+	ScannerConfig as LlmScannerConfig, ScannerConfigPatch, ScannerExcludePattern, ScannerExtension,
+	ScannerList,
+};

@@ -1,33 +1,18 @@
-//! Strict paths plus the two legacy validators: disagreements are D17 inputs,
-//! not a demand to tighten legacy behavior during S1.
-
-use loupe_core::text::RepoPath;
-use loupe_proto::{validate_llm_finding_submission, LlmFindingSubmission, PROTOCOL_VERSION};
+//! Strict source-owned paths plus lexical predicates. The lexical
+//! observation is not an unlabelled full submission construction entry point.
 
 use crate::utils::test_logger;
 
 pub fn legacy_acceptance(path: &str) -> (bool, bool) {
-	let finding = LlmFindingSubmission {
-		protocol_version: PROTOCOL_VERSION,
-		severity: loupe_core::Severity::High,
-		title: "A valid example title".into(),
-		description: "description ".repeat(10),
-		file_path: path.into(),
-		line_start: 1,
-		line_end: 1,
-		cwe: None,
-		poc_unified: "--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
-		fingerprint: "a".repeat(64),
-	};
 	(
-		validate_llm_finding_submission(&finding).is_ok(),
+		loupe_proto::fuzz_llm_path_is_normalized(path),
 		loupe_worker::mcp::normalize_path_component_rules(path).is_ok(),
 	)
 }
 
 pub fn do_test(data: &[u8]) {
 	let Ok(path) = std::str::from_utf8(data) else { return };
-	if let Ok(strict) = RepoPath::new(path) {
+	if let Ok(strict) = crate::fixtures::path(path) {
 		assert_eq!(strict.expose(), path);
 		assert!(path.len() <= 512);
 		assert!(!path.contains(['\\', '\0']));
@@ -67,15 +52,15 @@ mod tests {
 	#[test]
 	fn recorded_legacy_disagreements_stay_explicit() {
 		for path in ["a//b", "a/./b", "a/", "a\\b", "a\0b", "a\nb"] {
-			assert!(RepoPath::new(path).is_err());
+			assert!(crate::fixtures::path(path).is_err());
 			assert_eq!(legacy_acceptance(path), (true, true), "{path:?}");
 		}
 		for path in ["./a", "/workdir/a"] {
-			assert!(RepoPath::new(path).is_err());
+			assert!(crate::fixtures::path(path).is_err());
 			assert_eq!(legacy_acceptance(path), (false, true), "{path:?}");
 		}
 		let long = "a".repeat(513);
-		assert!(RepoPath::new(&long).is_err());
+		assert!(crate::fixtures::path(&long).is_err());
 		assert_eq!(legacy_acceptance(&long), (true, true));
 	}
 }

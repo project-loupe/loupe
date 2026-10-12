@@ -1,12 +1,12 @@
 # Direct web boundary coverage
 
 The `web_api` and `web_server_response` fuzz targets call the actual router.
-Forwarded requests therefore use the private `AdminClient::call_forward` path
-and the named Browser/Server validators. The old public Value-returning client
-facade is not the response target's entry.
+Forwarded requests use the closed `AdminRequest` dispatch and the named
+Browser/Server owners through their selected HTTP sinks. No public Value-returning
+client facade exists.
 
 `fuzz_support` exists only under `cfg(fuzzing)`. It exposes observations and
-three fixed Config parser choices, the actual selected Config read, and the
+three fixed Config parser choices, native admission followed by the selected Config read, and the
 pure query byte-budget seam. It cannot return an ingress token or marked owner,
 select a source, or decode an arbitrary type. The normal-build documentation
 test verifies that this module is absent. These fixtures introduce no new
@@ -46,7 +46,7 @@ by a static suffix matches the route and receives the fixed 400 path error
 after Guard/Token/Path validation. Both cases make no upstream request.
 
 Typed query observations accept only `BoundedText<P, Browser>` and occur before
-the temporary string projection. Body observations inspect the concrete owner
+the selected reqwest query encoder. Body observations inspect the concrete owner
 and compare its bytes pointer with the actual validator input while both are
 live. They check the owner's real redacted Debug output.
 
@@ -100,14 +100,19 @@ whole-process erasure claim is introduced.
 
 ## Atomic M join
 
-The normal-build exits remain exactly those listed in `INGRESS.md`: query
-strings, body/response forwarding, opaque health and Config public values.
-The cfg-only observations sit immediately before those exits or inside their
-fixed validators. At M they must follow the final typed outputs, and the three
-Config fixture callbacks must follow their concrete replacement interfaces;
-they cannot justify retaining legacy exits, public source casts, or a generic
-decoder. Original Server bytes remain retained through the current opaque
-owner. Final field-level Agent carries remain an M obligation for consumers
-that interpret those fields. The dashboard's transparent forwarding retains
-Server ownership, including its existing lossy UTF-8 view; it does not assign
-Agent provenance to replacement or reencoded bytes.
+Normal builds retain Browser/Server/Config owners through the final named sinks
+listed in `INGRESS.md`. The cfg-only observations remain inside their concrete
+validators or just before their selected HTTP/TLS encoders. They do not justify
+source casts, arbitrary decoders or raw conversion APIs.
+
+The router fixture admits its upstream URL through actual Clap before passing
+ConfigUrl to AdminClient::from_parts. The selected-PEM fixture now also admits
+each supplied raw/base64/native-path value through the actual native parser.
+Its trace therefore records those supplied-input admissions before the original
+Raw/Base64/File selection event. The two ConfigSelected observations still
+compare the same live guarded allocation before and after selection. Oracles
+check parser and selection observations separately by owner.
+
+Original Server bytes and the compatible lossy view remain source-bound through
+transparent forwarding. Consumers that interpret finding fields elsewhere still
+require original-token Agent attribution; this proxy assigns none.

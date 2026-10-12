@@ -31,7 +31,7 @@ use super::mcp::{
 use super::model_broker::{
 	bind_model_into_sandbox, ModelBrokerBackend, ModelBrokerContext, SANDBOX_MODEL_SOCKET,
 };
-use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
+use super::{CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
 
 const BACKEND_ID: &str = "claude-cli";
@@ -100,7 +100,7 @@ fn prepare_mcp_scratch(ctx: &McpContext, broker: &McpBroker, repo_id: i64) -> Re
 				"type": "stdio",
 				"command": SANDBOX_BKB_MCP_BIN,
 				"args": [],
-				"env": { "BKB_API_URL": ctx.bkb_api_url.as_str() }
+				"env": { "BKB_API_URL": ctx.bkb_api_url.for_operation() }
 			}),
 		);
 	}
@@ -133,8 +133,8 @@ impl ClaudeCliBackend {
 		Self {
 			bin: CLAUDE_BIN.to_owned(),
 			agent: CliModelConfig {
-				model: DEFAULT_CLAUDE_MODEL.to_owned(),
-				effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
+				model: crate::config::ConfiguredText::Builtin(DEFAULT_CLAUDE_MODEL),
+				effort: crate::config::ConfiguredText::Builtin(DEFAULT_CLAUDE_EFFORT),
 			},
 			mcp: None,
 			model_broker: None,
@@ -209,9 +209,9 @@ impl LlmBackend for ClaudeCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			workdir = %req.workdir.display(),
-			model = %self.agent.model,
-			effort = %self.agent.effort,
-			prompt_chars = req.prompt.chars().count(),
+			model = %self.agent.model.for_operation(),
+			effort = %self.agent.effort.for_operation(),
+			prompt_chars = req.prompt.for_cli_argument().chars().count(),
 			timeout_ms = req.timeout.as_millis() as u64,
 			"claude-cli: invoking",
 		);
@@ -248,7 +248,7 @@ impl LlmBackend for ClaudeCliBackend {
 				.mcp
 				.as_ref()
 				.filter(|ctx| ctx.bkb_mcp_path.is_some())
-				.map(|ctx| ctx.bkb_api_url.as_str());
+				.map(|ctx| ctx.bkb_api_url.for_operation());
 			let required_hosts = super::required_network_hosts(bkb_api_url)?;
 			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
 				sandbox_builder
@@ -304,7 +304,7 @@ impl LlmBackend for ClaudeCliBackend {
 			_ => None,
 		};
 
-		let mut agent_args = claude_invocation_args(&self.agent, &req.prompt);
+		let mut agent_args = claude_invocation_args(&self.agent, req.prompt.for_cli_argument());
 		if _mcp_scratch.is_some() {
 			agent_args.extend(claude_mcp_args().into_iter().map(str::to_owned));
 		}
@@ -396,8 +396,8 @@ impl LlmBackend for ClaudeCliBackend {
 
 		let output_truncated = stdout.truncated || stderr.truncated;
 		if !status.success() {
-			let stderr_text = stderr.diagnostic().into_legacy();
-			let stdout_text = stdout.diagnostic().into_legacy();
+			let stderr_text = stderr.diagnostic();
+			let stdout_text = stdout.diagnostic();
 			tracing::debug!(
 				backend = BACKEND_ID,
 				exit = ?status.code(),
@@ -411,14 +411,14 @@ impl LlmBackend for ClaudeCliBackend {
 			// both so the operator's log shows whichever the CLI
 			// chose. Trim and truncate so a multi-MB diagnostic dump
 			// doesn't drown the log line.
-			let combined = format!(
-				"stderr(chars={})=`{}` stdout(chars={})=`{}`",
-				stderr_text.chars().count(),
-				summarize_cli_stream_for_error(&stderr_text, MAX_CLI_DIAGNOSTIC_CHARS),
-				stdout_text.chars().count(),
-				summarize_cli_stream_for_error(&stdout_text, MAX_CLI_DIAGNOSTIC_CHARS),
-			);
-			return Err(anyhow!("claude CLI exited with {}: {}", status, combined));
+			return Err(super::cli_output::CliProcessFailure {
+				backend: "claude",
+				status,
+				stderr: stderr_text,
+				stdout: stdout_text,
+				max_chars: MAX_CLI_DIAGNOSTIC_CHARS,
+			}
+			.into());
 		}
 		// Reported last: a CLI failure explains a broker failure, so the
 		// CLI diagnostic is the more useful error to surface.
@@ -430,10 +430,7 @@ impl LlmBackend for ClaudeCliBackend {
 				"claude CLI output exceeds {MAX_CLI_OUTPUT_BYTES} bytes per stream"
 			));
 		}
-		let text = stdout
-			.text()
-			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?
-			.into_legacy();
+		let text = stdout.text().map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
 		// Debug instrumentation hooks (no-ops when env vars unset):
 		//
 		// - worker config `[logging].agent_output = true` dumps the full
@@ -446,14 +443,14 @@ impl LlmBackend for ClaudeCliBackend {
 		if self.log_agent_output {
 			tracing::info!(
 				backend = BACKEND_ID,
-				agent_stdout = %text,
+				agent_stdout = %text.for_log(),
 				"claude-cli: agent stdout (full)"
 			);
 			if !stderr.is_empty() {
-				let stderr_text = stderr.diagnostic().into_legacy();
+				let stderr_text = stderr.diagnostic();
 				tracing::info!(
 					backend = BACKEND_ID,
-					agent_stderr = %stderr_text,
+					agent_stderr = %stderr_text.for_log(),
 					"claude-cli: agent stderr (full)"
 				);
 			}
@@ -461,7 +458,7 @@ impl LlmBackend for ClaudeCliBackend {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			elapsed_ms = started.elapsed().as_millis() as u64,
-			stdout_chars = text.chars().count(),
+			stdout_chars = text.for_log().chars().count(),
 			stderr_chars = stderr.len(),
 			"claude-cli: subprocess succeeded",
 		);
@@ -492,9 +489,9 @@ fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 	vec![
 		"--dangerously-skip-permissions".to_owned(),
 		"--model".to_owned(),
-		agent.model.clone(),
+		agent.model.for_operation().to_owned(),
 		"--effort".to_owned(),
-		agent.effort.clone(),
+		agent.effort.for_operation().to_owned(),
 		"--no-session-persistence".to_owned(),
 		"-p".to_owned(),
 		prompt.to_owned(),
@@ -522,7 +519,7 @@ mod tests {
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let result = backend
 			.run(LlmRequest {
-				prompt: "fixture".into(),
+				prompt: crate::llm::prompts::Prompt::instruction("fixture"),
 				workdir: workdir.path().to_owned(),
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
@@ -711,7 +708,7 @@ mod tests {
 			.with_network_disabled_for_tests()
 			.with_model_broker_context(model_broker);
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -723,7 +720,7 @@ mod tests {
 
 		let response = backend.run(req).await.expect("fake Claude CLI should run");
 		assert_eq!(
-			response.text.trim(),
+			response.text.for_log().trim(),
 			"SAFE",
 			"the sandbox must receive only local broker configuration, not host auth"
 		);
@@ -784,7 +781,7 @@ mod tests {
 		let backend = ClaudeCliBackend::with_bin("loupe-worker-no-such-bin")
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -822,7 +819,7 @@ mod tests {
 			.with_sandbox_disabled_for_tests()
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_millis(500),
 			cancel: CancellationToken::new(),
@@ -855,7 +852,10 @@ mod tests {
 	#[test]
 	fn invocation_args_include_configured_model_and_effort() {
 		let args = claude_invocation_args(
-			&CliModelConfig { model: "claude-test".into(), effort: "xhigh".into() },
+			&CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
 			"hello",
 		);
 

@@ -2,9 +2,8 @@
 //! mark scope through matching and source-bearing finding construction.
 use std::path::PathBuf;
 
-use loupe_core::source_migration::text::{BoundedText, RepoPath};
-use loupe_core::source_migration::Finding;
-use loupe_core::Severity;
+use loupe_core::text::{BoundedText, RepoPath};
+use loupe_core::{Finding, Severity};
 use loupe_provenance::{Mark, Repo, Unvalidated, Validate};
 
 pub(super) struct RepoFileInput {
@@ -64,29 +63,14 @@ impl Validate<RepoFileInput, Repo> for RegexSecretFindings<'_> {
 	}
 }
 impl RepoFinding {
-	/// Temporary concrete Scanner::scan exit. M changes the trait to Repo
-	/// findings; no Agent mark is introduced by this projection.
-	pub(super) fn into_legacy(self) -> loupe_core::Finding {
+	pub(super) fn into_finding(self) -> Finding<Repo> {
 		#[cfg(fuzzing)]
 		observe::record(&self.0);
-		let f = self.0;
-		loupe_core::Finding {
-			scanner_id: f.scanner_id.expose().to_owned(),
-			severity: f.severity,
-			title: f.title.expose().to_owned(),
-			description: f.description.expose().to_owned(),
-			file_path: f.file_path.map(|v| v.expose().to_owned()),
-			line_start: f.line_start,
-			line_end: f.line_end,
-			cwe: f.cwe.map(|v| v.expose().to_owned()),
-			patch_unified: None,
-			poc_unified: None,
-			fingerprint: f.fingerprint.expose().to_owned(),
-		}
+		self.0
 	}
 }
 
-/// Observe the actual Repo-typed result immediately before its temporary exit.
+/// Observe the actual Repo-typed scanner result.
 #[cfg(fuzzing)]
 pub(super) mod observe {
 	use std::cell::RefCell;

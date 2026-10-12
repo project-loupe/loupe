@@ -42,13 +42,15 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+pub(crate) use ingress::McpFindingSubmission;
+pub use ingress::QueryText;
 use loupe_core::format_finding_id;
 #[cfg(test)]
-use loupe_core::{Finding, Severity};
+use loupe_core::Severity;
+use loupe_proto::JobCapability;
 #[cfg(test)]
 use loupe_proto::PROTOCOL_VERSION;
-use loupe_proto::{validate_llm_finding_submission, JobCapability, LlmFindingSubmission};
-use loupe_provenance::{Ingress, Repo, Sandbox, Untrusted};
+use loupe_provenance::{Agent, Ingress, Repo, Sandbox, Untrusted};
 #[cfg(test)]
 use serde::Deserialize;
 use serde::Serialize;
@@ -72,36 +74,14 @@ const LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
 /// staying narrow enough that touching the bug body shifts it.
 const FINGERPRINT_CONTEXT_LINES: u32 = 2;
 
-/// Pull a required string argument out of an MCP `tools/call` payload.
-/// Compresses the `args.get(k).and_then(as_str).context(...)` triplet
-/// repeated across every tool handler.
-#[cfg(test)]
-fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-	args.get(key)
-		.and_then(|v| v.as_str())
-		.with_context(|| format!("`{key}` argument is required and must be a string"))
-}
-
-/// Pull a required positive `u32` argument out of an MCP `tools/call`
-/// payload. Saturates at `u32::MAX` so a model that emits an absurdly
-/// large line number doesn't poison downstream arithmetic — line
-/// counts are 1-indexed and capped well below 4 billion in any real
-/// source file.
-#[cfg(test)]
-fn arg_u32(args: &Value, key: &str) -> Result<u32> {
-	let v = args
-		.get(key)
-		.and_then(|v| v.as_u64())
-		.with_context(|| format!("`{key}` argument is required and must be a positive integer"))?;
-	Ok(v.min(u32::MAX as u64) as u32)
-}
-
-fn normalize_submitted_file(workdir: &Path, file: &str) -> Result<String> {
-	let rel = PathBuf::from(normalize_path_component_rules(file)?);
+fn check_submitted_membership(
+	workdir: &Path, file: &loupe_core::text::RepoPath<Agent>,
+) -> Result<Option<repo_ingress::ObservedSubmittedPath>> {
+	let rel = Path::new(file.expose());
 	let workdir = workdir.canonicalize().with_context(|| {
 		format!("canonicalizing workdir {} before validating submitted path", workdir.display())
 	})?;
-	let candidate = workdir.join(&rel);
+	let candidate = workdir.join(rel);
 	if candidate.exists() {
 		let canonical = candidate
 			.canonicalize()
@@ -109,15 +89,16 @@ fn normalize_submitted_file(workdir: &Path, file: &str) -> Result<String> {
 		// SAFETY: native canonical path returned by the actual filesystem.
 		#[allow(unsafe_code)]
 		let canonical = Untrusted::new(canonical, unsafe { Ingress::<Repo>::new() });
-		canonical
+		let observed = canonical
 			.validate(repo_ingress::SubmittedPathMembership { workdir: &workdir })
 			.with_context(|| format!("`file` resolves outside the workdir: {}", rel.display()))?;
+		return Ok(Some(observed));
 	}
-	Ok(rel.to_string_lossy().into_owned())
+	Ok(None)
 }
 
-/// Legacy lexical normalization, independent of filesystem containment.
-/// Keep its acceptance distinct from `RepoPath` until legacy paths migrate.
+/// Existing lexical normalization, independent of filesystem containment.
+/// Its acceptance remains distinct from the first `RepoPath` admission.
 pub fn normalize_path_component_rules(file: &str) -> Result<String> {
 	let stripped = file.strip_prefix("/workdir/").unwrap_or(file);
 	let path = Path::new(stripped);
@@ -206,12 +187,12 @@ struct VerifySessionState {
 struct VerifySessionInner {
 	/// Locked on first `submit_verdict`. A second call returns an
 	/// error so the agent can't revise mid-session.
-	verdict: Option<loupe_core::Verdict>,
+	verdict: Option<loupe_core::Verdict<Agent>>,
 	/// Locked on first `submit_patch`. Held separately from the
 	/// verdict's own `patch` field so we can pin "patch tool was
 	/// called once" even if the merge into Verdict::Confirmed
 	/// happens later, at flush time.
-	patch: Option<loupe_core::VerdictPatch>,
+	patch: Option<loupe_core::VerdictPatch<Agent>>,
 }
 
 /// JSON-RPC 2.0 envelope shapes. Kept small — we don't need batch
@@ -732,7 +713,7 @@ async fn handle_decoded_tool_call(
 					&session.client,
 					&session.job_capability,
 					session.repo_id,
-					args.query.expose(),
+					&args.query,
 					args.limit,
 				)
 				.await
@@ -741,11 +722,13 @@ async fn handle_decoded_tool_call(
 				get_finding_by_id(&session.client, &session.job_capability, finding_id).await
 			},
 			ingress::Arguments::Finding(args) => tool_submit_finding(session, args).await,
-			ingress::Arguments::Poc(diff) => validate_diff(&session.workdir, diff.expose()).await,
+			ingress::Arguments::Poc(diff) => {
+				validate_diff(&session.workdir, AgentDiff::Poc(&diff)).await
+			},
 			ingress::Arguments::Verdict(args) => submit_verdict(session, args).await,
 			ingress::Arguments::Patch(args) => submit_patch(session, args).await,
 			ingress::Arguments::ValidatePatch(diff) => {
-				validate_diff(&session.workdir, diff.expose()).await
+				validate_diff(&session.workdir, AgentDiff::Patch(&diff)).await
 			},
 		},
 	};
@@ -804,8 +787,12 @@ async fn get_finding_by_id(
 		.get_finding(id, job_capability)
 		.await
 		.with_context(|| format!("calling /v1/findings/{id}"))?;
-	let loc = format_location(detail.file_path.as_deref(), detail.line_start, detail.line_end);
-	let mut out = String::with_capacity(detail.description.len() + 256);
+	let loc = format_location(
+		detail.file_path.as_ref().map(|v| v.expose()),
+		detail.line_start,
+		detail.line_end,
+	);
+	let mut out = String::with_capacity(detail.description.expose().len() + 256);
 	let _ = std::fmt::Write::write_fmt(
 		&mut out,
 		format_args!(
@@ -814,33 +801,34 @@ async fn get_finding_by_id(
 			detail.severity,
 			detail.state,
 			loc,
-			detail.title,
+			detail.title.expose(),
 		),
 	);
 	if let Some(cwe) = &detail.cwe {
-		let _ = std::fmt::Write::write_fmt(&mut out, format_args!("CWE: {cwe}\n"));
+		let _ = std::fmt::Write::write_fmt(&mut out, format_args!("CWE: {}\n", cwe.expose()));
 	}
 	out.push_str("\nDescription:\n");
-	out.push_str(&detail.description);
+	out.push_str(detail.description.expose());
 	if let Some(poc) = &detail.poc_unified {
 		out.push_str("\n\nProof of concept (unified diff):\n");
-		out.push_str(poc);
+		out.push_str(poc.expose());
 	}
 	if let Some(patch) = &detail.patch_unified {
 		out.push_str("\n\nSuggested fix (unified diff):\n");
-		out.push_str(patch);
+		out.push_str(patch.expose());
 	}
 	Ok(out)
 }
 
 async fn query_prior_findings(
-	client: &Arc<ServerClient>, job_capability: &JobCapability, repo_id: i64, query: &str,
-	limit: i64,
+	client: &Arc<ServerClient>, job_capability: &JobCapability, repo_id: i64,
+	query: &loupe_core::text::BoundedText<QueryText, Agent>, limit: i64,
 ) -> Result<String> {
 	let resp = client
 		.search_findings(repo_id, job_capability, query, limit)
 		.await
 		.context("calling /v1/repos/:id/findings/search")?;
+	let query = query.expose();
 
 	if resp.findings.is_empty() {
 		return Ok(format!(
@@ -855,56 +843,29 @@ async fn query_prior_findings(
 	for f in &resp.findings {
 		// Search summaries don't include line_end; pass None so the
 		// helper renders `path:line` instead of falling through.
-		let loc = format_location(f.file_path.as_deref(), f.line_start, None);
+		let loc = format_location(f.file_path.as_ref().map(|v| v.expose()), f.line_start, None);
 		out.push_str(&format!(
 			"- {} [{:?}] state={} {} — {}\n",
 			format_finding_id(f.id),
 			f.severity,
 			f.state,
 			loc,
-			f.title,
+			f.title.expose(),
 		));
 	}
 	Ok(out)
 }
 
-/// Build a [`Finding`] from `submit_finding` arguments.
+/// Build a mixed-source submission from `submit_finding` arguments.
 ///
 /// Pure function — extracted from `tool_submit_finding` so tests can
 /// exercise the fingerprint / clamp / parse logic without standing
 /// up an MCP server or a real HTTP backend.
 #[cfg(test)]
-pub(crate) fn build_finding_from_args(workdir: &Path, args: &Value) -> Result<Finding> {
-	let severity_str = arg_str(args, "severity")?;
-	let severity: Severity =
-		severity_str.parse().with_context(|| format!("unknown severity: `{severity_str}`"))?;
-	let title = arg_str(args, "title")?.to_owned();
-	let file = arg_str(args, "file")?;
-	let line_start = arg_u32(args, "line_start")?;
-	let line_end = arg_u32(args, "line_end")?;
-	let description = arg_str(args, "description")?.to_owned();
-	let poc_unified = arg_str(args, "poc_unified")?.to_owned();
-	let cwe = args.get("cwe").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
-
-	// Sandbox-leak guard: the agent occasionally echoes the in-bwrap
-	// path. Normalize it to a repo-relative path and reject traversal
-	// before reading source for the fingerprint.
-	let rel_file = normalize_submitted_file(workdir, file)?;
-	let fingerprint = fingerprint_for(workdir, &rel_file, line_start, line_end);
-
-	Ok(Finding {
-		scanner_id: SCANNER_ID.into(),
-		severity,
-		title,
-		description,
-		file_path: Some(rel_file),
-		line_start: Some(line_start),
-		line_end: Some(line_end),
-		cwe,
-		patch_unified: None,
-		poc_unified: Some(poc_unified),
-		fingerprint,
-	})
+pub(crate) fn build_finding_from_args(
+	workdir: &Path, args: &Value,
+) -> Result<McpFindingSubmission> {
+	ingress::fuzz_support::finding_fixture(workdir, args)
 }
 
 async fn tool_submit_finding(
@@ -915,9 +876,9 @@ async fn tool_submit_finding(
 		 nowhere to attribute the submission. This is a worker-side configuration \
 		 bug — the tool should not have been advertised.",
 	)?;
-	let submission = args.into_legacy_submission(&session.workdir)?;
-	let file = &submission.file_path;
-	let fingerprint = &submission.fingerprint;
+	let submission = args.into_submission(&session.workdir)?;
+	let file = submission.file_path.expose();
+	let fingerprint = submission.fingerprint.for_submission();
 	validate_local_llm_submission(&session.workdir, &submission).await?;
 	session
 		.client
@@ -935,41 +896,41 @@ async fn tool_submit_finding(
 }
 
 async fn validate_local_llm_submission(
-	workdir: &Path, submission: &LlmFindingSubmission,
+	workdir: &Path, submission: &McpFindingSubmission,
 ) -> Result<()> {
-	validate_llm_finding_submission(submission).map_err(anyhow::Error::msg)?;
-	let path = workdir.join(&submission.file_path);
+	submission.validate().map_err(anyhow::Error::msg)?;
+	let path = workdir.join(submission.file_path.expose());
 	// Repository-sized reads on the broker's runtime thread: the
 	// discovery scanner fans out one agent session per file, so a
 	// blocking read here stalls every other session's tool calls.
-	let metadata = tokio::fs::metadata(&path)
-		.await
-		.with_context(|| format!("submitted file does not exist: {}", submission.file_path))?;
+	let metadata = tokio::fs::metadata(&path).await.with_context(|| {
+		format!("submitted file does not exist: {}", submission.file_path.expose())
+	})?;
 	if !metadata.is_file() {
-		anyhow::bail!("submitted path is not a regular file: {}", submission.file_path);
+		anyhow::bail!("submitted path is not a regular file: {}", submission.file_path.expose());
 	}
 	let source = tokio::fs::read(&path)
 		.await
-		.with_context(|| format!("reading submitted file {}", submission.file_path))?;
+		.with_context(|| format!("reading submitted file {}", submission.file_path.expose()))?;
 	// SAFETY: original bytes read from the submitted repository file.
 	#[allow(unsafe_code)]
 	let source = Untrusted::new(source, unsafe { Ingress::<Repo>::new() });
 	let line_count = source
 		.as_bytes()
 		.validate(repo_ingress::LocalFindingSource)
-		.with_context(|| format!("reading submitted file {}", submission.file_path))?;
+		.with_context(|| format!("reading submitted file {}", submission.file_path.expose()))?;
 	if u64::from(submission.line_end) > line_count {
 		anyhow::bail!(
 			"line_end {} exceeds {} lines in {}",
 			submission.line_end,
 			line_count,
-			submission.file_path
+			submission.file_path.expose()
 		);
 	}
-	match check_diff_applies(workdir, &submission.poc_unified).await? {
+	match check_diff_applies(workdir, AgentDiff::Poc(&submission.poc_unified)).await? {
 		DiffCheck::Applies => Ok(()),
 		DiffCheck::Rejects { stderr } => {
-			anyhow::bail!("poc_unified does not apply to the reviewed revision: {stderr}")
+			Err(ApplicabilityError { field: "poc_unified", diagnostic: stderr }.into())
 		},
 	}
 }
@@ -979,7 +940,7 @@ async fn validate_local_llm_submission(
 /// `validate_patch(patch_unified)`. The field name is the only
 /// difference, so both tools dispatch into this with the
 /// appropriate `field` argument.
-async fn validate_diff(workdir: &Path, diff: &str) -> Result<String> {
+async fn validate_diff(workdir: &Path, diff: AgentDiff<'_>) -> Result<String> {
 	let outcome = check_diff_applies(workdir, diff).await?;
 	let payload = match outcome {
 		DiffCheck::Applies => json!({
@@ -988,7 +949,7 @@ async fn validate_diff(workdir: &Path, diff: &str) -> Result<String> {
 		}),
 		DiffCheck::Rejects { stderr } => json!({
 			"applies": false,
-			"error": stderr,
+			"error": stderr.for_tool_response(),
 		}),
 	};
 	// Tools return a string `text` per MCP convention; serialise the
@@ -1005,7 +966,7 @@ async fn submit_verdict(
 		 bug — the tool should not have been advertised.",
 	)?;
 
-	let verdict = args.into_legacy_submission();
+	let verdict = args.verdict;
 	let verdict_str = match &verdict {
 		loupe_core::Verdict::Confirmed { .. } => "confirmed",
 		loupe_core::Verdict::Dismissed { .. } => "dismissed",
@@ -1050,7 +1011,7 @@ async fn submit_patch(session: &Arc<Session>, args: ingress::DecodedPatchArgs) -
 		 bug — the tool should not have been advertised.",
 	)?;
 
-	let loupe_core::VerdictPatch { patch_unified, notes } = args.into_legacy_submission();
+	let loupe_core::VerdictPatch { patch_unified, notes } = args.patch;
 
 	// Cheap state checks first — verdict shape, then "patch slot
 	// already taken." Saves spawning `git apply --check` when the
@@ -1085,9 +1046,9 @@ async fn submit_patch(session: &Arc<Session>, args: ingress::DecodedPatchArgs) -
 	// patch must remain retryable within the same agent session.
 	let finding = session.client.get_finding(verify.finding_id, &session.job_capability).await?;
 	loupe_core::report_limits::validate_report_content(
-		&finding.description,
-		finding.poc_unified.as_deref(),
-		Some(&patch_unified),
+		finding.description.expose(),
+		finding.poc_unified.as_ref().map(|v| v.expose()),
+		Some(patch_unified.expose()),
 	)
 	.map_err(anyhow::Error::msg)?;
 
@@ -1095,13 +1056,10 @@ async fn submit_patch(session: &Arc<Session>, args: ingress::DecodedPatchArgs) -
 	// `attach_proposed_patch` won't catch a bad diff because storage
 	// doesn't validate; surfacing the failure here gives the agent a
 	// chance to revise.
-	match check_diff_applies(&session.workdir, &patch_unified).await? {
+	match check_diff_applies(&session.workdir, AgentDiff::Patch(&patch_unified)).await? {
 		DiffCheck::Applies => {},
 		DiffCheck::Rejects { stderr } => {
-			anyhow::bail!(
-				"patch_unified does not apply against the worktree (`git apply --check` \
-				 rejected it). Revise and re-call `validate_patch` first. stderr: {stderr}"
-			);
+			return Err(ApplicabilityError { field: "patch_unified", diagnostic: stderr }.into());
 		},
 	}
 
@@ -1117,7 +1075,7 @@ async fn submit_patch(session: &Arc<Session>, args: ingress::DecodedPatchArgs) -
 #[derive(Debug)]
 enum DiffCheck {
 	Applies,
-	Rejects { stderr: String },
+	Rejects { stderr: repo_ingress::RepoDiffCheck },
 }
 
 /// Run `git apply --check` against `workdir`, feeding `diff` over
@@ -1157,8 +1115,21 @@ fn configure_git_apply_check_command(cmd: &mut tokio::process::Command, workdir:
 		.stderr(Stdio::piped());
 }
 
-async fn check_diff_applies(workdir: &Path, diff: &str) -> Result<DiffCheck> {
-	check_diff_applies_with_command(git_apply_check_command(workdir), diff).await
+enum AgentDiff<'a> {
+	Poc(&'a loupe_core::text::BoundedText<loupe_core::text::policy::PocUnified, Agent>),
+	Patch(&'a loupe_core::text::BoundedText<loupe_core::text::policy::PatchUnified, Agent>),
+}
+impl AgentDiff<'_> {
+	fn for_git_stdin(&self) -> &str {
+		match self {
+			Self::Poc(v) => v.expose(),
+			Self::Patch(v) => v.expose(),
+		}
+	}
+}
+
+async fn check_diff_applies(workdir: &Path, diff: AgentDiff<'_>) -> Result<DiffCheck> {
+	check_diff_applies_with_command(git_apply_check_command(workdir), diff.for_git_stdin()).await
 }
 
 async fn check_diff_applies_with_command(
@@ -1175,15 +1146,42 @@ async fn check_diff_applies_with_command(
 	// response cap is applied by the decoder; it is not a collection budget.
 	#[allow(unsafe_code)]
 	let output = Untrusted::new(output, unsafe { Ingress::<Repo>::new() });
-	Ok(output.validate(repo_ingress::RepoDiffCheckDecoder)?.legacy_tool_diagnostic())
+	Ok(output.validate(repo_ingress::RepoDiffCheckDecoder)?.into_outcome())
 }
+
+#[derive(Debug)]
+struct ApplicabilityError {
+	field: &'static str,
+	diagnostic: repo_ingress::RepoDiffCheck,
+}
+impl std::fmt::Display for ApplicabilityError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		if self.field == "patch_unified" {
+			return write!(
+				f,
+				"patch_unified does not apply against the worktree (`git apply --check` \
+			 rejected it). Revise and re-call `validate_patch` first. stderr: {}",
+				self.diagnostic.for_tool_response()
+			);
+		}
+		write!(
+			f,
+			"{} does not apply to the reviewed revision: {}",
+			self.field,
+			self.diagnostic.for_tool_response()
+		)
+	}
+}
+impl std::error::Error for ApplicabilityError {}
 
 /// Read `workdir/file` and compute the fingerprint for the bug at
 /// `line_start..=line_end`. Falls back to a degenerate-but-safe input
 /// when the file can't be read (model hallucinated a path, file is
 /// non-UTF-8, etc.) so submission still succeeds — the line range
 /// alone is the worst-case fingerprint input.
-fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -> String {
+fn fingerprint_for(
+	workdir: &Path, file: &str, line_start: u32, line_end: u32,
+) -> repo_ingress::ComputedFingerprint {
 	let abs = workdir.join(file);
 	let source = match std::fs::read(&abs) {
 		Ok(s) => {
@@ -1198,13 +1196,13 @@ fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -
 		Err(error) => Err(error),
 	};
 	match source {
-		Ok(digest) => digest.legacy_digest(),
+		Ok(digest) => digest,
 		Err(e) => {
 			tracing::warn!(
 				error_kind = ?e.kind(),
 				"fingerprint: could not read worktree file; falling back to line-range-only window",
 			);
-			crate::fingerprint::compute(SCANNER_ID, file, &format!("L{line_start}-L{line_end}"))
+			repo_ingress::ComputedFingerprint::line_range(file, line_start, line_end)
 		},
 	}
 }
@@ -1438,23 +1436,51 @@ mod tests {
 		}
 	}
 
-	fn valid_local_submission() -> (tempfile::TempDir, LlmFindingSubmission) {
+	fn valid_local_submission() -> (tempfile::TempDir, McpFindingSubmission) {
 		let workdir = tempfile::tempdir().unwrap();
 		std::fs::create_dir_all(workdir.path().join("src")).unwrap();
 		std::fs::write(workdir.path().join("src/lib.rs"), "fn vulnerable() {}\n").unwrap();
-		let submission = LlmFindingSubmission {
-			protocol_version: PROTOCOL_VERSION,
-			severity: Severity::High,
-			title: "Unchecked operation terminates the service".into(),
-			description: "An attacker-controlled request reaches the vulnerable operation without validation and can reliably terminate the service process.".into(),
-			file_path: "src/lib.rs".into(),
-			line_start: 1,
-			line_end: 1,
-			cwe: Some("CWE-20".into()),
-			poc_unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn vulnerable() {}\n+#[test] fn demonstrates_failure() {}\n".into(),
-			fingerprint: "c".repeat(64),
-		};
+		let submission = build_finding_from_args(workdir.path(), &json!({
+			"protocol_version": LOUPE_MCP_PROTOCOL_VERSION,
+			"severity": "high",
+			"title": "Unchecked operation terminates the service",
+			"description": "An attacker-controlled request reaches the vulnerable operation without validation and can reliably terminate the service process.",
+			"file": "src/lib.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"cwe": "CWE-20",
+			"poc_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn vulnerable() {}\n+#[test] fn demonstrates_failure() {}\n"
+		})).unwrap();
 		(workdir, submission)
+	}
+
+	#[tokio::test]
+	async fn r2_final_owner_keeps_spaces_and_rejects_only_the_strict_whitespace_path() {
+		let (workdir, valid) = valid_local_submission();
+		let mut args = serde_json::to_value(valid).unwrap();
+		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
+		for (file, normalized, strict) in [
+			(" /", " ", false),
+			(" /./", " ", false),
+			(" /a", " /a", true),
+			(" a/", " a", true),
+			("src/lib.rs", "src/lib.rs", true),
+		] {
+			args["file"] = json!(file);
+			let submission = build_finding_from_args(workdir.path(), &args).unwrap();
+			assert_eq!(submission.file_path.expose(), normalized, "first owner changed");
+			assert_eq!(submission.validate().is_ok(), strict, "final strict path check: {file:?}");
+			if !strict {
+				let error =
+					validate_local_llm_submission(workdir.path(), &submission).await.unwrap_err();
+				assert_eq!(error.to_string(), "file_path must be a normalized repo-relative path");
+			}
+		}
+		args["file"] = json!(" ");
+		assert!(
+			build_finding_from_args(workdir.path(), &args).is_err(),
+			"raw whitespace fails the first owner"
+		);
 	}
 
 	#[tokio::test]
@@ -1462,16 +1488,19 @@ mod tests {
 		let (workdir, submission) = valid_local_submission();
 		validate_local_llm_submission(workdir.path(), &submission).await.unwrap();
 
-		let mut out_of_bounds = submission.clone();
+		let mut args = serde_json::to_value(&submission).unwrap();
+		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
+		args["file"] = json!(submission.file_path.expose());
+		let mut out_of_bounds = build_finding_from_args(workdir.path(), &args).unwrap();
 		out_of_bounds.line_end = 2;
 		let error = validate_local_llm_submission(workdir.path(), &out_of_bounds)
 			.await
 			.expect_err("line beyond the reviewed file must fail");
 		assert!(error.to_string().contains("exceeds"));
 
-		let mut non_applying = submission;
-		non_applying.poc_unified =
-			non_applying.poc_unified.replace("fn vulnerable() {}", "fn other() {}");
+		args["poc_unified"] =
+			json!(submission.poc_unified.expose().replace("fn vulnerable() {}", "fn other() {}"));
+		let non_applying = build_finding_from_args(workdir.path(), &args).unwrap();
 		let error = validate_local_llm_submission(workdir.path(), &non_applying)
 			.await
 			.expect_err("PoC for different source must fail");
@@ -1504,7 +1533,7 @@ mod tests {
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
-		args["file"] = json!(submission.file_path);
+		args["file"] = json!(submission.file_path.expose());
 		let response = handle_tool_call(
 			&session,
 			&Request {
@@ -1542,8 +1571,9 @@ mod tests {
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
-		args["file"] = json!(submission.file_path);
-		args["poc_unified"] = json!(format!("{}{}", submission.poc_unified, "x".repeat(60_000)));
+		args["file"] = json!(submission.file_path.expose());
+		args["poc_unified"] =
+			json!(format!("{}{}", submission.poc_unified.expose(), "x".repeat(60_000)));
 		let response = handle_tool_call(
 			&session,
 			&Request {
@@ -1851,13 +1881,21 @@ mod tests {
 		let f_a = build_finding_from_args(workdir_a.path(), &args).expect("a");
 		let f_b = build_finding_from_args(workdir_b.path(), &args).expect("b");
 		assert_eq!(
-			f_a.fingerprint, f_b.fingerprint,
+			f_a.fingerprint.for_submission(),
+			f_b.fingerprint.for_submission(),
 			"whitespace-only difference must not shift the fingerprint",
 		);
-		assert_eq!(f_a.scanner_id, SCANNER_ID);
+		assert_eq!(
+			f_a.fingerprint.for_submission(),
+			crate::fingerprint::compute(
+				SCANNER_ID,
+				"src/lib.rs",
+				"pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }"
+			)
+		);
 		assert_eq!(f_a.severity, Severity::High);
-		assert_eq!(f_a.file_path.as_deref(), Some("src/lib.rs"));
-		assert!(f_a.poc_unified.as_deref().unwrap().contains("#[test]"));
+		assert_eq!(f_a.file_path.expose(), "src/lib.rs");
+		assert!(f_a.poc_unified.expose().contains("#[test]"));
 	}
 
 	#[test]
@@ -1880,7 +1918,7 @@ mod tests {
 			"poc_unified": "x",
 		});
 		let f = build_finding_from_args(workdir.path(), &args).expect("ok");
-		assert_eq!(f.file_path.as_deref(), Some("src/lib.rs"));
+		assert_eq!(f.file_path.expose(), "src/lib.rs");
 	}
 
 	#[test]

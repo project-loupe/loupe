@@ -8,7 +8,7 @@
 //! `submit_finding` tool POSTs straight to
 //! `/v1/jobs/{job_id}/llm-findings`, so submissions land on the server
 //! before this scanner returns. The scanner's own return value is
-//! always an empty `Vec<Finding>` — its job is orchestration, not
+//! always an empty `Vec<Finding<loupe_provenance::Repo>>` — its job is orchestration, not
 //! emission.
 //!
 //! Why no separate validation pass: the agent owns its own validation
@@ -16,7 +16,7 @@
 //! asked to produce a regression-test PoC inline). A second worker-
 //! side parse would be a poor model of what the agent already did.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,10 +26,10 @@ pub use loupe_proto::LLM_CODE_REVIEW_SCANNER_ID as SCANNER_ID;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::prompts::{self, DISCOVERY};
+use crate::llm::prompts::{self, Prompt};
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::scanner::{ScanContext, Scanner};
-use crate::source_discovery::{walk_source_files, ScannerConfig, ScannerConfigPatch};
+use crate::source_discovery::{walk_source_files, DiscoveredSourcePath, ScannerConfig};
 const CAPABILITIES: &[&str] = &["scan:llm"];
 
 pub struct LlmCodeReviewScanner {
@@ -74,17 +74,12 @@ impl Scanner for LlmCodeReviewScanner {
 		CAPABILITIES
 	}
 
-	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding>> {
+	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 		// Apply any per-repo overrides from the lease envelope on top
 		// of our baseline config.
 		let mut cfg = self.config.clone();
-		if !ctx.config.is_null() {
-			match serde_json::from_value::<ScannerConfigPatch>(ctx.config.clone()) {
-				Ok(patch) => cfg.apply_patch(patch),
-				Err(e) => {
-					tracing::warn!(error = %e, "ignoring scanner_config: not a ScannerConfigPatch");
-				},
-			}
+		if let Some(patch) = &ctx.config {
+			cfg.apply_patch(patch.clone());
 		}
 
 		let files = walk_source_files(&ctx.workdir, &cfg);
@@ -97,7 +92,7 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting agent fan-out"
 		);
 
-		let errors = self
+		let (errors, skipped) = self
 			.run_all(
 				&cfg,
 				&ctx.workdir,
@@ -116,18 +111,20 @@ impl Scanner for LlmCodeReviewScanner {
 		// apart from "this is a clean repo." The agent producing no
 		// findings on a healthy session is a success — only backend /
 		// sandbox errors fail the scan.
-		if errors > 0 && errors == files.len() {
+		let sessions = files.len() - skipped;
+		if errors > 0 && errors == sessions {
 			anyhow::bail!(
 				"llm-code-review: every one of {n} agent sessions errored; \
 				 check worker logs for the underlying error (`RUST_LOG=loupe_worker=debug` \
 				 surfaces the per-call failures)",
-				n = files.len(),
+				n = sessions,
 			);
 		}
 		if errors > 0 {
 			tracing::warn!(
 				errored = errors,
-				total = files.len(),
+				total = sessions,
+				skipped,
 				"llm-code-review: some agent sessions errored",
 			);
 		}
@@ -142,14 +139,14 @@ impl Scanner for LlmCodeReviewScanner {
 
 impl LlmCodeReviewScanner {
 	/// Fan out one agent session per file with bounded concurrency.
-	/// Returns the count of session-level errors; per-session "no
-	/// finding" is a success (not an error).
+	/// Returns session-level errors and skipped native paths; a healthy
+	/// session producing no finding remains successful.
 	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
-		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
-		job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
+		&self, cfg: &ScannerConfig, workdir: &Path, files: &[DiscoveredSourcePath], repo_id: i64,
+		job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
 		cancel: &CancellationToken,
-	) -> usize {
+	) -> (usize, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
@@ -181,33 +178,36 @@ impl LlmCodeReviewScanner {
 		}
 
 		let mut errors = 0usize;
+		let mut skipped = 0usize;
 		for h in handles {
 			match h.await {
-				Ok(Ok(())) => {},
-				Ok(Err(())) => errors += 1,
+				Ok(FileOutcome::Complete) => {},
+				Ok(FileOutcome::SkippedNative) => skipped += 1,
+				Ok(FileOutcome::Failed) => errors += 1,
 				Err(e) => {
 					tracing::warn!(error = %e, "agent session task panicked");
 					errors += 1;
 				},
 			}
 		}
-		errors
+		(errors, skipped)
 	}
 }
 
-/// Run one agent session against `file`. Returns `Err(())` for
-/// session-level errors (sandbox / network / CLI failure); the call
-/// counts these and fails the scan when every attempt errors. A
-/// healthy session that produced no submission still returns `Ok(())`
-/// — the agent decided there was nothing to report.
+/// Run one agent session against a representable source file. Keep skipped
+/// native paths distinct from failed and healthy sessions for scan accounting.
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
-	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
-	job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
+	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &DiscoveredSourcePath, cfg: &ScannerConfig,
+	repo_id: i64, job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
 	cancel: CancellationToken,
-) -> Result<(), ()> {
-	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
-	let prompt = prompts::render(DISCOVERY, &[("file", &rel), ("bkb_hint", bkb_hint)]);
+) -> FileOutcome {
+	let Some(path) = file.for_prompt() else {
+		tracing::warn!("llm-code-review: skipped unrepresentable native source path");
+		return FileOutcome::SkippedNative;
+	};
+	let prompt = Prompt::discovery(path, bkb_hint);
+	let rel = path.expose();
 	tracing::info!(file = %rel, "llm-code-review: launching agent session");
 	let started = std::time::Instant::now();
 	let req = LlmRequest {
@@ -225,16 +225,22 @@ async fn run_one(
 			tracing::debug!(
 				file = %rel,
 				elapsed_ms = started.elapsed().as_millis() as u64,
-				response_chars = r.text.chars().count(),
+				response_chars = r.text.for_log().chars().count(),
 				"agent session finished",
 			);
-			Ok(())
+			FileOutcome::Complete
 		},
 		Err(e) => {
 			tracing::warn!(file = %rel, error = %e, "agent session failed");
-			Err(())
+			FileOutcome::Failed
 		},
 	}
+}
+
+enum FileOutcome {
+	Complete,
+	SkippedNative,
+	Failed,
 }
 
 #[cfg(test)]
@@ -242,30 +248,11 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Arc;
 
-	use loupe_core::RepoSpec;
-	use tokio_util::sync::CancellationToken;
-
 	use super::*;
 	use crate::llm::testing::StubLlmBackend;
 
 	fn make_ctx(workdir: &Path) -> ScanContext {
-		ScanContext {
-			workdir: workdir.to_path_buf(),
-			repo_id: 1,
-			job_id: 1,
-			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
-			repo: RepoSpec {
-				host: "github.com".into(),
-				owner: "a".into(),
-				repo: "b".into(),
-				clone_url: "https://github.com/a/b.git".into(),
-				branch: None,
-			},
-			head_sha: "deadbeef".into(),
-			base_sha: None,
-			config: serde_json::Value::Null,
-			cancel: CancellationToken::new(),
-		}
+		crate::test_support::scan_context(workdir, "deadbeef")
 	}
 
 	fn write_crate(root: &Path, files: &[(&str, &str)]) {
@@ -282,6 +269,44 @@ mod tests {
 			}
 			std::fs::write(p, body).unwrap();
 		}
+	}
+
+	#[tokio::test]
+	#[cfg(unix)]
+	async fn unrepresentable_native_file_is_skipped_without_masking_sibling_outcomes() {
+		use std::os::unix::ffi::OsStringExt;
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// valid sibling\n")]);
+		let native_dir =
+			tmp.path().join("src").join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
+		std::fs::create_dir(&native_dir).unwrap();
+		std::fs::write(native_dir.join("hidden.rs"), "// native name\n").unwrap();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let observed = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+			observed.fetch_add(1, Ordering::SeqCst);
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+		assert!(scanner.scan(&make_ctx(tmp.path())).await.unwrap().is_empty());
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			1,
+			"only the valid sibling may launch an agent session"
+		);
+
+		let failing = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
+			Err(anyhow::anyhow!("backend exploded"))
+		}));
+		let err = LlmCodeReviewScanner::new(failing)
+			.scan(&make_ctx(tmp.path()))
+			.await
+			.expect_err("skipped native file must not mask failure of every launched session");
+		assert!(err.to_string().contains("every one of 1 agent sessions errored"));
+
+		std::fs::remove_file(tmp.path().join("src/lib.rs")).unwrap();
+		assert!(scanner.scan(&make_ctx(tmp.path())).await.unwrap().is_empty());
+		assert_eq!(calls.load(Ordering::SeqCst), 1, "an all-skipped scan must launch no session");
 	}
 
 	#[tokio::test]
@@ -339,7 +364,7 @@ mod tests {
 		}));
 		let scanner = LlmCodeReviewScanner::new(backend);
 		let mut ctx = make_ctx(tmp.path());
-		ctx.config = serde_json::json!({"include_extensions":["c"]});
+		ctx.config = Some(crate::test_support::patch(r#"{"include_extensions":["c"]}"#));
 		scanner.scan(&ctx).await.unwrap();
 		assert_eq!(
 			calls.load(Ordering::SeqCst),
@@ -355,8 +380,8 @@ mod tests {
 			std::fs::write(tmp.path().join(name), "// source\n").unwrap();
 		}
 		let baseline = ScannerConfig {
-			include_extensions: vec!["rs".to_owned()],
-			exclude_path_substrings: vec!["blocked".to_owned()],
+			include_extensions: crate::source_discovery::ScannerList::Builtin(&["rs"]),
+			exclude_path_substrings: crate::source_discovery::ScannerList::Builtin(&["blocked"]),
 			..Default::default()
 		};
 		for (patch, expected_calls) in [
@@ -416,10 +441,10 @@ mod tests {
 			}));
 			let scanner = LlmCodeReviewScanner::new(backend).with_config(baseline.clone());
 			let mut ctx = make_ctx(tmp.path());
-			ctx.config = patch;
+			ctx.config = crate::client::test_scanner_patch(&patch.to_string()).unwrap();
 			let findings = scanner.scan(&ctx).await.unwrap();
 			assert!(findings.is_empty());
-			assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "patch: {}", ctx.config);
+			assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "patch: {:?}", ctx.config);
 		}
 	}
 }

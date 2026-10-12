@@ -185,11 +185,13 @@ pub fn do_test(data: &[u8]) {
 
 fn check_response(kind: u8, status: StatusCode, body: &[u8]) {
 	check_actual_decoder(kind, body);
-	// Historical helpers deliberately retain their old schema-only admission.
-	// Actual production App slug admission above also applies the exact policy.
+	// These cfg-only status helpers now return final typed owners. App admission
+	// therefore also requires its exact field policy; status/field comparisons stay.
 	match kind {
 		0 => {
-			let expected = Fields(&["id", "slug"]).decode(body);
+			let expected = Fields(&["id", "slug"]).decode(body).filter(|fields| {
+				fields.get(1).and_then(Value::as_str).is_some_and(app_slug_admitted)
+			});
 			let result = github_app::parse_app_response(status, body, 7);
 			assert_eq!(
 				result.is_ok(),
@@ -205,7 +207,7 @@ fn check_response(kind: u8, status: StatusCode, body: &[u8]) {
 					);
 					assert_eq!(
 						expected.as_ref().and_then(|fields| fields.get(1)).and_then(Value::as_str),
-						Some(app.slug.as_str())
+						Some(app.slug.expose())
 					);
 				},
 				Err(error) => {

@@ -98,7 +98,7 @@ mod tests {
 		for (raw, expected) in [(" base ", Some("base")), ("bad\u{1}revision", None), ("", None)] {
 			cache.write_cursor(&key, raw).unwrap_or_else(|error| panic!("write cursor: {error}"));
 			assert_eq!(
-				cache.read_cursor(&key).as_deref(),
+				cache.read_cursor(&key).as_ref().map(|revision| revision.expose()),
 				expected,
 				"actual persisted cursor differs from admitted Repo decoder"
 			);

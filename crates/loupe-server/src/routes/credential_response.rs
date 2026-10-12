@@ -15,7 +15,9 @@ impl AsRef<[u8]> for CredentialBody {
 	}
 }
 
-pub(super) fn lease(value: &LeaseResponse) -> Result<Response, (StatusCode, String)> {
+pub(super) fn lease(
+	value: &LeaseResponse<loupe_provenance::Agent, loupe_provenance::Db>,
+) -> Result<Response, (StatusCode, String)> {
 	response(value.credential_json(), StatusCode::OK)
 }
 

@@ -1,5 +1,5 @@
+mod common;
 use loupe_core::text::policy::Payload;
-use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState};
 use loupe_server::review::campaign::{self, KindHint, OpenCampaign, Opened, RequestedRef};
 use loupe_server::review::policy::ReviewPolicy;
@@ -21,7 +21,9 @@ fn fixture() -> Db {
 	db
 }
 
-fn request(reference: RequestedRef<'_>) -> OpenCampaign<'_> {
+fn request(
+	reference: RequestedRef<'_, loupe_provenance::Operator>,
+) -> OpenCampaign<'_, loupe_provenance::Operator> {
 	OpenCampaign {
 		repo_id: 1,
 		trigger: campaigns::Trigger::Manual,
@@ -39,7 +41,7 @@ fn created(opened: Opened) -> (i64, i64) {
 }
 
 fn ready(tx: &rusqlite::Transaction<'_>, generation: i64) -> loupe_storage::Result<()> {
-	generations::set_profile(tx, generation, 1, &BoundedJson::<Payload>::new("{}")?)?;
+	generations::set_profile(tx, generation, 1, &common::marked::agent::json::<Payload>("{}"))?;
 	tx.execute(
 		"UPDATE review_generations SET inventory_digest=zeroblob(32) WHERE generation_id=?1",
 		[generation],
@@ -50,7 +52,8 @@ fn ready(tx: &rusqlite::Transaction<'_>, generation: i64) -> loupe_storage::Resu
 fn idle_campaign(
 	tx: &rusqlite::Transaction<'_>, repo_id: i64, policy: &ReviewPolicy, now: i64, has_work: bool,
 ) -> loupe_storage::Result<(i64, i64)> {
-	let mut new = request(RequestedRef::Pinned(SHA));
+	let reference = common::marked::operator::text(SHA);
+	let mut new = request(RequestedRef::Pinned(&reference));
 	new.repo_id = repo_id;
 	let (campaign_id, job_id) = created(campaign::open(tx, &new, policy, now)?);
 	let generation = jobs::get(tx, job_id)?.unwrap().generation_id.unwrap();
@@ -113,14 +116,22 @@ fn open_pins_only_known_commits_and_freezes_policy() {
 					survey_token_budget: Some(123),
 					..ReviewPolicy::default()
 				};
-				let reference =
-					if pinned { RequestedRef::Pinned(SHA) } else { RequestedRef::Branch("main") };
+				let value = common::marked::operator::text(if pinned { SHA } else { "main" });
+				let reference = if pinned {
+					RequestedRef::Pinned(&value)
+				} else {
+					RequestedRef::Branch(&value)
+				};
 				let (campaign, job) =
 					created(campaign::open(tx, &request(reference), &policy, 100)?);
 				let row = campaigns::get(tx, campaign)?.unwrap();
 				assert_eq!(row.recipe, campaigns::Recipe::Bootstrap);
 				assert_eq!(row.deadline_at, Some(21700));
-				assert_eq!(row.effective_policy, policy.snapshot().unwrap());
+				assert_eq!(
+					serde_json::from_str::<serde_json::Value>(row.effective_policy.expose())
+						.unwrap(),
+					serde_json::to_value(policy.snapshot().unwrap()).unwrap()
+				);
 				assert_eq!(row.generation_id.is_some(), pinned);
 				let job = jobs::get(tx, job)?.unwrap();
 				assert_eq!(job.kind, JobKind::Survey);
@@ -141,7 +152,7 @@ fn pending_triggers_do_not_write_and_pinned_triggers_coalesce_boundedly() {
 		transaction::immediate(c, |tx| {
 			let (campaign, job) = created(campaign::open(
 				tx,
-				&request(RequestedRef::Branch("main")),
+				&request(RequestedRef::Branch(&common::marked::operator::text("main"))),
 				&ReviewPolicy::default(),
 				0,
 			)?);
@@ -149,19 +160,21 @@ fn pending_triggers_do_not_write_and_pinned_triggers_coalesce_boundedly() {
 			assert_eq!(
 				campaign::open(
 					tx,
-					&request(RequestedRef::Pinned(NEW)),
+					&request(RequestedRef::Pinned(&common::marked::operator::text(NEW))),
 					&ReviewPolicy::default(),
 					1
 				)?,
 				Opened::Pending { campaign_id: campaign }
 			);
 			assert_eq!(tx.total_changes(), before, "pending must not pretend to persist a trigger");
-			let generation = campaign::pin(tx, campaign, job, SHA, 2)?;
+			let generation = campaign::pin(tx, campaign, job, &common::marked::repo::text(SHA), 2)?;
 			for at in 0..20 {
 				assert_eq!(
 					campaign::open(
 						tx,
-						&request(RequestedRef::Pinned(&format!("next-{at}"))),
+						&request(RequestedRef::Pinned(&common::marked::operator::text(&format!(
+							"next-{at}"
+						)))),
 						&ReviewPolicy::default(),
 						at + 3
 					)?,
@@ -188,7 +201,7 @@ fn coalescing_retains_the_strongest_kind_hint_after_truncation() {
 				transaction::immediate(conn, |tx| {
 					let (campaign_id, _) = created(campaign::open(
 						tx,
-						&request(RequestedRef::Pinned(SHA)),
+						&request(RequestedRef::Pinned(&common::marked::operator::text(SHA))),
 						&ReviewPolicy::default(),
 						0,
 					)?);
@@ -198,9 +211,9 @@ fn coalescing_retains_the_strongest_kind_hint_after_truncation() {
 					generations::set_pending_follow_up(
 						tx,
 						generation_id,
-						&BoundedJson::new(
+						&common::marked::operator::json::<Payload>(
 							r#"{"version":1,"triggers":[{"trigger":"manual","ref":"old","at":0}],"newest_ref":"old"}"#,
-						)?,
+						),
 					)?;
 					Ok((campaign_id, generation_id))
 				})
@@ -209,7 +222,7 @@ fn coalescing_retains_the_strongest_kind_hint_after_truncation() {
 		for at in 1..=20 {
 			db.with_conn(|conn| {
 				transaction::immediate(conn, |tx| {
-					let reference = format!("next-{at}");
+					let reference = common::marked::operator::text(&format!("next-{at}"));
 					let mut new = request(RequestedRef::Branch(&reference));
 					if full_review && at == 1 {
 						new.kind_hint = KindHint::FullReview;
@@ -250,21 +263,25 @@ fn pin_is_idempotent_but_never_changes_an_already_pinned_commit() {
 		transaction::immediate(c, |tx| {
 			let (campaign, job) = created(campaign::open(
 				tx,
-				&request(RequestedRef::Branch("main")),
+				&request(RequestedRef::Branch(&common::marked::operator::text("main"))),
 				&ReviewPolicy::default(),
 				0,
 			)?);
-			let generation = campaign::pin(tx, campaign, job, SHA, 1)?;
+			let generation = campaign::pin(tx, campaign, job, &common::marked::repo::text(SHA), 1)?;
 			let before = tx.total_changes();
-			assert_eq!(campaign::pin(tx, campaign, job, SHA, 2)?, generation);
+			assert_eq!(
+				campaign::pin(tx, campaign, job, &common::marked::repo::text(SHA), 2)?,
+				generation
+			);
 			assert_eq!(before, tx.total_changes());
 			assert!(matches!(
-				campaign::pin(tx, campaign, job, DIFFERENT, 2),
+				campaign::pin(tx, campaign, job, &common::marked::repo::text(DIFFERENT), 2),
 				Err(Error::Conflict(Conflict::CampaignPinned))
 			));
-			assert!(campaign::pin(tx, campaign, job + 100, SHA, 2).is_err());
+			assert!(campaign::pin(tx, campaign, job + 100, &common::marked::repo::text(SHA), 2)
+				.is_err());
 			tx.execute("UPDATE jobs SET state='failed' WHERE id=?1", [job])?;
-			assert!(campaign::pin(tx, campaign, job, SHA, 2).is_err());
+			assert!(campaign::pin(tx, campaign, job, &common::marked::repo::text(SHA), 2).is_err());
 			Ok(())
 		})
 	})
@@ -281,7 +298,7 @@ fn bootstrap_abandons_all_building_leftovers_without_relaxing_retire() {
 				&generations::NewGeneration {
 					repo_id: 1,
 					predecessor_generation_id: None,
-					commit_sha: SHA,
+					commit_sha: &common::marked::repo::text(SHA),
 					workflow_contract_version: 1,
 				},
 				0,
@@ -292,15 +309,17 @@ fn bootstrap_abandons_all_building_leftovers_without_relaxing_retire() {
 				&generations::NewGeneration {
 					repo_id: 1,
 					predecessor_generation_id: None,
-					commit_sha: OTHER,
+					commit_sha: &common::marked::repo::text(OTHER),
 					workflow_contract_version: 1,
 				},
 				0,
 			)?;
-			assert!(generations::retire(tx, same, &BoundedText::new("test")?, 1).is_err());
+			assert!(
+				generations::retire(tx, same, &common::marked::operator::text("test"), 1).is_err()
+			);
 			let (campaign, _) = created(campaign::open(
 				tx,
-				&request(RequestedRef::Pinned(SHA)),
+				&request(RequestedRef::Pinned(&common::marked::operator::text(SHA))),
 				&ReviewPolicy::default(),
 				2,
 			)?);
@@ -313,11 +332,13 @@ fn bootstrap_abandons_all_building_leftovers_without_relaxing_retire() {
 				assert_eq!(row.activated_at, None);
 				assert_eq!(row.retired_at, Some(2));
 				assert_eq!(row.retired_reason.unwrap().expose(), "superseded bootstrap");
-				assert!(generations::abandon(tx, id, &BoundedText::new("again")?, 3).is_err());
+				assert!(generations::abandon(tx, id, &common::marked::operator::text("again"), 3)
+					.is_err());
 			}
 			ready(tx, new)?;
 			campaign::activate_generation(tx, campaign, 3)?;
-			assert!(generations::abandon(tx, new, &BoundedText::new("active")?, 4).is_err());
+			assert!(generations::abandon(tx, new, &common::marked::operator::text("active"), 4)
+				.is_err());
 			Ok(())
 		})
 	})
@@ -340,7 +361,7 @@ fn pin_selects_active_continuation_or_matching_successor() {
 					&generations::NewGeneration {
 						repo_id: 1,
 						predecessor_generation_id: None,
-						commit_sha: active_sha,
+						commit_sha: &common::marked::repo::text(active_sha),
 						workflow_contract_version: active_version,
 					},
 					0,
@@ -353,7 +374,7 @@ fn pin_selects_active_continuation_or_matching_successor() {
 						&generations::NewGeneration {
 							repo_id: 1,
 							predecessor_generation_id: Some(active),
-							commit_sha: SHA,
+							commit_sha: &common::marked::repo::text(SHA),
 							workflow_contract_version: 1,
 						},
 						1,
@@ -363,7 +384,7 @@ fn pin_selects_active_continuation_or_matching_successor() {
 				};
 				let (campaign, _) = created(campaign::open(
 					tx,
-					&request(RequestedRef::Pinned(SHA)),
+					&request(RequestedRef::Pinned(&common::marked::operator::text(SHA))),
 					&ReviewPolicy::default(),
 					2,
 				)?);
@@ -401,10 +422,11 @@ fn recipe_selection_uses_only_an_active_baseline() {
 				if let Some(state)=state {
 					tx.execute("INSERT INTO review_generations(repo_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES(1,?2,?1,1,0)",rusqlite::params![state, SHA])?;
 				}
-				let mut new=request(RequestedRef::Branch("main"));new.kind_hint=hint;
-				let (campaign,_)=created(campaign::open(tx,&new,&ReviewPolicy::default(),0)?);
+				let reference = common::marked::operator::text("main");let mut new=request(RequestedRef::Branch(&reference));new.kind_hint=hint;
+				let (campaign,job)=created(campaign::open(tx,&new,&ReviewPolicy::default(),0)?);
 				let expected=if state!=Some("active") {campaigns::Recipe::Bootstrap} else if hint==KindHint::FullReview {campaigns::Recipe::Reconciliation} else {campaigns::Recipe::Incremental};
 				assert_eq!(campaigns::get(tx,campaign)?.unwrap().recipe,expected);
+				common::assert_survey_recipe(tx, &jobs::get(tx, job)?.unwrap(), expected.as_str());
 				Ok(())
 			})).unwrap();
 		}
@@ -415,10 +437,10 @@ fn recipe_selection_uses_only_an_active_baseline() {
 fn bootstrap_activation_requires_profile_and_inventory() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx| {
-		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(SHA)),&ReviewPolicy::default(),0)?);
+		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(&common::marked::operator::text(SHA))),&ReviewPolicy::default(),0)?);
 		let generation=jobs::get(tx,job)?.unwrap().generation_id.unwrap();
 		assert!(campaign::activate_generation(tx,campaign,1).is_err());
-		generations::set_profile(tx,generation,1,&BoundedJson::<Payload>::new("{}")?)?;
+		generations::set_profile(tx,generation,1,&common::marked::agent::json::<Payload>("{}"))?;
 		assert!(campaign::activate_generation(tx,campaign,1).is_err());
 		tx.execute("UPDATE review_generations SET inventory_digest=zeroblob(32) WHERE generation_id=?1",[generation])?;
 		campaign::activate_generation(tx,campaign,1)?;
@@ -432,7 +454,7 @@ fn replenish_uses_coverage_recipe_and_frozen_budget_after_activation() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx| {
 		let policy=ReviewPolicy{campaign_max_jobs:3,campaign_handoff_reserve:1,..ReviewPolicy::default()};
-		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(SHA)),&policy,0)?);
+		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(&common::marked::operator::text(SHA))),&policy,0)?);
 		let generation=jobs::get(tx,job)?.unwrap().generation_id.unwrap();
 		ready(tx,generation)?;
 		tx.execute("INSERT INTO review_units(generation_id,client_review_unit_key,title,objective,source_refs,priority_band,created_at) VALUES(?1,'u','t','o','[]','high',0)",[generation])?;
@@ -459,11 +481,11 @@ fn replenish_uses_coverage_recipe_and_frozen_budget_after_activation() {
 fn cancellation_keeps_leased_children_and_records_a_summary() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx| {
-		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(SHA)),&ReviewPolicy::default(),0)?);
+		let (campaign,job)=created(campaign::open(tx,&request(RequestedRef::Pinned(&common::marked::operator::text(SHA))),&ReviewPolicy::default(),0)?);
 		tx.execute("UPDATE jobs SET state='leased' WHERE id=?1",[job])?;
 		tx.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,enqueued_at) VALUES(1,'survey','queued',?1,1)",[campaign])?;
 		let queued=tx.last_insert_rowid();
-		campaign::cancel(tx,campaign,&BoundedText::new("operator")?,2)?;
+		campaign::cancel(tx,campaign,&common::marked::operator::text("operator"),2)?;
 		assert_eq!(jobs::get(tx,job)?.unwrap().state,JobState::Leased);
 		assert_eq!(jobs::get(tx,queued)?.unwrap().state,JobState::Cancelled);
 		let row=campaigns::get(tx,campaign)?.unwrap();
@@ -519,7 +541,7 @@ fn deadline_cancels_only_queued_work_and_waits_for_the_leased_child() {
 	let db = fixture();
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
-			let (id, leased) = created(campaign::open(tx, &request(RequestedRef::Branch("main")), &ReviewPolicy::default(), 0)?);
+			let (id, leased) = created(campaign::open(tx, &request(RequestedRef::Branch(&common::marked::operator::text("main"))), &ReviewPolicy::default(), 0)?);
 			tx.execute("UPDATE jobs SET state='leased' WHERE id=?1", [leased])?;
 			tx.execute("INSERT INTO jobs(repo_id,kind,state,campaign_id,enqueued_at) VALUES(1,'survey','queued',?1,1)", [id])?;
 			let queued = tx.last_insert_rowid();
@@ -528,7 +550,7 @@ fn deadline_cancels_only_queued_work_and_waits_for_the_leased_child() {
 			assert_eq!(campaign::try_finish(tx, id, 21600)?, None);
 			let cancelled = jobs::get(tx, queued)?.unwrap();
 			assert_eq!(cancelled.state, JobState::Cancelled);
-			assert_eq!(cancelled.error.as_deref(), Some("campaign deadline"));
+			assert_eq!(cancelled.error.as_ref().map(|v| v.expose()), Some("campaign deadline"));
 			assert_eq!(jobs::get(tx, leased)?.unwrap().state, JobState::Leased);
 			assert_eq!(campaign::replenish(tx, id, 21600)?, None);
 			tx.execute("UPDATE jobs SET state='succeeded',finished_at=21601 WHERE id=?1", [leased])?;
@@ -633,7 +655,7 @@ fn pin_accepts_only_full_lowercase_hex_commit_ids() {
 			transaction::immediate(c, |tx| {
 				let (campaign, job) = created(campaign::open(
 					tx,
-					&request(RequestedRef::Branch("main")),
+					&request(RequestedRef::Branch(&common::marked::operator::text("main"))),
 					&ReviewPolicy::default(),
 					0,
 				)?);
@@ -646,14 +668,28 @@ fn pin_accepts_only_full_lowercase_hex_commit_ids() {
 					&format!("{}\n", "a".repeat(39)),
 					&"g".repeat(40),
 				] {
-					let outcome = campaign::pin(tx, campaign, job, bad, 1);
-					assert!(matches!(outcome, Err(Error::Validation(_))), "{bad:?} → {outcome:?}");
+					match common::marked::repo::try_text(bad) {
+						Ok(revision) => {
+							let outcome = campaign::pin(tx, campaign, job, &revision, 1);
+							assert!(
+								matches!(outcome, Err(Error::Validation(_))),
+								"{bad:?} → {outcome:?}"
+							);
+						},
+						Err(error) => {
+							// The original newline case now fails before the typed API.
+							assert!(bad.ends_with('\n'));
+							assert_eq!(error.field, "revision");
+							assert_eq!(error.rule, loupe_core::text::Rule::Character);
+							assert_eq!(error.code_point, Some(10));
+						},
+					}
 				}
 				let row = campaigns::get(tx, campaign)?.unwrap();
 				assert!(row.generation_id.is_none());
-				assert_eq!(row.target_commit_sha, "main");
-				campaign::pin(tx, campaign, job, good, 1)?;
-				assert_eq!(campaigns::get(tx, campaign)?.unwrap().target_commit_sha, good);
+				assert_eq!(row.target_commit_sha.expose(), "main");
+				campaign::pin(tx, campaign, job, &common::marked::repo::text(good), 1)?;
+				assert_eq!(campaigns::get(tx, campaign)?.unwrap().target_commit_sha.expose(), good);
 				Ok(())
 			})
 		})

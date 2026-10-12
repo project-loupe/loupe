@@ -3,12 +3,27 @@
 use axum::extract::{FromRequestParts, Query};
 use axum::http::request::Parts;
 use axum::http::Uri;
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::{policy, Normalization, TextPolicy, Whitespace};
+use loupe_core::text::{policy, BoundedText, Normalization, TextPolicy, Whitespace};
 use loupe_provenance::{Browser, Mark, Untrusted, Unvalidated, Validate};
 
 use super::{BrowserRequest, Failure};
 use crate::WebState;
+
+#[derive(serde::Deserialize)]
+struct JobsQuery {
+	#[serde(default)]
+	limit: Option<i64>,
+	#[serde(default)]
+	state: Option<String>,
+	#[serde(default)]
+	kind: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+	q: String,
+	#[serde(default)]
+	limit: Option<i64>,
+}
 
 macro_rules! policy {
 	($name:ident, $field:literal, $multi:literal) => {
@@ -100,9 +115,7 @@ impl Validate<&Uri, Browser> for JobsDecoder {
 		#[cfg(fuzzing)]
 		crate::fuzz_support::hit(crate::fuzz_support::Entry::Jobs);
 		preflight(u.get(), &["state", "kind"])?;
-		let raw = Query::<crate::routes::api::JobsQuery>::try_from_uri(u.get())
-			.map_err(|_| Failure::Query)?
-			.0;
+		let raw = Query::<JobsQuery>::try_from_uri(u.get()).map_err(|_| Failure::Query)?.0;
 		Ok(BrowserJobs {
 			limit: raw.limit,
 			state: raw
@@ -117,7 +130,9 @@ impl Validate<&Uri, Browser> for JobsDecoder {
 	}
 }
 impl BrowserJobs {
-	pub(crate) fn into_pairs_legacy(self) -> Vec<(&'static str, String)> {
+	pub(crate) async fn send(
+		self, mut request: reqwest::RequestBuilder,
+	) -> Result<reqwest::Response, reqwest::Error> {
 		#[cfg(fuzzing)]
 		{
 			if let Some(text) = &self.state {
@@ -127,17 +142,16 @@ impl BrowserJobs {
 				crate::fuzz_support::browser_text(crate::fuzz_support::BrowserField::Kind, text);
 			}
 		}
-		let mut pairs = Vec::new();
 		if let Some(limit) = self.limit {
-			pairs.push(("limit", limit.to_string()));
+			request = request.query(&[("limit", limit)]);
 		}
-		if let Some(state) = self.state.filter(|s| !s.expose().is_empty()) {
-			pairs.push(("state", state.expose().to_owned()));
+		if let Some(state) = self.state.as_ref().filter(|s| !s.expose().is_empty()) {
+			request = request.query(&[("state", state.expose())]);
 		}
-		if let Some(kind) = self.kind.filter(|s| !s.expose().is_empty()) {
-			pairs.push(("kind", kind.expose().to_owned()));
+		if let Some(kind) = self.kind.as_ref().filter(|s| !s.expose().is_empty()) {
+			request = request.query(&[("kind", kind.expose())]);
 		}
-		pairs
+		request.send().await
 	}
 }
 pub(crate) struct BrowserSearch {
@@ -154,9 +168,7 @@ impl Validate<&Uri, Browser> for SearchDecoder {
 		#[cfg(fuzzing)]
 		crate::fuzz_support::hit(crate::fuzz_support::Entry::Search);
 		preflight(u.get(), &["q"])?;
-		let raw = Query::<crate::routes::api::SearchQuery>::try_from_uri(u.get())
-			.map_err(|_| Failure::Query)?
-			.0;
+		let raw = Query::<SearchQuery>::try_from_uri(u.get()).map_err(|_| Failure::Query)?.0;
 		Ok(BrowserSearch {
 			query: BoundedText::new(&mark, &raw.q).map_err(|_| Failure::Query)?,
 			limit: raw.limit,
@@ -164,14 +176,16 @@ impl Validate<&Uri, Browser> for SearchDecoder {
 	}
 }
 impl BrowserSearch {
-	pub(crate) fn into_pairs_legacy(self) -> Vec<(&'static str, String)> {
+	pub(crate) async fn send(
+		self, request: reqwest::RequestBuilder,
+	) -> Result<reqwest::Response, reqwest::Error> {
 		#[cfg(fuzzing)]
 		crate::fuzz_support::browser_text(crate::fuzz_support::BrowserField::Search, &self.query);
-		let mut pairs = vec![("q", self.query.expose().to_owned())];
+		let mut request = request.query(&[("q", self.query.expose())]);
 		if let Some(limit) = self.limit {
-			pairs.push(("limit", limit.to_string()));
+			request = request.query(&[("limit", limit)]);
 		}
-		pairs
+		request.send().await
 	}
 }
 macro_rules! extractor {

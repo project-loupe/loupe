@@ -80,13 +80,15 @@ fn fixture(bytes_capacity: u64) -> (Arc<Db>, AppState, i64) {
 				} else {
 					workers::WorkerKind::Worker
 				};
-				let id = workers::insert(
-					conn,
-					&format!("fixture-{index}"),
-					kind,
-					&cert_fingerprint(peer.0.as_ref()),
-					0,
-				)?;
+				let body = format!(r#"{{"protocol_version":2,"name":"fixture-{index}"}}"#);
+				// SAFETY: this fixed synthetic Operator message registers the fixture actor.
+				#[allow(unsafe_code)]
+				let ingress =
+					unsafe { loupe_provenance::Ingress::<loupe_provenance::Operator>::new() };
+				let (_, name) = loupe_provenance::Untrusted::new(body.as_bytes(), ingress)
+					.validate(crate::ingress::registry::RegisterWorkerDecoder)
+					.expect("fixture worker name");
+				let id = workers::insert(conn, &name, kind, &cert_fingerprint(peer.0.as_ref()), 0)?;
 				if index == 0 {
 					worker_id = id;
 				}

@@ -10,13 +10,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use git2::{Repository, Signature};
-use loupe_core::{Finding, Severity};
-use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseRequest, LeaseResponse,
+use common::wire::{
+	CompleteOutcome, CompleteRequest, Finding, FindingsBatch, LeaseRequest, LeaseResponse,
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
 	ScanRequest, SetGithubAppRequest, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION,
 };
+use git2::{Repository, Signature};
+use loupe_core::Severity;
 use loupe_server::init::run_init;
 use loupe_server::reporters::github_app::testing::APP_PRIVATE_KEY_PEM;
 use loupe_server::reporters::GithubReporter;
@@ -174,27 +174,32 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 
 	// Stand up loupe-server with a GithubReporter pointed at the stub.
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
-		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	// SQLCipher seals the whole DB under `init.master_key`; the dispatch
 	// path therefore reads / decrypts the PAT transparently. The
@@ -327,7 +332,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	// contain the PAT in the clear. (The DAO-level "raw .sqlite is
 	// ciphertext" guarantee is also tested in `loupe-storage::db`
 	// tests; this one proves it survives a real dispatch path.)
-	let raw = std::fs::read(&init.layout.db_path).unwrap();
+	let raw = std::fs::read(init.layout.db_path.as_path()).unwrap();
 	assert!(
 		!raw.windows(b"ghp_test_pat_value".len()).any(|w| w == b"ghp_test_pat_value"),
 		"plaintext PAT must not survive in the encrypted db file"
@@ -342,27 +347,32 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
-		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();
@@ -579,28 +589,27 @@ async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_cert).unwrap(),
-		),
-		server_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_key).unwrap(),
-		),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.ca_key).unwrap(),
-		),
+		server_cert_pem: init.layout.server_cert.read_tls_pem().unwrap(),
+		server_key_pem: init.layout.server_key.read_tls_pem().unwrap(),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: init.layout.ca_key.read_tls_pem().unwrap(),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();
@@ -749,31 +758,30 @@ async fn dispatch_refuses_app_mode_targets_outside_the_owner_allowlist() {
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_cert).unwrap(),
-		),
-		server_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_key).unwrap(),
-		),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.ca_key).unwrap(),
-		),
+		server_cert_pem: init.layout.server_cert.read_tls_pem().unwrap(),
+		server_key_pem: init.layout.server_key.read_tls_pem().unwrap(),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: init.layout.ca_key.read_tls_pem().unwrap(),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter)
-		.with_github_app_allowed_owners(Some(vec!["acme".into()]));
+		.with_github_app_allowed_owners(common::allowed_owners(Some(vec!["acme".into()])));
 	let server = serve(cfg, state).await.unwrap();
 	let addr = server.local_addr;
 	let admin = reqwest::Client::builder()
@@ -836,8 +844,8 @@ async fn dispatch_refuses_app_mode_targets_outside_the_owner_allowlist() {
 			let job_id = c.last_insert_rowid();
 			c.execute(
 				"INSERT INTO findings (repo_id, job_id, scanner_id, severity, title, description,
-				    fingerprint, state, verification_required, created_at)
-				 VALUES (?1, ?2, 'regex-secrets', 'high', 'leaked key', 'd', 'fp', 'confirmed', 0, 0)",
+				    fingerprint, state, verification_required, created_at, report_identity)
+				 VALUES (?1, ?2, 'regex-secrets', 'high', 'leaked key', 'd', 'fp', 'confirmed', 0, 0, randomblob(16))",
 				(repo_id, job_id),
 			)?;
 			Ok(c.last_insert_rowid())

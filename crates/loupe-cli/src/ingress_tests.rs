@@ -1,8 +1,12 @@
 //! Tests at the actual CLI argument/HTTP boundaries.
+use legacy::{
+	FindingDetail, GithubAppResponse, GithubReportingAuth, ListReposResponse, ReportingSummary,
+};
 use serde_json::{json, Value};
 
 use super::*;
 use crate::ingress::test_support::{received, respond};
+use crate::legacy_responses as legacy;
 
 const PAT: &str = "FAKE_CLI_ARG_PAT_abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -56,6 +60,105 @@ fn summary() -> Value {
 fn job() -> Value {
 	json!({"job_id":1,"repo_id":2,"kind":"future-kind","state":"queued",
 		"incremental":false,"attempts":0,"enqueued_at":0})
+}
+
+#[tokio::test]
+async fn original_optional_defaults_survive_actual_response_owners() {
+	let old_job = job().to_string();
+	for decode in [ingress::get_job, ingress::retry_job, ingress::cancel_job] {
+		let decoded = decode(received(old_job.as_bytes()).await).unwrap();
+		assert_eq!(decoded.worker_id, None);
+		assert_eq!(decoded.lease_expires_at, None);
+		assert_eq!(decoded.started_at, None);
+		assert_eq!(decoded.finished_at, None);
+		assert_eq!(decoded.error, None);
+		assert_eq!(decoded.since_sha, None);
+		assert_eq!(decoded.head_sha, None);
+		assert_eq!(decoded.parent_job_id, None);
+		assert_eq!(decoded.target_finding_id, None);
+		assert_eq!(serde_json::to_value(decoded).unwrap(), job());
+	}
+	let list = ingress::list_jobs(received(format!("[{old_job}]").as_bytes()).await).unwrap();
+	assert_eq!(serde_json::to_value(&list).unwrap(), json!([job()]));
+
+	let base = json!({"id":1,"clone_url":"local","host":"host","owner":"owner",
+		"repo":"repo","verification_enabled":false,"created_at":0});
+	for reporting in [
+		None,
+		Some(Value::Null),
+		Some(json!({"kind":"github_issue",
+		"target_owner":"owner","target_repo":"issues"})),
+	] {
+		let mut row = base.clone();
+		if let Some(reporting) = &reporting {
+			row["reporting"] = reporting.clone();
+		}
+		let body = json!({"protocol_version":2,"repos":[row]}).to_string();
+		let decoded = ingress::list_repos(received(body.as_bytes()).await).unwrap();
+		let mut expected = base.clone();
+		if reporting.as_ref().is_some_and(|value| !value.is_null()) {
+			assert!(matches!(
+				decoded.repos[0].reporting,
+				Some(loupe_proto::ReportingSummary::GithubIssue {
+					auth: loupe_proto::GithubReportingAuth::Pat,
+					..
+				})
+			));
+			expected["reporting"] = json!({"kind":"github_issue", "target_owner":"owner",
+				"target_repo":"issues", "auth":"pat"});
+		} else {
+			assert!(decoded.repos[0].reporting.is_none());
+		}
+		assert_eq!(
+			serde_json::to_value(decoded).unwrap(),
+			json!({"protocol_version":2,"repos":[expected]})
+		);
+	}
+	for auth in ["app", "pat"] {
+		let mut row = base.clone();
+		row["reporting"] = json!({"kind":"github_issue", "target_owner":"acme",
+			"target_repo":"tracker", "auth":auth});
+		let body = json!({"protocol_version":2,"repos":[row]}).to_string();
+		let decoded = ingress::list_repos(received(body.as_bytes()).await).unwrap();
+		let encoded = serde_json::to_value(decoded).unwrap();
+		assert_eq!(
+			encoded["repos"][0]["reporting"],
+			json!({"kind":"github_issue",
+			"target_owner":"acme", "target_repo":"tracker", "auth":auth})
+		);
+		assert_eq!(encoded, json!({"protocol_version":2,"repos":[row]}));
+	}
+}
+
+// Missing optional fields are admitted by each response's production decoder.
+#[tokio::test]
+async fn original_job_parentage_and_failure_fields_survive_response_owners() {
+	let verify = json!({"job_id":5,"repo_id":2,"kind":"verify","state":"leased",
+		"incremental":false,"head_sha":"abc123","parent_job_id":1,
+		"target_finding_id":42,"attempts":0,"enqueued_at":1700000100});
+	let failed = json!({"job_id":1,"repo_id":2,"kind":"scan","state":"failed",
+		"incremental":false,"attempts":3,"enqueued_at":1700000000,"worker_id":7,
+		"lease_expires_at":1700000600,"started_at":1700000010,"finished_at":1700000400,
+		"error":"lease expired after max attempts"});
+	for expected in [&verify, &failed] {
+		let wire = serde_json::to_vec(expected).unwrap();
+		for decode in [ingress::get_job, ingress::retry_job, ingress::cancel_job] {
+			let decoded = decode(received(&wire).await).unwrap();
+			assert_eq!(serde_json::to_value(&decoded).unwrap(), *expected);
+			if expected == &failed {
+				assert_eq!(decoded.finished_at.unwrap() - decoded.started_at.unwrap(), 390);
+			} else {
+				assert_eq!(decoded.parent_job_id, Some(1));
+				assert_eq!(decoded.target_finding_id, Some(42));
+				assert_eq!(decoded.head_sha.as_ref().map(|value| value.expose()), Some("abc123"));
+			}
+		}
+	}
+	let expected = json!([verify, failed]);
+	let decoded =
+		ingress::list_jobs(received(&serde_json::to_vec(&expected).unwrap()).await).unwrap();
+	assert_eq!(serde_json::to_value(&decoded).unwrap(), expected);
+	assert_eq!(decoded[1].finished_at.unwrap() - decoded[1].started_at.unwrap(), 390);
 }
 
 #[tokio::test]
@@ -134,7 +237,12 @@ async fn existing_wire_and_text_compatibility_control() {
 	let finding = summary();
 	let body = json!({"protocol_version":65535,"findings":[finding],"ignored":{"future":true}});
 	let (base, server) = respond(body.to_string().into_bytes()).await;
-	finding_search(&reqwest::Client::new(), &base, 2, "query\nwords", -1).await.unwrap();
+	let Cli { cmd: Cmd::Finding(FindingCmd::Search { query, .. }), .. } =
+		Cli::try_parse_from(["loupectl", "finding", "search", "2", "query\nwords"]).unwrap()
+	else {
+		unreachable!()
+	};
+	finding_search(&reqwest::Client::new(), &base, 2, &query, -1).await.unwrap();
 	server.await.unwrap();
 	let mut value = job();
 	value["head_sha"] = "base".into();
@@ -210,20 +318,12 @@ async fn response_schema_matrix_matches_original_dtos() {
 		r#"{"kind":"manual","ignored":"\uD800"}"#,
 		"null",
 	] {
-		compare!(
-			format!("{prefix}{reporting}}}]}}"),
-			ListReposResponse,
-			ingress::list_repos_legacy
-		);
+		compare!(format!("{prefix}{reporting}}}]}}"), ListReposResponse, ingress::list_repos);
 	}
 	for depth in 120..=130 {
 		let nested = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
 		let reporting = format!(r#"{{"kind":"manual","ignored":{nested}}}"#);
-		compare!(
-			format!("{prefix}{reporting}}}]}}"),
-			ListReposResponse,
-			ingress::list_repos_legacy
-		);
+		compare!(format!("{prefix}{reporting}}}]}}"), ListReposResponse, ingress::list_repos);
 	}
 	for raw in [
 		r#"[2]"#.to_owned(),
@@ -237,11 +337,11 @@ async fn response_schema_matrix_matches_original_dtos() {
 		format!(r#"{{"protocol_version":2,"ignored":{}0{}}}"#, "[".repeat(140), "]".repeat(140)),
 		r#"{"protocol_version":2,"ignored":1e999}"#.to_owned(),
 	] {
-		compare!(raw, GithubAppResponse, ingress::show_github_app_legacy);
+		compare!(raw, GithubAppResponse, ingress::show_github_app);
 	}
 	for raw in [job().to_string(), r#"[1,2,"future",{"queued":null},false,null,"",null,null,0,0]"#.to_owned(),
 		r#"{"job_id":1,"repo_id":2,"kind":"","state":"queued","incremental":false,"attempts":4294967296,"enqueued_at":0}"#.to_owned()]
-	{ compare!(raw, loupe_proto::JobInfo, ingress::get_job_legacy); }
+	{ compare!(raw, legacy::JobInfo, ingress::get_job); }
 }
 
 #[tokio::test]
@@ -257,10 +357,10 @@ async fn concrete_response_owners_keep_wire_and_credential_shapes() {
 			.unwrap();
 	assert_eq!(retry.matched, 7);
 	let list = format!("[{}]", job());
-	assert_eq!(ingress::list_jobs_legacy(received(list.as_bytes()).await).unwrap().len(), 1);
+	assert_eq!(ingress::list_jobs(received(list.as_bytes()).await).unwrap().len(), 1);
 	let key = "FAKE-PEM-e\u{301}\r\n\t\\\"";
 	let raw = json!({"protocol_version":65535,"worker_id":4,"client_cert_pem":" cert ","client_key_pem":key,"ca_cert_pem":key}).to_string();
-	let bundle = ingress::register_worker_bundle_legacy(received(raw.as_bytes()).await).unwrap();
+	let bundle = ingress::register_worker_bundle(received(raw.as_bytes()).await).unwrap();
 	assert_eq!(bundle.client_cert_pem, " cert ");
 	assert_eq!(bundle.client_key_pem.expose(), key);
 	assert_eq!(bundle.ca_cert_pem.expose(), key);
@@ -302,10 +402,10 @@ async fn detail_optional_and_positional_schema_controls() {
 	for length in 0..=row.len() {
 		let raw = serde_json::to_string(&row[..length]).unwrap();
 		let old = serde_json::from_str::<FindingDetail>(&raw);
-		let new = ingress::get_finding_legacy(received(raw.as_bytes()).await);
+		let new = ingress::get_finding(received(raw.as_bytes()).await);
 		assert_eq!(old.is_ok(), new.is_ok(), "detail sequence prefix length {length}");
 		if let (Ok(old), Ok(new)) = (old, new) {
-			assert_eq!(old, new);
+			assert_eq!(serde_json::to_value(old).unwrap(), serde_json::to_value(new).unwrap());
 		}
 	}
 	for optional in
@@ -320,8 +420,8 @@ async fn detail_optional_and_positional_schema_controls() {
 		}
 		let raw = row.to_string();
 		let old = serde_json::from_str::<FindingDetail>(&raw).unwrap();
-		let new = ingress::get_finding_legacy(received(raw.as_bytes()).await).unwrap();
-		assert_eq!(old, new);
+		let new = ingress::get_finding(received(raw.as_bytes()).await).unwrap();
+		assert_eq!(serde_json::to_value(old).unwrap(), serde_json::to_value(new).unwrap());
 	}
 }
 
@@ -332,14 +432,14 @@ async fn response_text_boundaries_and_closed_error_chains() {
 		let mut row = summary();
 		row[field] = value.clone().into();
 		let raw = json!({"protocol_version":2,"findings":[row]}).to_string();
-		let result = ingress::list_findings_legacy(received(raw.as_bytes()).await).unwrap();
+		let result = ingress::list_findings(received(raw.as_bytes()).await).unwrap();
 		assert_eq!(serde_json::to_value(result).unwrap()["findings"][0][field], value);
 	}
 	for value in ["REJECTED_FIELD_SENTINEL\u{1b}".to_owned(), "\u{85}".repeat(cap + 1)] {
 		let mut row = summary();
 		row["title"] = value.into();
 		let raw = json!({"protocol_version":2,"findings":[row]}).to_string();
-		let error = ingress::list_findings_legacy(received(raw.as_bytes()).await).unwrap_err();
+		let error = ingress::list_findings(received(raw.as_bytes()).await).unwrap_err();
 		let expected = "server response violates schema or field policy";
 		for message in [format!("{error}"), format!("{error:#}")] {
 			assert_eq!(message, expected);

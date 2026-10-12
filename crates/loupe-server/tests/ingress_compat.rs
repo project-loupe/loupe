@@ -2,11 +2,12 @@
 //! Initial controls preserve existing behavior. The later sentinel tests pin
 //! deliberate diagnostic hardening with separately recorded pre-change failures.
 
+mod common;
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
+use common::wire::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_server::{router, AppState, PeerCert};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::{repos, workers, Db};
@@ -32,7 +33,13 @@ fn fixture() -> Fixture {
 			("worker", &worker, workers::WorkerKind::Worker),
 			("revoked", &revoked, workers::WorkerKind::Worker),
 		] {
-			let id = workers::insert(conn, name, kind, &cert_fingerprint(cert.0.as_ref()), 0)?;
+			let id = workers::insert(
+				conn,
+				&common::marked::operator::text(name),
+				kind,
+				&cert_fingerprint(cert.0.as_ref()),
+				0,
+			)?;
 			if name == "revoked" {
 				assert!(workers::revoke(conn, id, 1)?);
 			}
@@ -92,8 +99,8 @@ async fn lease_overflow_number_keeps_syntax_category() {
 		observed.push((capability, status, body.contains(diagnostic)));
 		if expected == StatusCode::OK {
 			assert!(matches!(
-				serde_json::from_str::<loupe_proto::LeaseResponse>(&body).unwrap(),
-				loupe_proto::LeaseResponse::Empty { .. }
+				serde_json::from_str::<common::wire::LeaseResponse>(&body).unwrap(),
+				common::wire::LeaseResponse::Empty { .. }
 			));
 		}
 	}
@@ -260,8 +267,8 @@ async fn json_media_types_and_unknown_fields_preserve_route_values() {
 		let reply: loupe_proto::RegisterRepoResponse = serde_json::from_str(&body).unwrap();
 		assert_eq!(reply.protocol_version, PROTOCOL_VERSION);
 		let row = f.db.with_conn(|conn| Ok(repos::get(conn, reply.repo_id)?)).unwrap().unwrap();
-		assert_eq!(row.clone_url, format!("https://github.com/acme/repo-{index}.git"));
-		assert_eq!(row.default_branch.as_deref(), Some(" Main-é "));
+		assert_eq!(row.clone_url.expose(), format!("https://github.com/acme/repo-{index}.git"));
+		assert_eq!(row.default_branch.as_ref().map(|v| v.expose()), Some(" Main-é "));
 		assert_eq!(row.reporting, loupe_core::ReportingDestination::Manual);
 	}
 }
@@ -384,8 +391,8 @@ async fn worker_json_admission_preserves_media_and_field_semantics() {
 		assert_eq!(status, expected, "{label}: {body}");
 		if expected == StatusCode::OK {
 			assert!(matches!(
-				serde_json::from_str::<loupe_proto::LeaseResponse>(&body).unwrap(),
-				loupe_proto::LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }
+				serde_json::from_str::<common::wire::LeaseResponse>(&body).unwrap(),
+				common::wire::LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }
 			));
 		} else {
 			assert!(body.contains(diagnostic), "{label}: {body}");
@@ -451,7 +458,7 @@ async fn operator_json_body_cap_is_exactly_two_mib() {
 	}
 	let rows = f.db.with_conn(|conn| Ok(repos::list(conn, None)?)).unwrap();
 	assert_eq!(rows.len(), 1);
-	assert_eq!(rows[0].repo, "at-cap");
+	assert_eq!(rows[0].repo.expose(), "at-cap");
 }
 
 #[tokio::test]
@@ -466,7 +473,7 @@ async fn operator_no_body_handler_keeps_ignoring_the_body() {
 		let request = Request::builder().uri("/v1/repos").body(body).unwrap();
 		let (status, body) = send(&f, Some(&f.admin), request).await;
 		assert_eq!(status, StatusCode::OK, "{body}");
-		let repos: loupe_proto::ListReposResponse = serde_json::from_str(&body).unwrap();
+		let repos: common::wire::ListReposResponse = serde_json::from_str(&body).unwrap();
 		assert_eq!(repos.protocol_version, PROTOCOL_VERSION);
 		assert!(repos.repos.is_empty());
 	}

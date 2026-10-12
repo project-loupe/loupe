@@ -1,8 +1,12 @@
 //! Transactional campaign orchestration. Worker checkout pins the commit.
-use loupe_core::text::policy::{Payload, Reason};
-use loupe_core::text::{BoundedJson, BoundedText};
-use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
-use loupe_storage::scheduler::{self, Band, CampaignPolicy, NewPhaseJob};
+use loupe_core::text::policy::{Reason, RevisionText};
+use loupe_core::text::BoundedText;
+pub use loupe_core::ReviewIntent as KindHint;
+use loupe_core::{FollowUpTrigger, JobKind, JobState, PendingFollowUp, WORKFLOW_CONTRACT_VERSION};
+use loupe_provenance::{Db as DbSource, Source};
+use loupe_storage::scheduler::{
+	self, Band, CampaignPolicy, NewPhaseJob, PhaseRecipeInput, SurveyRecipe,
+};
 use loupe_storage::{
 	campaigns, generations, jobs, review_units, transaction, Conflict, Db, Entity, Error,
 	Ownership, Result,
@@ -11,38 +15,31 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use super::policy::ReviewPolicy;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KindHint {
-	FullReview,
-	Incremental,
+#[derive(Debug)]
+pub enum RequestedRef<'a, S: Source> {
+	Pinned(&'a BoundedText<RevisionText, S>),
+	Branch(&'a BoundedText<RevisionText, S>),
 }
-impl KindHint {
-	fn as_str(self) -> &'static str {
-		match self {
-			Self::FullReview => "full_review",
-			Self::Incremental => "incremental",
-		}
+impl<S: Source> Clone for RequestedRef<'_, S> {
+	fn clone(&self) -> Self {
+		*self
 	}
 }
+impl<S: Source> Copy for RequestedRef<'_, S> {}
 
-#[derive(Debug, Clone, Copy)]
-pub enum RequestedRef<'a> {
-	Pinned(&'a str),
-	Branch(&'a str),
-}
-impl<'a> RequestedRef<'a> {
-	fn as_str(self) -> &'a str {
+impl<'a, S: Source> RequestedRef<'a, S> {
+	fn value(&self) -> &'a BoundedText<RevisionText, S> {
 		match self {
 			Self::Pinned(value) | Self::Branch(value) => value,
 		}
 	}
 }
 
-pub struct OpenCampaign<'a> {
+pub struct OpenCampaign<'a, S: Source> {
 	pub repo_id: i64,
 	pub trigger: campaigns::Trigger,
-	pub requested_ref: RequestedRef<'a>,
-	pub base_sha: Option<&'a str>,
+	pub requested_ref: RequestedRef<'a, S>,
+	pub base_sha: Option<&'a BoundedText<RevisionText, S>>,
 	pub kind_hint: KindHint,
 }
 
@@ -57,12 +54,8 @@ fn get(tx: &Transaction<'_>, id: i64) -> Result<campaigns::Campaign> {
 	campaigns::get(tx, id)?.ok_or(Error::NotFound(Entity::Campaign, id))
 }
 
-fn recipe(name: &str) -> Result<BoundedJson<Payload>> {
-	Ok(BoundedJson::new(&serde_json::json!({"version":1,"phase":"survey","recipe":name,"assignment_key":"ordinary"}).to_string())?)
-}
-
-pub fn open(
-	tx: &Transaction<'_>, new: &OpenCampaign<'_>, policy: &ReviewPolicy, now: i64,
+pub fn open<S: Source>(
+	tx: &Transaction<'_>, new: &OpenCampaign<'_, S>, policy: &ReviewPolicy, now: i64,
 ) -> Result<Opened> {
 	let active: Option<i64> = tx
 		.query_row(
@@ -78,27 +71,21 @@ pub fn open(
 		};
 		let generation = generations::get(tx, generation_id)?
 			.ok_or(Error::NotFound(Entity::Generation, generation_id))?;
-		let previous = generation
-			.pending_follow_up
-			.as_ref()
-			.and_then(|p| serde_json::from_str::<serde_json::Value>(p.expose()).ok());
-		// Intent outlives the bounded trigger history: incremental requests
-		// must not downgrade a pending full review, even after it is pruned.
-		let kind_hint = if previous.as_ref().is_some_and(|p| p["kind_hint"] == "full_review") {
-			KindHint::FullReview
-		} else {
-			new.kind_hint
+		let trigger = match new.trigger {
+			campaigns::Trigger::Manual => FollowUpTrigger::Manual,
+			campaigns::Trigger::Scheduled => FollowUpTrigger::Scheduled,
+			campaigns::Trigger::CompatScanApi => FollowUpTrigger::CompatScanApi,
+			campaigns::Trigger::Reconciliation => FollowUpTrigger::Reconciliation,
+			campaigns::Trigger::Operator => FollowUpTrigger::Operator,
 		};
-		let mut triggers =
-			previous.and_then(|p| p["triggers"].as_array().cloned()).unwrap_or_default();
-		triggers.push(
-			serde_json::json!({"trigger":new.trigger.as_str(),"ref":new.requested_ref.as_str(),"at":now,"kind_hint":new.kind_hint.as_str()}),
-		);
-		if triggers.len() > 16 {
-			triggers.drain(..triggers.len() - 16);
-		}
-		let pending=BoundedJson::new(&serde_json::json!({"version":1,"triggers":triggers,"newest_ref":new.requested_ref.as_str(),"kind_hint":kind_hint.as_str()}).to_string())?;
-		generations::set_pending_follow_up(tx, generation_id, &pending)?;
+		let pending = PendingFollowUp::new(
+			generation.pending_follow_up.as_ref(),
+			new.requested_ref.value(),
+			trigger,
+			new.kind_hint,
+			now,
+		)?;
+		generations::coalesce_follow_up(tx, generation_id, &pending)?;
 		return Ok(Opened::Coalesced { campaign_id });
 	}
 	let has_baseline: bool = tx.query_row(
@@ -124,21 +111,26 @@ pub fn open(
 			recipe: initial,
 			trigger: new.trigger,
 			requested_base_sha: new.base_sha,
-			target_commit_sha: new.requested_ref.as_str(),
+			target_commit_sha: new.requested_ref.value(),
 			generation_id: None,
-			effective_policy: &snapshot,
+			effective_policy: campaigns::CampaignPolicyInput::<S>::Resolved(&snapshot),
 			deadline_at: Some(deadline),
 			root_campaign_id: None,
 			continuation_of_campaign_id: None,
 		},
 		now,
 	)?;
-	let recipe = recipe(initial.as_str())?;
+	let recipe = match initial {
+		campaigns::Recipe::Bootstrap => SurveyRecipe::Bootstrap,
+		campaigns::Recipe::Incremental => SurveyRecipe::Incremental,
+		campaigns::Recipe::Reconciliation => SurveyRecipe::Reconciliation,
+		campaigns::Recipe::Corroboration => unreachable!("initial recipe is a survey"),
+	};
 	let job_id = scheduler::enqueue_phase(
 		tx,
 		&NewPhaseJob {
 			repo_id: new.repo_id,
-			kind: JobKind::Survey,
+			kind: JobKind::<S>::Survey,
 			campaign_id,
 			generation_id: None,
 			assigned_lead_id: None,
@@ -148,7 +140,7 @@ pub fn open(
 			effective_priority: 0,
 			eligible_at: now,
 			token_budget: policy.survey_token_budget,
-			recipe: &recipe,
+			recipe: PhaseRecipeInput::Survey(recipe),
 			handoff: false,
 		},
 		now,
@@ -166,10 +158,11 @@ fn is_commit_sha(sha: &str) -> bool {
 	matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-pub fn pin(
-	tx: &Transaction<'_>, campaign_id: i64, job_id: i64, sha: &str, now: i64,
+pub fn pin<S: Source>(
+	tx: &Transaction<'_>, campaign_id: i64, job_id: i64, sha: &BoundedText<RevisionText, S>,
+	now: i64,
 ) -> Result<i64> {
-	if !is_commit_sha(sha) {
+	if !is_commit_sha(sha.expose()) {
 		return Err(
 			loupe_core::text::Error::new("commit_sha", loupe_core::text::Rule::Identifier).into()
 		);
@@ -187,7 +180,7 @@ pub fn pin(
 		return Err(Error::Ownership(Ownership::CampaignJob));
 	}
 	if let Some(generation) = campaign.generation_id {
-		return if campaign.target_commit_sha == sha {
+		return if campaign.target_commit_sha.expose() == sha.expose() {
 			Ok(generation)
 		} else {
 			Err(Error::Conflict(Conflict::CampaignPinned))
@@ -196,14 +189,16 @@ pub fn pin(
 	let generations = generations::list_for_repo(tx, campaign.repo_id)?;
 	let active = generations.iter().find(|g| g.state == generations::State::Active);
 	let existing = active.and_then(|g| {
-		if g.commit_sha == sha && g.workflow_contract_version == WORKFLOW_CONTRACT_VERSION {
+		if g.commit_sha.expose() == sha.expose()
+			&& g.workflow_contract_version == WORKFLOW_CONTRACT_VERSION
+		{
 			Some(g.generation_id)
-		} else if g.commit_sha != sha {
+		} else if g.commit_sha.expose() != sha.expose() {
 			generations
 				.iter()
 				.find(|s| {
 					s.state == generations::State::Building
-						&& s.commit_sha == sha
+						&& s.commit_sha.expose() == sha.expose()
 						&& s.workflow_contract_version == WORKFLOW_CONTRACT_VERSION
 						&& s.predecessor_generation_id == Some(g.generation_id)
 				})
@@ -216,9 +211,8 @@ pub fn pin(
 		existing
 	} else {
 		if active.is_none() {
-			let reason = BoundedText::new("superseded bootstrap")?;
 			for g in generations.iter().filter(|g| g.state == generations::State::Building) {
-				generations::abandon(tx, g.generation_id, &reason, now)?;
+				generations::abandon_superseded_bootstrap(tx, g.generation_id, now)?;
 			}
 		}
 		generations::create(
@@ -234,7 +228,7 @@ pub fn pin(
 	};
 	tx.execute(
 		"UPDATE review_campaigns SET target_commit_sha=?2,generation_id=?3 WHERE campaign_id=?1",
-		params![campaign_id, sha, generation_id],
+		params![campaign_id, sha.expose(), generation_id],
 	)?;
 	tx.execute("UPDATE jobs SET generation_id=?2 WHERE id=?1", params![job_id, generation_id])?;
 	Ok(generation_id)
@@ -299,12 +293,11 @@ fn replenish_inner(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<R
 	let band: Band = band.parse()?;
 	let parent:Option<i64>=tx.query_row("SELECT id FROM jobs WHERE campaign_id=?1 AND kind='survey' AND state IN ('succeeded','failed','cancelled') ORDER BY finished_at DESC,id DESC LIMIT 1",[campaign_id],|r|r.get(0)).optional()?;
 	let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
-	let recipe = recipe("coverage")?;
 	match scheduler::enqueue_phase(
 		tx,
 		&NewPhaseJob {
 			repo_id: campaign.repo_id,
-			kind: JobKind::Survey,
+			kind: JobKind::<DbSource>::Survey,
 			campaign_id,
 			generation_id: Some(generation_id),
 			assigned_lead_id: None,
@@ -314,7 +307,7 @@ fn replenish_inner(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<R
 			effective_priority: 0,
 			eligible_at: now,
 			token_budget: policy.survey_token_budget,
-			recipe: &recipe,
+			recipe: PhaseRecipeInput::Survey(SurveyRecipe::Coverage),
 			handoff: false,
 		},
 		now,
@@ -325,8 +318,8 @@ fn replenish_inner(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<R
 	}
 }
 
-pub fn cancel(
-	tx: &Transaction<'_>, campaign_id: i64, reason: &BoundedText<Reason>, now: i64,
+pub fn cancel<S: Source>(
+	tx: &Transaction<'_>, campaign_id: i64, reason: &BoundedText<Reason, S>, now: i64,
 ) -> Result<()> {
 	scheduler::cancel_queued_children(tx, campaign_id, now, reason)?;
 	campaigns::cancel(tx, campaign_id, reason, now)
@@ -367,12 +360,7 @@ fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress>
 	}
 	let expired = campaign.deadline_at.is_some_and(|at| at <= now);
 	if expired {
-		scheduler::cancel_queued_children(
-			tx,
-			campaign_id,
-			now,
-			&BoundedText::new("campaign deadline")?,
-		)?;
+		scheduler::cancel_queued_at_deadline(tx, campaign_id, now)?;
 	}
 	let busy: bool = tx.query_row(
 		"SELECT EXISTS(SELECT 1 FROM jobs WHERE campaign_id=?1 AND state IN ('queued','leased'))",
@@ -393,12 +381,12 @@ fn advance(tx: &Transaction<'_>, campaign_id: i64, now: i64) -> Result<Progress>
 		}
 	}
 	let (finish, reason) = if expired {
-		(Finish::DeadlineReached, "deadline")
+		(Finish::DeadlineReached, campaigns::FinishedReason::Deadline)
 	} else {
-		(Finish::Completed, "completed")
+		(Finish::Completed, campaigns::FinishedReason::Completed)
 	};
 	let summary = campaigns::summarize(tx, campaign_id)?;
-	campaigns::finish(tx, campaign_id, &summary, &BoundedText::new(reason)?, now)?;
+	campaigns::finish_scheduled(tx, campaign_id, &summary, reason, now)?;
 	progress.finish = Some(finish);
 	Ok(progress)
 }
@@ -438,4 +426,34 @@ pub fn tick(db: &Db, now: i64) -> Result<TickReport> {
 		}
 	}
 	Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn requested_ref_traits_need_only_source_and_preserve_variant_and_borrow() {
+		#[allow(clippy::clone_on_copy)] // Exercise Clone independently to check its generic bounds.
+		fn cloned<'a, S: Source>(value: &RequestedRef<'a, S>) -> RequestedRef<'a, S> {
+			Clone::clone(value)
+		}
+		fn copied<'a, S: Source>(value: &RequestedRef<'a, S>) -> RequestedRef<'a, S> {
+			*value
+		}
+
+		let pinned = crate::test_support::text("pinned-revision");
+		let branch = crate::test_support::text("main");
+		for original in [RequestedRef::Pinned(&pinned), RequestedRef::Branch(&branch)] {
+			for copy in [cloned(&original), copied(&original)] {
+				match (&original, &copy) {
+					(RequestedRef::Pinned(left), RequestedRef::Pinned(right))
+					| (RequestedRef::Branch(left), RequestedRef::Branch(right)) => {
+						assert!(std::ptr::eq(*left, *right));
+					},
+					_ => panic!("requested reference clone or copy changed variant"),
+				}
+			}
+		}
+	}
 }

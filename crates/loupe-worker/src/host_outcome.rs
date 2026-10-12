@@ -1,6 +1,6 @@
 //! Closed host decisions with separately retained Server revision evidence.
 //! Host-generated reasons are serialized here and never minted as Agent text.
-use loupe_core::source_migration::text::BoundedText;
+use loupe_core::text::BoundedText;
 use loupe_provenance::Server;
 
 use crate::ingress_text::RevisionText;
@@ -13,6 +13,9 @@ impl ReviewedRevision {
 	}
 	pub(crate) fn text(&self) -> &str {
 		self.0.expose()
+	}
+	pub(crate) fn into_revision(self) -> BoundedText<RevisionText, Server> {
+		self.0
 	}
 }
 #[derive(Clone)]
@@ -55,24 +58,55 @@ pub enum HostVerifyReason {
 	ReviewedRevisionUnavailable { revision: ReviewedRevision, failure: CheckoutFailure },
 }
 impl HostVerifyReason {
-	/// Named mixed-source submission egress. The temporary legacy DTO adapter
-	/// disappears at M; the closed reason and Server input survive that join.
-	pub(crate) fn into_legacy_submission(self) -> loupe_proto::VerdictSubmission {
-		let (reason,terminal)=match self {
-			Self::ScannerDoesNotVerify=>("scanner does not verify".to_owned(),false),
-			Self::MissingReviewedRevision=>("original reviewed revision is unavailable: verify lease did not carry the original reviewed revision".to_owned(),true),
-			Self::ReviewedRevisionUnavailable{revision,failure}=>{
-				let sha=revision.text();
-				let detail=match failure {
-					CheckoutFailure::ParseRevision|CheckoutFailure::LocateRevision=>format!("{failure} {sha}"),
-					_=>failure.to_string(),
-				};
-				(format!("original reviewed revision {sha} is unavailable after refreshing and re-cloning the repository: {detail}"),true)
-			}
-		};
-		loupe_proto::VerdictSubmission {
-			protocol_version: loupe_proto::PROTOCOL_VERSION,
-			verdict: loupe_core::Verdict::Inconclusive { reason, terminal },
+	pub(crate) fn into_submission(self) -> HostSubmission {
+		HostSubmission(self)
+	}
+}
+
+/// Only this closed host decision can construct the mixed-source wire owner.
+pub(crate) struct HostSubmission(HostVerifyReason);
+impl serde::Serialize for HostSubmission {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		use serde::ser::SerializeStruct;
+		let mut wire = serializer.serialize_struct("VerdictSubmission", 2)?;
+		wire.serialize_field("protocol_version", &loupe_proto::PROTOCOL_VERSION)?;
+		wire.serialize_field("verdict", &HostVerdict(&self.0))?;
+		wire.end()
+	}
+}
+struct HostVerdict<'a>(&'a HostVerifyReason);
+impl serde::Serialize for HostVerdict<'_> {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		use serde::ser::SerializeStruct;
+		let terminal = !matches!(self.0, HostVerifyReason::ScannerDoesNotVerify);
+		let mut wire = serializer.serialize_struct("Verdict", if terminal { 3 } else { 2 })?;
+		wire.serialize_field("outcome", "inconclusive")?;
+		wire.serialize_field("reason", &HostReason(self.0))?;
+		if terminal {
+			wire.serialize_field("terminal", &true)?;
 		}
+		wire.end()
+	}
+}
+struct HostReason<'a>(&'a HostVerifyReason);
+impl std::fmt::Display for HostReason<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self.0 {
+			HostVerifyReason::ScannerDoesNotVerify => f.write_str("scanner does not verify"),
+			HostVerifyReason::MissingReviewedRevision => f.write_str("original reviewed revision is unavailable: verify lease did not carry the original reviewed revision"),
+			HostVerifyReason::ReviewedRevisionUnavailable { revision, failure } => {
+				let sha = revision.text();
+				write!(f, "original reviewed revision {sha} is unavailable after refreshing and re-cloning the repository: {failure}")?;
+				if matches!(failure, CheckoutFailure::ParseRevision | CheckoutFailure::LocateRevision) {
+					write!(f, " {sha}")?;
+				}
+				Ok(())
+			},
+		}
+	}
+}
+impl serde::Serialize for HostReason<'_> {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.collect_str(self)
 	}
 }

@@ -3,23 +3,24 @@
 //!
 //! ```compile_fail
 //! use loupe_core::text::{BoundedText, policy::{Title, Objective}};
-//! fn title(_: BoundedText<Title>) {}
-//! title(BoundedText::<Objective>::new("not a title").unwrap());
+//! use loupe_provenance::Agent;
+//! fn title(_: BoundedText<Title, Agent>) {}
+//! fn wrong(value: BoundedText<Objective, Agent>) { title(value); }
 //! ```
 
 pub(crate) mod checked;
+#[cfg(doctest)]
+mod contract;
 pub(crate) mod json;
 pub(crate) mod json_string;
 pub mod policy;
+mod values;
 use std::fmt;
-use std::marker::PhantomData;
-use std::str::FromStr;
 
-pub use json::BoundedJson;
 pub use json_string::decode_json_string_bounded;
-use serde::{Deserialize, Serialize};
 use unicode_general_category::{get_general_category, GeneralCategory as G};
 use unicode_normalization::UnicodeNormalization;
+pub use values::{Anchor, BoundedJson, BoundedText, Identifier, RepoPath, SourceRef};
 
 /// Whether field validation normalizes prose or retains admitted UTF-8 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,15 +155,6 @@ pub(crate) fn normalized(raw: &str) -> String {
 	raw.replace("\r\n", "\n").replace('\r', "\n").nfc().collect()
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct BoundedText<P: TextPolicy>(String, PhantomData<P>);
-#[derive(Clone, PartialEq, Eq)]
-pub struct Identifier<P: IdentPolicy>(String, PhantomData<P>);
-#[derive(Clone, PartialEq, Eq)]
-pub struct Anchor<P: AnchorPolicy>(String, PhantomData<P>);
-#[derive(Clone, PartialEq, Eq)]
-pub struct RepoPath(String);
-
 /// Reject oversized prose before allocating, with a conservative margin for
 /// CRLF folding and NFC contraction. The exact normalized caps follow below.
 /// This is not valid for anchors: whitespace collapse can shrink them without
@@ -174,30 +166,6 @@ fn oversized(field: &'static str, raw: &str, max_bytes: usize) -> Result<(), Err
 	Ok(())
 }
 
-impl<P: TextPolicy> BoundedText<P> {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		checked::text::<P>(raw).map(|text| Self(text, PhantomData))
-	}
-}
-impl<P: IdentPolicy> Identifier<P> {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		checked::identifier::<P>(raw).map(|text| Self(text, PhantomData))
-	}
-}
-impl<P: AnchorPolicy> Anchor<P> {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		checked::anchor::<P>(raw).map(|text| Self(text, PhantomData))
-	}
-}
-impl RepoPath {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		checked::path(raw).map(Self)
-	}
-	pub fn expose(&self) -> &str {
-		&self.0
-	}
-}
-
 /// Path structure after the constructor's character and byte-limit checks.
 pub(crate) fn is_repo_path(raw: &[u8]) -> bool {
 	!raw.contains(&b'\\')
@@ -205,83 +173,13 @@ pub(crate) fn is_repo_path(raw: &[u8]) -> bool {
 		&& !raw.split(|byte| *byte == b'/').any(|part| matches!(part, b"" | b"." | b".."))
 }
 
-macro_rules! text_impls {
-	($ty:ident, $policy:ident) => {
-		impl<P: $policy> $ty<P> {
-			pub fn expose(&self) -> &str {
-				&self.0
-			}
-		}
-		impl<P: $policy> fmt::Debug for $ty<P> {
-			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-				write!(f, "{}<{}>(len={})", stringify!($ty), P::FIELD, self.0.len())
-			}
-		}
-		impl<P: $policy> FromStr for $ty<P> {
-			type Err = Error;
-			fn from_str(raw: &str) -> Result<Self, Error> {
-				Self::new(raw)
-			}
-		}
-		impl<P: $policy> TryFrom<String> for $ty<P> {
-			type Error = Error;
-			fn try_from(raw: String) -> Result<Self, Error> {
-				Self::new(&raw)
-			}
-		}
-		impl<P: $policy> Serialize for $ty<P> {
-			fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-				s.serialize_str(&self.0)
-			}
-		}
-		impl<'de, P: $policy> Deserialize<'de> for $ty<P> {
-			fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-				Self::new(&String::deserialize(d)?).map_err(serde::de::Error::custom)
-			}
-		}
-	};
-}
-text_impls!(BoundedText, TextPolicy);
-text_impls!(Identifier, IdentPolicy);
-text_impls!(Anchor, AnchorPolicy);
-
-impl fmt::Debug for RepoPath {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "RepoPath(len={})", self.0.len())
-	}
-}
-impl FromStr for RepoPath {
-	type Err = Error;
-	fn from_str(raw: &str) -> Result<Self, Error> {
-		Self::new(raw)
-	}
-}
-impl TryFrom<String> for RepoPath {
-	type Error = Error;
-	fn try_from(raw: String) -> Result<Self, Error> {
-		Self::new(&raw)
-	}
-}
-impl Serialize for RepoPath {
-	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-		s.serialize_str(&self.0)
-	}
-}
-impl<'de> Deserialize<'de> for RepoPath {
-	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-		Self::new(&String::deserialize(d)?).map_err(serde::de::Error::custom)
-	}
-}
-
-/// Structured storage reference; protocol adapters may accept path#symbol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceRef {
-	pub path: RepoPath,
-	pub symbol: Option<BoundedText<policy::Symbol>>,
-}
-
 #[cfg(test)]
 mod json_string_tests;
 #[cfg(test)]
 mod tests;
+/// Fuzz-only observation of Payload's actual embedded serde visitor. This
+/// deliberately omits the outer raw-document cap and creates no labelled owner.
+#[cfg(fuzzing)]
+pub fn fuzz_payload_visitor(raw: &str) -> Option<(String, [u8; 32])> {
+	json::payload_visitor_observation(raw)
+}

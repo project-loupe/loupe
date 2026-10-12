@@ -17,7 +17,7 @@ pub struct Identifier<P: IdentPolicy, S: Source>(String, PhantomData<(P, S)>);
 pub struct Anchor<P: AnchorPolicy, S: Source>(String, PhantomData<(P, S)>);
 /// Exact validated repository-relative spelling; not filesystem authorization.
 pub struct RepoPath<S: Source>(String, PhantomData<S>);
-/// Bounded semantic JSON retaining its source and existing canonical digest.
+/// Bounded semantic JSON retaining its source and canonical digest.
 pub struct BoundedJson<P: JsonPolicy, S: Source>(CheckedJson, PhantomData<(P, S)>);
 
 macro_rules! marked_text {
@@ -78,7 +78,7 @@ impl<S: Source> PartialEq for RepoPath<S> {
 impl<S: Source> Eq for RepoPath<S> {}
 impl<S: Source> fmt::Debug for RepoPath<S> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "RepoPath<{}>([redacted])", S::NAME)
+		write!(f, "RepoPath<{}>(len={}, [redacted])", S::NAME, self.0.len())
 	}
 }
 impl<S: Source> Serialize for RepoPath<S> {
@@ -116,7 +116,13 @@ impl<P: JsonPolicy, S: Source> PartialEq for BoundedJson<P, S> {
 impl<P: JsonPolicy, S: Source> Eq for BoundedJson<P, S> {}
 impl<P: JsonPolicy, S: Source> fmt::Debug for BoundedJson<P, S> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "BoundedJson<{}, {}>([redacted])", P::FIELD, S::NAME)
+		write!(
+			f,
+			"BoundedJson<{}, {}>(len={}, [redacted])",
+			P::FIELD,
+			S::NAME,
+			self.canonical().len()
+		)
 	}
 }
 impl<P: JsonPolicy, S: Source> Serialize for BoundedJson<P, S> {

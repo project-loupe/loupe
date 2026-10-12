@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use loupe_core::source_migration::text::BoundedText;
+use loupe_core::text::BoundedText;
 use loupe_provenance::{Ingress, Mark, Repo, Secret, Untrusted, Unvalidated, Validate};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
@@ -225,13 +225,13 @@ impl RepoCache {
 	/// if the file is missing, has a bad magic, or carries an unknown
 	/// version — in any of those cases the caller should treat the repo
 	/// as never-scanned.
-	pub fn read_cursor(&self, key: &RepoKey) -> Option<String> {
+	pub fn read_cursor(&self, key: &RepoKey) -> Option<BoundedText<RevisionText, Repo>> {
 		let path = self.repo_path(key).join(CURSOR_FILENAME);
 		let bytes = std::fs::read(&path).ok()?;
 		// SAFETY: actual cached repository cursor bytes, before decoding.
 		#[allow(unsafe_code)]
 		let bytes = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
-		bytes.as_bytes().validate(RepoCursorDecoder).ok()?.map(RepoCursor::legacy_revision)
+		bytes.as_bytes().validate(RepoCursorDecoder).ok()?.map(RepoCursor::into_revision)
 	}
 
 	/// Write the cursor for `key`. Always writes the current cursor
@@ -405,8 +405,8 @@ impl Validate<&[u8], Repo> for RepoCursorDecoder {
 }
 impl RepoCursor {
 	/// Temporary concrete cursor exit; M retains the Repo revision.
-	fn legacy_revision(self) -> String {
-		self.0.expose().to_owned()
+	fn into_revision(self) -> BoundedText<RevisionText, Repo> {
+		self.0
 	}
 }
 
@@ -418,7 +418,7 @@ pub mod fuzz_support {
 		use super::*;
 		// SAFETY: cfg-only original Repo cursor fixture bytes, before decoding.
 		let original = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
-		original.validate(RepoCursorDecoder).unwrap().map(RepoCursor::legacy_revision)
+		original.validate(RepoCursorDecoder).unwrap().map(|v| v.into_revision().expose().to_owned())
 	}
 
 	pub fn encode_cursor(sha: &str) -> Vec<u8> {
@@ -584,7 +584,7 @@ mod tests {
 
 		assert!(cache.read_cursor(&key).is_none());
 		cache.write_cursor(&key, "abc123def456").unwrap();
-		assert_eq!(cache.read_cursor(&key).as_deref(), Some("abc123def456"));
+		assert_eq!(cache.read_cursor(&key).as_ref().map(|v| v.expose()), Some("abc123def456"));
 	}
 
 	#[test]
@@ -596,7 +596,7 @@ mod tests {
 		cache.write_cursor(&key, "bad\u{1}revision").unwrap();
 		assert!(cache.read_cursor(&key).is_none(), "Repo cursor control bytes were admitted");
 		cache.write_cursor(&key, " base ").unwrap();
-		assert_eq!(cache.read_cursor(&key).as_deref(), Some("base"));
+		assert_eq!(cache.read_cursor(&key).as_ref().map(|v| v.expose()), Some("base"));
 	}
 
 	#[test]

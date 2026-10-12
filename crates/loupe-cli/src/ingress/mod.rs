@@ -1,9 +1,9 @@
 //! Actual CLI response ingress. Original guarded Bytes stays alive through
-//! every named decoder. Private legacy exits are removed at atomic M.
+//! every named decoder and returns source-bearing domain values.
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::{decode_json_string_bounded, policy, Normalization, TextPolicy, Whitespace};
+use loupe_core::text::policy::{AuditName, JobDiagnostic, JobKindName, RevisionText};
+use loupe_core::text::{decode_json_string_bounded, policy, BoundedText, TextPolicy};
 use loupe_provenance::{Ingress, Mark, Server, Untrusted, Unvalidated, Validate};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -14,15 +14,20 @@ mod registry;
 mod reporting;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(super) use findings::{get_finding_legacy, list_findings_legacy, search_findings_legacy};
+#[cfg_attr(test, allow(unused_imports))] // Library rendering tests use only detail ingress.
+pub(super) use findings::{get_finding, list_findings, search_findings};
 #[cfg(fuzzing)]
+#[allow(unused_imports)] // Only the library's fuzz fixture reads these shared observations.
 pub(crate) use findings::{reset_observations, take_observations};
 #[cfg(fuzzing)]
+#[allow(unused_imports)] // Only the library's fuzz fixture exports these shared observations.
 pub use findings::{Field, FieldObservation, FieldSource};
-pub(super) use jobs::{cancel_job_legacy, get_job_legacy, list_jobs_legacy, retry_job_legacy};
-pub(super) use registry::{
-	list_repos_legacy, register_worker_bundle_legacy, show_github_app_legacy,
-};
+#[cfg_attr(test, allow(unused_imports))]
+// Binary and fuzz fixtures exercise the full inventory.
+pub(super) use jobs::{cancel_job, get_job, list_jobs, retry_job};
+#[cfg_attr(test, allow(unused_imports))]
+// Binary and fuzz fixtures exercise the full inventory.
+pub(super) use registry::{list_repos, register_worker_bundle, show_github_app};
 
 fn invalid() -> anyhow::Error {
 	anyhow!("server response violates schema or field policy")
@@ -54,6 +59,7 @@ fn entered(entry: Entry) {
 	ENTRIES.with(|entries| entries.borrow_mut().push(entry));
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // The binary shares ingress; the library fixture collects its observations.
 pub(crate) fn take_entries() -> Vec<Entry> {
 	ENTRIES.with(|entries| std::mem::take(&mut *entries.borrow_mut()))
 }
@@ -75,7 +81,7 @@ pub(super) async fn receive(
 	// SAFETY: these exact guarded bytes were read from the actual server response.
 	let received = Untrusted::new(bytes, unsafe { Ingress::<Server>::new() });
 	if !status.is_success() {
-		return Err(received.as_bytes().validate(ServerDiagnostic { status, action })?);
+		return Err(received.as_bytes().validate(ServerDiagnostic { status, action })?.into());
 	}
 	Ok(received)
 }
@@ -85,14 +91,45 @@ struct ServerDiagnostic {
 	action: &'static str,
 }
 impl Validate<&[u8], Server> for ServerDiagnostic {
-	type Output = anyhow::Error;
+	type Output = TerminalDiagnostic;
 	type Error = anyhow::Error;
 	fn validate<'v>(self, u: Unvalidated<'v, &[u8]>, _: Mark<'v, Server>) -> Result<Self::Output> {
-		// Explicit diagnostic legacy exit: existing lossy presentation, after
-		// transport admission. main owns the final terminal escaping.
-		Ok(anyhow!("{}: {} — {}", self.action, self.status, String::from_utf8_lossy(u.get())))
+		Ok(TerminalDiagnostic {
+			bytes: loupe_provenance::Secret::new(u.get().to_vec()),
+			status: self.status,
+			action: self.action,
+			source: std::marker::PhantomData,
+		})
 	}
 }
+
+/// An intentional Server diagnostic owns its bytes until terminal rendering.
+/// Schema/policy errors remain fixed host messages and never use this path.
+#[cfg_attr(fuzzing, allow(dead_code))] // The library fuzz fixture bypasses HTTP error collection.
+struct TerminalDiagnostic {
+	bytes: loupe_provenance::Secret<Vec<u8>>,
+	status: reqwest::StatusCode,
+	action: &'static str,
+	source: std::marker::PhantomData<Server>,
+}
+impl std::fmt::Debug for TerminalDiagnostic {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("TerminalDiagnostic<Server>([redacted])")
+	}
+}
+impl std::fmt::Display for TerminalDiagnostic {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// The CLI's final error boundary escapes terminal controls, as before.
+		write!(
+			f,
+			"{}: {} — {}",
+			self.action,
+			self.status,
+			String::from_utf8_lossy(self.bytes.expose())
+		)
+	}
+}
+impl std::error::Error for TerminalDiagnostic {}
 
 macro_rules! scalar_decoder {
 	($name:ident, $validator:ident, $output:ty) => {
@@ -116,26 +153,6 @@ macro_rules! scalar_decoder {
 scalar_decoder!(register_repo, RegisterRepo, loupe_proto::RegisterRepoResponse);
 scalar_decoder!(scan_repo, ScanRepo, loupe_proto::ScanResponse);
 scalar_decoder!(retry_verification, RetryVerification, loupe_proto::RetryVerifyResponse);
-
-macro_rules! local_policy {
-	($name:ident, $field:literal, $multi:literal) => {
-		struct $name;
-		impl TextPolicy for $name {
-			const FIELD: &'static str = $field;
-			const MAX_BYTES: usize = policy::LEGACY_TEXT_MAX_BYTES;
-			const MAX_CHARS: usize = policy::LEGACY_TEXT_MAX_BYTES;
-			const MULTILINE: bool = $multi;
-			const ALLOW_EMPTY: bool = true;
-			const NORMALIZATION: Normalization = Normalization::Exact;
-			const WHITESPACE: Whitespace = Whitespace::Significant;
-			const ALLOW_CR: bool = $multi;
-		}
-	};
-}
-local_policy!(RevisionText, "revision", false);
-local_policy!(AuditName, "audit_common_name", false);
-local_policy!(JobDiagnostic, "job_diagnostic", true);
-local_policy!(JobKindName, "job_kind", false);
 
 macro_rules! server_field {
 	($name:ident, $policy:ty) => {
@@ -165,24 +182,6 @@ server_field!(branch, policy::GitBranch);
 server_field!(slug, policy::GithubAppSlug);
 server_field!(address, policy::MailAddress);
 server_field!(subject, policy::MailSubjectPrefix);
-
-// These concrete projections are the only field-level legacy exits. They
-// keep each source fixed; there is no caller-selected source or typed decoder.
-macro_rules! legacy_server_field {
-	($name:ident, $typed:ident) => {
-		fn $name(mark: &Mark<'_, Server>, token: &RawValue) -> Result<String> {
-			Ok($typed(mark, token)?.expose().to_owned())
-		}
-	};
-}
-legacy_server_field!(revision_legacy, revision);
-legacy_server_field!(diagnostic_legacy, diagnostic);
-legacy_server_field!(clone_url_legacy, clone_url);
-legacy_server_field!(host_legacy, host);
-legacy_server_field!(owner_legacy, owner);
-legacy_server_field!(repo_legacy, repo);
-legacy_server_field!(branch_legacy, branch);
-legacy_server_field!(slug_legacy, slug);
 
 struct DiscardSuccess;
 impl Validate<&[u8], Server> for DiscardSuccess {

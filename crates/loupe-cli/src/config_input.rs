@@ -1,5 +1,5 @@
 //! Config enters at Clap's actual argv/environment value callbacks. The
-//! concrete *_legacy parsers end in the old argument shapes until atomic M.
+//! concrete parsers retain their Config owners through destination use.
 use std::ffi::OsStr;
 use std::fmt;
 use std::marker::PhantomData;
@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use clap::builder::TypedValueParser;
 use clap::parser::ValueSource;
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::{policy, Normalization, TextPolicy, Whitespace};
+use loupe_core::text::{policy, BoundedText, Normalization, TextPolicy, Whitespace};
 use loupe_provenance::{Config, Ingress, Mark, Secret, Untrusted, Unvalidated, Validate};
 
 // This is only called by the concrete Clap value parsers below, before any
@@ -62,52 +61,76 @@ macro_rules! text_parser {
 		#[derive(Clone)]
 		pub(super) struct $parser;
 		impl TypedValueParser for $parser {
-			type Value = String;
+			type Value = BoundedText<$policy, Config>;
 			fn parse_ref(
 				&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
-			) -> Result<String, clap::Error> {
+			) -> Result<Self::Value, clap::Error> {
 				#[cfg(fuzzing)]
 				entered(stringify!($parser));
-				// Explicit temporary Config-text legacy exit; M removes it.
 				let typed = argument(value).validate($validator)?;
 				#[cfg(fuzzing)]
 				observe_text(&typed);
-				Ok(typed.expose().to_owned())
+				Ok(typed)
 			}
 		}
 	};
 }
-text_parser!(CloneUrlLegacy, CloneUrl, policy::CloneUrl);
-text_parser!(BranchLegacy, Branch, policy::GitBranch);
-text_parser!(OwnerLegacy, Owner, policy::RepoOwner);
-text_parser!(RepoLegacy, Repo, policy::RepoName);
-text_parser!(WorkerNameLegacy, WorkerName, policy::WorkerName);
-text_parser!(SearchLegacy, Search, SearchQuery);
-text_parser!(HostnameLegacy, Hostname, CertificateName);
+text_parser!(CloneUrlArgument, CloneUrl, policy::CloneUrl);
+text_parser!(BranchArgument, Branch, policy::GitBranch);
+text_parser!(OwnerArgument, Owner, policy::RepoOwner);
+text_parser!(RepoArgument, Repo, policy::RepoName);
+text_parser!(WorkerNameArgument, WorkerName, policy::WorkerName);
+text_parser!(SearchArgument, Search, SearchQuery);
+text_parser!(HostnameArgument, Hostname, CertificateName);
 
 #[derive(Clone)]
-pub(super) struct CommonNameLegacy;
-impl TypedValueParser for CommonNameLegacy {
-	type Value = String;
+pub(super) struct CommonNameArgument;
+impl TypedValueParser for CommonNameArgument {
+	type Value = CertificateCommonName;
 	fn parse_ref(
 		&self, c: &clap::Command, a: Option<&clap::Arg>, value: &OsStr,
-	) -> Result<String, clap::Error> {
-		HostnameLegacy.parse_ref(c, a, value)
+	) -> Result<Self::Value, clap::Error> {
+		HostnameArgument.parse_ref(c, a, value).map(CertificateCommonName::Configured)
 	}
 	fn parse_ref_(
 		&self, c: &clap::Command, a: Option<&clap::Arg>, value: &OsStr, source: ValueSource,
-	) -> Result<String, clap::Error> {
+	) -> Result<Self::Value, clap::Error> {
 		#[cfg(fuzzing)]
-		entered("CommonNameLegacy");
+		entered("CommonNameArgument");
 		if source == ValueSource::DefaultValue {
-			Ok("loupe-server".to_owned())
+			Ok(CertificateCommonName::Default)
 		} else {
 			self.parse_ref(c, a, value)
 		}
 	}
 }
 
-struct ConfiguredPath(PathBuf, PhantomData<Config>);
+#[derive(Clone)]
+pub(super) struct ConfiguredPath(PathBuf, PhantomData<Config>);
+impl std::fmt::Debug for ConfiguredPath {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ConfiguredPath([redacted])")
+	}
+}
+impl ConfiguredPath {
+	pub(super) fn for_filesystem(&self) -> &std::path::Path {
+		&self.0
+	}
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum CertificateCommonName {
+	Default,
+	Configured(BoundedText<CertificateName, Config>),
+}
+impl CertificateCommonName {
+	pub(super) fn for_certificate(&self) -> &str {
+		match self {
+			Self::Default => "loupe-server",
+			Self::Configured(name) => name.expose(),
+		}
+	}
+}
 struct PathInput;
 impl Validate<&OsStr, Config> for PathInput {
 	type Output = ConfiguredPath;
@@ -119,19 +142,30 @@ impl Validate<&OsStr, Config> for PathInput {
 	}
 }
 #[derive(Clone)]
-pub(super) struct PathLegacy;
-impl TypedValueParser for PathLegacy {
-	type Value = PathBuf;
+pub(super) struct PathArgument;
+impl TypedValueParser for PathArgument {
+	type Value = ConfiguredPath;
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
-	) -> Result<PathBuf, clap::Error> {
+	) -> Result<Self::Value, clap::Error> {
 		#[cfg(fuzzing)]
-		entered("PathLegacy");
-		Ok(argument(value).validate(PathInput)?.0)
+		entered("PathArgument");
+		argument(value).validate(PathInput)
 	}
 }
 
-struct ConfiguredUrl(reqwest::Url, PhantomData<Config>);
+#[derive(Clone)]
+pub(super) struct ConfiguredUrl(reqwest::Url, PhantomData<Config>);
+impl std::fmt::Debug for ConfiguredUrl {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ConfiguredUrl([redacted])")
+	}
+}
+impl ConfiguredUrl {
+	pub(super) fn for_request(&self) -> &reqwest::Url {
+		&self.0
+	}
+}
 struct UrlInput;
 impl Validate<&OsStr, Config> for UrlInput {
 	type Output = ConfiguredUrl;
@@ -144,21 +178,71 @@ impl Validate<&OsStr, Config> for UrlInput {
 	}
 }
 #[derive(Clone)]
-pub(super) struct UrlLegacy;
-impl TypedValueParser for UrlLegacy {
-	type Value = reqwest::Url;
+pub(super) struct UrlArgument;
+impl TypedValueParser for UrlArgument {
+	type Value = ConfiguredUrl;
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
-	) -> Result<reqwest::Url, clap::Error> {
+	) -> Result<Self::Value, clap::Error> {
 		#[cfg(fuzzing)]
-		entered("UrlLegacy");
-		Ok(argument(value).validate(UrlInput)?.0)
+		entered("UrlArgument");
+		argument(value).validate(UrlInput)
 	}
 }
 
-struct ConfiguredPem(loupe_tls::PemInput, PhantomData<Config>);
-struct PemArgument;
-impl Validate<&OsStr, Config> for PemArgument {
+#[derive(Clone)]
+pub(super) struct ConfiguredPem(loupe_tls::PemInput, PhantomData<Config>);
+impl std::fmt::Debug for ConfiguredPem {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ConfiguredPem([redacted])")
+	}
+}
+#[cfg_attr(fuzzing, allow(dead_code))] // Binary consumes selections; library only observes parsers.
+impl ConfiguredPem {
+	#[cfg(fuzzing)]
+	pub(super) fn observe_pem(&self) -> String {
+		self.0.expose().to_owned()
+	}
+	pub(super) fn is_empty(&self) -> bool {
+		self.0.expose().is_empty()
+	}
+	pub(super) fn selected_raw(&self) -> SelectedPem {
+		SelectedPem(self.0.clone().into_pem(), self.1)
+	}
+	pub(super) fn selected_base64(&self) -> anyhow::Result<SelectedPem> {
+		Ok(SelectedPem(loupe_tls::decode_pem_base64(self.0.expose().trim())?, self.1))
+	}
+}
+
+/// The selected credential retains Config through the concrete operation.
+#[cfg_attr(fuzzing, allow(dead_code))] // The fuzz library does not perform TLS or App writes.
+pub(super) struct SelectedPem(Secret<String>, PhantomData<Config>);
+impl fmt::Debug for SelectedPem {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+impl fmt::Display for SelectedPem {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+#[cfg_attr(fuzzing, allow(dead_code))] // The fuzz library does not perform TLS or App writes.
+impl SelectedPem {
+	pub(super) fn for_tls(&self) -> &str {
+		self.0.expose()
+	}
+	pub(super) fn app_credential_json(self, app_id: u64) -> serde_json::Result<Secret<Vec<u8>>> {
+		loupe_proto::SetGithubAppRequest {
+			protocol_version: loupe_proto::PROTOCOL_VERSION,
+			app_id,
+			private_key_pem: self.0,
+		}
+		.credential_json()
+	}
+}
+struct PemValue;
+impl Validate<&OsStr, Config> for PemValue {
 	type Output = ConfiguredPem;
 	type Error = clap::Error;
 	fn validate<'v>(
@@ -169,15 +253,15 @@ impl Validate<&OsStr, Config> for PemArgument {
 	}
 }
 #[derive(Clone)]
-pub(super) struct PemLegacy;
-impl TypedValueParser for PemLegacy {
-	type Value = loupe_tls::PemInput;
+pub(super) struct PemArgument;
+impl TypedValueParser for PemArgument {
+	type Value = ConfiguredPem;
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
 	) -> Result<Self::Value, clap::Error> {
 		#[cfg(fuzzing)]
-		entered("PemLegacy");
-		Ok(argument(value).validate(PemArgument)?.0)
+		entered("PemArgument");
+		argument(value).validate(PemValue)
 	}
 }
 
@@ -234,23 +318,24 @@ impl TypedValueParser for Pat {
 #[cfg_attr(fuzzing, allow(dead_code))] // Direct callback fuzzing does not read files.
 struct PemRead;
 impl Validate<&str, Config> for PemRead {
-	type Output = ();
+	type Output = PhantomData<Config>;
 	type Error = std::convert::Infallible;
 	fn validate<'v>(
 		self, _: Unvalidated<'v, &str>, _: Mark<'v, Config>,
-	) -> Result<(), Self::Error> {
+	) -> Result<Self::Output, Self::Error> {
 		// The existing guarded TLS reader already enforces UTF-8. PEM syntax
 		// and trust remain with the existing operation-specific constructors.
-		Ok(())
+		Ok(PhantomData)
 	}
 }
 #[allow(unsafe_code)]
 #[cfg_attr(fuzzing, allow(dead_code))] // Actual file source join stays in runtime tests.
-pub(super) fn read_pem(path: &std::path::Path) -> anyhow::Result<Secret<String>> {
+pub(super) fn read_pem(path: &std::path::Path) -> anyhow::Result<SelectedPem> {
 	let owner = loupe_tls::read_pem_file(path)?;
 	// SAFETY: exact still-live text returned by this actual Config PEM file read.
-	Untrusted::new(owner.expose().as_str(), unsafe { Ingress::new() }).validate(PemRead)?;
-	Ok(owner)
+	let source =
+		Untrusted::new(owner.expose().as_str(), unsafe { Ingress::new() }).validate(PemRead)?;
+	Ok(SelectedPem(owner, source))
 }
 
 #[cfg(fuzzing)]
@@ -269,6 +354,7 @@ fn observe_text<P: TextPolicy>(text: &BoundedText<P, Config>) {
 	TYPED_TEXT.with(|v| v.borrow_mut().push(text.expose().to_owned()));
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // Shared with the binary; only the library fixture collects observations.
 pub(super) fn take_callbacks() -> (Vec<&'static str>, Vec<String>) {
 	(
 		CALLBACKS.with(|v| std::mem::take(&mut *v.borrow_mut())),
@@ -276,16 +362,19 @@ pub(super) fn take_callbacks() -> (Vec<&'static str>, Vec<String>) {
 	)
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // Shared with the binary; only the library fixture resets observations.
 pub(super) fn reset_mints() {
 	MINTS.with(|s| s.set(0));
 	let _ = take_callbacks();
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // Shared with the binary; only the library fixture collects observations.
 pub(super) fn mints() -> usize {
 	MINTS.with(std::cell::Cell::get)
 }
 #[cfg(fuzzing)]
 #[derive(Debug)]
+#[allow(dead_code)] // The library fixture exposes this observation; the binary does not.
 pub struct PatObservation {
 	pub shared: bool,
 	pub redacted: bool,
@@ -295,6 +384,7 @@ pub struct PatObservation {
 	pub shared_copy: bool,
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // The library fixture exercises these operations; the binary does not.
 pub(super) fn observe_pat(input: PatInput, actions: &[u8]) -> PatObservation {
 	let pointer = input.0.expose().as_ptr();
 	let mut redacted =
@@ -365,11 +455,11 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn native_paths_preserve_distinct_non_utf8_bytes_and_text_errors_are_fixed() {
-		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+		use std::os::unix::ffi::OsStrExt;
 		let command = clap::Command::new("test");
 		for raw in [b"relative/\xff".as_slice(), b"relative/\xfe"] {
-			let path = PathLegacy.parse_ref(&command, None, OsStr::from_bytes(raw)).unwrap();
-			assert_eq!(path.into_os_string().into_vec(), raw);
+			let path = PathArgument.parse_ref(&command, None, OsStr::from_bytes(raw)).unwrap();
+			assert_eq!(path.for_filesystem().as_os_str().as_bytes(), raw);
 			let error = Pat.parse_ref(&command, None, OsStr::from_bytes(raw)).unwrap_err();
 			assert!(!format!("{error:?}").contains("relative"));
 			assert!(error.to_string().contains("configuration value violates field policy"));
@@ -380,18 +470,28 @@ mod tests {
 	fn exact_query_and_certificate_policies_retain_empty_spacing_and_boundaries() {
 		let command = clap::Command::new("test");
 		for value in ["", " NFD-e\u{301} *markup* ", "\r\n\tquery\n\n\n"] {
-			assert_eq!(SearchLegacy.parse_ref(&command, None, OsStr::new(value)).unwrap(), value);
+			assert_eq!(
+				SearchArgument.parse_ref(&command, None, OsStr::new(value)).unwrap().expose(),
+				value
+			);
 		}
 		for value in ["", " space é *markup* "] {
-			assert_eq!(HostnameLegacy.parse_ref(&command, None, OsStr::new(value)).unwrap(), value);
+			assert_eq!(
+				HostnameArgument.parse_ref(&command, None, OsStr::new(value)).unwrap().expose(),
+				value
+			);
 		}
 		let exact = "x".repeat(policy::LEGACY_TEXT_MAX_BYTES);
-		assert_eq!(SearchLegacy.parse_ref(&command, None, OsStr::new(&exact)).unwrap(), exact);
-		assert!(SearchLegacy.parse_ref(&command, None, OsStr::new(&(exact + "x"))).is_err());
 		assert_eq!(
-			CommonNameLegacy
+			SearchArgument.parse_ref(&command, None, OsStr::new(&exact)).unwrap().expose(),
+			exact
+		);
+		assert!(SearchArgument.parse_ref(&command, None, OsStr::new(&(exact + "x"))).is_err());
+		assert_eq!(
+			CommonNameArgument
 				.parse_ref_(&command, None, OsStr::new("loupe-server"), ValueSource::DefaultValue)
-				.unwrap(),
+				.unwrap()
+				.for_certificate(),
 			"loupe-server"
 		);
 	}

@@ -1,6 +1,7 @@
 //! Semantic identity attachment never discards a submitted observation.
-use loupe_core::text::policy::{Payload, Reason};
+use loupe_core::text::policy::{Payload, Reason, RevisionText};
 use loupe_core::text::{BoundedJson, BoundedText};
+use loupe_provenance::{Agent, Db, Source};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::identity::Identity;
@@ -9,14 +10,14 @@ use crate::review_units::Priority;
 use crate::{lead_observations, ownership, Conflict, Entity, Error, Ownership, Result};
 string_enum!(Status { Open=>"open", Deferred=>"deferred", Closed=>"closed" });
 string_enum!(Disposition { Promoted=>"promoted", Rejected=>"rejected", Duplicate=>"duplicate", Hardening=>"hardening", Stale=>"stale" });
-pub struct NewLead<'a> {
+pub struct NewLead<'a, RevisionS: Source> {
 	pub generation_id: i64,
 	pub unit_id: Option<i64>,
-	pub identity: &'a Identity,
-	pub payload: &'a BoundedJson<Payload>,
-	pub commit_sha: &'a str,
+	pub identity: &'a Identity<Agent>,
+	pub payload: &'a BoundedJson<Payload, Agent>,
+	pub commit_sha: &'a BoundedText<RevisionText, RevisionS>,
 	pub priority: Priority,
-	pub priority_proposal: Option<&'a BoundedJson<Payload>>,
+	pub priority_proposal: Option<&'a BoundedJson<Payload, Agent>>,
 	pub supersedes: Option<i64>,
 	pub created_by_job: Option<i64>,
 }
@@ -27,13 +28,13 @@ pub struct Lead {
 	pub unit_id: Option<i64>,
 	pub status: Status,
 	pub disposition: Option<Disposition>,
-	pub defer_reason: Option<BoundedText<Reason>>,
-	pub retry_condition: Option<BoundedText<Reason>>,
+	pub defer_reason: Option<BoundedText<Reason, Db>>,
+	pub retry_condition: Option<BoundedText<Reason, Db>>,
 	pub priority: Priority,
-	pub priority_proposal: Option<BoundedJson<Payload>>,
-	pub identity: Identity,
-	pub payload: BoundedJson<Payload>,
-	pub commit_sha: String,
+	pub priority_proposal: Option<BoundedJson<Payload, Agent>>,
+	pub identity: Identity<Agent>,
+	pub payload: BoundedJson<Payload, Agent>,
+	pub commit_sha: BoundedText<RevisionText, Db>,
 	pub needs_revalidation: bool,
 	pub carry_depth: i64,
 	pub supersedes: Option<i64>,
@@ -57,7 +58,9 @@ pub enum Closure {
 	Hardening,
 	Stale,
 }
-pub fn submit(tx: &Transaction<'_>, new: &NewLead<'_>, now: i64) -> Result<Submitted> {
+pub fn submit<RevisionS: Source>(
+	tx: &Transaction<'_>, new: &NewLead<'_, RevisionS>, now: i64,
+) -> Result<Submitted> {
 	ownership::generation_repo(tx, new.generation_id)?;
 	if let Some(unit) = new.unit_id {
 		ownership::unit_in_generation(tx, unit, new.generation_id, Ownership::LeadUnit)?;
@@ -84,7 +87,7 @@ pub fn submit(tx: &Transaction<'_>, new: &NewLead<'_>, now: i64) -> Result<Submi
   None=>tx.query_row("SELECT lead_id FROM leads WHERE generation_id=?1 AND identity_fingerprint=?2 AND status='closed' AND disposition='stale' ORDER BY lead_id DESC LIMIT 1",params![new.generation_id,fingerprint.as_slice()],|r|r.get(0)).optional()?
  };
 	let result=tx.execute("INSERT INTO leads (generation_id,review_unit_id,priority_band,priority_proposal,identity_family,identity_anchor,identity_instance_key,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,supersedes_lead_id,created_by_job_id,created_at)
- VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![new.generation_id,new.unit_id,new.priority.as_str(),new.priority_proposal.map(BoundedJson::expose),new.identity.family.expose(),new.identity.anchor.expose(),new.identity.instance.as_ref().map(|v|v.expose()),fingerprint.as_slice(),new.payload.expose(),new.payload.digest().as_slice(),new.commit_sha,supersedes,new.created_by_job,now]);
+ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![new.generation_id,new.unit_id,new.priority.as_str(),new.priority_proposal.map(BoundedJson::expose),new.identity.family.expose(),new.identity.anchor.expose(),new.identity.instance.as_ref().map(|v|v.expose()),fingerprint.as_slice(),new.payload.expose(),new.payload.digest().as_slice(),new.commit_sha.expose(),supersedes,new.created_by_job,now]);
 	match result {
 		Ok(_) => Ok(Submitted::Created(tx.last_insert_rowid())),
 		Err(error) if is_unique(&error, "leads.generation_id, leads.identity_fingerprint") => {
@@ -121,25 +124,26 @@ pub fn submit(tx: &Transaction<'_>, new: &NewLead<'_>, now: i64) -> Result<Submi
 		Err(error) => Err(error.into()),
 	}
 }
-const COLUMNS:&str="lead_id,generation_id,review_unit_id,status,disposition,defer_reason,retry_condition,priority_band,priority_proposal,identity_family,identity_anchor,identity_instance_key,anchored_payload,commit_sha,needs_revalidation,carry_depth,supersedes_lead_id,duplicate_of_lead_id,duplicate_of_finding_id,promoted_finding_id,created_by_job_id,created_at,closed_at";
+const COLUMNS:&str="lead_id,generation_id,review_unit_id,status,disposition,defer_reason,retry_condition,priority_band,priority_proposal,identity_family,identity_anchor,identity_instance_key,anchored_payload,commit_sha,needs_revalidation,carry_depth,supersedes_lead_id,duplicate_of_lead_id,duplicate_of_finding_id,promoted_finding_id,created_by_job_id,created_at,closed_at,source";
 fn row(r: &Row<'_>) -> rusqlite::Result<Lead> {
+	crate::ingress::require_agent_source(r, 23)?;
 	Ok(Lead {
 		lead_id: r.get(0)?,
 		generation_id: r.get(1)?,
 		unit_id: r.get(2)?,
 		status: parsed(r, 3)?,
 		disposition: optional(r, 4)?,
-		defer_reason: crate::ingress::optional_reason_legacy(r, 5)?,
-		retry_condition: crate::ingress::optional_reason_legacy(r, 6)?,
+		defer_reason: crate::ingress::optional_reason(r, 5)?,
+		retry_condition: crate::ingress::optional_reason(r, 6)?,
 		priority: parsed(r, 7)?,
-		priority_proposal: crate::ingress::optional_agent_payload_legacy(r, 8)?,
+		priority_proposal: crate::ingress::optional_agent_payload(r, 8)?,
 		identity: Identity {
-			family: crate::ingress::family_legacy(r, 9)?,
-			anchor: crate::ingress::anchor_legacy(r, 10)?,
-			instance: crate::ingress::optional_instance_legacy(r, 11)?,
+			family: crate::ingress::family(r, 9)?,
+			anchor: crate::ingress::anchor(r, 10)?,
+			instance: crate::ingress::optional_instance(r, 11)?,
 		},
-		payload: crate::ingress::agent_payload_legacy(r, 12)?,
-		commit_sha: crate::ingress::revision_legacy(r, 13)?,
+		payload: crate::ingress::agent_payload(r, 12)?,
+		commit_sha: crate::ingress::revision(r, 13)?,
 		needs_revalidation: r.get(14)?,
 		carry_depth: r.get(15)?,
 		supersedes: r.get(16)?,
@@ -150,6 +154,16 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Lead> {
 		created_at: r.get(21)?,
 		closed_at: r.get(22)?,
 	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
+	crate::migrations::admission::scan(conn, "leads", COLUMNS, row)?;
+	crate::migrations::admission::scan(
+		conn,
+		"leads",
+		"identity_fingerprint,anchored_digest",
+		|_| Ok::<_, rusqlite::Error>(()),
+	)
 }
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Lead>> {
 	Ok(conn
@@ -188,9 +202,9 @@ pub fn close(tx: &Transaction<'_>, id: i64, closure: &Closure, now: i64) -> Resu
 	};
 	changed(tx.execute("UPDATE leads SET status='closed',disposition=?2,duplicate_of_lead_id=?3,duplicate_of_finding_id=?4,promoted_finding_id=?5,closed_at=?6 WHERE lead_id=?1 AND status IN ('open','deferred') AND (?2<>'stale' OR NOT EXISTS(SELECT 1 FROM jobs WHERE assigned_lead_id=?1 AND state IN ('queued','leased')))",params![id,disposition.as_str(),duplicate_lead,duplicate_finding,promoted_finding,now])?,Conflict::LeadState)
 }
-pub fn defer(
-	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>,
-	retry: Option<&BoundedText<Reason>>,
+pub fn defer<S: Source>(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>,
+	retry: Option<&BoundedText<Reason, S>>,
 ) -> Result<()> {
 	changed(tx.execute("UPDATE leads SET status='deferred',defer_reason=?2,retry_condition=?3 WHERE lead_id=?1 AND status='open'",params![id,reason.expose(),retry.map(BoundedText::expose)])?,Conflict::LeadState)
 }
@@ -200,6 +214,6 @@ pub fn reopen(tx: &Transaction<'_>, id: i64) -> Result<()> {
 pub fn mark_needs_revalidation(tx: &Transaction<'_>, id: i64) -> Result<()> {
 	changed(tx.execute("UPDATE leads SET needs_revalidation=1 WHERE lead_id=?1 AND status IN ('open','deferred')",[id])?,Conflict::LeadState)
 }
-standalone! {submit(new:&NewLead<'_>,now:i64)->Submitted;close(id:i64,closure:&Closure,now:i64)->();
-defer(id:i64,reason:&BoundedText<Reason>,retry:Option<&BoundedText<Reason>>)->();
+standalone! {submit<RevisionS>(new:&NewLead<'_, RevisionS>,now:i64)->Submitted;close(id:i64,closure:&Closure,now:i64)->();
+defer<S>(id:i64,reason:&BoundedText<Reason, S>,retry:Option<&BoundedText<Reason, S>>)->();
 reopen(id:i64)->();mark_needs_revalidation(id:i64)->();}

@@ -6,7 +6,7 @@
 
 use std::io::{self, Write};
 
-use loupe_provenance::{Secret, Zeroise};
+use loupe_provenance::{Secret, Source, Zeroise};
 use serde::Serialize;
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
 macro_rules! credential_encoder {
 	($($dto:ty),+ $(,)?) => { $(
 		impl $dto {
-			/// Encode the existing compact wire format into a wiping owner.
+			/// Encode the compact wire format into a wiping owner.
 			///
 			/// Deliberately delivers plaintext credentials. Retain this owner
 			/// through the authenticated transport's last body clone.
@@ -30,24 +30,36 @@ macro_rules! credential_encoder {
 	)+ };
 }
 
-credential_encoder!(
-	LeaseResponse,
-	RegisterWorkerResponse,
-	RegisterRepoRequest,
-	RotateRepoPatRequest,
-	SetRepoGithubReportingRequest,
-	SetGithubAppRequest,
-);
+credential_encoder!(RegisterWorkerResponse, RotateRepoPatRequest, SetGithubAppRequest,);
+
+impl<ContentS: Source, MetaS: Source> LeaseResponse<ContentS, MetaS> {
+	/// Deliver this lease and its credentials through the authenticated wire sink.
+	pub fn credential_json(&self) -> serde_json::Result<Secret<Vec<u8>>> {
+		encode(self, false)
+	}
+}
+impl<S: Source> RegisterRepoRequest<S> {
+	/// Deliver this registration and its optional PAT through the admin wire sink.
+	pub fn credential_json(&self) -> serde_json::Result<Secret<Vec<u8>>> {
+		encode(self, false)
+	}
+}
+impl<S: Source> SetRepoGithubReportingRequest<S> {
+	/// Deliver the named reporting setting and optional PAT through the admin sink.
+	pub fn credential_json(&self) -> serde_json::Result<Secret<Vec<u8>>> {
+		encode(self, false)
+	}
+}
 
 impl RegisterWorkerResponse {
 	/// Encode the operator's pretty worker bundle into a wiping owner.
-	/// Deliberate file/stdout export retains the existing JSON format.
+	/// Deliberate file/stdout export uses the registration response's JSON format.
 	pub fn credential_json_pretty(&self) -> serde_json::Result<Secret<Vec<u8>>> {
 		encode(self, true)
 	}
 }
 
-/// Encode the operator's server certificate bundle with its existing two-field
+/// Encode the operator's server certificate bundle with its two-field
 /// pretty JSON shape. Retain the returned owner through deliberate file/stdout
 /// export; certificate input can itself be a mixed PEM bundle.
 pub fn server_certificate_json_pretty(

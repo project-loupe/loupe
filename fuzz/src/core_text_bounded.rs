@@ -3,7 +3,7 @@
 //! This checks prose policies; Anchor's additional identity rules are separate.
 
 use loupe_core::text::policy::*;
-use loupe_core::text::{BoundedText, Rule, TextPolicy};
+use loupe_core::text::{Rule, TextPolicy};
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
@@ -61,7 +61,7 @@ fn normalize(raw: &str) -> String {
 }
 
 fn check<P: TextPolicy>(raw: &str) {
-	let result = BoundedText::<P>::new(raw);
+	let result = crate::fixtures::text::<P>(raw);
 	// The documented raw admission budget is separate from normalized limits.
 	// Check it before allocating the oracle's normalized representation too.
 	let normalized = (raw.len() <= P::MAX_BYTES.saturating_mul(4)).then(|| normalize(raw));
@@ -82,7 +82,7 @@ fn check<P: TextPolicy>(raw: &str) {
 			// Exact metadata grammar proves redaction without short-input collisions.
 			assert_eq!(
 				format!("{value:?}"),
-				format!("BoundedText<{}>(len={})", P::FIELD, value.expose().len()),
+				format!("BoundedText<{}, agent>([redacted])", P::FIELD),
 				"bounded-text Debug must contain only metadata"
 			);
 		},

@@ -1,4 +1,4 @@
-//! Actual six Worker, eight Operator and three query validators. Legacy DTOs
+//! Actual six Worker, eight Operator and three query validators. Oracle DTOs
 //! supply schema compatibility only; exact policies and field outputs are
 //! independently checked. Authentication and collection have separate targets.
 use http::Uri;
@@ -81,11 +81,11 @@ fn worker_expected(kind: usize, body: &[u8]) -> Option<Value> {
 	let mut value = match kind {
 		0 if body.is_empty() => return Some(Value::Null),
 		0 => legacy::<loupe_proto::HeartbeatRequest>(body)?,
-		1 => legacy::<loupe_proto::CompleteRequest>(body)?,
-		2 => legacy::<loupe_proto::FindingsBatch>(body)?,
-		3 => legacy::<loupe_proto::LlmFindingSubmission>(body)?,
-		4 => legacy::<loupe_proto::VerdictSubmission>(body)?,
-		_ => legacy::<loupe_proto::LeaseRequest>(body)?,
+		1 => legacy::<crate::wire_oracle::CompleteRequest>(body)?,
+		2 => legacy::<crate::wire_oracle::FindingsBatch>(body)?,
+		3 => legacy::<crate::wire_oracle::LlmFindingSubmission>(body)?,
+		4 => legacy::<crate::wire_oracle::VerdictSubmission>(body)?,
+		_ => legacy::<crate::wire_oracle::LeaseRequest>(body)?,
 	};
 	let valid = match kind {
 		0 => true,
@@ -132,14 +132,14 @@ fn worker_expected(kind: usize, body: &[u8]) -> Option<Value> {
 
 fn operator_expected(kind: usize, body: &[u8]) -> Option<Value> {
 	let mut value = match kind {
-		0 => legacy::<loupe_proto::RegisterRepoRequest>(body)?,
+		0 => legacy::<crate::wire_oracle::RegisterRepoRequest>(body)?,
 		1 => legacy::<loupe_proto::UpdateRepoRequest>(body)?,
 		2 => legacy::<loupe_proto::ScanRequest>(body)?,
 		3 => legacy::<loupe_proto::RetryVerifyRequest>(body)?,
-		4 => legacy::<loupe_proto::RegisterWorkerRequest>(body)?,
+		4 => legacy::<crate::wire_oracle::RegisterWorkerRequest>(body)?,
 		5 => legacy::<loupe_proto::RotateRepoPatRequest>(body)?,
 		6 => legacy::<loupe_proto::SetGithubAppRequest>(body)?,
-		_ => legacy::<loupe_proto::SetRepoGithubReportingRequest>(body)?,
+		_ => legacy::<crate::wire_oracle::SetRepoGithubReportingRequest>(body)?,
 	};
 	let valid = match kind {
 		0 => {
@@ -190,7 +190,16 @@ fn operator_expected(kind: usize, body: &[u8]) -> Option<Value> {
 		6 => secrets(&value, "private_key_pem"),
 		_ => {
 			defaults(&mut value, &["github_pat"]);
-			texts(&value, &["target_owner", "target_repo"], false) && secrets(&value, "github_pat")
+			let admitted = texts(&value, &["target_owner", "target_repo"], false)
+				&& secrets(&value, "github_pat");
+			// Trimming follows admission of the original untrimmed value and its
+			// byte cap, so padding cannot bypass the input limit.
+			if admitted {
+				for field in ["target_owner", "target_repo"] {
+					value[field] = value[field].as_str()?.trim().to_owned().into();
+				}
+			}
+			admitted
 		},
 	};
 	valid.then_some(value)
@@ -428,7 +437,7 @@ fn span_recipe(mode: u8) {
 		3 => {
 			body.append("\"severity\":\"high\",\"line_start\":1,\"line_end\":2");
 			for (name, field) in [
-				("title", "AgentTitle"),
+				("title", "LlmTitle"),
 				("description", "AgentDescription"),
 				("file_path", "AgentPath"),
 				("cwe", "AgentCwe"),

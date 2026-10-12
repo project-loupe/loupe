@@ -15,6 +15,11 @@ publish.workspace = true
 name = "loupe-worker"
 path = "src/main.rs"
 
+[features]
+# Explicit synthetic Sandbox fixture authority for sibling integration tests.
+# Opting in is permitted outside tests too; keep it out of normal dependencies.
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -28,7 +33,7 @@ glob = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-loupe-core = { version = "0.1.0", path = "../loupe-core", features = ["source-migration"] }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
 loupe-http = { version = "0.1.0", path = "../loupe-http" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
 loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }

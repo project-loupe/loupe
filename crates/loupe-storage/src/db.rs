@@ -84,7 +84,7 @@ impl Db {
 		Ok(Self { conn: Mutex::new(conn) })
 	}
 
-	fn finalize(conn: &Connection, _upgrading: bool) -> Result<()> {
+	fn finalize(conn: &Connection, upgrading: bool) -> Result<()> {
 		// Foreign keys do not retroactively validate rows inserted with
 		// enforcement disabled. Check on every boot, not just during v3.
 		// NOT EXISTS rather than NOT IN: a NULL in the lookup would make
@@ -104,6 +104,9 @@ impl Db {
 			.into());
 		}
 		crate::scheduler::ensure_state(conn)?;
+		if upgrading {
+			crate::migrations::admission::validate(conn)?;
+		}
 		Ok(())
 	}
 

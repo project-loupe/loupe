@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use loupe_core::text::policy::{Argument, ClientKey, Objective, Payload, Reason, Title};
 use loupe_core::text::{BoundedJson, BoundedText, Identifier};
+use loupe_provenance::{Agent, Db, Source};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::review::{changed, classify, parsed, standalone, string_enum};
@@ -17,17 +18,17 @@ pub static UNIT_NEEDS_WORK: LazyLock<String> = LazyLock::new(|| {
 });
 string_enum!(Status { Open=>"open", Deferred=>"deferred", Retired=>"retired" });
 string_enum!(Priority { Urgent=>"urgent", High=>"high", Normal=>"normal", Background=>"background" });
-pub struct NewUnit<'a> {
+pub struct NewUnit<'a, KeyS: Source> {
 	pub generation_id: i64,
-	pub client_key: &'a Identifier<ClientKey>,
-	pub title: &'a BoundedText<Title>,
-	pub objective: &'a BoundedText<Objective>,
+	pub client_key: &'a Identifier<ClientKey, KeyS>,
+	pub title: &'a BoundedText<Title, Agent>,
+	pub objective: &'a BoundedText<Objective, Agent>,
 	pub priority: Priority,
-	pub priority_proposal: Option<&'a BoundedJson<Payload>>,
-	pub source_refs: &'a UnitRefs,
-	pub depends_on: Option<&'a BoundedJson<Payload>>,
-	pub closure_criteria: Option<&'a BoundedText<Argument>>,
-	pub semantic_context: Option<&'a BoundedJson<Payload>>,
+	pub priority_proposal: Option<&'a BoundedJson<Payload, Agent>>,
+	pub source_refs: &'a UnitRefs<Agent>,
+	pub depends_on: Option<&'a BoundedJson<Payload, Agent>>,
+	pub closure_criteria: Option<&'a BoundedText<Argument, Agent>>,
+	pub semantic_context: Option<&'a BoundedJson<Payload, Agent>>,
 	pub carried_from: Option<i64>,
 	pub created_by_job: Option<i64>,
 }
@@ -35,21 +36,21 @@ pub struct NewUnit<'a> {
 pub struct Unit {
 	pub unit_id: i64,
 	pub generation_id: i64,
-	pub client_key: Identifier<ClientKey>,
-	pub title: BoundedText<Title>,
-	pub objective: BoundedText<Objective>,
+	pub client_key: Identifier<ClientKey, Db>,
+	pub title: BoundedText<Title, Agent>,
+	pub objective: BoundedText<Objective, Agent>,
 	pub status: Status,
-	pub defer_reason: Option<BoundedText<Reason>>,
+	pub defer_reason: Option<BoundedText<Reason, Db>>,
 	pub priority: Priority,
-	pub priority_proposal: Option<BoundedJson<Payload>>,
-	pub source_refs: UnitRefs,
-	pub depends_on: Option<BoundedJson<Payload>>,
-	pub closure_criteria: Option<BoundedText<Argument>>,
-	pub semantic_context: Option<BoundedJson<Payload>>,
+	pub priority_proposal: Option<BoundedJson<Payload, Agent>>,
+	pub source_refs: UnitRefs<Agent>,
+	pub depends_on: Option<BoundedJson<Payload, Agent>>,
+	pub closure_criteria: Option<BoundedText<Argument, Agent>>,
+	pub semantic_context: Option<BoundedJson<Payload, Agent>>,
 	pub carry_depth: i64,
 	pub carried_from: Option<i64>,
 	pub stale: bool,
-	pub stale_reason: Option<BoundedText<Reason>>,
+	pub stale_reason: Option<BoundedText<Reason, Db>>,
 	pub assignment_epoch: i64,
 	pub created_by_job: Option<i64>,
 	pub created_at: i64,
@@ -59,7 +60,9 @@ pub struct Assignment {
 	pub unit_id: i64,
 	pub expected_epoch: i64,
 }
-pub fn create(tx: &Transaction<'_>, new: &NewUnit<'_>, now: i64) -> Result<i64> {
+pub fn create<KeyS: Source>(
+	tx: &Transaction<'_>, new: &NewUnit<'_, KeyS>, now: i64,
+) -> Result<i64> {
 	let repo = ownership::generation_repo(tx, new.generation_id)?;
 	if let Some(job) = new.created_by_job {
 		ownership::job_for_generation(tx, job, new.generation_id, Ownership::UnitJob)?;
@@ -80,30 +83,35 @@ pub fn create(tx: &Transaction<'_>, new: &NewUnit<'_>, now: i64) -> Result<i64> 
  .map_err(|e|classify(e,"review_units.generation_id, review_units.client_review_unit_key",Conflict::UnitKey))?;
 	Ok(tx.last_insert_rowid())
 }
-const COLUMNS:&str="review_unit_id,generation_id,client_review_unit_key,title,objective,status,defer_reason,priority_band,priority_proposal,source_refs,depends_on,closure_criteria,semantic_context,carry_depth,carried_from_review_unit_id,stale,stale_reason,assignment_epoch,created_by_job_id,created_at";
+const COLUMNS:&str="review_unit_id,generation_id,client_review_unit_key,title,objective,status,defer_reason,priority_band,priority_proposal,source_refs,depends_on,closure_criteria,semantic_context,carry_depth,carried_from_review_unit_id,stale,stale_reason,assignment_epoch,created_by_job_id,created_at,source";
 fn row(r: &Row<'_>) -> rusqlite::Result<Unit> {
+	crate::ingress::require_agent_source(r, 20)?;
 	Ok(Unit {
 		unit_id: r.get(0)?,
 		generation_id: r.get(1)?,
-		client_key: crate::ingress::client_key_legacy(r, 2)?,
-		title: crate::ingress::title_legacy(r, 3)?,
-		objective: crate::ingress::objective_legacy(r, 4)?,
+		client_key: crate::ingress::client_key(r, 2)?,
+		title: crate::ingress::title(r, 3)?,
+		objective: crate::ingress::objective(r, 4)?,
 		status: parsed(r, 5)?,
-		defer_reason: crate::ingress::optional_reason_legacy(r, 6)?,
+		defer_reason: crate::ingress::optional_reason(r, 6)?,
 		priority: parsed(r, 7)?,
-		priority_proposal: crate::ingress::optional_agent_payload_legacy(r, 8)?,
-		source_refs: crate::ingress::unit_refs_legacy(r, 9)?,
-		depends_on: crate::ingress::optional_agent_payload_legacy(r, 10)?,
-		closure_criteria: crate::ingress::optional_argument_legacy(r, 11)?,
-		semantic_context: crate::ingress::optional_agent_payload_legacy(r, 12)?,
+		priority_proposal: crate::ingress::optional_agent_payload(r, 8)?,
+		source_refs: crate::ingress::unit_refs(r, 9)?,
+		depends_on: crate::ingress::optional_agent_payload(r, 10)?,
+		closure_criteria: crate::ingress::optional_argument(r, 11)?,
+		semantic_context: crate::ingress::optional_agent_payload(r, 12)?,
 		carry_depth: r.get(13)?,
 		carried_from: r.get(14)?,
 		stale: r.get(15)?,
-		stale_reason: crate::ingress::optional_reason_legacy(r, 16)?,
+		stale_reason: crate::ingress::optional_reason(r, 16)?,
 		assignment_epoch: r.get(17)?,
 		created_by_job: r.get(18)?,
 		created_at: r.get(19)?,
 	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
+	crate::migrations::admission::scan(conn, "review_units", COLUMNS, row)
 }
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Unit>> {
 	Ok(conn
@@ -122,7 +130,9 @@ pub fn list(conn: &Connection, generation: i64) -> Result<Vec<Unit>> {
 		.query_map([generation], row)?
 		.collect::<rusqlite::Result<_>>()?)
 }
-pub fn defer(tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>) -> Result<()> {
+pub fn defer<S: Source>(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>,
+) -> Result<()> {
 	changed(tx.execute("UPDATE review_units SET status='deferred',defer_reason=?2 WHERE review_unit_id=?1 AND status='open'",params![id,reason.expose()])?,Conflict::UnitState)
 }
 pub fn reopen(tx: &Transaction<'_>, id: i64) -> Result<()> {
@@ -131,7 +141,9 @@ pub fn reopen(tx: &Transaction<'_>, id: i64) -> Result<()> {
 pub fn retire(tx: &Transaction<'_>, id: i64) -> Result<()> {
 	changed(tx.execute("UPDATE review_units SET status='retired' WHERE review_unit_id=?1 AND status IN ('open','deferred')",[id])?,Conflict::UnitState)
 }
-pub fn mark_stale(tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>) -> Result<()> {
+pub fn mark_stale<S: Source>(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>,
+) -> Result<()> {
 	changed(tx.execute("UPDATE review_units SET stale=1,stale_reason=?2 WHERE review_unit_id=?1 AND status<>'retired'",params![id,reason.expose()])?,Conflict::UnitState)
 }
 /// Propagate any error to roll back the entire batch, including earlier claims.
@@ -171,7 +183,7 @@ pub fn assign(tx: &Transaction<'_>, job: i64, units: &[Assignment]) -> Result<()
 /// never copied implicitly. The reconciliation layer rebuilds that graph.
 pub fn carry_forward(
 	tx: &Transaction<'_>, id: i64, generation: i64, job: Option<i64>,
-	dependencies: Option<&BoundedJson<Payload>>, now: i64,
+	dependencies: Option<&BoundedJson<Payload, Agent>>, now: i64,
 ) -> Result<i64> {
 	let source = get(tx, id)?.ok_or(Error::NotFound(Entity::Unit, id))?;
 	create(
@@ -194,10 +206,10 @@ pub fn carry_forward(
 	)
 }
 standalone! {
- create(new:&NewUnit<'_>,now:i64)->i64;
- defer(id:i64,reason:&BoundedText<Reason>)->();
+ create<KeyS>(new:&NewUnit<'_, KeyS>,now:i64)->i64;
+ defer<S>(id:i64,reason:&BoundedText<Reason, S>)->();
  reopen(id:i64)->(); retire(id:i64)->();
- mark_stale(id:i64,reason:&BoundedText<Reason>)->();
+ mark_stale<S>(id:i64,reason:&BoundedText<Reason, S>)->();
  assign(job:i64,units:&[Assignment])->();
- carry_forward(id:i64,generation:i64,job:Option<i64>,dependencies:Option<&BoundedJson<Payload>>,now:i64)->i64;
+ carry_forward(id:i64,generation:i64,job:Option<i64>,dependencies:Option<&BoundedJson<Payload, Agent>>,now:i64)->i64;
 }

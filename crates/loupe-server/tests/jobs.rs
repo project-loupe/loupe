@@ -6,14 +6,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_core::{Finding, JobState, Severity, Verdict};
-use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, JobInfo,
-	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ListFindingsResponse,
+use common::wire::{
+	CompleteOutcome, CompleteRequest, Finding, FindingDetail, FindingsBatch, HeartbeatRequest,
+	JobInfo, LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ListFindingsResponse,
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RetryVerifyRequest, RetryVerifyResponse, ScanRequest, ScanResponse, VerdictSubmission,
+	RetryVerifyRequest, RetryVerifyResponse, ScanRequest, ScanResponse, Verdict, VerdictSubmission,
 	JOB_CAPABILITY_HEADER, PROTOCOL_VERSION,
 };
+use loupe_core::{JobState, Severity};
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
@@ -30,9 +30,9 @@ async fn review_scheduler_preserves_legacy_verify_first_through_http() {
 	let verify = f.db.with_conn(|c| {
 		c.execute("UPDATE jobs SET enqueued_at=1 WHERE id=?1",[first.job_id])?;
 		c.execute("UPDATE jobs SET enqueued_at=2 WHERE id=?1",[second.job_id])?;
-		c.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,created_at) VALUES(?1,?2,'test','high','t','d','scheduler-parity','validating',0)",(f.repo_id,first.job_id))?;
+		c.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,created_at,report_identity) VALUES(?1,?2,'test','high','t','d','scheduler-parity','validating',0,randomblob(16))",(f.repo_id,first.job_id))?;
 		let finding=c.last_insert_rowid();
-		loupe_storage::jobs::enqueue(c,&loupe_storage::jobs::NewJob{repo_id:f.repo_id,kind:loupe_core::JobKind::Verify,incremental:false,since_sha:None,parent_job_id:Some(first.job_id),target_finding_id:Some(finding)},3)
+		loupe_storage::jobs::enqueue(c,&loupe_storage::jobs::NewJob{repo_id:f.repo_id,kind:loupe_core::JobKind::<loupe_provenance::Operator>::Verify,incremental:false,since_sha:None,parent_job_id:Some(first.job_id),target_finding_id:Some(finding)},3)
 	}).unwrap();
 	assert_eq!(lease_verify_job(&f.worker).await.job_id, verify);
 	assert_eq!(lease_job(&f.worker).await.job_id, first.job_id);
@@ -73,27 +73,32 @@ struct Fixture {
 
 async fn bring_up_with_repo_and_worker() -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
-
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(tmp.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
-		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),
@@ -490,6 +495,54 @@ async fn ingress_llm_route_retains_original_title_and_description() {
 	);
 }
 
+/// Passing pre-M compatibility: equal fields must remain distinct original
+/// tokens, and transport/storage/readback must retain final-newline variants.
+#[tokio::test]
+async fn atomic_m_batch_roundtrip_preserves_equal_fields_and_final_newlines() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	for (index, suffix) in ["", "\n", "\n\n\n"].into_iter().enumerate() {
+		let single = " Cafe\u{301} same  ";
+		let exact = format!(" Cafe\u{301}\r\n\t same  {suffix}");
+		let original = Finding {
+			scanner_id: single.into(),
+			title: single.into(),
+			description: exact.clone(),
+			patch_unified: Some(exact.clone()),
+			poc_unified: Some(exact.clone()),
+			file_path: Some("src/cafe\u{301}.rs".into()),
+			..finding(single, &format!("atomic-m-{index}"))
+		};
+		submit_finding(&f.worker, &lease, original.clone()).await;
+		let (id, scanner, title, description, patch, poc, path): (i64, String, String, String, String, String, String) = f.db.with_conn(|conn| {
+			Ok(conn.query_row("SELECT id,scanner_id,title,description,patch_unified,poc_unified,file_path FROM findings WHERE fingerprint=?1", [&original.fingerprint], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?)
+		}).unwrap();
+		assert_eq!(
+			(
+				scanner.as_str(),
+				title.as_str(),
+				description.as_str(),
+				patch.as_str(),
+				poc.as_str(),
+				path.as_str()
+			),
+			(single, single, exact.as_str(), exact.as_str(), exact.as_str(), "src/cafe\u{301}.rs")
+		);
+		let response =
+			f.admin.get(format!("https://loupe-server/v1/findings/{id}")).send().await.unwrap();
+		assert_eq!(response.status(), 200);
+		let detail: FindingDetail = response.json().await.unwrap();
+		assert_eq!(detail.scanner_id, single);
+		assert_eq!(detail.title, single);
+		assert_eq!(detail.description, exact);
+		assert_eq!(detail.patch_unified.as_deref(), Some(exact.as_str()));
+		assert_eq!(detail.poc_unified.as_deref(), Some(exact.as_str()));
+		assert_eq!(detail.file_path.as_deref(), Some("src/cafe\u{301}.rs"));
+	}
+	f.handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn cloned_capability_authenticates_after_lease_owner_drops() {
 	let f = bring_up_with_repo_and_worker().await;
@@ -498,8 +551,10 @@ async fn cloned_capability_authenticates_after_lease_owner_drops() {
 		f.worker.clone(),
 		"https://loupe-server/".parse().unwrap(),
 	);
-	let response = client.lease(vec!["scan:secrets".into()], 0).await.unwrap();
-	let LeaseResponse::Lease(lease) = response else { panic!("expected queued lease") };
+	let response = client.lease(vec!["scan:secrets"], 0).await.unwrap();
+	let loupe_proto::LeaseResponse::Lease(lease) = response else {
+		panic!("expected queued lease")
+	};
 	assert_eq!(lease.job_id, queued.job_id);
 	let capability = lease.job_capability.clone();
 	drop(lease);
@@ -564,7 +619,7 @@ async fn list_routes_accept_positive_limits() {
 
 	let repos = f.admin.get("https://loupe-server/v1/repos?limit=2").send().await.unwrap();
 	assert!(repos.status().is_success());
-	let repos: loupe_proto::ListReposResponse = repos.json().await.unwrap();
+	let repos: common::wire::ListReposResponse = repos.json().await.unwrap();
 	assert_eq!(repos.repos.len(), 2);
 
 	enqueue_scan(&f, f.repo_id).await;
@@ -747,7 +802,7 @@ async fn end_to_end_scan_lifecycle() {
 	assert!(resp.status().is_success());
 
 	// Submit a finding (twice — second one must be a dedup no-op).
-	let f1 = loupe_core::Finding {
+	let f1 = common::wire::Finding {
 		scanner_id: "regex".into(),
 		severity: Severity::High,
 		title: "AWS access key".into(),
@@ -2759,7 +2814,7 @@ async fn oversized_verifier_patch_is_rejected_without_locking_the_verdict() {
 		protocol_version: PROTOCOL_VERSION,
 		verdict: Verdict::Confirmed {
 			notes: Some("real bug".into()),
-			patch: Some(loupe_core::VerdictPatch {
+			patch: Some(common::wire::VerdictPatch {
 				patch_unified: "x".repeat(21_000),
 				notes: "fix".into(),
 			}),

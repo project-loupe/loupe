@@ -21,7 +21,7 @@ const DEFAULT_FROM: &str = "loupe-noreply@localhost";
 
 pub struct EmailReporter {
 	sendmail_bin: PathBuf,
-	default_from: String,
+	default_from: &'static str,
 }
 
 impl EmailReporter {
@@ -30,7 +30,7 @@ impl EmailReporter {
 	}
 
 	pub fn with_bin(bin: impl Into<PathBuf>) -> Self {
-		Self { sendmail_bin: bin.into(), default_from: DEFAULT_FROM.to_owned() }
+		Self { sendmail_bin: bin.into(), default_from: DEFAULT_FROM }
 	}
 }
 
@@ -49,10 +49,8 @@ impl Reporter for EmailReporter {
 	async fn dispatch(
 		&self, repo: &RepoRow, findings: &[ReportFinding], _credential: &ReporterCredential,
 	) -> Result<DispatchReceipt> {
-		let (to, from, subject_prefix) = match &repo.reporting {
-			ReportingDestination::Email { to, from, subject_prefix } => {
-				(to.clone(), from.clone(), subject_prefix.clone())
-			},
+		let to = match &repo.reporting {
+			ReportingDestination::Email { to, .. } => to,
 			_ => bail!("EmailReporter dispatched against a non-email destination"),
 		};
 		if to.is_empty() {
@@ -62,21 +60,7 @@ impl Reporter for EmailReporter {
 			return Ok(DispatchReceipt { kind: self.kind(), external_id: None });
 		}
 
-		let from = from.unwrap_or_else(|| self.default_from.clone());
-		let prefix = subject_prefix.as_deref().unwrap_or("[loupe]");
-		let max_sev = max_severity(findings);
-		let subject = format!(
-			"{prefix} {} {max_sev} finding(s) in {}/{}",
-			findings.len(),
-			repo.owner,
-			repo.repo,
-		);
-		validate_header_value("From", &from)?;
-		for recipient in &to {
-			validate_header_value("To", recipient)?;
-		}
-		validate_header_value("Subject", &subject)?;
-		let message = render_message(&from, &to, &subject, repo, findings);
+		let message = render_message(repo, findings, self.default_from)?;
 
 		let mut child = Command::new(&self.sendmail_bin)
 			// `-t` — read recipients from To/Cc/Bcc headers.
@@ -107,12 +91,32 @@ pub fn validate_header_value(name: &str, value: &str) -> Result<()> {
 	Ok(())
 }
 
-pub fn render_message(
-	from: &str, to: &[String], subject: &str, repo: &RepoRow, findings: &[ReportFinding],
-) -> String {
+fn render_message(
+	repo: &RepoRow, findings: &[ReportFinding], default_from: &'static str,
+) -> Result<String> {
+	let ReportingDestination::Email { to, from, subject_prefix } = &repo.reporting else {
+		bail!("EmailReporter dispatched against a non-email destination");
+	};
+	let from = from.as_ref().map(|value| value.expose()).unwrap_or(default_from);
+	let prefix = subject_prefix.as_ref().map(|value| value.expose()).unwrap_or("[loupe]");
+	let max_sev = max_severity(findings);
+	let subject = format!(
+		"{prefix} {} {max_sev} finding(s) in {}/{}",
+		findings.len(),
+		repo.owner.expose(),
+		repo.repo.expose(),
+	);
+	validate_header_value("From", from)?;
+	for recipient in to {
+		validate_header_value("To", recipient.expose())?;
+	}
+	validate_header_value("Subject", &subject)?;
 	let mut out = String::new();
 	out.push_str(&format!("From: {from}\r\n"));
-	out.push_str(&format!("To: {}\r\n", to.join(", ")));
+	out.push_str(&format!(
+		"To: {}\r\n",
+		to.iter().map(|value| value.expose()).collect::<Vec<_>>().join(", ")
+	));
 	out.push_str(&format!("Subject: {subject}\r\n"));
 	out.push_str("MIME-Version: 1.0\r\n");
 	out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
@@ -120,7 +124,9 @@ pub fn render_message(
 
 	out.push_str(&format!(
 		"loupe has finished a scan of {}/{} (clone url {}).\n",
-		repo.owner, repo.repo, repo.clone_url
+		repo.owner.expose(),
+		repo.repo.expose(),
+		repo.clone_url.expose()
 	));
 	out.push_str(&format!("Findings: {}\n\n", findings.len()));
 	for report_finding in findings {
@@ -129,106 +135,99 @@ pub fn render_message(
 			"{} [{}] {}\n",
 			format_finding_id(report_finding.id),
 			f.severity,
-			f.title
+			f.title.expose()
 		));
 		match &report_finding.reviewed_revision {
-			Some(revision) => out.push_str(&format!("   reviewed revision: {revision}\n")),
+			Some(revision) => {
+				out.push_str(&format!("   reviewed revision: {}\n", revision.expose()))
+			},
 			None => out.push_str("   reviewed revision: not recorded\n"),
 		}
 		if let Some(path) = &f.file_path {
-			out.push_str(&format!("   file: {path}"));
+			out.push_str(&format!("   file: {}", path.expose()));
 			if let Some(line) = f.line_start {
 				out.push_str(&format!(":{line}"));
 			}
 			out.push('\n');
 		}
 		if let Some(cwe) = &f.cwe {
-			out.push_str(&format!("   cwe:  {cwe}\n"));
+			out.push_str(&format!("   cwe:  {}\n", cwe.expose()));
 		}
-		out.push_str(&format!("   {}\n\n", f.description));
+		out.push_str(&format!("   {}\n\n", f.description.expose()));
 	}
-	out
+	Ok(out)
 }
 
 fn max_severity(findings: &[ReportFinding]) -> Severity {
 	findings.iter().map(|f| f.finding.severity).max().unwrap_or(Severity::Info)
 }
 
+/// Observe the concrete email renderer with its final typed inputs.
+#[cfg(fuzzing)]
+pub fn fuzz_render_message(repo: &RepoRow, findings: &[ReportFinding]) -> Result<String> {
+	render_message(repo, findings, DEFAULT_FROM)
+}
+
 #[cfg(test)]
 mod tests {
 	use loupe_core::Finding;
+	use loupe_provenance::Agent;
 
+	use super::super::fixtures::{path, revision, text};
 	use super::*;
 
 	fn repo_with_email(
 		from: Option<String>, to: Vec<String>, subject_prefix: Option<String>,
-	) -> RepoRow {
-		RepoRow {
-			id: 1,
-			clone_url: "https://github.com/acme/widget.git".into(),
-			host: "github.com".into(),
-			owner: "acme".into(),
-			repo: "widget".into(),
-			default_branch: None,
-			scan_interval_seconds: None,
-			scanner_config: serde_json::Value::Null,
-			reporting: ReportingDestination::Email { to, from, subject_prefix },
-			verification_enabled: false,
-			require_approval: None,
-			last_scanned_sha: None,
-			last_scanned_at: None,
-			created_at: 0,
-			disabled_at: None,
-		}
+	) -> loupe_storage::Result<RepoRow> {
+		super::super::fixtures::repo(serde_json::json!({
+			"kind":"email", "to":to, "from":from, "subject_prefix":subject_prefix
+		}))
 	}
 
-	fn finding() -> Finding {
+	fn finding() -> Finding<Agent> {
 		Finding {
-			scanner_id: "test".into(),
+			scanner_id: text("test"),
 			severity: Severity::High,
-			title: "bug".into(),
-			description: "description".into(),
-			file_path: Some("src/lib.rs".into()),
+			title: text("bug"),
+			description: text("description"),
+			file_path: Some(path("src/lib.rs")),
 			line_start: Some(1),
 			line_end: Some(1),
 			cwe: None,
 			patch_unified: None,
 			poc_unified: None,
-			fingerprint: "fp".into(),
+			fingerprint: text("fp"),
 		}
 	}
 
 	fn report_finding() -> ReportFinding {
-		ReportFinding { id: 1234, finding: finding(), reviewed_revision: Some("abc123".into()) }
+		ReportFinding { id: 1234, finding: finding(), reviewed_revision: Some(revision("abc123")) }
 	}
 
 	#[test]
 	fn message_identifies_findings_with_prefixed_ids() {
 		let message = render_message(
-			"loupe@example.com",
-			&[],
-			"findings",
-			&repo_with_email(None, vec![], None),
+			&repo_with_email(Some("loupe@example.com".into()), vec![], None).unwrap(),
 			&[report_finding()],
-		);
+			DEFAULT_FROM,
+		)
+		.unwrap();
 		assert!(message.contains("LUP-1234 [high] bug\n"), "message: {message}");
 	}
 
 	#[test]
 	fn message_omits_scanner_metadata() {
 		let message = render_message(
-			"loupe@example.com",
-			&[],
-			"findings",
-			&repo_with_email(None, vec![], None),
+			&repo_with_email(Some("loupe@example.com".into()), vec![], None).unwrap(),
 			&[report_finding()],
-		);
+			DEFAULT_FROM,
+		)
+		.unwrap();
 		assert!(!message.contains("scanner:"), "message must omit the scanner header: {message}");
 	}
 
-	#[tokio::test]
-	async fn dispatch_rejects_header_injection_values() {
-		let reporter = EmailReporter::with_bin("/definitely/missing/sendmail");
+	#[test]
+	fn stored_email_rejects_header_injection_values_before_dispatch() {
 		let cases = [
 			repo_with_email(
 				Some("loupe@example.com\r\nBcc: attacker@example.com".into()),
@@ -248,12 +247,28 @@ mod tests {
 		];
 
 		for repo in cases {
-			let err = reporter
-				.dispatch(&repo, &[report_finding()], &ReporterCredential::None)
-				.await
-				.expect_err("must reject");
-			let msg = err.to_string();
-			assert!(msg.contains("header contains a newline"), "got: {msg}");
+			assert!(repo.is_err(), "invalid header fields must not reach dispatch");
+		}
+		let valid = repo_with_email(
+			Some("loupe@example.com".into()),
+			vec!["security@example.com".into()],
+			Some("[loupe]".into()),
+		)
+		.unwrap();
+		let message = render_message(&valid, &[report_finding()], DEFAULT_FROM).unwrap();
+		assert!(message.starts_with("From: loupe@example.com\r\nTo: security@example.com\r\nSubject: [loupe] 1 high finding(s) in acme/widget\r\n"));
+	}
+
+	#[test]
+	fn header_predicate_rejects_newlines_and_keeps_valid_values() {
+		for (name, valid) in
+			[("From", "loupe@example.com"), ("To", "security@example.com"), ("Subject", "[loupe]")]
+		{
+			validate_header_value(name, valid).unwrap();
+			for suffix in ["\r\nBcc: attacker@example.com", "\nBcc: attacker@example.com"] {
+				let error = validate_header_value(name, &format!("{valid}{suffix}")).unwrap_err();
+				assert_eq!(error.to_string(), format!("{name} header contains a newline"));
+			}
 		}
 	}
 }

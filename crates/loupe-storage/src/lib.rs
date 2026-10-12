@@ -24,6 +24,7 @@ pub mod leads;
 pub mod migrations;
 pub mod ownership;
 pub mod proofs;
+mod report_identity;
 pub mod repos;
 mod review;
 pub mod review_unit_results;
@@ -44,6 +45,8 @@ mod replay_tests;
 mod review_tests;
 #[cfg(test)]
 mod scope_tests;
+#[cfg(test)]
+mod test_support;
 
 pub use db::{Db, Error, Result};
 pub use loupe_core::canonical;

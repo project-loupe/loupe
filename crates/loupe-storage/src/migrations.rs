@@ -7,9 +7,12 @@
 
 use rusqlite::{params, Connection};
 
+pub(crate) mod admission;
 mod error;
 mod framework;
 mod v3;
+mod v5;
+mod v6;
 
 pub use error::{MigrationFailure, MigrationReason, MigrationStage};
 use framework::apply_with_finalizer;
@@ -17,6 +20,8 @@ use framework::apply_with_finalizer;
 type MigrationResult<T = ()> = std::result::Result<T, MigrationFailure>;
 type Probe<'a> = dyn FnMut(v3::Step, &Connection) -> rusqlite::Result<()> + 'a;
 
+#[cfg(test)]
+mod admission_tests;
 #[cfg(test)]
 mod framework_tests;
 
@@ -26,6 +31,8 @@ mod failure_tests;
 mod fixtures;
 #[cfg(test)]
 mod ownership_tests;
+#[cfg(test)]
+mod source_adoption_tests;
 #[cfg(test)]
 mod v3_tests;
 
@@ -50,6 +57,8 @@ const MIGRATIONS: &[Migration] = &[
 	Migration::Sql { version: 2, sql: V2_JOB_CAPABILITIES },
 	Migration::Structural { version: 3, run: v3::run },
 	Migration::Sql { version: 4, sql: V4_GITHUB_APP },
+	Migration::Structural { version: 5, run: v5::run },
+	Migration::Sql { version: 6, sql: v6::SOURCE_METADATA },
 ];
 
 /// The highest version this build knows about.
@@ -438,7 +447,7 @@ mod tests {
 			.collect::<Result<_, _>>()
 			.unwrap();
 
-		apply_pending(&mut c).unwrap();
+		apply_migrations(&mut c, &MIGRATIONS[..4]).unwrap();
 
 		assert_eq!(current_schema_version(&c).unwrap(), 4);
 		let user_version: u32 = c.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();

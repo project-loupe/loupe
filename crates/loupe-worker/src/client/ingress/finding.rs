@@ -1,12 +1,10 @@
-use loupe_core::source_migration::text::{BoundedText, RepoPath};
-use loupe_core::source_migration::Finding;
-use loupe_core::text::{decode_json_string_bounded, policy};
-use loupe_core::{FindingState, Severity};
+use loupe_core::text::{decode_json_string_bounded, policy, BoundedText, RepoPath};
+use loupe_core::{Finding, FindingState, Severity};
 use loupe_provenance::{Agent, Mark, Server, Unvalidated, Validate};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::ingress_text::{json_text, require_string, token_range, AuditName, DecodeError};
+use crate::ingress_text::{json_text, require_string, token_range, DecodeError};
 
 macro_rules! field_validator {
 	($($name:ident, $policy:ty;)*) => { $(
@@ -126,20 +124,7 @@ pub(super) fn finding(
 	Ok(content!(u, raw))
 }
 
-pub(super) struct DecodedFindingDetail {
-	protocol_version: u16,
-	id: i64,
-	repo_id: i64,
-	job_id: i64,
-	finding: Finding<Agent>,
-	state: FindingState,
-	verification_required: bool,
-	created_at: i64,
-	approved_at: Option<i64>,
-	approved_by_cn: Option<BoundedText<AuditName, Server>>,
-	rejected_at: Option<i64>,
-	rejected_by_cn: Option<BoundedText<AuditName, Server>>,
-}
+pub(super) type DecodedFindingDetail = loupe_proto::FindingDetail<Agent, Server>;
 
 pub(super) fn detail(
 	u: &Unvalidated<'_, &[u8], Server>,
@@ -151,7 +136,17 @@ pub(super) fn detail(
 		id: raw.id,
 		repo_id: raw.repo_id,
 		job_id: raw.job_id,
-		finding,
+		scanner_id: finding.scanner_id,
+		severity: finding.severity,
+		title: finding.title,
+		description: finding.description,
+		file_path: finding.file_path,
+		line_start: finding.line_start,
+		line_end: finding.line_end,
+		cwe: finding.cwe,
+		patch_unified: finding.patch_unified,
+		poc_unified: finding.poc_unified,
+		fingerprint: finding.fingerprint,
 		state: raw.state,
 		verification_required: raw.verification_required,
 		created_at: raw.created_at,
@@ -160,53 +155,6 @@ pub(super) fn detail(
 		rejected_at: raw.rejected_at,
 		rejected_by_cn: raw.rejected_by_cn.map(|t| json_text(&u.mark(), t)).transpose()?,
 	})
-}
-
-impl DecodedFindingDetail {
-	/// Temporary private legacy DTO exit, deleted by atomic M adoption.
-	pub(super) fn into_legacy(self) -> loupe_proto::FindingDetail {
-		let f = into_legacy_finding(self.finding);
-		loupe_proto::FindingDetail {
-			protocol_version: self.protocol_version,
-			id: self.id,
-			repo_id: self.repo_id,
-			job_id: self.job_id,
-			scanner_id: f.scanner_id,
-			severity: f.severity,
-			title: f.title,
-			description: f.description,
-			file_path: f.file_path,
-			line_start: f.line_start,
-			line_end: f.line_end,
-			cwe: f.cwe,
-			patch_unified: f.patch_unified,
-			poc_unified: f.poc_unified,
-			fingerprint: f.fingerprint,
-			state: self.state,
-			verification_required: self.verification_required,
-			created_at: self.created_at,
-			approved_at: self.approved_at,
-			approved_by_cn: self.approved_by_cn.map(|s| s.expose().to_owned()),
-			rejected_at: self.rejected_at,
-			rejected_by_cn: self.rejected_by_cn.map(|s| s.expose().to_owned()),
-		}
-	}
-}
-
-pub(super) fn into_legacy_finding(f: Finding<Agent>) -> loupe_core::Finding {
-	loupe_core::Finding {
-		scanner_id: f.scanner_id.expose().to_owned(),
-		severity: f.severity,
-		title: f.title.expose().to_owned(),
-		description: f.description.expose().to_owned(),
-		file_path: f.file_path.map(|s| s.expose().to_owned()),
-		line_start: f.line_start,
-		line_end: f.line_end,
-		cwe: f.cwe.map(|s| s.expose().to_owned()),
-		patch_unified: f.patch_unified.map(|s| s.expose().to_owned()),
-		poc_unified: f.poc_unified.map(|s| s.expose().to_owned()),
-		fingerprint: f.fingerprint.expose().to_owned(),
-	}
 }
 
 #[derive(Deserialize)]
@@ -238,24 +186,7 @@ struct RawSummary<'a> {
 	rejected_by_cn: Option<&'a RawValue>,
 }
 
-pub(super) struct DecodedSummary {
-	id: i64,
-	repo_id: i64,
-	job_id: i64,
-	scanner_id: BoundedText<policy::ScannerIdText, Agent>,
-	severity: Severity,
-	title: BoundedText<policy::FindingTitle, Agent>,
-	file_path: Option<RepoPath<Agent>>,
-	line_start: Option<u32>,
-	fingerprint: BoundedText<policy::FindingFingerprintText, Agent>,
-	state: FindingState,
-	verification_required: bool,
-	created_at: i64,
-	approved_at: Option<i64>,
-	approved_by_cn: Option<BoundedText<AuditName, Server>>,
-	rejected_at: Option<i64>,
-	rejected_by_cn: Option<BoundedText<AuditName, Server>>,
-}
+pub(super) type DecodedSummary = loupe_proto::FindingSummary<Agent, Server>;
 
 pub(super) fn summary(
 	u: &Unvalidated<'_, &[u8], Server>, token: &RawValue,
@@ -282,26 +213,4 @@ pub(super) fn summary(
 		rejected_at: raw.rejected_at,
 		rejected_by_cn: raw.rejected_by_cn.map(|t| json_text(&u.mark(), t)).transpose()?,
 	})
-}
-impl DecodedSummary {
-	pub(super) fn into_legacy(self) -> loupe_proto::FindingSummary {
-		loupe_proto::FindingSummary {
-			id: self.id,
-			repo_id: self.repo_id,
-			job_id: self.job_id,
-			scanner_id: self.scanner_id.expose().to_owned(),
-			severity: self.severity,
-			title: self.title.expose().to_owned(),
-			file_path: self.file_path.map(|s| s.expose().to_owned()),
-			line_start: self.line_start,
-			fingerprint: self.fingerprint.expose().to_owned(),
-			state: self.state,
-			verification_required: self.verification_required,
-			created_at: self.created_at,
-			approved_at: self.approved_at,
-			approved_by_cn: self.approved_by_cn.map(|s| s.expose().to_owned()),
-			rejected_at: self.rejected_at,
-			rejected_by_cn: self.rejected_by_cn.map(|s| s.expose().to_owned()),
-		}
-	}
 }

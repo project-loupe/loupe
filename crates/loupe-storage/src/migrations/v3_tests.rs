@@ -11,10 +11,7 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 	settled(&mut conn);
 	let legacy_indexes = rows(&conn, "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs' ORDER BY name");
 	let legacy_jobs = rows(&conn, &format!("SELECT {LEGACY_COLUMNS} FROM jobs ORDER BY id"));
-	let legacy_rows: Vec<_> = LEGACY_TABLES
-		.iter()
-		.map(|table| rows(&conn, &format!("SELECT * FROM {table} ORDER BY id")))
-		.collect();
+	let legacy_rows: Vec<_> = LEGACY_TABLES.iter().map(|table| snapshot(&conn, table)).collect();
 	drop(conn);
 	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
 	assert_eq!(
@@ -34,9 +31,9 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 			rows(conn, &format!("SELECT {LEGACY_COLUMNS} FROM jobs ORDER BY id")),
 			legacy_jobs
 		);
-		for (table, before) in LEGACY_TABLES.iter().zip(&legacy_rows) {
+		for (table, (sql, before)) in LEGACY_TABLES.iter().zip(&legacy_rows) {
 			assert_eq!(
-				&rows(conn, &format!("SELECT * FROM {table} ORDER BY id")),
+				&rows(conn, sql),
 				before,
 				"{table} changed"
 			);
@@ -75,11 +72,11 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 			0
 		);
 		let scan = crate::transaction::immediate(conn, |tx| crate::scheduler::claim(tx, &crate::scheduler::ClaimRequest {
-			worker_id:1,kinds:&[loupe_core::JobKind::Scan],now:100,legacy_lease_seconds:600,capability_hash:&[0xa1;32],policy:&crate::scheduler::ClaimPolicy::default(),
+			worker_id:1,kinds:&[loupe_core::JobKind::<loupe_provenance::Db>::Scan],now:100,legacy_lease_seconds:600,capability_hash:&[0xa1;32],policy:&crate::scheduler::ClaimPolicy::default(),
 		}))?.unwrap().job;
 		assert_eq!(scan.id, 7);
 		let verify = crate::transaction::immediate(conn, |tx| crate::scheduler::claim(tx, &crate::scheduler::ClaimRequest {
-			worker_id:1,kinds:&[loupe_core::JobKind::Scan,loupe_core::JobKind::Verify],now:100,legacy_lease_seconds:600,capability_hash:&[0xa2;32],policy:&crate::scheduler::ClaimPolicy::default(),
+			worker_id:1,kinds:&[loupe_core::JobKind::<loupe_provenance::Db>::Scan,loupe_core::JobKind::<loupe_provenance::Db>::Verify],now:100,legacy_lease_seconds:600,capability_hash:&[0xa2;32],policy:&crate::scheduler::ClaimPolicy::default(),
 		}))?.unwrap().job;
 		assert_eq!(verify.id, 8);
 		Ok(())

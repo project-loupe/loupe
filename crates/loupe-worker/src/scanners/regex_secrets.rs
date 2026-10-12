@@ -39,7 +39,9 @@ impl RegexSecretsScanner {
 
 	/// Fuzz the synchronous walk used by `scan` without a runtime per input.
 	#[cfg(fuzzing)]
-	pub fn fuzz_walk(&self, workdir: &Path, cancelled: bool) -> Result<Vec<Finding>> {
+	pub fn fuzz_walk(
+		&self, workdir: &Path, cancelled: bool,
+	) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 		let cancel = tokio_util::sync::CancellationToken::new();
 		if cancelled {
 			cancel.cancel();
@@ -49,7 +51,7 @@ impl RegexSecretsScanner {
 	#[cfg(fuzzing)]
 	pub fn fuzz_walk_observed(
 		&self, workdir: &Path, cancelled: bool,
-	) -> Result<(Vec<Finding>, Vec<RepoFindingObservation>)> {
+	) -> Result<(Vec<Finding<loupe_provenance::Repo>>, Vec<RepoFindingObservation>)> {
 		let observation = ingress::observe::Scope::begin();
 		let findings = self.fuzz_walk(workdir, cancelled)?;
 		Ok((findings, observation.finish()))
@@ -72,7 +74,7 @@ impl Scanner for RegexSecretsScanner {
 		CAPABILITIES
 	}
 
-	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding>> {
+	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 		let mut findings = Vec::new();
 		let workdir = ctx.workdir.clone();
 		let re = self.re.clone();
@@ -81,9 +83,10 @@ impl Scanner for RegexSecretsScanner {
 		// the runtime on a large worktree.
 		let head_sha = ctx.head_sha.clone();
 		let cancel = ctx.cancel.clone();
-		let result = tokio::task::spawn_blocking(move || walk(&workdir, &re, &head_sha, &cancel))
-			.await
-			.map_err(|e| anyhow::anyhow!("scanner task panicked: {e}"))??;
+		let result =
+			tokio::task::spawn_blocking(move || walk(&workdir, &re, head_sha.expose(), &cancel))
+				.await
+				.map_err(|e| anyhow::anyhow!("scanner task panicked: {e}"))??;
 		findings.extend(result);
 		Ok(findings)
 	}
@@ -91,7 +94,7 @@ impl Scanner for RegexSecretsScanner {
 
 fn walk(
 	workdir: &Path, re: &Regex, head_sha: &str, cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<Finding>> {
+) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 	let mut out = Vec::new();
 	for entry in WalkDir::new(workdir).into_iter().filter_entry(|e| !is_git_metadata(e.path())) {
 		if cancel.is_cancelled() {
@@ -127,7 +130,7 @@ fn walk(
 		match input.validate(ingress::RegexSecretFindings { regex: re })? {
 			ingress::FileFindings::UnrepresentablePath => continue,
 			ingress::FileFindings::Findings(findings) => {
-				out.extend(findings.into_iter().map(ingress::RepoFinding::into_legacy))
+				out.extend(findings.into_iter().map(ingress::RepoFinding::into_finding))
 			},
 		}
 	}
@@ -142,8 +145,7 @@ fn is_git_metadata(path: &Path) -> bool {
 mod tests {
 	use std::fs;
 
-	use loupe_core::{RepoSpec, Severity};
-	use tokio_util::sync::CancellationToken;
+	use loupe_core::Severity;
 
 	use super::*;
 
@@ -161,27 +163,11 @@ mod tests {
 			1,
 			"unrepresentable native Repo path produced a lossy finding alias"
 		);
-		assert_eq!(findings[0].file_path.as_deref(), Some("visible.rs"));
+		assert_eq!(findings[0].file_path.as_ref().map(|v| v.expose()), Some("visible.rs"));
 	}
 
 	fn make_ctx(workdir: &Path) -> ScanContext {
-		ScanContext {
-			workdir: workdir.to_path_buf(),
-			repo_id: 1,
-			job_id: 1,
-			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
-			repo: RepoSpec {
-				host: "github.com".into(),
-				owner: "a".into(),
-				repo: "b".into(),
-				clone_url: "https://github.com/a/b.git".into(),
-				branch: None,
-			},
-			head_sha: "abc".into(),
-			base_sha: None,
-			config: serde_json::Value::Null,
-			cancel: CancellationToken::new(),
-		}
+		crate::test_support::scan_context(workdir, "abc")
 	}
 
 	#[tokio::test]
@@ -207,9 +193,9 @@ mod tests {
 		let scanner = RegexSecretsScanner::new();
 		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
 		assert_eq!(findings.len(), 1);
-		assert_eq!(findings[0].scanner_id, SCANNER_ID);
+		assert_eq!(findings[0].scanner_id.expose(), SCANNER_ID);
 		assert_eq!(findings[0].severity, Severity::High);
-		assert_eq!(findings[0].file_path.as_deref(), Some("config.rs"));
+		assert_eq!(findings[0].file_path.as_ref().map(|v| v.expose()), Some("config.rs"));
 		assert_eq!(findings[0].line_start, Some(1));
 	}
 

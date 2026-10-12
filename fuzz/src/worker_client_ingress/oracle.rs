@@ -1,4 +1,4 @@
-//! Harness-local specification: legacy public schemas plus independent field rules.
+//! Harness-local specification: public wire schemas plus independent field rules.
 //! No production text constructor, decoder, token-range helper or source mint.
 use serde_json::Value;
 use unicode_general_category::{get_general_category, GeneralCategory};
@@ -9,6 +9,12 @@ pub(crate) const BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// Original text decoders have no diagnostic log egress. Keep this baseline
 /// separate from sender-facing error/echo observations and runtime collectors.
 pub(crate) fn without_logs<T>(action: impl FnOnce() -> T) -> T {
+	let (result, log) = capture_logs(action);
+	assert!(log.is_empty(), "pure original decoder emitted diagnostic log content");
+	result
+}
+
+fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, Vec<u8>) {
 	#[derive(Clone, Default)]
 	struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 	impl std::io::Write for Capture {
@@ -32,11 +38,92 @@ pub(crate) fn without_logs<T>(action: impl FnOnce() -> T) -> T {
 		.finish();
 	let _guard = tracing::subscriber::set_default(subscriber);
 	let result = action();
-	assert!(
-		capture.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
-		"pure original decoder emitted diagnostic log content"
-	);
-	result
+	let log = capture.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+	(result, log)
+}
+
+const SCANNER_WARNING: &[u8] = b" WARN loupe_worker::client::ingress::scanner: ignoring scanner_config: not a ScannerConfigPatch\n";
+
+// Patch wire schema, used only as an independent fallback oracle.
+// All fields affect serde admission; they are intentionally not output owners.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+#[allow(dead_code)]
+struct ScannerPatch {
+	max_concurrent_files: Option<usize>,
+	max_file_bytes: Option<u64>,
+	per_request_timeout_seconds: Option<u64>,
+	include_extensions: Option<Vec<String>>,
+	exclude_path_substrings: Option<Vec<String>>,
+}
+
+fn malformed_scanner_patch(body: &[u8]) -> bool {
+	use serde_json::value::RawValue;
+	// Preserve the real envelope's sequence positions and duplicate-field
+	// rejection while observing only the original scanner token. Do not parse
+	// the whole message as Value: later ignored overflow/depth errors may occur
+	// after the fixed warning. No production decoder participates in this oracle.
+	#[derive(serde::Deserialize)]
+	#[allow(dead_code)]
+	struct Envelope<'a> {
+		#[serde(borrow)]
+		kind: &'a RawValue,
+		#[serde(borrow)]
+		protocol_version: &'a RawValue,
+		#[serde(borrow)]
+		job_id: &'a RawValue,
+		#[serde(borrow)]
+		job_capability: &'a RawValue,
+		#[serde(borrow)]
+		repo_id: &'a RawValue,
+		#[serde(borrow)]
+		repo: &'a RawValue,
+		#[serde(default, borrow)]
+		head_branch: Option<&'a RawValue>,
+		#[serde(borrow)]
+		lease_expires_at: &'a RawValue,
+		#[serde(borrow)]
+		scanner_config: &'a RawValue,
+		#[serde(default, borrow)]
+		github_pat: Option<&'a RawValue>,
+		#[serde(borrow)]
+		payload: &'a RawValue,
+	}
+	if body.len() > BODY_LIMIT {
+		return false;
+	}
+	let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(body) else { return false };
+	if serde_json::from_str::<String>(envelope.kind.get()).ok().as_deref() != Some("lease") {
+		return false;
+	}
+	let Ok(value) = serde_json::from_str::<Value>(envelope.scanner_config.get()) else {
+		return false;
+	};
+	!value.is_null() && scanner(&value) && serde_json::from_value::<ScannerPatch>(value).is_err()
+}
+
+/// The lease owner also projects the operational scanner patch. A
+/// malformed non-null patch intentionally emits one fixed warning at admission.
+/// Admitted responses must emit it. Rejected responses may stop before that
+/// projection or fail afterward (PAT/envelope checks); only this exact event
+/// is permitted there, never an extra event, payload, parser error or field.
+pub(crate) fn lease_logs<T>(body: &[u8], admitted: bool, action: impl FnOnce() -> T) -> (T, usize) {
+	let fallback = malformed_scanner_patch(body);
+	let (result, log) = capture_logs(action);
+	if fallback && admitted {
+		assert_eq!(
+			log, SCANNER_WARNING,
+			"admitted scanner fallback must emit only its fixed warning"
+		);
+	} else if fallback {
+		assert!(
+			log.is_empty() || log == SCANNER_WARNING,
+			"rejected lease emitted unexpected diagnostic content"
+		);
+	} else {
+		assert!(log.is_empty(), "non-fallback lease emitted diagnostic content");
+	}
+	(result, usize::from(!log.is_empty()))
 }
 
 pub(crate) fn permitted(ch: char, multiline: bool) -> bool {
@@ -98,8 +185,8 @@ pub(crate) fn scanner(value: &Value) -> bool {
 		.all(|value| text(value, false))
 }
 
-pub(crate) fn lease(value: &mut loupe_proto::LeaseResponse) -> bool {
-	let loupe_proto::LeaseResponse::Lease(env) = value else { return true };
+pub(crate) fn lease(value: &mut crate::wire_oracle::LeaseResponse) -> bool {
+	let crate::wire_oracle::LeaseResponse::Lease(env) = value else { return true };
 	let repo = &env.repo;
 	if [&repo.host, &repo.owner, &repo.repo, &repo.clone_url].into_iter().any(|v| !text(v, false))
 		|| repo.branch.as_deref().is_some_and(|v| !text(v, false))
@@ -109,10 +196,10 @@ pub(crate) fn lease(value: &mut loupe_proto::LeaseResponse) -> bool {
 		return false;
 	}
 	match &mut env.payload {
-		loupe_proto::LeasePayload::Scan { since_sha } => {
+		crate::wire_oracle::LeasePayload::Scan { since_sha } => {
 			since_sha.as_deref().is_none_or(|v| text(v, false))
 		},
-		loupe_proto::LeasePayload::Verify { finding: content, reviewed_sha, .. } => {
+		crate::wire_oracle::LeasePayload::Verify { finding: content, reviewed_sha, .. } => {
 			if let Some(revision) = reviewed_sha {
 				if revision.len() > TEXT_LIMIT {
 					return false;
@@ -131,14 +218,15 @@ pub(crate) fn lease(value: &mut loupe_proto::LeaseResponse) -> bool {
 	}
 }
 
-/// Canonical output is produced only from the unchanged public legacy schemas.
+/// Canonical output uses the oracle's wire schemas, independently of production.
 pub(crate) fn client(kind: u8, bytes: &[u8]) -> Option<Value> {
 	if bytes.len() > BODY_LIMIT {
 		return None;
 	}
 	match kind {
 		0 => {
-			let mut value = serde_json::from_slice::<loupe_proto::LeaseResponse>(bytes).ok()?;
+			let mut value =
+				serde_json::from_slice::<crate::wire_oracle::LeaseResponse>(bytes).ok()?;
 			lease(&mut value).then(|| {
 				serde_json::to_value(value).unwrap_or_else(|error| panic!("fixture lease: {error}"))
 			})
@@ -147,13 +235,14 @@ pub(crate) fn client(kind: u8, bytes: &[u8]) -> Option<Value> {
 			serde_json::to_value(v).unwrap_or_else(|error| panic!("fixture heartbeat: {error}"))
 		}),
 		2 => {
-			let value = serde_json::from_slice::<loupe_proto::ListFindingsResponse>(bytes).ok()?;
+			let value =
+				serde_json::from_slice::<crate::wire_oracle::ListFindingsResponse>(bytes).ok()?;
 			let value = serde_json::to_value(value)
 				.unwrap_or_else(|error| panic!("fixture search: {error}"));
 			value["findings"].as_array()?.iter().all(finding).then_some(value)
 		},
 		3 => {
-			let value = serde_json::from_slice::<loupe_proto::FindingDetail>(bytes).ok()?;
+			let value = serde_json::from_slice::<crate::wire_oracle::FindingDetail>(bytes).ok()?;
 			let value = serde_json::to_value(value)
 				.unwrap_or_else(|error| panic!("fixture detail: {error}"));
 			finding(&value).then_some(value)

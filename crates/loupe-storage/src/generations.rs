@@ -1,6 +1,7 @@
 //! Rebuildable generations; all lifecycle writes are caller-transactional.
-use loupe_core::text::policy::{Payload, Reason};
+use loupe_core::text::policy::{Payload, Reason, RevisionText};
 use loupe_core::text::{BoundedJson, BoundedText};
+use loupe_provenance::{Db, Source};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::review::{changed, classify, parsed, standalone, string_enum};
@@ -9,10 +10,10 @@ use crate::{ownership, Conflict, Entity, Error, Ownership, Result};
 string_enum!(State { Building => "building", Active => "active", Retired => "retired" });
 string_enum!(Coverage { Complete => "complete", Partial => "partial", Unknown => "unknown" });
 string_enum!(Corroboration { Pending => "pending", Sampled => "sampled", Satisfied => "satisfied", Contradicted => "contradicted" });
-pub struct NewGeneration<'a> {
+pub struct NewGeneration<'a, S: Source> {
 	pub repo_id: i64,
 	pub predecessor_generation_id: Option<i64>,
-	pub commit_sha: &'a str,
+	pub commit_sha: &'a BoundedText<RevisionText, S>,
 	pub workflow_contract_version: i64,
 }
 #[derive(Debug, Clone)]
@@ -20,19 +21,19 @@ pub struct Generation {
 	pub generation_id: i64,
 	pub repo_id: i64,
 	pub predecessor_generation_id: Option<i64>,
-	pub commit_sha: String,
+	pub commit_sha: BoundedText<RevisionText, Db>,
 	pub state: State,
 	pub workflow_contract_version: i64,
 	pub profile_version: i64,
-	pub generated_profile: Option<BoundedJson<Payload>>,
+	pub generated_profile: Option<BoundedJson<Payload, Db>>,
 	pub inventory_digest: Option<Vec<u8>>,
 	pub coverage: Coverage,
 	pub corroboration: Corroboration,
-	pub pending_follow_up: Option<BoundedJson<Payload>>,
+	pub pending_follow_up: Option<BoundedJson<Payload, Db>>,
 	pub created_at: i64,
 	pub activated_at: Option<i64>,
 	pub retired_at: Option<i64>,
-	pub retired_reason: Option<BoundedText<Reason>>,
+	pub retired_reason: Option<BoundedText<Reason, Db>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageRollup {
@@ -52,26 +53,38 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Generation> {
 		generation_id: r.get(0)?,
 		repo_id: r.get(1)?,
 		predecessor_generation_id: r.get(2)?,
-		commit_sha: crate::ingress::revision_legacy(r, 3)?,
+		commit_sha: crate::ingress::revision(r, 3)?,
 		state: parsed(r, 4)?,
 		workflow_contract_version: r.get(5)?,
 		profile_version: r.get(6)?,
-		generated_profile: crate::ingress::optional_db_payload_legacy(r, 7)?,
+		generated_profile: crate::ingress::optional_db_payload(r, 7)?,
 		inventory_digest: r.get(8)?,
 		coverage: parsed(r, 9)?,
 		corroboration: parsed(r, 10)?,
-		pending_follow_up: crate::ingress::optional_db_payload_legacy(r, 11)?,
+		pending_follow_up: crate::ingress::optional_db_payload(r, 11)?,
 		created_at: r.get(12)?,
 		activated_at: r.get(13)?,
 		retired_at: r.get(14)?,
-		retired_reason: crate::ingress::optional_reason_legacy(r, 15)?,
+		retired_reason: crate::ingress::optional_reason(r, 15)?,
 	})
 }
-pub fn create(tx: &Transaction<'_>, new: &NewGeneration<'_>, now: i64) -> Result<i64> {
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
+	crate::migrations::admission::scan(conn, "review_generations", COLUMNS, row)?;
+	crate::migrations::admission::scan(
+		conn,
+		"review_generations",
+		"generated_profile_digest",
+		|_| Ok::<_, rusqlite::Error>(()),
+	)
+}
+pub fn create<S: Source>(
+	tx: &Transaction<'_>, new: &NewGeneration<'_, S>, now: i64,
+) -> Result<i64> {
 	if let Some(parent) = new.predecessor_generation_id {
 		ownership::generation(tx, new.repo_id, parent, Ownership::GenerationPredecessor)?;
 	}
-	tx.execute("INSERT INTO review_generations (repo_id,predecessor_generation_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES (?1,?2,?3,'building',?4,?5)",params![new.repo_id,new.predecessor_generation_id,new.commit_sha,new.workflow_contract_version,now])?;
+	tx.execute("INSERT INTO review_generations (repo_id,predecessor_generation_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES (?1,?2,?3,'building',?4,?5)",params![new.repo_id,new.predecessor_generation_id,new.commit_sha.expose(),new.workflow_contract_version,now])?;
 	Ok(tx.last_insert_rowid())
 }
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Generation>> {
@@ -102,22 +115,31 @@ pub fn activate(tx: &Transaction<'_>, id: i64, now: i64) -> Result<()> {
 		if successor.predecessor_generation_id != Some(active) {
 			return Err(Error::Conflict(Conflict::GenerationPredecessor));
 		}
-		retire(tx, active, &BoundedText::new("superseded")?, now)?;
+		retire_superseded(tx, active, now)?;
 	}
 	changed(tx.execute("UPDATE review_generations SET state='active',activated_at=?2 WHERE generation_id=?1 AND state='building'",params![id,now])
 		.map_err(|e|classify(e,"review_generations.repo_id",Conflict::ActiveGeneration))?,Conflict::GenerationState)
 }
-pub fn retire(tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>, now: i64) -> Result<()> {
+fn retire_superseded(tx: &Transaction<'_>, id: i64, now: i64) -> Result<()> {
+	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason='superseded',retired_at=?2 WHERE generation_id=?1 AND state='active'", params![id, now])?, Conflict::GenerationState)
+}
+pub fn retire<S: Source>(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>, now: i64,
+) -> Result<()> {
 	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason=?2,retired_at=?3 WHERE generation_id=?1 AND state='active'",params![id,reason.expose(),now])?,Conflict::GenerationState)
 }
 /// Discard rebuildable state from a bootstrap that never became a baseline.
-pub fn abandon(
-	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>, now: i64,
+pub fn abandon<S: Source>(
+	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>, now: i64,
 ) -> Result<()> {
 	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason=?2,retired_at=?3 WHERE generation_id=?1 AND state='building'",params![id,reason.expose(),now])?,Conflict::GenerationState)
 }
-pub fn set_profile(
-	tx: &Transaction<'_>, id: i64, version: i64, profile: &BoundedJson<Payload>,
+/// The scheduler supersedes an unactivated bootstrap using a closed host fact.
+pub fn abandon_superseded_bootstrap(tx: &Transaction<'_>, id: i64, now: i64) -> Result<()> {
+	changed(tx.execute("UPDATE review_generations SET state='retired',retired_reason='superseded bootstrap',retired_at=?2 WHERE generation_id=?1 AND state='building'", params![id, now])?, Conflict::GenerationState)
+}
+pub fn set_profile<S: Source>(
+	tx: &Transaction<'_>, id: i64, version: i64, profile: &BoundedJson<Payload, S>,
 ) -> Result<()> {
 	changed(tx.execute("UPDATE review_generations SET profile_version=?2,generated_profile=?3,generated_profile_digest=?4 WHERE generation_id=?1 AND state IN ('building','active') AND ?2>0 AND (?2>profile_version OR generated_profile IS NULL)",params![id,version,profile.expose(),profile.digest().as_slice()])?,Conflict::GenerationState)
 }
@@ -139,18 +161,23 @@ pub fn coverage_rollup(tx: &Transaction<'_>, id: i64) -> Result<CoverageRollup> 
 	let unresolved_inventory = tx.query_row("SELECT COUNT(*) FROM generation_inventory WHERE generation_id=?1 AND disposition='unresolved'",[id],|r|r.get(0))?;
 	Ok(CoverageRollup { missing_results, needs_follow_up, unresolved_inventory })
 }
-pub fn set_pending_follow_up(
-	tx: &Transaction<'_>, id: i64, follow_up: &BoundedJson<Payload>,
+pub fn set_pending_follow_up<S: Source>(
+	tx: &Transaction<'_>, id: i64, follow_up: &BoundedJson<Payload, S>,
 ) -> Result<()> {
 	changed(tx.execute("UPDATE review_generations SET pending_follow_up=?2 WHERE generation_id=?1 AND state IN ('building','active')",params![id,follow_up.expose()])?,Conflict::GenerationState)
 }
+pub fn coalesce_follow_up<S: Source>(
+	tx: &Transaction<'_>, id: i64, follow_up: &loupe_core::PendingFollowUp<'_, S>,
+) -> Result<()> {
+	changed(tx.execute("UPDATE review_generations SET pending_follow_up=?2 WHERE generation_id=?1 AND state IN ('building','active')", params![id, follow_up.canonical()])?, Conflict::GenerationState)
+}
 standalone! {
-	create(new: &NewGeneration<'_>, now: i64) -> i64;
+	create<S>(new: &NewGeneration<'_, S>, now: i64) -> i64;
 	activate(id: i64, now: i64) -> ();
-	retire(id: i64, reason: &BoundedText<Reason>, now: i64) -> ();
-	abandon(id: i64, reason: &BoundedText<Reason>, now: i64) -> ();
-	set_profile(id: i64, version: i64, profile: &BoundedJson<Payload>) -> ();
+	retire<S>(id: i64, reason: &BoundedText<Reason, S>, now: i64) -> ();
+	abandon<S>(id: i64, reason: &BoundedText<Reason, S>, now: i64) -> ();
+	set_profile<S>(id: i64, version: i64, profile: &BoundedJson<Payload, S>) -> ();
 	set_corroboration(id: i64, state: Corroboration) -> ();
 	set_coverage(id: i64, coverage: Coverage) -> ();
-	set_pending_follow_up(id: i64, follow_up: &BoundedJson<Payload>) -> ();
+	set_pending_follow_up<S>(id: i64, follow_up: &BoundedJson<Payload, S>) -> ();
 }

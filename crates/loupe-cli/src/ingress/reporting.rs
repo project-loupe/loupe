@@ -1,5 +1,5 @@
 //! Reporting's internally tagged Content rules differ from ignored members of
-//! ordinary DTOs. Preserve its original envelope depth without a dynamic tree.
+//! ordinary DTOs. Envelope depth counts toward the parser's recursion budget.
 use std::fmt;
 
 use loupe_proto::{GithubReportingAuth, ReportingSummary};
@@ -79,9 +79,9 @@ struct Email<'a> {
 	#[serde(default, borrow)]
 	subject_prefix: Option<&'a RawValue>,
 }
-pub(super) fn reporting_summary_legacy(
+pub(super) fn reporting_summary(
 	mark: &Mark<'_, Server>, token: &RawValue, depth: usize,
-) -> Result<ReportingSummary> {
+) -> Result<ReportingSummary<Server>> {
 	let raw = token.get();
 	let mut decoder = serde_json::Deserializer::from_str(raw);
 	ContentDepth(depth).deserialize(&mut decoder).map_err(|_| invalid())?;
@@ -95,27 +95,17 @@ pub(super) fn reporting_summary_legacy(
 		Kind::GithubIssue => {
 			let r: Github<'_> = serde_json::from_str(raw).map_err(|_| invalid())?;
 			ReportingSummary::GithubIssue {
-				target_owner: owner(mark, r.target_owner)?.expose().to_owned(),
-				target_repo: repo(mark, r.target_repo)?.expose().to_owned(),
+				target_owner: owner(mark, r.target_owner)?,
+				target_repo: repo(mark, r.target_repo)?,
 				auth: r.auth,
 			}
 		},
 		Kind::Email => {
 			let r: Email<'_> = serde_json::from_str(raw).map_err(|_| invalid())?;
 			ReportingSummary::Email {
-				to: r
-					.to
-					.into_iter()
-					.map(|t| Ok::<_, anyhow::Error>(address(mark, t)?.expose().to_owned()))
-					.collect::<Result<_>>()?,
-				from: r
-					.from
-					.map(|t| Ok::<_, anyhow::Error>(address(mark, t)?.expose().to_owned()))
-					.transpose()?,
-				subject_prefix: r
-					.subject_prefix
-					.map(|t| Ok::<_, anyhow::Error>(subject(mark, t)?.expose().to_owned()))
-					.transpose()?,
+				to: r.to.into_iter().map(|t| address(mark, t)).collect::<Result<_>>()?,
+				from: r.from.map(|t| address(mark, t)).transpose()?,
+				subject_prefix: r.subject_prefix.map(|t| subject(mark, t)).transpose()?,
 			}
 		},
 		Kind::Manual => {

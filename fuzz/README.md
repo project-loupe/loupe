@@ -496,9 +496,9 @@ oracle; the target does not mistake those values for security options.
 
 All 34 main-surface S1 targets plus smoke are registered. S3 additionally
 registers `core_text_exact` for the marked exact-text policies and `tls_input`
-for guarded PEM readers and exports. The former's temporary
-`source-migration` dependency is removed at atomic source adoption; the target
-and its independent oracle remain. Each real target has
+for guarded PEM readers and exports. The text target now exercises the final
+source-bearing policies through its fixed Agent fixture; its independent
+oracle remains. Each real target has
 a retained corpus, a clean short campaign and a detected guard mutation.
 The broader ingress gaps below remain separate from this named target set.
 

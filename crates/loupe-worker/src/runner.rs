@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use loupe_core::text::policy::RevisionText;
+use loupe_core::text::BoundedText;
 use loupe_proto::{
-	CompleteOutcome, CompleteRequest, FindingsBatch, JobCapability, LeaseEnvelope, LeasePayload,
-	LeaseResponse, VerdictSubmission, PROTOCOL_VERSION,
+	CompleteOutcome, FindingsBatch, JobCapability, LeaseEnvelope, LeasePayload, LeaseResponse,
+	VerdictSubmission, PROTOCOL_VERSION,
 };
-use loupe_provenance::{Ingress, Repo, Untrusted};
+use loupe_provenance::{Agent, Ingress, Repo, Server, Untrusted};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::ServerClient;
@@ -36,11 +38,36 @@ const LEASE_WAIT_SECONDS: u32 = 25;
 /// worker host. Operators can override per-runner.
 pub const DEFAULT_MAX_WORKDIR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum CompletionRevision {
+	CheckedOut(BoundedText<RevisionText, Repo>),
+	Reviewed(BoundedText<RevisionText, Server>),
+}
+
+/// The original error (including any typed diagnostic cause) stays alive
+/// until the named completion serializer intentionally displays it.
+struct CompletionDiagnostic(anyhow::Error);
+impl serde::Serialize for CompletionDiagnostic {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.collect_str(&self.0)
+	}
+}
+#[derive(serde::Serialize)]
+pub(crate) struct RunnerCompletion {
+	protocol_version: u16,
+	outcome: CompleteOutcome,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	head_sha: Option<CompletionRevision>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	error: Option<CompletionDiagnostic>,
+}
+
 pub struct Runner {
 	client: Arc<ServerClient>,
 	cache: Arc<RepoCache>,
 	scanners: Vec<Arc<dyn Scanner>>,
-	capabilities: Vec<String>,
+	capabilities: Vec<&'static str>,
 	max_workdir_bytes: u64,
 }
 
@@ -48,10 +75,8 @@ impl Runner {
 	pub fn new(
 		client: Arc<ServerClient>, cache: Arc<RepoCache>, scanners: Vec<Arc<dyn Scanner>>,
 	) -> Self {
-		let capabilities: Vec<String> = scanners
-			.iter()
-			.flat_map(|s| s.capabilities().iter().map(|c| (*c).to_owned()))
-			.collect();
+		let capabilities: Vec<&'static str> =
+			scanners.iter().flat_map(|s| s.capabilities().iter().copied()).collect();
 		Self { client, cache, scanners, capabilities, max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES }
 	}
 
@@ -71,7 +96,8 @@ impl Runner {
 		match receipt.response {
 			LeaseResponse::Empty { .. } => Ok(false),
 			LeaseResponse::Lease(env) => {
-				self.run_lease(*env, receipt.reviewed_revision, cancel).await?;
+				self.run_lease(*env, receipt.reviewed_revision, receipt.scanner_patch, cancel)
+					.await?;
 				Ok(true)
 			},
 		}
@@ -96,16 +122,18 @@ impl Runner {
 	}
 
 	async fn run_lease(
-		&self, env: LeaseEnvelope, reviewed_revision: ReviewedRevisionFact,
+		&self, env: LeaseEnvelope<Agent, Server>, reviewed_revision: ReviewedRevisionFact,
+		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 		cancel: &CancellationToken,
 	) -> Result<()> {
 		let job_id = env.job_id;
 		let job_capability = env.job_capability.clone();
-		tracing::info!(job_id, repo = %env.repo.clone_url, "leased job");
+		tracing::info!(job_id, repo = %env.repo.clone_url.expose(), "leased job");
 		let scan_cancel = cancel.child_token();
 		let heartbeat = self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone());
 
-		let outcome = self.execute(env, reviewed_revision, scan_cancel.clone()).await;
+		let outcome =
+			self.execute(env, reviewed_revision, scanner_patch, scan_cancel.clone()).await;
 
 		// Stop the heartbeat task before completing — otherwise it might
 		// race the complete and turn into a 403.
@@ -114,24 +142,24 @@ impl Runner {
 
 		match outcome {
 			Ok((head_sha, _findings_count)) => {
-				let req = CompleteRequest {
+				let req = RunnerCompletion {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Succeeded,
 					head_sha,
 					error: None,
 				};
-				self.client.complete(job_id, &job_capability, &req).await?;
+				self.client.complete_runner(job_id, &job_capability, &req).await?;
 				tracing::info!(job_id, "job succeeded");
 			},
 			Err(e) => {
 				tracing::warn!(job_id, error = %e, "job failed");
-				let req = CompleteRequest {
+				let req = RunnerCompletion {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Failed,
 					head_sha: None,
-					error: Some(e.to_string()),
+					error: Some(CompletionDiagnostic(e)),
 				};
-				if let Err(ce) = self.client.complete(job_id, &job_capability, &req).await {
+				if let Err(ce) = self.client.complete_runner(job_id, &job_capability, &req).await {
 					tracing::warn!(job_id, error = %ce, "complete(Failed) call failed too");
 				}
 			},
@@ -141,14 +169,16 @@ impl Runner {
 
 	/// Returns (head_sha, findings_count).
 	async fn execute(
-		&self, env: LeaseEnvelope, reviewed_revision: ReviewedRevisionFact,
+		&self, env: LeaseEnvelope<Agent, Server>, reviewed_revision: ReviewedRevisionFact,
+		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 		cancel: CancellationToken,
-	) -> Result<(Option<String>, usize)> {
-		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
+	) -> Result<(Option<CompletionRevision>, usize)> {
+		let key =
+			RepoKey::new(env.repo.host.expose(), env.repo.owner.expose(), env.repo.repo.expose());
 		let clone_url = env.repo.clone_url.clone();
 		let github_pat = env.github_pat.map(Arc::new);
 		let mut ensured =
-			self.cache.ensure_repo(&key, &env.repo.clone_url, github_pat.as_ref()).await?;
+			self.cache.ensure_repo(&key, env.repo.clone_url.expose(), github_pat.as_ref()).await?;
 		// `ensured` (and its pin) lives until the end of this fn; the
 		// repo cache won't evict the bare clone while the worktree
 		// alternate is still in use.
@@ -167,43 +197,47 @@ impl Runner {
 				};
 				// This operational view comes from the original Server mark retained
 				// by the lease decoder, never from the legacy envelope String.
-				let reviewed_sha = revision.text().to_owned();
-				let (workdir, head_sha) = match checkout_revision(&ensured.path, &reviewed_sha)
-					.await
-				{
-					Ok(ok) => ok,
-					Err(first_error) => {
-						tracing::warn!(
-							job_id = env.job_id,
-							finding_id,
-							reviewed_sha = %reviewed_sha,
-							error = %first_error,
-							"verify revision missing from refreshed cache; re-cloning",
-						);
-						drop(ensured);
-						ensured =
-							self.cache.reclone_repo(&key, &clone_url, github_pat.as_ref()).await?;
-						match checkout_revision(&ensured.path, &reviewed_sha).await {
-							Ok(ok) => ok,
-							Err(second_error) => {
-								self.submit_revision_unavailable_verdict(
-									env.job_id,
-									&env.job_capability,
-									finding_id,
-									HostVerifyReason::ReviewedRevisionUnavailable {
-										revision,
-										failure: second_error
-											.downcast_ref::<CheckoutFailure>()
-											.copied()
-											.unwrap_or(CheckoutFailure::Task),
-									},
-								)
+				let reviewed_sha = revision.clone().into_revision();
+				let (workdir, head_sha) =
+					match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
+						Ok(ok) => ok,
+						Err(first_error) => {
+							tracing::warn!(
+								job_id = env.job_id,
+								finding_id,
+								reviewed_sha = %reviewed_sha.expose(),
+								error = %first_error,
+								"verify revision missing from refreshed cache; re-cloning",
+							);
+							drop(ensured);
+							ensured = self
+								.cache
+								.reclone_repo(&key, clone_url.expose(), github_pat.as_ref())
 								.await?;
-								return Ok((Some(reviewed_sha), 0));
-							},
-						}
-					},
-				};
+							match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
+								Ok(ok) => ok,
+								Err(second_error) => {
+									self.submit_revision_unavailable_verdict(
+										env.job_id,
+										&env.job_capability,
+										finding_id,
+										HostVerifyReason::ReviewedRevisionUnavailable {
+											revision,
+											failure: second_error
+												.downcast_ref::<CheckoutFailure>()
+												.copied()
+												.unwrap_or(CheckoutFailure::Task),
+										},
+									)
+									.await?;
+									return Ok((
+										Some(CompletionRevision::Reviewed(reviewed_sha)),
+										0,
+									));
+								},
+							}
+						},
+					};
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
@@ -219,7 +253,7 @@ impl Runner {
 					job_capability: env.job_capability.clone(),
 					finding_id,
 					finding: *finding,
-					config: env.scanner_config,
+					config: scanner_patch,
 					cancel: cancel.clone(),
 				};
 				// Pick the first scanner advertising any verify:* tag.
@@ -239,11 +273,7 @@ impl Runner {
 				match outcome {
 					crate::VerifyOutcome::Host(reason) => {
 						self.client
-							.submit_verdict(
-								env.job_id,
-								&env.job_capability,
-								&reason.into_legacy_submission(),
-							)
+							.submit_host_verdict(env.job_id, &env.job_capability, reason)
 							.await?;
 					},
 					crate::VerifyOutcome::Verdict(verdict) => {
@@ -274,31 +304,36 @@ impl Runner {
 						);
 					},
 				}
-				Ok((Some(head_sha), 0))
+				Ok((Some(CompletionRevision::CheckedOut(head_sha)), 0))
 			},
 			LeasePayload::Scan { since_sha } => {
 				tracing::info!(job_id = env.job_id, "checking out worktree");
-				let (workdir, head_sha) =
-					match checkout_latest(&ensured.path, env.head_branch.as_deref()).await {
-						Ok(ok) => ok,
-						Err(first_error) => {
-							tracing::warn!(
-								job_id = env.job_id,
-								error = %first_error,
-								"scan checkout failed from refreshed cache; re-cloning",
-							);
-							drop(ensured);
-							ensured = self
-								.cache
-								.reclone_repo(&key, &clone_url, github_pat.as_ref())
-								.await?;
-							checkout_latest(&ensured.path, env.head_branch.as_deref()).await?
-						},
-					};
+				let (workdir, head_sha) = match checkout_latest(
+					&ensured.path,
+					env.head_branch.as_ref().map(|v| v.expose()),
+				)
+				.await
+				{
+					Ok(ok) => ok,
+					Err(first_error) => {
+						tracing::warn!(
+							job_id = env.job_id,
+							error = %first_error,
+							"scan checkout failed from refreshed cache; re-cloning",
+						);
+						drop(ensured);
+						ensured = self
+							.cache
+							.reclone_repo(&key, clone_url.expose(), github_pat.as_ref())
+							.await?;
+						checkout_latest(&ensured.path, env.head_branch.as_ref().map(|v| v.expose()))
+							.await?
+					},
+				};
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				tracing::info!(
 					job_id = env.job_id,
-					head_sha = %head_sha,
+					head_sha = %head_sha.expose(),
 					workdir_bytes = workdir_size,
 					"worktree ready"
 				);
@@ -316,7 +351,7 @@ impl Runner {
 					job_capability: env.job_capability.clone(),
 					head_sha: head_sha.clone(),
 					base_sha: since_sha,
-					config: env.scanner_config,
+					config: scanner_patch,
 					cancel: cancel.clone(),
 				};
 
@@ -351,7 +386,7 @@ impl Runner {
 						FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all.clone() };
 					self.client.submit_findings(env.job_id, &env.job_capability, &batch).await?;
 				}
-				Ok((Some(head_sha), all.len()))
+				Ok((Some(CompletionRevision::CheckedOut(head_sha)), all.len()))
 			},
 		}
 	}
@@ -365,7 +400,7 @@ impl Runner {
 			finding_id,
 			"submitting terminal inconclusive verdict for unavailable verify revision",
 		);
-		self.client.submit_verdict(job_id, job_capability, &reason.into_legacy_submission()).await
+		self.client.submit_host_verdict(job_id, job_capability, reason).await
 	}
 
 	fn spawn_heartbeat(
@@ -392,13 +427,15 @@ impl Runner {
 /// worktree dir (a `TempDir` for cleanup) plus the resolved commit SHA.
 pub async fn checkout_latest(
 	bare: &Path, branch: Option<&str>,
-) -> Result<(tempfile::TempDir, String)> {
+) -> Result<(tempfile::TempDir, BoundedText<RevisionText, Repo>)> {
 	checkout(bare, CheckoutTarget::Latest { branch: branch.map(str::to_owned) }).await
 }
 
 /// Produce a fresh worktree from the bare clone at `bare` checked out
 /// to one exact commit SHA.
-pub async fn checkout_revision(bare: &Path, sha: &str) -> Result<(tempfile::TempDir, String)> {
+pub async fn checkout_revision(
+	bare: &Path, sha: &str,
+) -> Result<(tempfile::TempDir, BoundedText<RevisionText, Repo>)> {
 	checkout(bare, CheckoutTarget::Revision(sha.to_owned())).await
 }
 
@@ -433,83 +470,86 @@ fn submodule_paths(tree: &git2::Tree<'_>) -> Result<Vec<repo_ingress::Repository
 	Ok(paths)
 }
 
-async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::TempDir, String)> {
+async fn checkout(
+	bare: &Path, target: CheckoutTarget,
+) -> Result<(tempfile::TempDir, BoundedText<RevisionText, Repo>)> {
 	let bare = bare.to_path_buf();
 	let tmp = tempfile::tempdir().context(CheckoutFailure::CreateWorktree)?;
 	let workdir = tmp.path().to_path_buf();
-	let head_sha = tokio::task::spawn_blocking(move || -> Result<String> {
-		let repo = git2::Repository::open_bare(&bare)
-			.context(CheckoutFailure::OpenRepository)
-			.with_context(|| format!("opening bare repo at {}", bare.display()))?;
-		let commit = match target {
-			CheckoutTarget::Latest { branch } => {
-				let target_ref = match branch.as_deref() {
-					Some(b) => repo
-						.find_reference(&format!("refs/remotes/origin/{b}"))
-						.or_else(|_| repo.find_reference(&format!("refs/heads/{b}")))
-						.context(CheckoutFailure::LocateBranch)
-						.with_context(|| format!("locating ref for branch {b}"))?,
-					None => repo
-						.find_reference("refs/remotes/origin/HEAD")
-						.or_else(|_| repo.find_reference("HEAD"))
-						.context(CheckoutFailure::LocateHead)?,
-				};
-				target_ref.peel_to_commit().context(CheckoutFailure::ResolveReference)?
-			},
-			CheckoutTarget::Revision(sha) => {
-				let oid = git2::Oid::from_str(&sha)
-					.context(CheckoutFailure::ParseRevision)
-					.with_context(|| format!("parsing reviewed revision {sha}"))?;
-				let object = repo
-					.find_object(oid, None)
-					.context(CheckoutFailure::LocateRevision)
-					.with_context(|| format!("locating reviewed revision {sha}"))?;
-				object.peel_to_commit().context(CheckoutFailure::ResolveRevision)?
-			},
-		};
-		let tree = commit.tree().context(CheckoutFailure::ResolveTree)?;
-		// Diagnostics only: never fail a checkout over the warning.
-		match submodule_paths(&tree) {
-			Ok(paths) if !paths.is_empty() => {
-				let count = paths.len();
-				let diagnostics = paths
-					.into_iter()
-					.take(SUBMODULE_PATH_LIMIT)
-					.map(repo_ingress::RepositoryGitlinkPath::legacy_diagnostic)
-					.collect::<Vec<_>>();
-				tracing::warn!(
-					bare_repo = %bare.display(),
-					head_sha = %commit.id(),
-					submodule_count = count,
-					submodules = ?diagnostics,
-					"checkout leaves submodules unpopulated; their contents are not scanned",
-				);
-			},
-			Ok(_) => {},
-			Err(e) => tracing::debug!(error = ?e, "could not inspect submodules for warning"),
-		}
-		// `target_dir` alone leaves the handle bare, and libgit2 refuses
-		// to resolve a gitlink without a working tree. Point this handle
-		// at the temp dir; with `update_gitlink` false nothing is
-		// persisted, so the shared bare cache is untouched.
-		repo.set_workdir(&workdir, false).context(CheckoutFailure::AttachWorktree)?;
-		let mut opts = git2::build::CheckoutBuilder::new();
-		// Never touch the index in the bare cache: it is shared by every
-		// job checking out of this mirror, and the checkout is
-		// content-only, so scanners read the files directly.
-		opts.target_dir(&workdir).recreate_missing(true).force().update_index(false);
-		repo.checkout_tree(tree.as_object(), Some(&mut opts))
-			.context(CheckoutFailure::CheckoutTree)?;
-		let oid = commit.id();
-		// SAFETY: binary object id read from the actual checked-out Git commit,
-		// before hexadecimal String formatting.
-		#[allow(unsafe_code)]
-		let oid = Untrusted::new(oid.as_bytes(), unsafe { Ingress::<Repo>::new() });
-		Ok(oid.validate(repo_ingress::CheckedOutRevisionDecoder)?.legacy_revision())
-	})
-	.await
-	.map_err(|e| anyhow::anyhow!("checkout task panicked: {e}"))
-	.context(CheckoutFailure::Task)??;
+	let head_sha =
+		tokio::task::spawn_blocking(move || -> Result<BoundedText<RevisionText, Repo>> {
+			let repo = git2::Repository::open_bare(&bare)
+				.context(CheckoutFailure::OpenRepository)
+				.with_context(|| format!("opening bare repo at {}", bare.display()))?;
+			let commit = match target {
+				CheckoutTarget::Latest { branch } => {
+					let target_ref = match branch.as_deref() {
+						Some(b) => repo
+							.find_reference(&format!("refs/remotes/origin/{b}"))
+							.or_else(|_| repo.find_reference(&format!("refs/heads/{b}")))
+							.context(CheckoutFailure::LocateBranch)
+							.with_context(|| format!("locating ref for branch {b}"))?,
+						None => repo
+							.find_reference("refs/remotes/origin/HEAD")
+							.or_else(|_| repo.find_reference("HEAD"))
+							.context(CheckoutFailure::LocateHead)?,
+					};
+					target_ref.peel_to_commit().context(CheckoutFailure::ResolveReference)?
+				},
+				CheckoutTarget::Revision(sha) => {
+					let oid = git2::Oid::from_str(&sha)
+						.context(CheckoutFailure::ParseRevision)
+						.with_context(|| format!("parsing reviewed revision {sha}"))?;
+					let object = repo
+						.find_object(oid, None)
+						.context(CheckoutFailure::LocateRevision)
+						.with_context(|| format!("locating reviewed revision {sha}"))?;
+					object.peel_to_commit().context(CheckoutFailure::ResolveRevision)?
+				},
+			};
+			let tree = commit.tree().context(CheckoutFailure::ResolveTree)?;
+			// Diagnostics only: never fail a checkout over the warning.
+			match submodule_paths(&tree) {
+				Ok(paths) if !paths.is_empty() => {
+					let count = paths.len();
+					let diagnostics = paths
+						.iter()
+						.take(SUBMODULE_PATH_LIMIT)
+						.map(repo_ingress::RepositoryGitlinkPath::for_log)
+						.collect::<Vec<_>>();
+					tracing::warn!(
+						bare_repo = %bare.display(),
+						head_sha = %commit.id(),
+						submodule_count = count,
+						submodules = ?diagnostics,
+						"checkout leaves submodules unpopulated; their contents are not scanned",
+					);
+				},
+				Ok(_) => {},
+				Err(e) => tracing::debug!(error = ?e, "could not inspect submodules for warning"),
+			}
+			// `target_dir` alone leaves the handle bare, and libgit2 refuses
+			// to resolve a gitlink without a working tree. Point this handle
+			// at the temp dir; with `update_gitlink` false nothing is
+			// persisted, so the shared bare cache is untouched.
+			repo.set_workdir(&workdir, false).context(CheckoutFailure::AttachWorktree)?;
+			let mut opts = git2::build::CheckoutBuilder::new();
+			// Never touch the index in the bare cache: it is shared by every
+			// job checking out of this mirror, and the checkout is
+			// content-only, so scanners read the files directly.
+			opts.target_dir(&workdir).recreate_missing(true).force().update_index(false);
+			repo.checkout_tree(tree.as_object(), Some(&mut opts))
+				.context(CheckoutFailure::CheckoutTree)?;
+			let oid = commit.id();
+			// SAFETY: binary object id read from the actual checked-out Git commit,
+			// before hexadecimal String formatting.
+			#[allow(unsafe_code)]
+			let oid = Untrusted::new(oid.as_bytes(), unsafe { Ingress::<Repo>::new() });
+			Ok(oid.validate(repo_ingress::CheckedOutRevisionDecoder)?.into_revision())
+		})
+		.await
+		.map_err(|e| anyhow::anyhow!("checkout task panicked: {e}"))
+		.context(CheckoutFailure::Task)??;
 	Ok((tmp, head_sha))
 }
 
@@ -535,7 +575,7 @@ mod tests {
 		fn capabilities(&self) -> &[&'static str] {
 			self.caps
 		}
-		async fn scan(&self, _: &ScanContext) -> Result<Vec<loupe_core::Finding>> {
+		async fn scan(&self, _: &ScanContext) -> Result<Vec<loupe_core::Finding<Repo>>> {
 			Ok(vec![])
 		}
 	}
@@ -644,8 +684,8 @@ mod tests {
 		assert_eq!(
 			submodule_paths(&tree)
 				.unwrap()
-				.into_iter()
-				.map(repo_ingress::RepositoryGitlinkPath::legacy_diagnostic)
+				.iter()
+				.map(repo_ingress::RepositoryGitlinkPath::for_log)
 				.collect::<Vec<_>>(),
 			vec!["vendor/dependency".to_owned()]
 		);
@@ -666,7 +706,7 @@ mod tests {
 				("checkout_revision", sha, workdir)
 			},
 		] {
-			assert_eq!(checked_out, head, "{label} resolved the wrong commit");
+			assert_eq!(checked_out.expose(), head, "{label} resolved the wrong commit");
 			let submodule = workdir.path().join("vendor/dependency");
 			assert!(submodule.is_dir(), "{label} did not create the submodule dir");
 			assert_eq!(
@@ -693,7 +733,7 @@ mod tests {
 		assert!(!bare.join("index").exists(), "a fresh bare mirror has no index");
 
 		let (_workdir, sha) = checkout_latest(&bare, Some("main")).await.unwrap();
-		assert_eq!(sha, head);
+		assert_eq!(sha.expose(), head);
 		assert!(
 			!bare.join("index").exists(),
 			"checkout must not write an index into the shared bare cache",
@@ -712,14 +752,14 @@ mod tests {
 		clone_bare(remote_tmp.path(), &bare);
 
 		let (latest_workdir, latest_sha) = checkout_latest(&bare, Some("main")).await.unwrap();
-		assert_eq!(latest_sha, second);
+		assert_eq!(latest_sha.expose(), second);
 		assert_eq!(
 			std::fs::read_to_string(latest_workdir.path().join("file.txt")).unwrap(),
 			"two\n"
 		);
 
 		let (review_workdir, reviewed_sha) = checkout_revision(&bare, &first).await.unwrap();
-		assert_eq!(reviewed_sha, first);
+		assert_eq!(reviewed_sha.expose(), first);
 		assert_eq!(
 			std::fs::read_to_string(review_workdir.path().join("file.txt")).unwrap(),
 			"one\n"

@@ -21,20 +21,20 @@ use crate::state::AppState;
 pub async fn create(
 	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-	let req = crate::ingress::registry::RegisterWorkerDecoder::decode_legacy(body)?;
+	let req = crate::ingress::registry::RegisterWorkerDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
 			format!("unsupported protocol_version {}", req.protocol_version),
 		));
 	}
-	if req.name.trim().is_empty() {
+	if req.name.expose().trim().is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "worker name must be non-empty".into()));
 	}
 
 	let bundle = state
 		.ca
-		.mint_client(&req.name)
+		.mint_client(req.name.expose())
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint failed: {e}")))?;
 
 	let fingerprint = first_cert_fingerprint(&bundle.cert_pem)

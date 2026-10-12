@@ -1,4 +1,5 @@
 //! Budget regressions exercise the real router and mTLS identity middleware.
+mod common;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -16,7 +17,7 @@ fn fixture() -> (axum::Router, PeerCert) {
 	db.with_conn(|conn| {
 		Ok(workers::insert(
 			conn,
-			"worker",
+			&common::marked::operator::text("worker"),
 			workers::WorkerKind::Worker,
 			&cert_fingerprint(cert.0.as_ref()),
 			0,

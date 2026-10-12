@@ -1,9 +1,10 @@
 //! Shared socket/runtime mechanics for the two concrete web fixtures.
-use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use axum::body::Body;
 use axum::http::Request;
+use clap::Parser;
+use loupe_web::config::ConfigUrl;
 use loupe_web::{AdminClient, Token, WebState};
 
 pub const BROWSER_CAP: usize = 2 * 1024 * 1024;
@@ -12,7 +13,7 @@ pub const RAW_CAP: usize = 64 * 1024;
 pub struct Fixture {
 	pub runtime: tokio::runtime::Runtime,
 	listener: std::net::TcpListener,
-	pub address: SocketAddr,
+	url: ConfigUrl,
 }
 impl Fixture {
 	pub fn new() -> Mutex<Self> {
@@ -24,7 +25,15 @@ impl Fixture {
 			.unwrap_or_else(|e| panic!("web fixture listener: {e}"));
 		listener.set_nonblocking(true).unwrap_or_else(|e| panic!("web nonblocking: {e}"));
 		let address = listener.local_addr().unwrap_or_else(|e| panic!("web fixture address: {e}"));
-		Mutex::new(Self { runtime, listener, address })
+		// Native setup admission happens before any per-request observation session.
+		let cli = loupe_web::Cli::try_parse_from([
+			"loupe-web",
+			"--server-url",
+			&format!("http://{address}/"),
+		])
+		.unwrap_or_else(|e| panic!("web URL: {e}"));
+		let url = cli.conn.server_url().unwrap_or_else(|e| panic!("web URL: {e}"));
+		Mutex::new(Self { runtime, listener, url })
 	}
 	// One bound socket per process. Each iteration owns and reaps its acceptor.
 	pub fn listener(&self) -> tokio::net::TcpListener {
@@ -41,10 +50,7 @@ impl Fixture {
 			.timeout(std::time::Duration::from_secs(5))
 			.build()
 			.unwrap_or_else(|e| panic!("web client: {e}"));
-		let client = AdminClient::from_parts(
-			client,
-			format!("http://{}/", self.address).parse().unwrap_or_else(|e| panic!("web URL: {e}")),
-		);
+		let client = AdminClient::from_parts(client, self.url.clone());
 		let token = Token::generate();
 		let secret = token.reveal().to_owned();
 		for rendered in

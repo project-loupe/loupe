@@ -1,37 +1,15 @@
-//! New-API tests. The old public API remains covered by source_migration_baseline.
-#![cfg(feature = "source-migration")]
+//! Source-bearing API, exact field and wire-shape tests.
 
-use loupe_core::source_migration::text::{
-	Anchor, BoundedJson, BoundedText, Identifier, RepoPath, SourceRef,
-};
-use loupe_core::source_migration::{
-	Finding, RepoSpec, ReportingDestination, Verdict, VerdictPatch,
-};
+#[path = "support/marked.rs"]
+mod marked;
 use loupe_core::text::policy::*;
-use loupe_core::text::{AnchorPolicy, Error, IdentPolicy, JsonPolicy, Rule, TextPolicy};
-use loupe_core::Severity;
-use loupe_provenance::{
-	Agent, Config, Db, Ingress, Mark, Repo, Source, Untrusted, Unvalidated, Validate,
+use loupe_core::text::{
+	Anchor, AnchorPolicy, BoundedJson, BoundedText, Error, IdentPolicy, Identifier, JsonPolicy,
+	RepoPath, Rule, SourceRef, TextPolicy,
 };
-
-struct Fixture<F>(F);
-impl<S: Source, F, R> Validate<&str, S> for Fixture<F>
-where
-	F: for<'a> FnOnce(&'a str, &Mark<'a, S>) -> R,
-{
-	type Output = R;
-	type Error = std::convert::Infallible;
-	fn validate<'a>(self, u: Unvalidated<'a, &str>, mark: Mark<'a, S>) -> Result<R, Self::Error> {
-		Ok((self.0)(u.get(), &mark))
-	}
-}
-
-#[allow(unsafe_code)]
-fn fixture<S: Source, R>(raw: &str, f: impl for<'a> FnOnce(&'a str, &Mark<'a, S>) -> R) -> R {
-	// SAFETY: this integration fixture mints a source for input the test made up.
-	let ingress = unsafe { Ingress::<S>::new() };
-	Untrusted::new(raw, ingress).validate(Fixture(f)).unwrap()
-}
+use loupe_core::{Finding, RepoSpec, ReportingDestination, Severity, Verdict, VerdictPatch};
+use loupe_provenance::{Agent, Config, Db, Mark, Repo, Source};
+use marked::fixture;
 
 fn text<P: TextPolicy>(raw: &str) -> Result<BoundedText<P, Agent>, Error> {
 	fixture(raw, |raw, mark| BoundedText::new(mark, raw))
@@ -258,47 +236,55 @@ fn new_legacy_caps_are_exact_and_not_the_llm_poc_route_cap() {
 		assert!(text::<FindingTitle>(&format!("{raw}x")).is_err());
 	}
 	assert!(text::<PocUnified>(&"x".repeat(256 * 1024 + 1)).is_ok());
-	// The strict LLM route still owns its smaller cap; D does not change it.
+	// The strict LLM route applies a smaller cap than the domain field policy.
 }
 
 #[test]
-fn staged_semantic_json_anchor_and_path_contracts_match_legacy() {
+fn semantic_json_anchor_and_path_contracts_keep_admitted_values() {
 	fixture::<Agent, _>("", |_, mark| {
-		for raw in ["cafe\u{301}\r\nnext", "", " x", "x ", "a\n\n\nb", "x\0y"] {
-			assert_eq!(
-				BoundedText::<Objective, _>::new(mark, raw).map(|v| v.expose().to_owned()),
-				loupe_core::text::BoundedText::<Objective>::new(raw).map(|v| v.expose().to_owned())
-			);
-		}
-		for raw in ["  CAFE\u{301}   handler  ", "job_9", "file.rs:9", "a\tb"] {
-			assert_eq!(
-				Anchor::<AnchorText, _>::new(mark, raw).map(|v| v.expose().to_owned()),
-				loupe_core::text::Anchor::<AnchorText>::new(raw).map(|v| v.expose().to_owned())
-			);
-		}
-		for raw in [r#"{"z":"cafe\u0301","a":1}"#, r#"{"a":1,"a":2}"#, r#"{"a":" trailing "}"#] {
-			assert_eq!(
-				BoundedJson::<Payload, _>::new(mark, raw)
-					.map(|v| (v.expose().to_owned(), *v.digest())),
-				loupe_core::text::BoundedJson::<Payload>::new(raw)
-					.map(|v| (v.expose().to_owned(), *v.digest()))
-			);
-		}
-		for raw in [
-			"café.rs",
-			"cafe\u{301}.rs",
-			"dir/%2e%2e.rs",
-			"",
-			"a/../b",
-			"a//b",
-			"a\\b",
-			&"x".repeat(513),
+		assert_eq!(
+			BoundedText::<Objective, _>::new(mark, "cafe\u{301}\r\nnext").unwrap().expose(),
+			"café\nnext"
+		);
+		for (raw, rule) in [
+			("", Rule::Empty),
+			(" x", Rule::Whitespace),
+			("x ", Rule::Whitespace),
+			("a\n\n\nb", Rule::Whitespace),
+			("x\0y", Rule::Character),
 		] {
-			assert_eq!(
-				RepoPath::new(mark, raw).map(|v| v.expose().to_owned()),
-				loupe_core::text::RepoPath::new(raw).map(|v| v.expose().to_owned())
-			);
+			assert_eq!(BoundedText::<Objective, _>::new(mark, raw).unwrap_err().rule, rule);
 		}
+		assert_eq!(
+			Anchor::<AnchorText, _>::new(mark, "  CAFE\u{301}   handler  ").unwrap().expose(),
+			"café handler"
+		);
+		for (raw, rule) in [
+			("job_9", Rule::IdentityTransientId),
+			("file.rs:9", Rule::IdentityLocation),
+			("a\tb", Rule::Character),
+		] {
+			assert_eq!(Anchor::<AnchorText, _>::new(mark, raw).unwrap_err().rule, rule);
+		}
+		let (raw, expected) = (r#"{"z":"cafe\u0301","a":1}"#, r#"{"a":1,"z":"café"}"#);
+		let value = BoundedJson::<Payload, _>::new(mark, raw).unwrap();
+		assert_eq!(value.expose(), expected);
+		assert_eq!(*value.digest(), *blake3::hash(expected.as_bytes()).as_bytes());
+		assert_eq!(
+			BoundedJson::<Payload, _>::new(mark, r#"{"a":1,"a":2}"#).unwrap_err().rule,
+			Rule::JsonDuplicateKey
+		);
+		assert_eq!(
+			BoundedJson::<Payload, _>::new(mark, r#"{"a":" trailing "}"#).unwrap_err().rule,
+			Rule::Whitespace
+		);
+		for raw in ["café.rs", "cafe\u{301}.rs", "dir/%2e%2e.rs"] {
+			assert_eq!(RepoPath::new(mark, raw).unwrap().expose(), raw);
+		}
+		for raw in ["", "a/../b", "a//b", "a\\b"] {
+			assert_eq!(RepoPath::new(mark, raw).unwrap_err().rule, Rule::Path);
+		}
+		assert_eq!(RepoPath::new(mark, &"x".repeat(513)).unwrap_err().rule, Rule::Bytes);
 		let reference = SourceRef {
 			path: RepoPath::new(mark, "cafe\u{301}.rs").unwrap(),
 			symbol: Some(BoundedText::new(mark, "cafe\u{301}").unwrap()),
@@ -315,12 +301,15 @@ fn serialized_findings_and_all_verdict_variants_keep_the_legacy_wire_schema() {
 	fixture::<Agent, _>("quote\r\n\t cafe\u{301} \n", |raw, mark| {
 		let f = finding(mark, raw);
 		let json = serde_json::to_value(&f).unwrap();
-		let old: loupe_core::Finding = serde_json::from_value(json.clone()).unwrap();
-		assert_eq!(old.title, f.title.expose());
-		assert_eq!(old.description, raw);
-		assert_eq!(old.patch_unified.as_deref(), Some(raw));
-		assert_eq!(old.poc_unified.as_deref(), Some(""));
-		assert_eq!(serde_json::to_value(old).unwrap(), json);
+		assert_eq!(
+			json,
+			serde_json::json!({
+				"scanner_id":"regex-secrets", "severity":"high", "title":f.title.expose(),
+				"description":raw, "file_path":"src/cafe\u{301}.rs", "line_start":1,
+				"line_end":2, "cwe":"", "patch_unified":raw, "poc_unified":"",
+				"fingerprint":"legacy-fingerprint"
+			})
+		);
 		for (verdict, expected) in [
 			(
 				Verdict::Confirmed { notes: None, patch: None },
@@ -357,8 +346,9 @@ fn serialized_findings_and_all_verdict_variants_keep_the_legacy_wire_schema() {
 		] {
 			let value = serde_json::to_value(&verdict).unwrap();
 			assert_eq!(value, expected);
-			let old: loupe_core::Verdict = serde_json::from_value(value.clone()).unwrap();
-			assert_eq!(serde_json::to_value(old).unwrap(), value);
+			let roundtrip: serde_json::Value =
+				serde_json::from_str(&serde_json::to_string(&verdict).unwrap()).unwrap();
+			assert_eq!(roundtrip, value);
 			same(&verdict);
 		}
 	});
@@ -407,9 +397,6 @@ fn repository_and_reporting_configuration_keep_the_exact_wire_schema() {
 		] {
 			assert_eq!(serde_json::to_value(&destination).unwrap(), expected);
 			same(&destination);
-			let old: loupe_core::ReportingDestination =
-				serde_json::from_value(expected.clone()).unwrap();
-			assert_eq!(serde_json::to_value(old).unwrap(), expected);
 		}
 	});
 }

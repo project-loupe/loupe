@@ -6,15 +6,20 @@
 //! operator can spot a finding stuck in `validating` or already
 //! `reported` without having to read the database.
 
+use loupe_core::text::policy::*;
+use loupe_core::text::{BoundedText, RepoPath};
 use loupe_core::{FindingState, Severity};
+use loupe_provenance::Source;
 use serde::{Deserialize, Serialize};
 
 /// Findings listing response body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListFindingsResponse {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct ListFindingsResponse<ContentS: Source, AuditS: Source> {
 	pub protocol_version: u16,
-	pub findings: Vec<FindingSummary>,
+	pub findings: Vec<FindingSummary<ContentS, AuditS>>,
 }
+record_impls!(ListFindingsResponse<ContentS, AuditS> { protocol_version, findings });
 
 /// Body of `POST /v1/findings/retry-verify`.
 ///
@@ -54,19 +59,20 @@ pub struct RetryVerifyResponse {
 /// Compact view used in listings — drops `description`, `patch_unified`,
 /// and `poc_unified` to keep responses small. `loupectl finding get
 /// <id>` returns the full detail view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FindingSummary {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct FindingSummary<ContentS: Source, AuditS: Source> {
 	pub id: i64,
 	pub repo_id: i64,
 	pub job_id: i64,
-	pub scanner_id: String,
+	pub scanner_id: BoundedText<ScannerIdText, ContentS>,
 	pub severity: Severity,
-	pub title: String,
+	pub title: BoundedText<FindingTitle, ContentS>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub file_path: Option<String>,
+	pub file_path: Option<RepoPath<ContentS>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub line_start: Option<u32>,
-	pub fingerprint: String,
+	pub fingerprint: BoundedText<FindingFingerprintText, ContentS>,
 	pub state: FindingState,
 	pub verification_required: bool,
 	pub created_at: i64,
@@ -76,7 +82,7 @@ pub struct FindingSummary {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub approved_at: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub approved_by_cn: Option<String>,
+	pub approved_by_cn: Option<BoundedText<AuditName, AuditS>>,
 	/// Rejection audit trail. Populated when an admin runs
 	/// `loupectl finding reject` on a finding parked in
 	/// `awaiting_approval`. Distinct from a verifier-issued dismiss
@@ -84,42 +90,45 @@ pub struct FindingSummary {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rejected_at: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub rejected_by_cn: Option<String>,
+	pub rejected_by_cn: Option<BoundedText<AuditName, AuditS>>,
 }
+record_impls!(FindingSummary<ContentS, AuditS> { id, repo_id, job_id, scanner_id, severity, title, file_path, line_start, fingerprint, state, verification_required, created_at, approved_at, approved_by_cn, rejected_at, rejected_by_cn });
 
 /// Full detail view for `GET /v1/findings/:id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FindingDetail {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct FindingDetail<ContentS: Source, AuditS: Source> {
 	pub protocol_version: u16,
 	pub id: i64,
 	pub repo_id: i64,
 	pub job_id: i64,
-	pub scanner_id: String,
+	pub scanner_id: BoundedText<ScannerIdText, ContentS>,
 	pub severity: Severity,
-	pub title: String,
-	pub description: String,
+	pub title: BoundedText<FindingTitle, ContentS>,
+	pub description: BoundedText<FindingDescription, ContentS>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub file_path: Option<String>,
+	pub file_path: Option<RepoPath<ContentS>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub line_start: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub line_end: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub cwe: Option<String>,
+	pub cwe: Option<BoundedText<CweText, ContentS>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub patch_unified: Option<String>,
+	pub patch_unified: Option<BoundedText<PatchUnified, ContentS>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub poc_unified: Option<String>,
-	pub fingerprint: String,
+	pub poc_unified: Option<BoundedText<PocUnified, ContentS>>,
+	pub fingerprint: BoundedText<FindingFingerprintText, ContentS>,
 	pub state: FindingState,
 	pub verification_required: bool,
 	pub created_at: i64,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub approved_at: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub approved_by_cn: Option<String>,
+	pub approved_by_cn: Option<BoundedText<AuditName, AuditS>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rejected_at: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub rejected_by_cn: Option<String>,
+	pub rejected_by_cn: Option<BoundedText<AuditName, AuditS>>,
 }
+record_impls!(FindingDetail<ContentS, AuditS> { protocol_version, id, repo_id, job_id, scanner_id, severity, title, description, file_path, line_start, line_end, cwe, patch_unified, poc_unified, fingerprint, state, verification_required, created_at, approved_at, approved_by_cn, rejected_at, rejected_by_cn });

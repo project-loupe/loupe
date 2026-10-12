@@ -1,18 +1,19 @@
 #![deny(unsafe_code)]
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use loupe_provenance::{
-	Config as ConfigSource, Ingress, Mark, Secret, Untrusted, Unvalidated, Validate,
+use loupe_provenance::{Config as ConfigSource, Ingress, Mark, Untrusted, Unvalidated, Validate};
+use loupe_server::config::{
+	select_tls_pem, ConfiguredHostname, ConfiguredPath, ConfiguredPemArgument, HostnameParser,
+	PathParser, PemParser,
 };
 use loupe_server::init::{run_init_with_options, DataDirLayout, InitOptions};
 use loupe_server::{serve, AppState, Config, FileConfig};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
-use loupe_tls::Ca;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe security-scanning daemon")]
@@ -35,16 +36,16 @@ enum Cmd {
 
 #[derive(Debug, Parser)]
 struct InitArgs {
-	#[arg(long, env = "LOUPE_DATA_DIR")]
-	data_dir: PathBuf,
+	#[arg(long, env = "LOUPE_DATA_DIR", value_parser = PathParser)]
+	data_dir: ConfiguredPath,
 	/// SubjectAltName entries for the server cert. Pass at least one.
 	/// Defaults cover both `localhost` and `127.0.0.1` so a fresh
 	/// bootstrap works for clients that prefer either form (rcgen
 	/// auto-classifies entries that parse as IPs into IP SANs and the
 	/// rest into DNS SANs). Override with `--hostname` for production
 	/// SAN lists.
-	#[arg(long = "hostname", value_name = "HOSTNAME", default_values_t = vec!["localhost".to_owned(), "127.0.0.1".to_owned()])]
-	hostnames: Vec<String>,
+	#[arg(long = "hostname", value_name = "HOSTNAME", default_values = ["localhost", "127.0.0.1"], value_parser = HostnameParser)]
+	hostnames: Vec<ConfiguredHostname>,
 	/// Print sourceable LOUPE_* env assignments carrying the generated
 	/// server/admin PEMs and master key. Useful for Docker bootstrap.
 	#[arg(long, default_value_t = false)]
@@ -60,59 +61,59 @@ struct ServeArgs {
 	/// Optional path to a TOML config file. Settings the file
 	/// supplies act as defaults; matching env vars or CLI flags
 	/// override them. See `contrib/config.toml` for a sample.
-	#[arg(long, env = "LOUPE_CONFIG")]
-	config: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_CONFIG", value_parser = PathParser)]
+	config: Option<ConfiguredPath>,
 	#[arg(long, env = "LOUPE_BIND")]
 	bind: Option<SocketAddr>,
-	#[arg(long, env = "LOUPE_DB")]
-	db: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_SERVER_CERT")]
-	server_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_SERVER_KEY")]
-	server_key: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_CA_KEY")]
-	ca_key: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_DB", value_parser = PathParser)]
+	db: Option<ConfiguredPath>,
+	#[arg(long, env = "LOUPE_SERVER_CERT", value_parser = PathParser)]
+	server_cert: Option<ConfiguredPath>,
+	#[arg(long, env = "LOUPE_SERVER_KEY", value_parser = PathParser)]
+	server_key: Option<ConfiguredPath>,
+	#[arg(long, env = "LOUPE_CA_CERT", value_parser = PathParser)]
+	ca_cert: Option<ConfiguredPath>,
+	#[arg(long, env = "LOUPE_CA_KEY", value_parser = PathParser)]
+	ca_key: Option<ConfiguredPath>,
 	/// Server certificate PEM content. When set, this takes precedence
 	/// over --server-cert / LOUPE_SERVER_CERT.
-	#[arg(long, env = "LOUPE_SERVER_CERT_PEM", hide_env_values = true)]
-	server_cert_pem: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_SERVER_CERT_PEM", hide_env_values = true, value_parser = PemParser)]
+	server_cert_pem: Option<ConfiguredPemArgument>,
 	/// Base64-encoded server certificate PEM content. Used when
 	/// LOUPE_SERVER_CERT_PEM is unset.
-	#[arg(long, env = "LOUPE_SERVER_CERT_PEM_B64", hide_env_values = true)]
-	server_cert_pem_b64: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_SERVER_CERT_PEM_B64", hide_env_values = true, value_parser = PemParser)]
+	server_cert_pem_b64: Option<ConfiguredPemArgument>,
 	/// Server private-key PEM content. When set, this takes precedence
 	/// over --server-key / LOUPE_SERVER_KEY.
-	#[arg(long, env = "LOUPE_SERVER_KEY_PEM", hide_env_values = true)]
-	server_key_pem: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_SERVER_KEY_PEM", hide_env_values = true, value_parser = PemParser)]
+	server_key_pem: Option<ConfiguredPemArgument>,
 	/// Base64-encoded server private-key PEM content. Used when
 	/// LOUPE_SERVER_KEY_PEM is unset.
-	#[arg(long, env = "LOUPE_SERVER_KEY_PEM_B64", hide_env_values = true)]
-	server_key_pem_b64: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_SERVER_KEY_PEM_B64", hide_env_values = true, value_parser = PemParser)]
+	server_key_pem_b64: Option<ConfiguredPemArgument>,
 	/// Internal CA certificate PEM content. When set, this takes
 	/// precedence over --ca-cert / LOUPE_CA_CERT.
-	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true, value_parser = PemParser)]
+	ca_cert_pem: Option<ConfiguredPemArgument>,
 	/// Base64-encoded internal CA certificate PEM content. Used when
 	/// LOUPE_CA_CERT_PEM is unset.
-	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true, value_parser = PemParser)]
+	ca_cert_pem_b64: Option<ConfiguredPemArgument>,
 	/// Internal CA private-key PEM content. When set, this takes
 	/// precedence over --ca-key / LOUPE_CA_KEY.
-	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
-	ca_key_pem: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true, value_parser = PemParser)]
+	ca_key_pem: Option<ConfiguredPemArgument>,
 	/// Base64-encoded internal CA private-key PEM content. Used when
 	/// LOUPE_CA_KEY_PEM is unset.
-	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
-	ca_key_pem_b64: Option<loupe_tls::PemInput>,
+	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true, value_parser = PemParser)]
+	ca_key_pem_b64: Option<ConfiguredPemArgument>,
 	/// Path to a file containing the database master key (64 hex
 	/// characters, optionally trailing newline — the shape
 	/// `loupe-server init` writes). Used only when `LOUPE_MASTER_KEY`
 	/// is not set; the env var still wins so operators who manage
 	/// the key in a secret store don't need to drop it on disk.
-	#[arg(long, env = "LOUPE_MASTER_KEY_FILE")]
-	master_key_file: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_MASTER_KEY_FILE", value_parser = PathParser)]
+	master_key_file: Option<ConfiguredPath>,
 	/// Server-level default for the human-in-the-loop approval gate.
 	/// Per-repo `require_approval` overrides this. When unset both
 	/// here and in the config file, the default is `false`
@@ -148,35 +149,35 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 		caller_key,
 		InitOptions { persist_secrets: !args.no_persist_secrets },
 	)
-	.with_context(|| format!("initialising data dir {}", args.data_dir.display()))?;
+	.with_context(|| format!("initialising data dir {}", args.data_dir.as_path().display()))?;
 	if args.emit_env {
 		print_init_env(&out)?;
 		return Ok(());
 	}
 	let layout = DataDirLayout::at(&args.data_dir);
-	println!("loupe data dir initialised at {}", out.layout.root.display());
+	println!("loupe data dir initialised at {}", out.layout.root.as_path().display());
 	println!();
-	println!("server cert: {}", layout.server_cert.display());
-	println!("server key:  {}", layout.server_key.display());
-	println!("ca cert:     {}", layout.ca_cert.display());
+	println!("server cert: {}", layout.server_cert.as_path().display());
+	println!("server key:  {}", layout.server_key.as_path().display());
+	println!("ca cert:     {}", layout.ca_cert.as_path().display());
 	println!();
 	if out.minted_master_key {
-		println!("master key:  {}", layout.master_key.display());
+		println!("master key:  {}", layout.master_key.as_path().display());
 		println!(
 			"  (32 random bytes, hex-encoded; database is sealed under this key.\n\
 			   Set `LOUPE_MASTER_KEY=$(cat {})` for `loupe-server serve`,\n\
 			   or pass --master-key {}.)",
-			layout.master_key.display(),
-			layout.master_key.display(),
+			layout.master_key.as_path().display(),
+			layout.master_key.as_path().display(),
 		);
 	} else {
 		println!("master key:  loaded from LOUPE_MASTER_KEY env (not persisted to disk)");
 	}
 	println!();
-	println!("admin client cert (saved to {}):", layout.admin_cert.display());
+	println!("admin client cert (saved to {}):", layout.admin_cert.as_path().display());
 	println!("{}", out.admin_bundle.cert_pem.trim_end());
 	println!();
-	println!("admin client key (saved to {}):", layout.admin_key.display());
+	println!("admin client key (saved to {}):", layout.admin_key.as_path().display());
 	println!("KEEP THIS SECRET — written once, never re-derivable.");
 	println!("{}", out.admin_bundle.key_pem.expose().trim_end());
 	Ok(())
@@ -206,26 +207,9 @@ fn init_env_assignments(
 	Ok(assignments)
 }
 
-async fn run_serve(mut args: ServeArgs) -> Result<()> {
-	// SAFETY: these are the actual process CLI/environment path arguments,
-	// before selecting file defaults. Keep native OS strings and precedence.
-	#[allow(unsafe_code)]
-	let input = unsafe { Ingress::<ConfigSource>::new() };
-	for path in [
-		&mut args.config,
-		&mut args.db,
-		&mut args.master_key_file,
-		&mut args.server_cert,
-		&mut args.server_key,
-		&mut args.ca_cert,
-		&mut args.ca_key,
-	] {
-		if let Some(raw) = path.take() {
-			*path = Some(ServerHostPathDecoder::decode_legacy(Untrusted::new(raw, input)));
-		}
-	}
+async fn run_serve(args: ServeArgs) -> Result<()> {
 	let file_cfg = match &args.config {
-		Some(path) => FileConfig::load(path)?,
+		Some(path) => FileConfig::load(path.as_path())?,
 		None => FileConfig::default(),
 	};
 	let review_policy = file_cfg.review.resolve()?;
@@ -253,8 +237,8 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
 		tracing::info!("loupe-server: master key loaded from LOUPE_MASTER_KEY");
 		key
 	} else if let Some(path) = args.master_key_file.or(file_cfg.paths.master_key) {
-		tracing::info!(path = %path.display(), "loupe-server: master key loaded from file");
-		read_master_key_from_file(&path)?
+		tracing::info!(path = %path.as_path().display(), "loupe-server: master key loaded from file");
+		read_master_key_from_file(path.as_path())?
 	} else {
 		bail!(
 			"master key missing — set LOUPE_MASTER_KEY, pass --master-key-file <path>,\n\
@@ -263,28 +247,28 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
 		);
 	};
 
-	let server_cert_pem = pem_from_env_or_file(
+	let server_cert_pem = select_tls_pem(
 		"server cert",
 		args.server_cert_pem,
 		args.server_cert_pem_b64,
 		args.server_cert.or(file_cfg.paths.server_cert),
 		"server cert missing — set LOUPE_SERVER_CERT_PEM, LOUPE_SERVER_CERT_PEM_B64, pass --server-cert, set LOUPE_SERVER_CERT, or [paths].server_cert",
 	)?;
-	let server_key_pem = pem_from_env_or_file(
+	let server_key_pem = select_tls_pem(
 		"server key",
 		args.server_key_pem,
 		args.server_key_pem_b64,
 		args.server_key.or(file_cfg.paths.server_key),
 		"server key missing — set LOUPE_SERVER_KEY_PEM, LOUPE_SERVER_KEY_PEM_B64, pass --server-key, set LOUPE_SERVER_KEY, or [paths].server_key",
 	)?;
-	let ca_cert_pem = pem_from_env_or_file(
+	let ca_cert_pem = select_tls_pem(
 		"CA cert",
 		args.ca_cert_pem,
 		args.ca_cert_pem_b64,
 		args.ca_cert.or(file_cfg.paths.ca_cert),
 		"CA cert missing — set LOUPE_CA_CERT_PEM, LOUPE_CA_CERT_PEM_B64, pass --ca-cert, set LOUPE_CA_CERT, or [paths].ca_cert",
 	)?;
-	let ca_key_pem = pem_from_env_or_file(
+	let ca_key_pem = select_tls_pem(
 		"CA key",
 		args.ca_key_pem,
 		args.ca_key_pem_b64,
@@ -292,8 +276,7 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
 		"CA key missing — set LOUPE_CA_KEY_PEM, LOUPE_CA_KEY_PEM_B64, pass --ca-key, set LOUPE_CA_KEY, or [paths].ca_key",
 	)?;
 
-	let ca = Ca::from_pem(ca_cert_pem.expose(), ca_key_pem.expose())
-		.context("rebuilding CA from PEM")?;
+	let ca = ca_cert_pem.import_ca(&ca_key_pem)?;
 
 	let cfg = Config {
 		bind_addr,
@@ -303,8 +286,13 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
 		ca_cert_pem,
 		ca_key_pem,
 	};
-	let db = Db::open(&db_path, &master_key)
-		.with_context(|| format!("opening db at {}", db_path.display()))?;
+	let db = Db::open(db_path.as_path(), &master_key)
+		.inspect_err(|error| {
+			if let loupe_storage::Error::Migration(failure) = error {
+				tracing::error!(error = %failure, "loupe-server: database upgrade failed");
+			}
+		})
+		.with_context(|| format!("opening db at {}", db_path.as_path().display()))?;
 	tracing::info!(
 		schema_version = db.schema_version()?,
 		build = %std::env::var("LOUPE_BUILD_REVISION").unwrap_or_else(|_| "unknown".into()),
@@ -387,64 +375,10 @@ fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
 		.with_context(|| format!("master key file at {}", path.display()))
 }
 
-fn pem_from_env_or_file(
-	label: &str, pem: Option<loupe_tls::PemInput>, pem_b64: Option<loupe_tls::PemInput>,
-	path: Option<PathBuf>, missing: &'static str,
-) -> Result<loupe_provenance::Secret<String>> {
-	if let Some(pem) = pem.filter(|s| !s.expose().is_empty()) {
-		tracing::info!(%label, "loupe-server: TLS PEM loaded from environment");
-		// SAFETY: this is the selected original CLI/environment PEM argument.
-		#[allow(unsafe_code)]
-		let input = unsafe { Ingress::<ConfigSource>::new() };
-		return Ok(ServerTlsPemEgress::move_legacy(pem.into_pem(), input));
-	}
-	if let Some(pem_b64) = pem_b64.filter(|s| !s.expose().is_empty()) {
-		tracing::info!(%label, "loupe-server: TLS PEM loaded from base64 environment");
-		return decode_pem_b64(label, pem_b64.expose());
-	}
-	let path = path.context(missing)?;
-	let pem = loupe_tls::read_pem_file(&path)
-		.with_context(|| format!("reading {label} at {}", path.display()))?;
-	// SAFETY: pem is the exact guarded UTF-8 payload of this actual file read.
-	#[allow(unsafe_code)]
-	let input = unsafe { Ingress::<ConfigSource>::new() };
-	Ok(ServerTlsPemEgress::move_legacy(pem, input))
-}
-
-fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<loupe_provenance::Secret<String>> {
-	// SAFETY: this is the selected actual base64 CLI/environment argument;
-	// capture precedes decoding and never relabels the derived PEM output.
-	#[allow(unsafe_code)]
-	let input = unsafe { Ingress::<ConfigSource>::new() };
-	Untrusted::new(pem_b64, input)
-		.validate(ServerBase64PemDecoder)
-		.with_context(|| format!("decoding base64 {label} PEM"))
-}
-
-struct ConfiguredHostPath(PathBuf);
-struct ServerHostPathDecoder;
-impl Validate<PathBuf, ConfigSource> for ServerHostPathDecoder {
-	type Output = ConfiguredHostPath;
-	type Error = std::convert::Infallible;
-	fn validate<'view>(
-		self, input: Unvalidated<'view, PathBuf>, _: Mark<'view, ConfigSource>,
-	) -> Result<Self::Output, Self::Error> {
-		Ok(ConfiguredHostPath(input.get().clone()))
-	}
-}
-impl ServerHostPathDecoder {
-	fn decode_legacy(input: Untrusted<PathBuf, ConfigSource>) -> PathBuf {
-		let Ok(path) = input.validate(Self);
-		path.0
-	}
-}
-
 #[derive(Debug, thiserror::Error)]
 enum CredentialInputError {
 	#[error("expected 64 hex characters, got {0} chars")]
 	MasterKey(usize),
-	#[error("invalid base64 or UTF-8 PEM input")]
-	Pem,
 }
 struct ServerMasterKeyDecoder;
 impl Validate<&str, ConfigSource> for ServerMasterKeyDecoder {
@@ -455,38 +389,6 @@ impl Validate<&str, ConfigSource> for ServerMasterKeyDecoder {
 	) -> Result<Self::Output, Self::Error> {
 		let raw = input.get().trim();
 		parse_master_key_hex(raw).map_err(|_| CredentialInputError::MasterKey(raw.len()))
-	}
-}
-struct ServerBase64PemDecoder;
-impl Validate<&str, ConfigSource> for ServerBase64PemDecoder {
-	type Output = Secret<String>;
-	type Error = CredentialInputError;
-	fn validate<'view>(
-		self, input: Unvalidated<'view, &str>, _: Mark<'view, ConfigSource>,
-	) -> Result<Self::Output, Self::Error> {
-		loupe_tls::decode_pem_base64(input.get().trim()).map_err(|_| CredentialInputError::Pem)
-	}
-}
-
-// A named TLS forward-payload egress, not PEM syntax or trust admission. The
-// existing TLS constructors own those checks. UTF-8 is already established by
-// PemInput/read_pem_file; impose no new cap or normalization on mixed bundles.
-// Validation borrows the original guarded owner; this temporary I exit moves
-// that exact allocation. M replaces the unlabelled consumer signature.
-struct ServerTlsPemEgress;
-impl Validate<&str, ConfigSource> for ServerTlsPemEgress {
-	type Output = ();
-	type Error = std::convert::Infallible;
-	fn validate<'view>(
-		self, _: Unvalidated<'view, &str>, _: Mark<'view, ConfigSource>,
-	) -> Result<Self::Output, Self::Error> {
-		Ok(())
-	}
-}
-impl ServerTlsPemEgress {
-	fn move_legacy(pem: Secret<String>, input: Ingress<ConfigSource>) -> Secret<String> {
-		let Ok(()) = Untrusted::new(pem.expose().as_str(), input).validate(Self);
-		pem
 	}
 }
 
@@ -521,28 +423,81 @@ mod tests {
 		// at handshake time, because the cert SAN list lacks the IP.
 		// Pinning the default catches anyone shrinking it back to
 		// just `localhost` for "tidiness."
-		let cli = Cli::try_parse_from(["loupe-server", "init", "--data-dir", "/tmp/x"]).unwrap();
+		let tmp = tempfile::tempdir().unwrap();
+		let cli = Cli::try_parse_from([
+			std::ffi::OsStr::new("loupe-server"),
+			std::ffi::OsStr::new("init"),
+			std::ffi::OsStr::new("--data-dir"),
+			tmp.path().as_os_str(),
+		])
+		.unwrap();
 		let Cmd::Init(args) = cli.cmd else {
 			panic!("expected init subcommand, got {:?}", cli.cmd);
 		};
-		assert!(
-			args.hostnames.contains(&"localhost".to_owned()),
-			"default SAN list must include `localhost`: {:?}",
-			args.hostnames,
-		);
-		assert!(
-			args.hostnames.contains(&"127.0.0.1".to_owned()),
-			"default SAN list must include `127.0.0.1`: {:?}",
-			args.hostnames,
-		);
+		let out = run_init_with_options(
+			&args.data_dir,
+			&args.hostnames,
+			None,
+			InitOptions { persist_secrets: false },
+		)
+		.unwrap();
+		let leaf = rustls_pemfile::certs(&mut out.server_bundle.cert_pem.as_bytes())
+			.next()
+			.unwrap()
+			.unwrap();
+		let mut roots = rustls::RootCertStore::empty();
+		let ca = rustls_pemfile::certs(&mut out.ca_cert_pem.expose().as_bytes())
+			.next()
+			.unwrap()
+			.unwrap();
+		roots.add(ca).unwrap();
+		let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+			Arc::new(roots),
+			Arc::new(rustls::crypto::ring::default_provider()),
+		)
+		.build()
+		.unwrap();
+		use rustls::client::danger::ServerCertVerifier;
+		for name in ["localhost", "127.0.0.1"] {
+			assert!(
+				verifier
+					.verify_server_cert(
+						&leaf,
+						&[],
+						&name.try_into().unwrap(),
+						&[],
+						rustls::pki_types::UnixTime::now()
+					)
+					.is_ok(),
+				"default SAN list must include `{name}`"
+			);
+		}
+		assert!(verifier
+			.verify_server_cert(
+				&leaf,
+				&[],
+				&"unlisted.invalid".try_into().unwrap(),
+				&[],
+				rustls::pki_types::UnixTime::now()
+			)
+			.is_err());
 	}
 
 	#[test]
 	fn init_env_assignments_are_complete_single_line_values() {
 		let tmp = tempfile::tempdir().unwrap();
+		let cli = Cli::try_parse_from([
+			std::ffi::OsStr::new("loupe-server"),
+			std::ffi::OsStr::new("init"),
+			std::ffi::OsStr::new("--data-dir"),
+			tmp.path().as_os_str(),
+			std::ffi::OsStr::new("--hostname=localhost"),
+		])
+		.unwrap();
+		let Cmd::Init(args) = cli.cmd else { panic!("init command") };
 		let out = loupe_server::init::run_init_with_options(
-			tmp.path(),
-			&["localhost".to_owned()],
+			&args.data_dir,
+			&args.hostnames,
 			None,
 			InitOptions { persist_secrets: false },
 		)
@@ -568,7 +523,8 @@ mod tests {
 		}
 		assert_eq!(assignments[0].1.expose(), out.master_key.to_hex().expose());
 		let exported_key = parse_master_key_hex(assignments[0].1.expose()).unwrap();
-		let reopened = loupe_storage::Db::open(&out.layout.db_path, &exported_key).unwrap();
+		let reopened =
+			loupe_storage::Db::open(out.layout.db_path.as_path(), &exported_key).unwrap();
 		let admin_count = reopened
 			.with_conn(|c| {
 				Ok(c.query_row("SELECT COUNT(*) FROM workers WHERE kind = 'admin'", [], |row| {
@@ -603,25 +559,15 @@ mod tls_consumer_tests {
 	use super::*;
 
 	#[test]
-	fn config_raw_pem_egress_moves_original_guarded_allocation() {
-		let pem: loupe_tls::PemInput = "FAKE_CONFIG_RAW_PEM".into();
-		let address = pem.expose().as_ptr();
-		let output = pem_from_env_or_file("key", Some(pem), None, None, "missing").unwrap();
-		assert_eq!(output.expose().as_ptr(), address);
-		assert_eq!(output.expose(), "FAKE_CONFIG_RAW_PEM");
-		assert_eq!(format!("{output:?}"), "[redacted]");
-	}
-
-	#[test]
 	fn config_master_key_file_preserves_trim_view_and_fixed_error() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("master.key");
 		let hex = "aB".repeat(32);
 		std::fs::write(&path, format!(" \n{hex}\r\n")).unwrap();
-		let key = read_master_key_from_file(&path).unwrap();
+		let key = read_master_key_from_file(path.as_path()).unwrap();
 		assert_eq!(key.to_hex().expose(), &"ab".repeat(32));
 		std::fs::write(&path, "FAKE_BAD_CONFIG_MASTER_KEY").unwrap();
-		let error = read_master_key_from_file(&path).unwrap_err();
+		let error = read_master_key_from_file(path.as_path()).unwrap_err();
 		assert!(format!("{error:#}").contains("expected 64 hex characters"));
 		assert!(!format!("{error:#?}").contains("FAKE_BAD_CONFIG_MASTER_KEY"));
 	}
@@ -648,90 +594,5 @@ mod tls_consumer_tests {
 			}
 		}
 		assert!(leaks.is_empty(), "server option Debug disclosed inputs at {leaks:?}");
-	}
-
-	#[test]
-	fn tls_consumer_server_loaded_pem_is_redacted() {
-		let loaded = pem_from_env_or_file(
-			"key",
-			Some("FAKE_LOADED_SERVER_TLS".into()),
-			None,
-			None,
-			"missing",
-		)
-		.unwrap();
-		for rendered in [
-			format!("{loaded:?}"),
-			format!("{loaded:#?}"),
-			format!("{loaded}"),
-			format!("{loaded:#}"),
-		] {
-			assert_eq!(rendered, "[redacted]", "loaded TLS owner must redact every formatter");
-		}
-	}
-
-	#[test]
-	fn tls_consumer_server_invalid_utf8_error_does_not_retain_private_bytes() {
-		let bytes = b"FAKE_INVALID_SERVER_TLS\xff";
-		let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-		let error = decode_pem_b64("server key", &encoded).unwrap_err();
-		let rendered: String = format!("{error:#?}").split_whitespace().collect();
-		let reflected: String = format!("bytes:{bytes:?}").split_whitespace().collect();
-		assert!(!rendered.contains(&reflected), "invalid UTF-8 error retained private input bytes");
-	}
-
-	#[test]
-	fn server_tls_loader_preserves_precedence_empty_fallback_and_errors() {
-		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("tls-input");
-		std::fs::write(&path, "FILE_TLS").unwrap();
-		let encoded = base64::engine::general_purpose::STANDARD.encode("B64_TLS");
-		assert_eq!(
-			pem_from_env_or_file(
-				"key",
-				Some("RAW_TLS".into()),
-				Some("invalid%%%".into()),
-				Some(path.clone()),
-				"missing"
-			)
-			.unwrap()
-			.expose(),
-			"RAW_TLS"
-		);
-		assert_eq!(
-			pem_from_env_or_file(
-				"key",
-				Some(String::new().into()),
-				Some(format!(" \n{encoded}\n ").into()),
-				Some(path.clone()),
-				"missing"
-			)
-			.unwrap()
-			.expose(),
-			"B64_TLS"
-		);
-		assert_eq!(
-			pem_from_env_or_file(
-				"key",
-				Some(String::new().into()),
-				Some(String::new().into()),
-				Some(path.clone()),
-				"missing"
-			)
-			.unwrap()
-			.expose(),
-			"FILE_TLS"
-		);
-		assert!(pem_from_env_or_file(
-			"key",
-			None,
-			Some("invalid%%%".into()),
-			Some(path.clone()),
-			"missing"
-		)
-		.is_err());
-		std::fs::write(&path, b"invalid\xff").unwrap();
-		assert!(pem_from_env_or_file("key", None, None, Some(path), "missing").is_err());
-		assert!(pem_from_env_or_file("key", None, None, None, "missing").is_err());
 	}
 }

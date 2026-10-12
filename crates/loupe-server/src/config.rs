@@ -2,8 +2,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use loupe_core::source_migration::text::BoundedText;
+mod input;
+pub use input::{
+	select_tls_pem, ConfiguredHostname, ConfiguredPath, ConfiguredPem, ConfiguredPemArgument,
+	HostnameParser, PathParser, PemParser,
+};
 use loupe_core::text::policy::RepoOwner;
+use loupe_core::text::BoundedText;
 use loupe_provenance::{Config as ConfigSource, Ingress, Mark, Untrusted, Unvalidated, Validate};
 use serde::Deserialize;
 
@@ -20,14 +25,36 @@ use serde::Deserialize;
 /// ```
 /// let metadata: fn(&loupe_server::Config) -> std::net::SocketAddr = |config| config.bind_addr;
 /// ```
-#[derive(Debug)]
 pub struct Config {
 	pub bind_addr: SocketAddr,
-	pub db_path: PathBuf,
-	pub server_cert_pem: loupe_provenance::Secret<String>,
-	pub server_key_pem: loupe_provenance::Secret<String>,
-	pub ca_cert_pem: loupe_provenance::Secret<String>,
-	pub ca_key_pem: loupe_provenance::Secret<String>,
+	pub db_path: ConfiguredPath,
+	pub server_cert_pem: ConfiguredPem,
+	pub server_key_pem: ConfiguredPem,
+	pub ca_cert_pem: ConfiguredPem,
+	pub ca_key_pem: ConfiguredPem,
+}
+impl std::fmt::Debug for Config {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// Preserve the existing public-path diagnostic; PEM owners redact.
+		f.debug_struct("Config")
+			.field("bind_addr", &self.bind_addr)
+			.field("db_path", &self.db_path.as_path())
+			.field("server_cert_pem", &self.server_cert_pem)
+			.field("server_key_pem", &self.server_key_pem)
+			.field("ca_cert_pem", &self.ca_cert_pem)
+			.field("ca_key_pem", &self.ca_key_pem)
+			.finish()
+	}
+}
+impl Config {
+	pub(crate) fn build_tls(&self) -> Result<rustls::ServerConfig> {
+		loupe_tls::server_config(
+			self.server_cert_pem.0.expose(),
+			self.server_key_pem.0.expose(),
+			self.ca_cert_pem.0.expose(),
+		)
+		.context("building loupe-server rustls config")
+	}
 }
 
 /// Wire shape of `config.toml`. All fields are optional so an operator
@@ -40,20 +67,13 @@ pub struct Config {
 /// cert/key) are interpreted relative to the directory containing the
 /// config file, so a single `config.toml` can ship next to the data
 /// directory without forcing absolute paths on operators.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct FileConfig {
-	#[serde(default)]
 	pub server: ServerSection,
-	#[serde(default)]
 	pub paths: PathsSection,
-	#[serde(default)]
 	pub policy: PolicySection,
-	#[serde(default)]
 	pub review: ReviewSection,
-	#[serde(default)]
 	pub github_app: GithubAppSection,
-	#[serde(default)]
 	pub worker_budgets: crate::request_budget::WorkerBudgetConfig,
 }
 
@@ -61,14 +81,12 @@ pub struct FileConfig {
 /// installation on GitHub already decides which trackers it can write
 /// to; this section lets the server refuse destinations outside an
 /// expected owner set before an issue is ever filed.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct GithubAppSection {
 	/// Tracker owners (users or organizations) that app-mode GitHub
 	/// destinations may point at, compared case-insensitively. Unset
 	/// means no server-side restriction.
-	#[serde(default)]
-	pub allowed_target_owners: Option<Vec<String>>,
+	pub allowed_target_owners: Option<Vec<BoundedText<RepoOwner, ConfigSource>>>,
 }
 
 /// Review-harness overrides. Environment and CLI overrides arrive at cutover.
@@ -111,25 +129,18 @@ pub struct ServerSection {
 	pub bind: Option<SocketAddr>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct PathsSection {
-	#[serde(default)]
-	pub db: Option<PathBuf>,
-	#[serde(default)]
-	pub server_cert: Option<PathBuf>,
-	#[serde(default)]
-	pub server_key: Option<PathBuf>,
-	#[serde(default)]
-	pub ca_cert: Option<PathBuf>,
-	#[serde(default)]
-	pub ca_key: Option<PathBuf>,
+	pub db: Option<ConfiguredPath>,
+	pub server_cert: Option<ConfiguredPath>,
+	pub server_key: Option<ConfiguredPath>,
+	pub ca_cert: Option<ConfiguredPath>,
+	pub ca_key: Option<ConfiguredPath>,
 	/// Path to a file holding the database master key as 64 hex
 	/// characters (the shape `loupe-server init` writes). Loaded once
 	/// at server startup and used for SQLCipher's `PRAGMA key`. Lower
 	/// priority than the `LOUPE_MASTER_KEY` env var.
-	#[serde(default)]
-	pub master_key: Option<PathBuf>,
+	pub master_key: Option<ConfiguredPath>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -161,7 +172,8 @@ impl FileConfig {
 		// SAFETY: raw is this actual configuration-file read, before TOML parsing.
 		#[allow(unsafe_code)]
 		let ingress = unsafe { Ingress::<ConfigSource>::new() };
-		let cfg = ServerFileConfigDecoder { base }.decode_legacy(Untrusted::new(raw, ingress))?;
+		let cfg =
+			Untrusted::new(raw, ingress).as_bytes().validate(ServerFileConfigDecoder { base })?;
 		cfg.github_app
 			.validate()
 			.with_context(|| format!("validating config file {}", path.display()))?;
@@ -170,27 +182,37 @@ impl FileConfig {
 	}
 }
 
-// Host paths retain their native representation and relative resolution. They
-// are not RepoPath and have no lossy UTF-8 conversion or repository-path cap.
-struct ConfiguredPath(PathBuf);
-impl ConfiguredPath {
-	fn new(_: &Mark<'_, ConfigSource>, base: &Path, path: PathBuf) -> Self {
-		Self(resolve(base, path))
-	}
+// Private wire schema: only the actual TOML decoder constructs retained Config owners.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileConfig {
+	#[serde(default)]
+	server: ServerSection,
+	#[serde(default)]
+	paths: RawPaths,
+	#[serde(default)]
+	policy: PolicySection,
+	#[serde(default)]
+	review: ReviewSection,
+	#[serde(default)]
+	github_app: RawGithubApp,
+	#[serde(default)]
+	worker_budgets: crate::request_budget::WorkerBudgetConfig,
 }
-struct ConfiguredPaths {
-	db: Option<ConfiguredPath>,
-	server_cert: Option<ConfiguredPath>,
-	server_key: Option<ConfiguredPath>,
-	ca_cert: Option<ConfiguredPath>,
-	ca_key: Option<ConfiguredPath>,
-	master_key: Option<ConfiguredPath>,
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPaths {
+	db: Option<PathBuf>,
+	server_cert: Option<PathBuf>,
+	server_key: Option<PathBuf>,
+	ca_cert: Option<PathBuf>,
+	ca_key: Option<PathBuf>,
+	master_key: Option<PathBuf>,
 }
-struct ServerFileInput {
-	// Text/path fields are removed before this closed-scalar remainder is stored.
-	scalars: FileConfig,
-	paths: ConfiguredPaths,
-	owners: Option<Vec<BoundedText<RepoOwner, ConfigSource>>>,
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGithubApp {
+	allowed_target_owners: Option<Vec<String>>,
 }
 #[derive(Debug, thiserror::Error)]
 enum ConfigDecodeError {
@@ -203,7 +225,7 @@ struct ServerFileConfigDecoder<'a> {
 	base: &'a Path,
 }
 impl Validate<&[u8], ConfigSource> for ServerFileConfigDecoder<'_> {
-	type Output = ServerFileInput;
+	type Output = FileConfig;
 	type Error = ConfigDecodeError;
 	fn validate<'view>(
 		self, input: Unvalidated<'view, &[u8]>, mark: Mark<'view, ConfigSource>,
@@ -212,17 +234,23 @@ impl Validate<&[u8], ConfigSource> for ServerFileConfigDecoder<'_> {
 			.map_err(|_| ConfigDecodeError::Toml("invalid UTF-8"))?;
 		// TOML parser scratch belongs to the pinned dependency. No whole-file
 		// ceiling is invented; admitted free text receives its exact field cap.
-		let mut cfg: FileConfig = toml::from_str(raw).map_err(|error: toml::de::Error| {
+		let mut cfg: RawFileConfig = toml::from_str(raw).map_err(|error: toml::de::Error| {
 			ConfigDecodeError::Toml(crate::ingress::error::category(&error.message()))
 		})?;
 		let paths = std::mem::take(&mut cfg.paths);
-		let paths = ConfiguredPaths {
-			db: paths.db.map(|path| ConfiguredPath::new(&mark, self.base, path)),
-			server_cert: paths.server_cert.map(|path| ConfiguredPath::new(&mark, self.base, path)),
-			server_key: paths.server_key.map(|path| ConfiguredPath::new(&mark, self.base, path)),
-			ca_cert: paths.ca_cert.map(|path| ConfiguredPath::new(&mark, self.base, path)),
-			ca_key: paths.ca_key.map(|path| ConfiguredPath::new(&mark, self.base, path)),
-			master_key: paths.master_key.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+		let paths = PathsSection {
+			db: paths.db.map(|path| ConfiguredPath::from_file(&mark, self.base, path)),
+			server_cert: paths
+				.server_cert
+				.map(|path| ConfiguredPath::from_file(&mark, self.base, path)),
+			server_key: paths
+				.server_key
+				.map(|path| ConfiguredPath::from_file(&mark, self.base, path)),
+			ca_cert: paths.ca_cert.map(|path| ConfiguredPath::from_file(&mark, self.base, path)),
+			ca_key: paths.ca_key.map(|path| ConfiguredPath::from_file(&mark, self.base, path)),
+			master_key: paths
+				.master_key
+				.map(|path| ConfiguredPath::from_file(&mark, self.base, path)),
 		};
 		let owners = cfg
 			.github_app
@@ -235,26 +263,14 @@ impl Validate<&[u8], ConfigSource> for ServerFileConfigDecoder<'_> {
 					.collect::<Result<Vec<_>, _>>()
 			})
 			.transpose()?;
-		Ok(ServerFileInput { scalars: cfg, paths, owners })
-	}
-}
-impl ServerFileConfigDecoder<'_> {
-	/// Temporary I exit for the existing defaults→file→env→flags process owner.
-	fn decode_legacy(self, input: Untrusted<String, ConfigSource>) -> Result<FileConfig> {
-		let input = input.as_bytes().validate(self)?;
-		let mut cfg = input.scalars;
-		cfg.paths = PathsSection {
-			db: input.paths.db.map(|path| path.0),
-			server_cert: input.paths.server_cert.map(|path| path.0),
-			server_key: input.paths.server_key.map(|path| path.0),
-			ca_cert: input.paths.ca_cert.map(|path| path.0),
-			ca_key: input.paths.ca_key.map(|path| path.0),
-			master_key: input.paths.master_key.map(|path| path.0),
-		};
-		cfg.github_app.allowed_target_owners = input
-			.owners
-			.map(|owners| owners.iter().map(|owner| owner.expose().to_owned()).collect());
-		Ok(cfg)
+		Ok(FileConfig {
+			server: cfg.server,
+			paths,
+			policy: cfg.policy,
+			review: cfg.review,
+			github_app: GithubAppSection { allowed_target_owners: owners },
+			worker_budgets: cfg.worker_budgets,
+		})
 	}
 }
 
@@ -268,14 +284,6 @@ impl GithubAppSection {
 			);
 		}
 		Ok(())
-	}
-}
-
-fn resolve(base: &Path, p: PathBuf) -> PathBuf {
-	if p.is_absolute() {
-		p
-	} else {
-		base.join(p)
 	}
 }
 
@@ -306,8 +314,8 @@ mod tests {
 		)
 		.unwrap();
 		let cfg = FileConfig::load(&path).unwrap();
-		assert_eq!(cfg.paths.db.unwrap(), dir.path().join("data/loupe.db"));
-		assert_eq!(cfg.paths.server_cert.unwrap(), dir.path().join("certs/server.pem"));
+		assert_eq!(cfg.paths.db.unwrap().as_path(), dir.path().join("data/loupe.db"));
+		assert_eq!(cfg.paths.server_cert.unwrap().as_path(), dir.path().join("certs/server.pem"));
 	}
 
 	#[test]
@@ -345,8 +353,11 @@ mod tests {
 			.unwrap();
 		let cfg = FileConfig::load(&path).unwrap();
 		assert_eq!(
-			cfg.github_app.allowed_target_owners,
-			Some(vec!["acme".to_owned(), "Acme-Labs".to_owned()])
+			cfg.github_app
+				.allowed_target_owners
+				.as_ref()
+				.map(|owners| owners.iter().map(BoundedText::expose).collect::<Vec<_>>()),
+			Some(vec!["acme", "Acme-Labs"])
 		);
 
 		let empty = dir.path().join("empty.toml");
@@ -381,19 +392,19 @@ mod tls_consumer_tests {
 		let unused = ca.mint_client("unused").unwrap();
 		let cfg = Config {
 			bind_addr: "127.0.0.1:0".parse().unwrap(),
-			db_path: "unused".into(),
-			server_cert_pem: loupe_provenance::Secret::new(format!(
+			db_path: crate::test_support::path(Path::new("unused")),
+			server_cert_pem: crate::test_support::pem(&format!(
 				"{}{}",
 				unused.key_pem.expose(),
 				server.cert_pem
 			)),
-			server_key_pem: server.key_pem,
-			ca_cert_pem: loupe_provenance::Secret::new(format!(
+			server_key_pem: crate::test_support::pem(server.key_pem.expose()),
+			ca_cert_pem: crate::test_support::pem(&format!(
 				"{}{}",
 				ca.cert_pem(),
 				unused.key_pem.expose()
 			)),
-			ca_key_pem: loupe_provenance::Secret::new(ca.key_pem().expose().to_owned()),
+			ca_key_pem: crate::test_support::pem(ca.key_pem().expose()),
 		};
 		assert!(crate::tls::build(&cfg).is_ok());
 	}
@@ -402,13 +413,11 @@ mod tls_consumer_tests {
 	fn tls_consumer_config_debug_redacts_keys_and_mixed_certificate_inputs() {
 		let cfg = Config {
 			bind_addr: "127.0.0.1:8443".parse().unwrap(),
-			db_path: "public-database-path".into(),
-			server_cert_pem: loupe_provenance::Secret::new(
-				"public-cert\nFAKE_MIXED_SERVER_PRIVATE".into(),
-			),
-			server_key_pem: loupe_provenance::Secret::new("FAKE_SERVER_PRIVATE".into()),
-			ca_cert_pem: loupe_provenance::Secret::new("public-ca\nFAKE_MIXED_CA_PRIVATE".into()),
-			ca_key_pem: loupe_provenance::Secret::new("FAKE_CA_PRIVATE".into()),
+			db_path: crate::test_support::path(Path::new("public-database-path")),
+			server_cert_pem: crate::test_support::pem("public-cert\nFAKE_MIXED_SERVER_PRIVATE"),
+			server_key_pem: crate::test_support::pem("FAKE_SERVER_PRIVATE"),
+			ca_cert_pem: crate::test_support::pem("public-ca\nFAKE_MIXED_CA_PRIVATE"),
+			ca_key_pem: crate::test_support::pem("FAKE_CA_PRIVATE"),
 		};
 		for rendered in [format!("{cfg:?}"), format!("{cfg:#?}")] {
 			assert!(rendered.contains("public-database-path"));

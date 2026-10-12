@@ -1,8 +1,10 @@
 //! Raw TOML bytes pass through the actual path-based loader and validation.
 //! The fixture parent is absolute; relative TLS/cache paths must resolve there.
 
-use loupe_worker::config::{fuzzing, FileConfig, WorkerConfig, WorkerConfigOverrides};
+use loupe_worker::config::{fuzzing, WorkerConfig, WorkerConfigOverrides};
+mod wire;
 use loupe_worker::sandbox::SandboxNetworkMode;
+use wire::FileConfig;
 
 use crate::utils::test_logger;
 
@@ -45,14 +47,12 @@ pub fn do_test(data: &[u8]) {
 	let path = fixture.path().join("worker.toml");
 	std::fs::write(&path, data).unwrap_or_else(|_| panic!("write config fixture"));
 	let loaded = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default());
-	let parsed = FileConfig::load(&path);
+	let parsed = fuzzing::load_document(&path);
 	let Ok(file) = parsed else {
 		assert!(loaded.is_err());
 		return;
 	};
-	for value in
-		[&file.tls.ca_cert, &file.tls.cert, &file.tls.key, &file.cache.dir].into_iter().flatten()
-	{
+	for value in file.resolved_paths() {
 		assert!(value.is_absolute(), "config path was not resolved against its absolute parent");
 	}
 	let Ok(config) = fuzzing::merge(file) else {
@@ -68,10 +68,10 @@ pub fn do_test(data: &[u8]) {
 	assert_eq!(loaded.is_ok(), expected, "config load skipped or changed validation");
 	if let Ok(loaded) = loaded {
 		assert!(allowed(&loaded));
-		assert!(loaded.cache.dir.is_absolute());
+		assert!(loaded.cache.dir.for_filesystem().is_absolute());
 		for value in [&loaded.tls.ca_cert, &loaded.tls.cert, &loaded.tls.key].into_iter().flatten()
 		{
-			assert!(value.is_absolute());
+			assert!(value.for_filesystem().is_absolute());
 		}
 	}
 }
@@ -239,23 +239,30 @@ fn check_argument_callbacks(data: &[u8]) {
 fn check_arguments(_: &[u8]) {}
 
 fn allowed(config: &WorkerConfig) -> bool {
-	let url = url::Url::parse(&config.bkb.api_url).ok();
+	let url = url::Url::parse(config.bkb.api_url.for_operation()).ok();
 	let bkb = url.as_ref().is_some_and(|url| {
 		["http", "https"].contains(&url.scheme())
 			&& url.host_str().is_some_and(crate::worker_network_host::allowed)
 	});
-	!config.agents.claude.model.trim().is_empty()
-		&& !config.agents.codex.model.trim().is_empty()
-		&& ["low", "medium", "high", "xhigh", "max"].contains(&config.agents.claude.effort.as_str())
-		&& ["none", "low", "medium", "high", "xhigh"].contains(&config.agents.codex.effort.as_str())
-		&& ["trace", "debug", "info", "warn", "error"].contains(&config.logging.level.as_str())
+	!config.agents.claude.model.for_operation().trim().is_empty()
+		&& !config.agents.codex.model.for_operation().trim().is_empty()
+		&& ["low", "medium", "high", "xhigh", "max"]
+			.contains(&config.agents.claude.effort.for_operation())
+		&& ["none", "low", "medium", "high", "xhigh"]
+			.contains(&config.agents.codex.effort.for_operation())
+		&& ["trace", "debug", "info", "warn", "error"]
+			.contains(&config.logging.level.for_operation())
 		&& config.cache.max_gb > 0
 		&& config.scanner_defaults.max_concurrent_files > 0
 		&& config.scanner_defaults.max_file_bytes > 0
 		&& config.scanner_defaults.per_request_timeout.as_secs() > 0
 		&& (config.sandbox.mode == SandboxNetworkMode::Allowlist
 			|| config.sandbox.allowlist.is_empty())
-		&& config.sandbox.allowlist.iter().all(|host| crate::worker_network_host::allowed(host))
+		&& config
+			.sandbox
+			.allowlist
+			.iter()
+			.all(|host| crate::worker_network_host::allowed(host.for_operation()))
 		&& bkb
 		&& config.broker.request_ceiling > 0
 		&& config.broker.output_ceiling_bytes > 0

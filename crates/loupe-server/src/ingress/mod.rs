@@ -1,5 +1,4 @@
-//! Actual authenticated request owners and their closed, temporary I decoders.
-//! The named `decode_legacy` exits are removed at atomic source adoption (M).
+//! Actual authenticated request owners and their closed source-retaining decoders.
 //! Transport chunks and serde scratch remain dependency-owned; collected
 //! request storage is guarded through validation and all failure exits.
 

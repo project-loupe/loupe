@@ -2,55 +2,13 @@
 //! values before their text, URL or native-path interpretation.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::builder::{TypedValueParser, ValueParserFactory};
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::{Normalization, TextPolicy, Whitespace};
+use loupe_core::text::BoundedText;
 use loupe_provenance::{Config, Ingress, Mark, Untrusted, Unvalidated, Validate};
 
-#[derive(Debug, Clone)]
-pub(super) struct WorkerArgument;
-impl TextPolicy for WorkerArgument {
-	const FIELD: &'static str = "worker_argument";
-	const MAX_BYTES: usize = loupe_core::text::policy::LEGACY_TEXT_MAX_BYTES;
-	const MAX_CHARS: usize = loupe_core::text::policy::LEGACY_TEXT_MAX_BYTES;
-	const MULTILINE: bool = false;
-	const ALLOW_EMPTY: bool = true;
-	const NORMALIZATION: Normalization = Normalization::Exact;
-	const WHITESPACE: Whitespace = Whitespace::Significant;
-}
-#[derive(Debug, Clone)]
-pub(super) struct ConfiguredText(BoundedText<WorkerArgument, Config>);
-impl ConfiguredText {
-	pub(super) fn legacy_override(&self) -> String {
-		self.0.expose().to_owned()
-	}
-}
-#[derive(Debug, Clone)]
-pub(super) struct ConfiguredUrl {
-	text: BoundedText<WorkerArgument, Config>,
-	url: reqwest::Url,
-}
-impl ConfiguredUrl {
-	pub(super) fn legacy_override(&self) -> reqwest::Url {
-		let _ = &self.text;
-		self.url.clone()
-	}
-}
-#[derive(Debug, Clone)]
-pub(super) struct ConfiguredPath {
-	native: PathBuf,
-	source: std::marker::PhantomData<Config>,
-}
-impl ConfiguredPath {
-	pub(super) fn as_path(&self) -> &Path {
-		&self.native
-	}
-	pub(super) fn legacy_override(&self) -> PathBuf {
-		self.native.clone()
-	}
-}
+pub use crate::config::value::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
 
 #[allow(unsafe_code)]
 fn original_argument(value: &OsStr) -> Untrusted<&OsStr, Config> {
@@ -67,7 +25,7 @@ impl Validate<&OsStr, Config> for WorkerTextArgument {
 	) -> anyhow::Result<Self::Output> {
 		let text =
 			u.get().to_str().ok_or_else(|| anyhow::anyhow!("worker argument is not UTF-8"))?;
-		Ok(ConfiguredText(BoundedText::new(&mark, text)?))
+		Ok(ConfiguredText::Argument(BoundedText::new(&mark, text)?))
 	}
 }
 struct WorkerUrlArgument;
@@ -78,9 +36,7 @@ impl Validate<&OsStr, Config> for WorkerUrlArgument {
 		self, u: Unvalidated<'view, &OsStr>, mark: Mark<'view, Config>,
 	) -> anyhow::Result<Self::Output> {
 		let text = u.get().to_str().ok_or_else(|| anyhow::anyhow!("worker URL is not UTF-8"))?;
-		let text = BoundedText::new(&mark, text)?;
-		let url = reqwest::Url::parse(text.expose())?;
-		Ok(ConfiguredUrl { text, url })
+		ConfiguredUrl::parse(ConfiguredText::Argument(BoundedText::new(&mark, text)?))
 	}
 }
 struct WorkerNativePathArgument;
@@ -88,15 +44,15 @@ impl Validate<&OsStr, Config> for WorkerNativePathArgument {
 	type Output = ConfiguredPath;
 	type Error = std::convert::Infallible;
 	fn validate<'view>(
-		self, u: Unvalidated<'view, &OsStr>, _: Mark<'view, Config>,
+		self, u: Unvalidated<'view, &OsStr>, mark: Mark<'view, Config>,
 	) -> Result<Self::Output, Self::Error> {
-		Ok(ConfiguredPath { native: PathBuf::from(u.get()), source: std::marker::PhantomData })
+		Ok(ConfiguredPath::admitted(&mark, PathBuf::from(u.get())))
 	}
 }
 macro_rules! parser {
 	($name:ident, $output:ty, $validator:expr) => {
 		#[derive(Clone)]
-		pub(super) struct $name;
+		pub struct $name;
 		impl TypedValueParser for $name {
 			type Value = $output;
 			fn parse_ref(

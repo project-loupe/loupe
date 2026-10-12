@@ -1,11 +1,13 @@
-//! New source-aware fixture acceptance; production DTOs are unchanged.
+//! Source-aware fixture compared with the independent serde wire oracle.
 #[path = "support/verdict_cases.rs"]
 mod cases;
 #[path = "support/verdict.rs"]
 mod fixture;
+#[path = "support/legacy_verdict.rs"]
+mod legacy;
 
-use loupe_core::source_migration::Verdict;
-use loupe_proto::VerdictSubmission;
+use legacy::VerdictSubmission;
+use loupe_core::Verdict;
 
 #[test]
 fn marked_original_envelopes_preserve_the_actual_serde_contract() {

@@ -48,10 +48,10 @@ type UpstreamByteStream =
 	Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>;
 
 /// Provider protocol plus the model policy fixed for one job.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ModelBrokerBackend {
-	Claude { model: String, effort: String },
-	Codex { model: String, effort: String },
+	Claude { model: crate::config::ConfiguredText, effort: crate::config::ConfiguredText },
+	Codex { model: crate::config::ConfiguredText, effort: crate::config::ConfiguredText },
 }
 
 impl ModelBrokerBackend {
@@ -64,13 +64,13 @@ impl ModelBrokerBackend {
 
 	fn model(&self) -> &str {
 		match self {
-			Self::Claude { model, .. } | Self::Codex { model, .. } => model,
+			Self::Claude { model, .. } | Self::Codex { model, .. } => model.for_operation(),
 		}
 	}
 
 	fn effort(&self) -> &str {
 		match self {
-			Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort,
+			Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort.for_operation(),
 		}
 	}
 }
@@ -1364,11 +1364,17 @@ mod tests {
 	}
 
 	fn claude_backend() -> ModelBrokerBackend {
-		ModelBrokerBackend::Claude { model: "claude-test".into(), effort: "high".into() }
+		ModelBrokerBackend::Claude {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("high"),
+		}
 	}
 
 	fn codex_backend() -> ModelBrokerBackend {
-		ModelBrokerBackend::Codex { model: "gpt-test".into(), effort: "high".into() }
+		ModelBrokerBackend::Codex {
+			model: crate::config::ConfiguredText::Builtin("gpt-test"),
+			effort: crate::config::ConfiguredText::Builtin("high"),
+		}
 	}
 
 	fn limits() -> ModelBrokerLimits {

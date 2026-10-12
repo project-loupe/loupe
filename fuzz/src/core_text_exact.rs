@@ -1,12 +1,11 @@
 //! Byte zero selects one of the 17 exact-text policies; the rest is UTF-8.
 //! The oracle independently pins byte preservation, admission and diagnostics.
-//! The temporary core namespace is removed at atomic source adoption.
+//! Source-bearing core policies are exercised under a fixed Agent fixture.
 
 use std::marker::PhantomData;
 
-use loupe_core::source_migration::text::BoundedText;
 use loupe_core::text::policy::*;
-use loupe_core::text::{Error, Normalization, Rule, TextPolicy, Whitespace};
+use loupe_core::text::{BoundedText, Error, Normalization, Rule, TextPolicy, Whitespace};
 use loupe_provenance::{Agent, Ingress, Mark, Untrusted, Unvalidated, Validate};
 use unicode_general_category::{get_general_category, GeneralCategory};
 

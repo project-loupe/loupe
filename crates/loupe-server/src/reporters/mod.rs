@@ -7,10 +7,15 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use loupe_core::text::policy::RevisionText;
+use loupe_core::text::BoundedText;
 use loupe_core::{Finding, ReportingDestination};
+use loupe_provenance::{Agent, Db};
 use loupe_storage::repos::RepoRow;
 
 pub mod email;
+#[cfg(test)]
+mod fixtures;
 pub mod github;
 pub mod github_app;
 mod ingress;
@@ -27,12 +32,22 @@ pub struct DispatchReceipt {
 	pub external_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReportFinding {
 	/// Stored finding ID, used to render the public `LUP-…` reference.
 	pub id: i64,
-	pub finding: Finding,
-	pub reviewed_revision: Option<String>,
+	pub finding: Finding<Agent>,
+	pub reviewed_revision: Option<BoundedText<RevisionText, Db>>,
+}
+
+impl std::fmt::Debug for ReportFinding {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ReportFinding")
+			.field("id", &self.id)
+			.field("finding", &"[redacted]")
+			.field("reviewed_revision", &"[redacted]")
+			.finish()
+	}
 }
 
 /// What the dispatcher resolved from the secrets table for one repo.

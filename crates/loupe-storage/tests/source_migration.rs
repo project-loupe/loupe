@@ -6,9 +6,8 @@ mod stored;
 
 use std::borrow::Cow;
 
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::decode_json_string_bounded as decode;
 use loupe_core::text::policy::LEGACY_TEXT_MAX_BYTES;
+use loupe_core::text::{decode_json_string_bounded as decode, BoundedText};
 use loupe_provenance::Db as DbSource;
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::{findings, review_units, Db};
@@ -225,12 +224,12 @@ fn raw_column_canonical_and_distinct_collection_budgets_stay_in_force() {
 	let raw =
 		format!("[{}]", vec![format!(r#"{{"path":"{}"}}"#, "\\\"".repeat(500)); 64].join(","));
 	assert!(raw.len() <= 65536);
-	assert!(
-		raw.parse::<loupe_storage::source_refs::InspectedRefs>().is_err(),
-		"canonical null members exceed the existing limit"
-	);
 	db.with_conn(|conn| {
 		conn.execute("UPDATE review_unit_results SET inspected_refs=?1", [&raw])?;
+		assert!(
+			loupe_storage::review_unit_results::list(conn, 1).is_err(),
+			"canonical null members exceed the existing limit"
+		);
 		Ok(())
 	})
 	.unwrap();

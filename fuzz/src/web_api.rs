@@ -465,12 +465,47 @@ fn config(mode: u8, bytes: &[u8]) {
 	assert_eq!(actual, expected.map_err(str::to_owned), "selected Config priority/grammar changed");
 	let (trace, drops) = session.finish();
 	support::assert_wiped(&drops);
-	assert_eq!(trace.entries, entry.into_iter().collect::<Vec<_>>());
+	let mut expected_entries = Vec::new();
+	let mut expected_native = Vec::new();
+	for pem in [raw, b64].into_iter().flatten() {
+		expected_entries.push(Entry::ConfigPem);
+		expected_native.push((
+			Entry::ConfigPem,
+			pem.as_bytes().to_vec(),
+			Some("[redacted]".to_owned()),
+		));
+	}
+	if let Some(path) = file {
+		expected_entries.push(Entry::ConfigPath);
+		expected_native.push((Entry::ConfigPath, path.as_os_str().as_bytes().to_vec(), None));
+	}
+	expected_entries.extend(entry);
+	assert_eq!(trace.entries, expected_entries);
+	let native: Vec<_> = trace
+		.values
+		.iter()
+		.filter_map(|v| match v {
+			Observation::ConfigValue {
+				owner: owner @ (Entry::ConfigPem | Entry::ConfigPath),
+				bytes,
+				debug,
+				..
+			} => Some((*owner, bytes.clone(), debug.clone())),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(native, expected_native, "supplied native Config inputs changed");
 	let values: Vec<_> = trace
 		.values
 		.iter()
 		.filter_map(|v| {
-			if let Observation::ConfigValue { bytes, pointer, debug, .. } = v {
+			if let Observation::ConfigValue {
+				owner: Entry::ConfigSelected,
+				bytes,
+				pointer,
+				debug,
+			} = v
+			{
 				Some((bytes, pointer, debug))
 			} else {
 				None
@@ -478,10 +513,11 @@ fn config(mode: u8, bytes: &[u8]) {
 		})
 		.collect();
 	assert_eq!(values.len(), if actual.is_ok() { 2 } else { 0 });
+	assert_eq!(trace.values.len(), native.len() + values.len());
 	if let Ok(expected) = actual {
 		assert_eq!(values[0].0, &expected);
 		assert_eq!(values[1].0, &expected);
-		assert_eq!(values[0].1, values[1].1, "selected PEM copied at legacy exit");
+		assert_eq!(values[0].1, values[1].1, "selected PEM owner copied at observation");
 		for value in values {
 			assert_eq!(value.2.as_deref(), Some("[redacted]"));
 		}

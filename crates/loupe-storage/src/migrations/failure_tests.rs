@@ -165,12 +165,11 @@ fn v3_restoration_failure_rejects_bootstrap_and_keeps_complete_v2() {
 	assert_eq!(schema(&conn), before);
 	let mut fresh = Connection::open_in_memory().unwrap();
 	apply_pending(&mut fresh).unwrap();
-	let expected = schema(&fresh);
 	assert!(rows(&conn, "PRAGMA foreign_key_check").is_empty());
 	drop(conn);
 	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
 	db.with_conn(|conn| {
-		assert_eq!(schema(conn), expected);
+		assert_eq!(schema(conn), schema(&fresh), "reopening must finish every later migration");
 		assert_eq!(markers(conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
 		assert!(fk_enabled(conn));
 		Ok(())

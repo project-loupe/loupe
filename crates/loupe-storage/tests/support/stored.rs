@@ -5,11 +5,11 @@
 use std::fmt;
 use std::ops::Range;
 
-use loupe_core::source_migration::text::{BoundedText, RepoPath, SourceRef};
-use loupe_core::source_migration::Finding;
 use loupe_core::text::{
-	decode_json_string_bounded, policy, Error, Normalization, Rule, TextPolicy, Whitespace,
+	decode_json_string_bounded, policy, BoundedText, Error, Normalization, RepoPath, Rule,
+	SourceRef, TextPolicy, Whitespace,
 };
+use loupe_core::Finding;
 use loupe_provenance::{
 	Agent, Db as DbSource, Ingress, Mark, Untrusted, Unvalidated, Validate, ValidateCarrying,
 };

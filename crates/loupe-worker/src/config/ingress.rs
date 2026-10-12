@@ -1,50 +1,27 @@
 //! Original Config file bytes, parsed in one fixed mark scope. Scalar defaults
 //! and final effective-config validation remain in the existing owner.
 
-use std::path::PathBuf;
-
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::text::{Normalization, TextPolicy, Whitespace};
 use loupe_provenance::{Config, Mark, Unvalidated, Validate};
 
-struct WorkerFileText;
-impl TextPolicy for WorkerFileText {
-	const FIELD: &'static str = "worker_config";
-	const MAX_BYTES: usize = loupe_core::text::policy::LEGACY_TEXT_MAX_BYTES;
-	const MAX_CHARS: usize = loupe_core::text::policy::LEGACY_TEXT_MAX_BYTES;
-	const MULTILINE: bool = false;
-	const ALLOW_EMPTY: bool = true;
-	const NORMALIZATION: Normalization = Normalization::Exact;
-	const WHITESPACE: Whitespace = Whitespace::Significant;
-}
-type FileText = BoundedText<WorkerFileText, Config>;
-struct NativeConfiguredPath {
-	path: PathBuf,
-	source: std::marker::PhantomData<Config>,
-}
-impl NativeConfiguredPath {
-	fn new(_: &Mark<'_, Config>, path: PathBuf) -> Self {
-		Self { path, source: std::marker::PhantomData }
-	}
-	fn into_legacy_native(self) -> PathBuf {
-		self.path
-	}
-}
+use super::value::{ConfiguredPath, ConfiguredText};
 
+#[derive(Debug)]
 pub(super) struct DecodedWorkerFileConfig {
-	scalars: super::FileConfig,
-	server_url: Option<FileText>,
-	allowlist: Option<Vec<FileText>>,
-	log_level: Option<FileText>,
-	claude_model: Option<FileText>,
-	claude_effort: Option<FileText>,
-	codex_model: Option<FileText>,
-	codex_effort: Option<FileText>,
-	bkb_api_url: Option<FileText>,
-	ca_cert: Option<NativeConfiguredPath>,
-	cert: Option<NativeConfiguredPath>,
-	key: Option<NativeConfiguredPath>,
-	cache_dir: Option<NativeConfiguredPath>,
+	#[cfg(fuzzing)]
+	pub(super) original_debug: String,
+	pub(super) scalars: super::FileConfig,
+	pub(super) server_url: Option<ConfiguredText>,
+	pub(super) allowlist: Option<Vec<ConfiguredText>>,
+	pub(super) log_level: Option<ConfiguredText>,
+	pub(super) claude_model: Option<ConfiguredText>,
+	pub(super) claude_effort: Option<ConfiguredText>,
+	pub(super) codex_model: Option<ConfiguredText>,
+	pub(super) codex_effort: Option<ConfiguredText>,
+	pub(super) bkb_api_url: Option<ConfiguredText>,
+	pub(super) ca_cert: Option<ConfiguredPath>,
+	pub(super) cert: Option<ConfiguredPath>,
+	pub(super) key: Option<ConfiguredPath>,
+	pub(super) cache_dir: Option<ConfiguredPath>,
 }
 pub(super) struct WorkerFileConfigDecoder;
 /// Parser failures deliberately retain no TOML error object: it owns the
@@ -75,17 +52,21 @@ impl Validate<&[u8], Config> for WorkerFileConfigDecoder {
 	) -> anyhow::Result<Self::Output> {
 		let text = std::str::from_utf8(u.get())?;
 		let mut cfg: super::FileConfig = toml::from_str(text).map_err(ConfigSyntaxError::from)?;
+		#[cfg(fuzzing)]
+		let original_debug = format!("{cfg:?}");
 		macro_rules! text {
 			($field:expr) => {
-				$field.take().map(|v| FileText::new(&mark, &v)).transpose()?
+				$field.take().map(|v| ConfiguredText::file(&mark, &v)).transpose()?
 			};
 		}
 		macro_rules! path {
 			($field:expr) => {
-				$field.take().map(|v| NativeConfiguredPath::new(&mark, v))
+				$field.take().map(|v| ConfiguredPath::admitted(&mark, v))
 			};
 		}
 		Ok(DecodedWorkerFileConfig {
+			#[cfg(fuzzing)]
+			original_debug,
 			server_url: text!(cfg.server.url),
 			allowlist: cfg
 				.sandbox
@@ -94,7 +75,7 @@ impl Validate<&[u8], Config> for WorkerFileConfigDecoder {
 				.map(|values| {
 					values
 						.into_iter()
-						.map(|v| FileText::new(&mark, &v))
+						.map(|v| ConfiguredText::file(&mark, &v))
 						.collect::<Result<Vec<_>, _>>()
 				})
 				.transpose()?,
@@ -110,26 +91,5 @@ impl Validate<&[u8], Config> for WorkerFileConfigDecoder {
 			cache_dir: path!(cfg.cache.dir),
 			scalars: cfg,
 		})
-	}
-}
-impl DecodedWorkerFileConfig {
-	/// Temporary concrete legacy exit. No already-decoded string is re-minted;
-	/// M removes this projection when WorkerConfig itself retains sources.
-	pub(super) fn into_legacy(self) -> super::FileConfig {
-		let mut cfg = self.scalars;
-		cfg.server.url = self.server_url.map(|v| v.expose().to_owned());
-		cfg.sandbox.allowlist =
-			self.allowlist.map(|v| v.into_iter().map(|s| s.expose().to_owned()).collect());
-		cfg.logging.level = self.log_level.map(|v| v.expose().to_owned());
-		cfg.agents.claude.model = self.claude_model.map(|v| v.expose().to_owned());
-		cfg.agents.claude.effort = self.claude_effort.map(|v| v.expose().to_owned());
-		cfg.agents.codex.model = self.codex_model.map(|v| v.expose().to_owned());
-		cfg.agents.codex.effort = self.codex_effort.map(|v| v.expose().to_owned());
-		cfg.bkb.api_url = self.bkb_api_url.map(|v| v.expose().to_owned());
-		cfg.tls.ca_cert = self.ca_cert.map(NativeConfiguredPath::into_legacy_native);
-		cfg.tls.cert = self.cert.map(NativeConfiguredPath::into_legacy_native);
-		cfg.tls.key = self.key.map(NativeConfiguredPath::into_legacy_native);
-		cfg.cache.dir = self.cache_dir.map(NativeConfiguredPath::into_legacy_native);
-		cfg
 	}
 }

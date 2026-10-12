@@ -150,7 +150,7 @@ fn check_host(choice: u8, expected: &Value, actual: &fuzz_support::Observation) 
 }
 
 pub fn do_test(data: &[u8]) {
-	oracle::without_logs(|| exercise(data));
+	exercise(data);
 }
 fn exercise(data: &[u8]) {
 	if data.len() > 65_536 {
@@ -170,7 +170,12 @@ fn exercise(data: &[u8]) {
 		_ => (payload.to_vec(), None),
 	};
 	let expected = oracle::client(kind, &body);
-	let actual = fuzz_support::observe(case(kind), &body, host(choice));
+	let observe = || fuzz_support::observe(case(kind), &body, host(choice));
+	let actual = if kind == 0 {
+		oracle::lease_logs(&body, expected.is_some(), observe).0
+	} else {
+		oracle::without_logs(observe)
+	};
 	assert_eq!(
 		actual.result.is_ok(),
 		expected.is_some(),
@@ -300,6 +305,46 @@ pub unsafe extern "C" fn worker_client_ingress_run(data: *const u8, len: usize) 
 
 #[cfg(test)]
 mod tests {
+	fn log_case(record: &str, admitted: bool, warnings: usize) {
+		let expected = super::oracle::client(0, record.as_bytes());
+		assert_eq!(expected.is_some(), admitted, "independent fixture admission changed");
+		let (actual, count) = super::oracle::lease_logs(record.as_bytes(), admitted, || {
+			super::fuzz_support::observe(super::case(0), record.as_bytes(), super::host(0))
+		});
+		assert_eq!(actual.result.is_ok(), admitted);
+		assert_eq!(count, warnings, "fixed warning moved across the expected validation stage");
+	}
+
+	#[test]
+	fn scanner_warning_is_fixed_and_only_emitted_at_its_projection_stage() {
+		let fixture = String::from_utf8(super::ledger_fixture(0, 0).bytes)
+			.unwrap_or_else(|e| panic!("lease fixture: {e}"));
+		for (scanner, admitted, warnings) in [
+			("null", true, 0),
+			("{}", true, 0),
+			(r#"[1,2,3,["rs"],["target"]]"#, true, 0),
+			("7", true, 1),
+			(r#"{"include_extensions":3}"#, true, 1),
+			(r#"{"include_extensions":[7,"rs"]}"#, true, 1),
+			(r#"{"include_extensions":["bad\u0001"]}"#, false, 0),
+			(r#"{"include_extensions":3,"include_extensions":["rs"]}"#, true, 0),
+			(r#"{"include_extensions":["rs"],"include_extensions":3}"#, true, 1),
+		] {
+			let record =
+				fixture.replace("\"scanner_config\":{}", &format!("\"scanner_config\":{scanner}"));
+			log_case(&record, admitted, warnings);
+		}
+		let malformed = fixture.replace("\"scanner_config\":{}", "\"scanner_config\":7");
+		// Repo policy is checked before scanner projection, PAT and the complete
+		// envelope's ignored content afterward. All three refusals remain fixed.
+		log_case(&malformed.replace(r#""host":"same""#, r#""host":"bad\u0001""#), false, 0);
+		log_case(&malformed.replace("\"payload\":", "\"github_pat\":7,\"payload\":"), false, 1);
+		log_case(&malformed.replace("\"payload\":", "\"ignored\":1e400,\"payload\":"), false, 1);
+		for kind in 1..6 {
+			super::do_test(&[kind, 1, 0]);
+		}
+	}
+
 	#[test]
 	fn every_response_schema_has_admitted_rejected_and_exact_output_controls() {
 		for kind in 0..6 {

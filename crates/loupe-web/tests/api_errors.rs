@@ -1,11 +1,11 @@
 //! Reflected extractor diagnostics must remain data in the API's JSON envelope.
 
-use loupe_web::{AdminClient, Token, WebState};
+mod support;
+use loupe_web::{Token, WebState};
 
 #[tokio::test]
 async fn invalid_path_values_have_fixed_json_diagnostics() {
-	let client =
-		AdminClient::from_parts(reqwest::Client::new(), "http://127.0.0.1:9/".parse().unwrap());
+	let client = support::client(reqwest::Client::new(), "http://127.0.0.1:9/".parse().unwrap());
 	let token = Token::generate();
 	let secret = token.reveal().to_owned();
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

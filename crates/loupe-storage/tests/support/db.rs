@@ -1,5 +1,28 @@
-use loupe_core::{Finding, Severity};
-use loupe_storage::{findings, Db};
+use loupe_core::Severity;
+use loupe_storage::Db;
+
+/// Raw historical SQL fixture, including values rejected by current admission.
+/// This test-only record is not an ingress decoder or a source-bearing DTO.
+#[derive(serde::Serialize)]
+pub struct Finding {
+	pub scanner_id: String,
+	pub severity: Severity,
+	pub title: String,
+	pub description: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub file_path: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub line_start: Option<u32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub line_end: Option<u32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cwe: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub patch_unified: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub poc_unified: Option<String>,
+	pub fingerprint: String,
+}
 
 pub fn finding() -> Finding {
 	Finding {
@@ -35,7 +58,8 @@ pub fn seed(db: &Db, finding: &Finding, refs: &str) -> i64 {
 			VALUES (1,11,'fixture','title','objective',?1,0)",
 			[refs],
 		)?;
-		Ok(findings::insert_or_ignore(conn, 1, 1, finding, false, 0)?.unwrap())
+		conn.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,file_path,line_start,line_end,cwe,patch_unified,poc_unified,fingerprint,state,verification_required,created_at,report_identity) VALUES(1,1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'pending',0,0,?12)", rusqlite::params![finding.scanner_id,finding.severity.as_str(),finding.title,finding.description,finding.file_path,finding.line_start,finding.line_end,finding.cwe,finding.patch_unified,finding.poc_unified,finding.fingerprint,[1u8;16].as_slice()])?;
+		Ok(conn.last_insert_rowid())
 	})
 	.unwrap()
 }

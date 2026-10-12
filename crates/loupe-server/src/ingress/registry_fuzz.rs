@@ -1,4 +1,4 @@
-//! Exact Operator/Secret observations, before the production legacy exits.
+//! Exact observations from the final typed Operator and Secret owners.
 use loupe_provenance::{Ingress, Untrusted};
 use serde_json::{json, Value};
 
@@ -15,6 +15,59 @@ pub enum OperatorRequest {
 	RotatePat,
 	SetApp,
 	SetReporting,
+}
+
+pub enum OperatorValue {
+	Register(loupe_proto::RegisterRepoRequest<Operator>),
+	Reporting(loupe_proto::SetRepoGithubReportingRequest<Operator>),
+	Worker(loupe_proto::RegisterWorkerRequest<Operator>),
+}
+
+/// Concrete actual Operator outputs, for the final DTO serializer harness.
+pub fn operator_value(kind: OperatorRequest, bytes: &[u8]) -> Option<OperatorValue> {
+	let input = original(bytes);
+	Some(match kind {
+		OperatorRequest::RegisterRepo => {
+			let value = input.validate(RegisterRepoDecoder).ok()?;
+			let reporting = match value.reporting {
+				ReportingDestination::Manual => loupe_proto::ReportingSetup::Manual,
+				ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
+					loupe_proto::ReportingSetup::GithubIssue {
+						target_owner,
+						target_repo,
+						github_pat: value.pat,
+					}
+				},
+				ReportingDestination::Email { to, from, subject_prefix } => {
+					loupe_proto::ReportingSetup::Email { to, from, subject_prefix }
+				},
+			};
+			OperatorValue::Register(loupe_proto::RegisterRepoRequest {
+				protocol_version: value.protocol_version,
+				clone_url: value.clone_url,
+				branch: value.branch,
+				scan_interval_seconds: value.scan_interval_seconds,
+				reporting,
+				scanner_config: Some(value.scanner_config),
+				verification_enabled: value.verification_enabled,
+				require_approval: value.require_approval,
+			})
+		},
+		OperatorRequest::SetReporting => {
+			let value = input.validate(SetRepoGithubReportingDecoder).ok()?;
+			OperatorValue::Reporting(loupe_proto::SetRepoGithubReportingRequest {
+				protocol_version: value.protocol_version,
+				target_owner: value.owner,
+				target_repo: value.repo,
+				github_pat: value.pat,
+			})
+		},
+		OperatorRequest::RegisterWorker => {
+			let (protocol_version, name) = input.validate(RegisterWorkerDecoder).ok()?;
+			OperatorValue::Worker(loupe_proto::RegisterWorkerRequest { protocol_version, name })
+		},
+		_ => return None,
+	})
 }
 
 fn original(bytes: &[u8]) -> Untrusted<&[u8], Operator> {
@@ -54,7 +107,7 @@ fn decode(kind: OperatorRequest, bytes: &[u8]) -> Result<Value, DecodeError> {
 			};
 			json!({"request": {"protocol_version":value.protocol_version, "clone_url":url.expose(),
 				"branch":branch.as_ref().map(BoundedText::expose), "scan_interval_seconds":value.scan_interval_seconds,
-				"reporting":reporting, "scanner_config":value.scanner_config.0,
+				"reporting":reporting, "scanner_config":value.scanner_config,
 				"verification_enabled":value.verification_enabled, "require_approval":value.require_approval},
 				"derived":derived.as_ref().map(|r| (r.host.expose(), r.owner.expose(), r.repo.expose()))})
 		},

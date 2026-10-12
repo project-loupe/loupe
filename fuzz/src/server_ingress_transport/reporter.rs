@@ -2,7 +2,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use loupe_core::{Finding, ReportingDestination, Severity};
 use loupe_provenance::Secret;
 use loupe_server::reporters::github_app::{GithubAppKey, InstallationTokens};
 use loupe_server::reporters::{GithubReporter, ReportFinding, Reporter, ReporterCredential};
@@ -18,43 +17,15 @@ fn key() -> GithubAppKey {
 }
 
 fn report() -> (RepoRow, ReportFinding) {
-	let repo = RepoRow {
-		id: 1,
-		clone_url: "https://github.com/example/repo.git".into(),
-		host: "github.com".into(),
-		owner: "example".into(),
-		repo: "repo".into(),
-		default_branch: None,
-		scan_interval_seconds: None,
-		scanner_config: serde_json::Value::Null,
-		reporting: ReportingDestination::GithubIssue {
-			target_owner: "example".into(),
-			target_repo: "repo".into(),
-			pat_secret_id: None,
-		},
-		verification_enabled: false,
-		require_approval: None,
-		last_scanned_sha: None,
-		last_scanned_at: None,
-		created_at: 0,
-		disabled_at: None,
-	};
+	let repo = crate::server_common::repo_with_reporting(serde_json::json!({
+		"kind":"github_issue", "target_owner":"example", "target_repo":"repo", "pat_secret_id":null
+	}))
+	.unwrap_or_else(|e| panic!("reporter repository: {e}"));
 	let finding = ReportFinding {
 		id: 1,
 		reviewed_revision: None,
-		finding: Finding {
-			scanner_id: "fixture".into(),
-			severity: Severity::High,
-			title: "title".into(),
-			description: "description".into(),
-			file_path: None,
-			line_start: None,
-			line_end: None,
-			cwe: None,
-			patch_unified: None,
-			poc_unified: None,
-			fingerprint: "fixture".into(),
-		},
+		finding: crate::server_common::finding(br#"{"scanner_id":"fixture","severity":"high","title":"title","description":"description","fingerprint":"fixture"}"#)
+			.unwrap_or_else(|| panic!("reporter finding admission")),
 	};
 	(repo, finding)
 }
@@ -243,7 +214,7 @@ pub(super) fn run(data: &[u8]) {
 				reporter
 					.verify_app(&key())
 					.await
-					.map(|value| format!("{}:{}", value.id, value.slug))
+					.map(|value| format!("{}:{}", value.id, value.slug.expose()))
 			} else if stage <= 2 {
 				let cache = InstallationTokens::default();
 				let base = reqwest::Url::parse(&base)

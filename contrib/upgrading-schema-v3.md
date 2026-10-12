@@ -84,6 +84,23 @@ Every subsequent startup rejects job kinds missing from `job_kinds`, even if
 schema v3 was already applied. Investigate the reported row rather than
 disabling validation.
 
+When later versions are pending, startup also streams every stored content
+table through its current admission rules before committing. This includes
+disabled repositories, revoked workers, terminal jobs, retired review state,
+replay records, and proof/detail rows. Valid UTF-8 scanner configuration with
+malformed JSON retains its historical fallback; registered future job kinds
+and accepted legacy reporting formats remain supported. Validation never
+rewrites historical text or JSON.
+
+An admission refusal identifies the source/target versions, table, numeric
+row ID, SQL column, and policy rule or safe failure category. Stop automatic
+restarts, inspect that row using authorized database tooling, and correct the
+invalid value before retrying. Neither payloads nor credential values appear
+in the diagnostic. GitHub App storage validation checks the complete stored
+document; credential syntax and authentication remain with their consumers.
+Report-identity entropy or backfill failures identify the affected finding
+row and also roll back all pending versions, including earlier rebuilds.
+
 After successful migration, old binaries reject schema v3. There is no
 automatic downgrade: restoring the external backup with its matching key is
 the rollback path, and it loses writes accepted since the backup. Once new

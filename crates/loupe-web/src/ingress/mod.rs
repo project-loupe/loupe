@@ -107,6 +107,11 @@ impl FromRequestParts<WebState> for BrowserId {
 	}
 }
 struct LimitDecoder;
+#[derive(serde::Deserialize)]
+struct LimitQuery {
+	#[serde(default)]
+	limit: Option<i64>,
+}
 impl Validate<&Uri, Browser> for LimitDecoder {
 	type Output = Option<i64>;
 	type Error = Failure;
@@ -115,15 +120,18 @@ impl Validate<&Uri, Browser> for LimitDecoder {
 	) -> Result<Self::Output, Failure> {
 		#[cfg(fuzzing)]
 		crate::fuzz_support::hit(crate::fuzz_support::Entry::Limit);
-		Query::<crate::routes::api::LimitQuery>::try_from_uri(u.get())
-			.map(|q| q.limit)
-			.map_err(|_| Failure::Query)
+		Query::<LimitQuery>::try_from_uri(u.get()).map(|q| q.limit).map_err(|_| Failure::Query)
 	}
 }
 pub(crate) struct BrowserLimit(pub(crate) Option<i64>);
 impl BrowserLimit {
-	pub(crate) fn pairs(&self) -> Vec<(&'static str, String)> {
-		crate::routes::api::LimitQuery { limit: self.0 }.pairs()
+	pub(crate) async fn send(
+		self, mut request: reqwest::RequestBuilder,
+	) -> Result<reqwest::Response, reqwest::Error> {
+		if let Some(limit) = self.0 {
+			request = request.query(&[("limit", limit)]);
+		}
+		request.send().await
 	}
 }
 impl FromRequestParts<WebState> for BrowserLimit {

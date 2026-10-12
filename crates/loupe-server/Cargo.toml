@@ -28,7 +28,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 mime = "0.3"
 tower = { workspace = true }
-loupe-core = { version = "0.1.0", path = "../loupe-core", features = ["source-migration"] }
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
 loupe-http = { version = "0.1.0", path = "../loupe-http" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
 loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
@@ -56,7 +56,7 @@ git2 = { workspace = true }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 # Keep this test dependency path-only: Cargo omits it on publication,
 # avoiding a server/worker cycle in the registry dependency graph.
-loupe-worker = { path = "../loupe-worker" }
+loupe-worker = { path = "../loupe-worker", features = ["test-support"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 tempfile = { workspace = true }
 tokio-util = { workspace = true }

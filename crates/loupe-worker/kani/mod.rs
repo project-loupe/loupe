@@ -374,13 +374,13 @@ fn request_policy_fixes_model_and_effort() {
 	let configured_effort = if kani::any() { "low" } else { "high" };
 	let backend = if claude {
 		ModelBrokerBackend::Claude {
-			model: configured_model.into(),
-			effort: configured_effort.into(),
+			model: crate::config::ConfiguredText::Builtin(configured_model),
+			effort: crate::config::ConfiguredText::Builtin(configured_effort),
 		}
 	} else {
 		ModelBrokerBackend::Codex {
-			model: configured_model.into(),
-			effort: configured_effort.into(),
+			model: crate::config::ConfiguredText::Builtin(configured_model),
+			effort: crate::config::ConfiguredText::Builtin(configured_effort),
 		}
 	};
 	let keys = ["mcp_servers", "model", "other", "output_config", "reasoning", "tools"];

@@ -2,11 +2,52 @@
 use std::path::Path;
 
 use loupe_server::config::FileConfig;
+use serde::Deserialize;
 use unicode_general_category::{get_general_category, GeneralCategory};
 
 use crate::utils::test_logger;
 
 const OWNER_CAP: usize = 2 * 1024 * 1024;
+
+// Independent wire schema: FileConfig has no Deserialize entry point, so the
+// production file loader is checked against this separate admission oracle.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireConfig {
+	#[serde(default, rename = "server")]
+	_server: loupe_server::config::ServerSection,
+	#[serde(default, rename = "paths")]
+	_paths: WirePaths,
+	#[serde(default, rename = "policy")]
+	_policy: loupe_server::config::PolicySection,
+	#[serde(default, rename = "review")]
+	_review: loupe_server::config::ReviewSection,
+	#[serde(default)]
+	github_app: WireGithubApp,
+	#[serde(default)]
+	worker_budgets: loupe_server::request_budget::WorkerBudgetConfig,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePaths {
+	#[serde(rename = "db")]
+	_db: Option<std::path::PathBuf>,
+	#[serde(rename = "server_cert")]
+	_server_cert: Option<std::path::PathBuf>,
+	#[serde(rename = "server_key")]
+	_server_key: Option<std::path::PathBuf>,
+	#[serde(rename = "ca_cert")]
+	_ca_cert: Option<std::path::PathBuf>,
+	#[serde(rename = "ca_key")]
+	_ca_key: Option<std::path::PathBuf>,
+	#[serde(rename = "master_key")]
+	_master_key: Option<std::path::PathBuf>,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireGithubApp {
+	allowed_target_owners: Option<Vec<String>>,
+}
 
 fn owner_error(owner: &str) -> Option<String> {
 	if owner.len() > OWNER_CAP {
@@ -30,7 +71,7 @@ fn owner_error(owner: &str) -> Option<String> {
 
 pub fn do_test(data: &[u8]) {
 	// Compact boundary controls exercise the real field policy without storing
-	// multi-megabyte corpus files. Ordinary TOML retains its existing uncapped I/O.
+	// multi-megabyte corpus files. Ordinary TOML file reads have no byte cap.
 	let expanded;
 	let data = if let [255, edge] = data {
 		let count = [OWNER_CAP - 1, OWNER_CAP, OWNER_CAP + 1][usize::from(edge % 3)];
@@ -54,10 +95,10 @@ pub fn do_test(data: &[u8]) {
 		return;
 	};
 	let parsed = toml::from_str::<toml::Value>(text);
-	// Deserialize the existing wire schema only as a compatibility oracle.
+	// Deserialize the wire schema only as a compatibility oracle.
 	// Independently evaluate every post-parse admission rule; do not call its
 	// production validators or labelled constructors on this side.
-	let wire = toml::from_str::<FileConfig>(text);
+	let wire = toml::from_str::<WireConfig>(text);
 	let expected_error = wire.as_ref().ok().and_then(|config| {
 		if let Some(owners) = &config.github_app.allowed_target_owners {
 			if let Some(error) = owners.iter().find_map(|owner| owner_error(owner)) {
@@ -118,8 +159,16 @@ pub fn do_test(data: &[u8]) {
 	}
 	if let Ok(config) = result {
 		assert_eq!(
-			config.github_app.allowed_target_owners,
-			wire.as_ref().ok().and_then(|wire| wire.github_app.allowed_target_owners.clone()),
+			config
+				.github_app
+				.allowed_target_owners
+				.as_ref()
+				.map(|owners| owners.iter().map(|owner| owner.expose()).collect::<Vec<_>>()),
+			wire.as_ref().ok().and_then(|wire| wire
+				.github_app
+				.allowed_target_owners
+				.as_ref()
+				.map(|owners| owners.iter().map(String::as_str).collect::<Vec<_>>())),
 			"Config owner spelling changed"
 		);
 		let raw = parsed.unwrap_or_else(|_| panic!("invalid TOML config accepted"));
@@ -141,6 +190,7 @@ pub fn do_test(data: &[u8]) {
 			("master_key", config.paths.master_key),
 		] {
 			if let Some(value) = value {
+				let value = value.as_path();
 				assert!(value.is_absolute(), "config path was not resolved to an absolute path");
 				let original = raw
 					.get("paths")

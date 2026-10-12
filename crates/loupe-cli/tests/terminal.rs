@@ -107,3 +107,28 @@ async fn github_app_slug_preserves_admitted_text() {
 	assert!(output.status.success(), "{:?}", output.stderr);
 	assert_safe_line(&output.stdout, 0);
 }
+
+#[tokio::test]
+async fn job_listing_preserves_known_and_unknown_kind_spelling() {
+	let rows: Vec<_> = ["scan", "verify", "survey", "drilldown", "future-\"kind\""]
+		.into_iter()
+		.enumerate()
+		.map(|(index, kind)| {
+			let mut row = json!({"job_id": index + 1, "repo_id":2, "kind":kind,
+				"state":"queued", "incremental":false, "attempts":0, "enqueued_at":0});
+			if index == 4 {
+				row["head_sha"] = "abc123".into();
+			}
+			row
+		})
+		.collect();
+	let output = command(&["job", "list"], "200 OK", serde_json::to_string(&rows).unwrap()).await;
+	assert!(output.status.success(), "{:?}", output.stderr);
+	assert_eq!(String::from_utf8(output.stdout).unwrap(), concat!(
+		"   5\trepo=2\tkind=Unknown(\"future-\\\"kind\\\"\")\tstate=Queued\tattempts=0\thead=Some(\"abc123\")\n",
+		"   4\trepo=2\tkind=Drilldown\tstate=Queued\tattempts=0\thead=None\n",
+		"   3\trepo=2\tkind=Survey\tstate=Queued\tattempts=0\thead=None\n",
+		"   2\trepo=2\tkind=Verify\tstate=Queued\tattempts=0\thead=None\n",
+		"   1\trepo=2\tkind=Scan\tstate=Queued\tattempts=0\thead=None\n",
+	), "job kind terminal spelling changed");
+}

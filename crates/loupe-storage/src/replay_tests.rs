@@ -1,5 +1,5 @@
 use loupe_core::text::policy::Payload;
-use loupe_core::text::{Anchor, BoundedJson, Identifier};
+use loupe_core::text::BoundedJson;
 
 use crate::review_tests::{fixture, payload, reason};
 use crate::{checkpoints as c, terminal_receipt as t, transaction, Conflict, Error};
@@ -9,7 +9,7 @@ fn checkpoint_replay_does_not_hide_other_insert_failures() {
 	let db = fixture();
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			let key = Identifier::new("insert-failure").unwrap();
+			let key = crate::test_support::identifier("insert-failure").unwrap();
 			let digest = [7; 32];
 			c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &digest, &payload(), 0)?;
 			tx.execute_batch(
@@ -41,7 +41,7 @@ fn checkpoint_replay_does_not_hide_other_insert_failures() {
 					&payload(),
 					2
 				)?,
-				c::Recorded::Replayed(payload()),
+				c::Recorded::Replayed(crate::test_support::db_json("{}").unwrap()),
 				"a genuine duplicate still replays after the independent failure is removed"
 			);
 			Ok(())
@@ -55,7 +55,7 @@ fn checkpoint_lookup_rejects_malformed_stored_digests() {
 	let db = fixture();
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			let key = Identifier::new("stored-digest").unwrap();
+			let key = crate::test_support::identifier("stored-digest").unwrap();
 			let digest = [7; 32];
 			assert!(c::lookup(tx, 101, c::Operation::SubmitLead, &key, &digest)?.is_none());
 			c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &digest, &payload(), 0)?;
@@ -64,7 +64,11 @@ fn checkpoint_lookup_rejects_malformed_stored_digests() {
 				tx.execute("UPDATE job_checkpoints SET payload_digest=?1", [&stored])?;
 				let result = c::lookup(tx, 101, c::Operation::SubmitLead, &key, &digest);
 				if length == 32 {
-					assert_eq!(result?, Some(payload()), "the identical digest must still replay");
+					assert_eq!(
+						result?,
+						Some(crate::test_support::db_json("{}").unwrap()),
+						"the identical digest must still replay"
+					);
 				} else {
 					assert!(
 						matches!(result, Err(Error::Conflict(Conflict::Checkpoint))),
@@ -83,11 +87,11 @@ fn checkpoint_run_owns_the_replay_sequence() {
 	// `run` is the API handlers are meant to use: the body never executes on a
 	// replay hit, and a reused key with different content is a conflict.
 	let db = fixture();
-	let key = Identifier::new("owned-sequence").unwrap();
+	let key = crate::test_support::identifier("owned-sequence").unwrap();
 	let calls = std::cell::Cell::new(0);
-	let body = |_: &rusqlite::Transaction<'_>| -> crate::Result<BoundedJson<Payload>> {
+	let body = |_: &rusqlite::Transaction<'_>| -> crate::Result<BoundedJson<Payload, loupe_provenance::Agent>> {
 		calls.set(calls.get() + 1);
-		Ok(BoundedJson::new("{\"lead_id\":7}")?)
+		Ok(crate::test_support::json("{\"lead_id\":7}")?)
 	};
 	db.with_conn(|conn| {
 		let first = transaction::immediate(conn, |tx| {
@@ -114,16 +118,16 @@ fn replay_lookup_prevents_repeating_domain_side_effects() {
 	use crate::leads as l;
 	use crate::review_units::Priority;
 	let db = fixture();
-	let key = Identifier::new("lead-command").unwrap();
+	let key = crate::test_support::identifier("lead-command").unwrap();
 	let data = payload();
 	let identity = Identity {
-		family: Identifier::new("auth-bypass").unwrap(),
-		anchor: Anchor::new("token refresh").unwrap(),
+		family: crate::test_support::identifier("auth-bypass").unwrap(),
+		anchor: crate::test_support::anchor("token refresh").unwrap(),
 		instance: None,
 	};
 	let submit = |tx: &rusqlite::Transaction<'_>| -> crate::Result<_> {
 		if let Some(response) = c::lookup(tx, 101, c::Operation::SubmitLead, &key, &[1; 32])? {
-			return Ok(response);
+			return Ok(response.expose().to_owned());
 		}
 		let outcome = l::submit(
 			tx,
@@ -132,7 +136,7 @@ fn replay_lookup_prevents_repeating_domain_side_effects() {
 				unit_id: None,
 				identity: &identity,
 				payload: &data,
-				commit_sha: "base",
+				commit_sha: &crate::test_support::db_text("base").unwrap(),
 				priority: Priority::Normal,
 				priority_proposal: None,
 				supersedes: None,
@@ -144,9 +148,9 @@ fn replay_lookup_prevents_repeating_domain_side_effects() {
 			l::Submitted::Created(id) | l::Submitted::Attached { lead_id: id, .. } => id,
 			_ => panic!("open lead"),
 		};
-		let response = BoundedJson::new(&format!("{{\"lead_id\":{id}}}"))?;
+		let response = crate::test_support::json(&format!("{{\"lead_id\":{id}}}"))?;
 		c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &[1; 32], &response, 0)?;
-		Ok(response)
+		Ok(response.expose().to_owned())
 	};
 	db.with_conn(|conn| {
 		let first = transaction::immediate(conn, submit)?;
@@ -175,7 +179,7 @@ fn lease_transaction_composes_checkpoints_and_typed_failures() {
 	db.with_conn(|conn|{
   conn.execute_batch("INSERT INTO workers VALUES(1,'worker','worker',x'01',0,0,NULL); UPDATE jobs SET kind='scan',state='leased',worker_id=1,lease_expires_at=10,job_capability_hash=zeroblob(32) WHERE id=101;")?;
   let lease=ActiveLease{identity:LeaseIdentity{job_id:101,worker_id:1,capability_hash:&[0;32]},now:5};
-  let key=Identifier::new("typed-transaction").unwrap();
+  let key=crate::test_support::identifier("typed-transaction").unwrap();
   let result:crate::Result<Option<()>>=jobs::with_active_lease_transaction(conn,lease,|tx,_|{
    c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),0)?;
    Err(Error::Conflict(Conflict::LeadState))
@@ -192,9 +196,9 @@ fn lease_transaction_composes_checkpoints_and_typed_failures() {
 fn checkpoint_replay_is_scoped_by_operation_job_and_digest() {
 	let db = fixture();
 	db.with_conn(|conn|transaction::immediate(conn,|tx|{
-  let key=Identifier::new("client-key").unwrap();let original=BoundedJson::new("{\"id\":42}").unwrap();
+  let key=crate::test_support::identifier("client-key").unwrap();let original=crate::test_support::json("{\"id\":42}").unwrap();
   assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&original,0).expect("record first submission"),c::Recorded::Recorded);
-  assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),1)?,c::Recorded::Replayed(original));
+  assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),1)?,c::Recorded::Replayed(crate::test_support::db_json(original.expose()).unwrap()));
   assert!(matches!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[2;32],&payload(),1),Err(Error::Conflict(Conflict::Checkpoint))));
   assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitReviewUnit,&key,&[2;32],&payload(),1)?,c::Recorded::Recorded);
   assert_eq!(c::record_or_replay(tx,102,c::Operation::SubmitLead,&key,&[2;32],&payload(),1)?,c::Recorded::Recorded);
@@ -210,7 +214,7 @@ fn checkpoint_and_domain_rows_roll_back_together() {
 	use crate::review_units::Priority;
 	let db = fixture();
 	db.with_conn(|conn| {
-		let key = Identifier::new("retry").unwrap();
+		let key = crate::test_support::identifier("retry").unwrap();
 		let data = payload();
 		let result: crate::Result<()> = transaction::immediate(conn, |tx| {
 			assert_eq!(
@@ -218,8 +222,8 @@ fn checkpoint_and_domain_rows_roll_back_together() {
 				c::Recorded::Recorded
 			);
 			let identity = Identity {
-				family: Identifier::new("auth-bypass").unwrap(),
-				anchor: Anchor::new("token refresh").unwrap(),
+				family: crate::test_support::identifier("auth-bypass").unwrap(),
+				anchor: crate::test_support::anchor("token refresh").unwrap(),
 				instance: None,
 			};
 			assert!(matches!(
@@ -230,7 +234,7 @@ fn checkpoint_and_domain_rows_roll_back_together() {
 						unit_id: None,
 						identity: &identity,
 						payload: &data,
-						commit_sha: "base",
+						commit_sha: &crate::test_support::db_text("base").unwrap(),
 						priority: Priority::Normal,
 						priority_proposal: None,
 						supersedes: None,
@@ -284,13 +288,19 @@ fn terminal_replay_rejects_each_incomplete_or_wrong_binding() {
 			rejected(t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?, t::Reject::MissingReceipt);
 			let data = payload();
 			let why = reason();
-			let new = t::NewReceipt {
+			let new = t::NewReceipt::<
+				loupe_provenance::Db,
+				loupe_provenance::Agent,
+				loupe_provenance::Agent,
+				loupe_provenance::Agent,
+				loupe_provenance::Agent,
+			> {
 				job_id: 101,
-				phase: loupe_core::JobKind::Survey,
+				phase: loupe_core::JobKind::<loupe_provenance::Db>::Survey,
 				terminal_reason: &why,
 				subject_title: None,
 				subject_digest: None,
-				pinned_commit_sha: "base",
+				pinned_commit_sha: &crate::test_support::db_text("base").unwrap(),
 				effective_recipe: &data,
 				result_digest: &[2; 32],
 				evidence_rung: Some(t::EvidenceRung::L1),
@@ -315,7 +325,7 @@ fn terminal_replay_rejects_each_incomplete_or_wrong_binding() {
 				t::insert(tx, &new, 2),
 				Err(Error::Conflict(Conflict::TerminalReceipt))
 			));
-			assert_eq!(t::get(tx, 101)?.unwrap().terminal_reason, why);
+			assert_eq!(t::get(tx, 101)?.unwrap().terminal_reason.expose(), why.expose());
 			Ok(())
 		})
 	})

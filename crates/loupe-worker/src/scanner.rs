@@ -7,8 +7,11 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use loupe_core::text::policy::RevisionText;
+use loupe_core::text::BoundedText;
 use loupe_core::{Finding, RepoSpec, Verdict};
 use loupe_proto::JobCapability;
+use loupe_provenance::{Agent, Repo, Server};
 use tokio_util::sync::CancellationToken;
 
 /// Outcome of `Scanner::verify`. Discriminates the two ways a
@@ -23,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 ///   must NOT POST again or the server will see two verification
 ///   rows for one verify job.
 pub enum VerifyOutcome {
-	Verdict(Verdict),
+	Verdict(Verdict<Agent>),
 	Host(crate::host_outcome::HostVerifyReason),
 	Submitted,
 }
@@ -32,7 +35,7 @@ pub enum VerifyOutcome {
 pub trait Scanner: Send + Sync {
 	fn id(&self) -> &'static str;
 	fn capabilities(&self) -> &[&'static str];
-	async fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<Finding>>;
+	async fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<Finding<Repo>>>;
 
 	/// Default impl: not a verifier. Override in scanners that
 	/// advertise a `verify:*` capability.
@@ -43,7 +46,7 @@ pub trait Scanner: Send + Sync {
 
 pub struct ScanContext {
 	pub workdir: PathBuf,
-	pub repo: RepoSpec,
+	pub repo: RepoSpec<Server>,
 	/// Server-side repo id from the lease envelope. Used by LLM
 	/// backends to scope MCP tool calls (e.g. `query_prior_findings`)
 	/// to this repo without relying on the agent to keep state.
@@ -54,15 +57,15 @@ pub struct ScanContext {
 	/// submission no longer goes through the runner's batch call.
 	pub job_id: i64,
 	pub job_capability: JobCapability,
-	pub head_sha: String,
-	pub base_sha: Option<String>,
-	pub config: serde_json::Value,
+	pub head_sha: BoundedText<RevisionText, Repo>,
+	pub base_sha: Option<BoundedText<RevisionText, Server>>,
+	pub config: Option<crate::source_discovery::ScannerConfigPatch>,
 	pub cancel: CancellationToken,
 }
 
 pub struct VerifyContext {
 	pub workdir: PathBuf,
-	pub repo: RepoSpec,
+	pub repo: RepoSpec<Server>,
 	pub repo_id: i64,
 	/// Server-side job id for this verify job. Required by the
 	/// MCP-driven verifier path: the agent's `submit_verdict` /
@@ -78,7 +81,7 @@ pub struct VerifyContext {
 	/// verifier scanner doesn't have to re-derive it from the
 	/// finding's fingerprint.
 	pub finding_id: i64,
-	pub finding: Finding,
-	pub config: serde_json::Value,
+	pub finding: Finding<Agent>,
+	pub config: Option<crate::source_discovery::ScannerConfigPatch>,
 	pub cancel: CancellationToken,
 }

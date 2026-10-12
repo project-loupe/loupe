@@ -1,16 +1,15 @@
 //! One transactional claim for legacy and campaign queues.
-use loupe_core::text::{BoundedJson, Identifier};
 use loupe_core::JobKind;
+use loupe_provenance::Source;
 use rusqlite::{named_params, params, OptionalExtension, Transaction};
-use sha2::{Digest, Sha256};
 
 use super::{invalid, CampaignPolicy, ClaimPolicy, PHASE_RUNTIME_KINDS};
 use crate::jobs::{self, JobRow, JOB_COLUMNS, RUNTIME_KINDS};
 use crate::{campaigns, checkpoints, review_units, Entity, Error, Result};
 
-pub struct ClaimRequest<'a> {
+pub struct ClaimRequest<'a, S: Source> {
 	pub worker_id: i64,
-	pub kinds: &'a [JobKind],
+	pub kinds: &'a [JobKind<S>],
 	pub now: i64,
 	pub capability_hash: &'a [u8],
 	pub legacy_lease_seconds: i64,
@@ -35,24 +34,39 @@ const ANTI_AFFINITY: &str = "CASE WHEN j.kind='verify' AND j.campaign_id IS NOT 
 /// phase handler for their kind (`PHASE_RUNTIME_KINDS`), because `verify`
 /// is a runtime kind for the legacy pipeline long before the phase
 /// endpoints exist.
-pub fn claim(tx: &Transaction<'_>, req: &ClaimRequest<'_>) -> Result<Option<Claimed>> {
-	let kinds: Vec<_> =
-		req.kinds.iter().filter(|kind| RUNTIME_KINDS.contains(kind)).cloned().collect();
-	let campaign_kinds: Vec<_> =
-		kinds.iter().filter(|kind| PHASE_RUNTIME_KINDS.contains(kind)).cloned().collect();
+pub fn claim<S: Source>(
+	tx: &Transaction<'_>, req: &ClaimRequest<'_, S>,
+) -> Result<Option<Claimed>> {
+	let kinds: Vec<_> = req
+		.kinds
+		.iter()
+		.filter(|kind| {
+			RUNTIME_KINDS.iter().any(|allowed| kind.is_known() && allowed.as_str() == kind.as_str())
+		})
+		.cloned()
+		.collect();
+	let campaign_kinds: Vec<_> = kinds
+		.iter()
+		.filter(|kind| {
+			PHASE_RUNTIME_KINDS
+				.iter()
+				.any(|allowed| kind.is_known() && allowed.as_str() == kind.as_str())
+		})
+		.cloned()
+		.collect();
 	claim_filtered(tx, req, &kinds, &campaign_kinds)
 }
 
 /// Kept inside this module's parent so phase logic can be tested before B4.
 /// Campaign rows are offered for every requested kind.
 #[cfg(test)]
-pub(super) fn claim_kinds(
-	tx: &Transaction<'_>, req: &ClaimRequest<'_>, kinds: &[JobKind],
+pub(super) fn claim_kinds<S: Source>(
+	tx: &Transaction<'_>, req: &ClaimRequest<'_, S>, kinds: &[JobKind<S>],
 ) -> Result<Option<Claimed>> {
 	claim_filtered(tx, req, kinds, kinds)
 }
 
-fn sql_kind_list(kinds: &[JobKind]) -> Vec<String> {
+fn sql_kind_list<S: Source>(kinds: &[JobKind<S>]) -> Vec<String> {
 	kinds
 		.iter()
 		.filter(|kind| {
@@ -62,8 +76,9 @@ fn sql_kind_list(kinds: &[JobKind]) -> Vec<String> {
 		.collect()
 }
 
-fn claim_filtered(
-	tx: &Transaction<'_>, req: &ClaimRequest<'_>, kinds: &[JobKind], campaign_kinds: &[JobKind],
+fn claim_filtered<S: Source>(
+	tx: &Transaction<'_>, req: &ClaimRequest<'_, S>, kinds: &[JobKind<S>],
+	campaign_kinds: &[JobKind<S>],
 ) -> Result<Option<Claimed>> {
 	let kinds = sql_kind_list(kinds);
 	if kinds.is_empty() {
@@ -175,21 +190,18 @@ fn claim_filtered(
 				// This host-only, once-per-job operation has no request payload.
 				// Record even an empty selection atomically with the lease so a
 				// retry cannot confuse it with a skipped (e.g. unpinned) batch.
-				let initialized = checkpoints::run(
+				let initialized = checkpoints::initialize_survey_batch(
 					tx,
 					job.id,
-					checkpoints::Operation::InitializeSurveyBatch,
-					&Identifier::new("ordinary")?,
-					&Sha256::digest(b"{}").into(),
 					req.now,
 					|tx| {
 						let units = tx.prepare(&format!("SELECT u.review_unit_id,u.assignment_epoch FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,u.created_at,u.review_unit_id LIMIT ?2",*review_units::UNIT_NEEDS_WORK))?
 							.query_map(params![generation,policy.survey_units_per_job],|r|Ok(review_units::Assignment{unit_id:r.get(0)?,expected_epoch:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
 						review_units::assign(tx, job.id, &units)?;
-						Ok(BoundedJson::new("{}")?)
+						Ok(())
 					},
 				)?;
-				resumed = matches!(initialized, checkpoints::Outcome::Replayed(_));
+				resumed = initialized;
 			}
 			assigned_units = tx.prepare("SELECT review_unit_id FROM job_assigned_review_units WHERE job_id=?1 AND completed=0 ORDER BY position")?.query_map([job.id],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
 		}

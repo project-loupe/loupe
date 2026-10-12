@@ -1,6 +1,18 @@
-# Staged original-message fixtures
+# Source-aware wire and original-message fixtures
 
-The baseline records unchanged VerdictSubmission serde behavior, including
+Source-bearing protocol DTOs deliberately have no general Deserialize or raw
+string constructor. Unit and credential tests assemble synthetic marked values
+and compare the complete serialized wire shape with explicit expected JSON.
+The fixed Server mark in `support/fixtures.rs` exists only in test binaries;
+it is not an ingress decoder or evidence of authentication/source assignment.
+Real missing/null/default admission belongs to the named server, worker and
+CLI decoders. Output-omission tests here do not establish input compatibility.
+Credential-only DTOs that still implement Deserialize retain their actual
+roundtrip tests, including private/mixed PEM and escaped credential bytes.
+
+The private `support/legacy_verdict.rs` oracle preserves the pre-adoption
+VerdictSubmission serde shape for the existing original-token comparison,
+including
 all variants, reordered tags, map and sequence representations, duplicates,
 ignored fields, null/default options, and exact text. It does not mistake
 new source-aware API admission for an existing production security regression.
@@ -23,8 +35,10 @@ visitor traverses the original envelope to retain this Unicode/numeric/depth
 behavior. It retains no dynamic values; serde scratch remains bounded by the
 original message cap. Unknown outer values retain ordinary IgnoredAny behavior.
 
-This is fixture evidence for D, not production ingress adoption. I/M still
-owns actual authenticated Worker ingress, route budgets and protocol-version
-checks, full owner migration, staging deletion, and exact patch bytes through
-the eventual Git applicability check. The shared parser also needs its
-independent arbitrary-byte/valid-token fuzz and mutation join before D closes.
+This remains fixture evidence, not production ingress adoption. The historical
+oracle intentionally accepts strings the final marked field policy rejects;
+it is private to these tests and cannot deserialize a production labelled DTO.
+Actual authenticated Worker ingress, route budgets, protocol-version checks,
+and exact patch bytes through SQL/reopen/Server/Agent/Git must be covered by
+their production owners. The parser's independent fuzz and mutation evidence
+also remains separate from these fixed original-token controls.

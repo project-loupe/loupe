@@ -1,8 +1,7 @@
 //! Closed Worker request schemas; only designated original spans become Agent.
 use axum::http::StatusCode;
-use loupe_core::source_migration::text::{BoundedText, RepoPath};
-use loupe_core::source_migration::Finding;
-use loupe_core::text::{decode_json_string_bounded, policy, TextPolicy};
+use loupe_core::text::{decode_json_string_bounded, policy, BoundedText, RepoPath};
+use loupe_core::Finding;
 use loupe_provenance::{Agent, Mark, Unvalidated, Validate, ValidateCarrying, Worker};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -15,11 +14,7 @@ use super::{DecodeError, WorkerBody, WorkerJson};
 pub(crate) mod fuzz;
 
 pub(crate) struct LeaseRequestDecoder;
-pub(crate) struct LeaseInput {
-	protocol_version: u16,
-	capabilities: Vec<BoundedText<policy::LeaseCapabilityName, Worker>>,
-	wait_seconds: u32,
-}
+pub(crate) type LeaseInput = loupe_proto::LeaseRequest<Worker>;
 
 pub(crate) struct HeartbeatDecoder;
 impl Validate<&[u8], Worker> for HeartbeatDecoder {
@@ -35,7 +30,7 @@ impl Validate<&[u8], Worker> for HeartbeatDecoder {
 	}
 }
 impl HeartbeatDecoder {
-	pub(crate) fn decode_legacy(
+	pub(crate) fn decode(
 		body: WorkerBody,
 	) -> Result<Option<loupe_proto::HeartbeatRequest>, (StatusCode, String)> {
 		body.0
@@ -45,29 +40,6 @@ impl HeartbeatDecoder {
 	}
 }
 
-// These owner-specific policies stay local during I; M's inventory must unify
-// revision/job-diagnostic names across their real producer/consumer owners.
-struct RevisionText;
-impl TextPolicy for RevisionText {
-	const FIELD: &'static str = "revision";
-	const MAX_BYTES: usize = policy::LEGACY_TEXT_MAX_BYTES;
-	const MAX_CHARS: usize = policy::LEGACY_TEXT_MAX_BYTES;
-	const MULTILINE: bool = false;
-	const ALLOW_EMPTY: bool = true;
-	const NORMALIZATION: loupe_core::text::Normalization = loupe_core::text::Normalization::Exact;
-	const WHITESPACE: loupe_core::text::Whitespace = loupe_core::text::Whitespace::Significant;
-}
-struct JobDiagnostic;
-impl TextPolicy for JobDiagnostic {
-	const FIELD: &'static str = "job_diagnostic";
-	const MAX_BYTES: usize = policy::LEGACY_TEXT_MAX_BYTES;
-	const MAX_CHARS: usize = policy::LEGACY_TEXT_MAX_BYTES;
-	const MULTILINE: bool = true;
-	const ALLOW_CR: bool = true;
-	const ALLOW_EMPTY: bool = true;
-	const NORMALIZATION: loupe_core::text::Normalization = loupe_core::text::Normalization::Exact;
-	const WHITESPACE: loupe_core::text::Whitespace = loupe_core::text::Whitespace::Significant;
-}
 #[derive(Deserialize)]
 struct RawComplete<'a> {
 	protocol_version: u16,
@@ -78,12 +50,7 @@ struct RawComplete<'a> {
 	error: Option<&'a RawValue>,
 }
 pub(crate) struct CompleteDecoder;
-pub(crate) struct CompleteInput {
-	protocol_version: u16,
-	outcome: loupe_proto::CompleteOutcome,
-	head_sha: Option<BoundedText<RevisionText, Worker>>,
-	error: Option<BoundedText<JobDiagnostic, Worker>>,
-}
+pub(crate) type CompleteInput = loupe_proto::CompleteRequest<Worker, Worker>;
 impl Validate<&[u8], Worker> for CompleteDecoder {
 	type Output = CompleteInput;
 	type Error = DecodeError;
@@ -101,16 +68,8 @@ impl Validate<&[u8], Worker> for CompleteDecoder {
 	}
 }
 impl CompleteDecoder {
-	pub(crate) fn decode_legacy(
-		body: WorkerJson,
-	) -> Result<loupe_proto::CompleteRequest, (StatusCode, String)> {
-		let input = body.0.as_bytes().validate(Self).map_err(DecodeError::response)?;
-		Ok(loupe_proto::CompleteRequest {
-			protocol_version: input.protocol_version,
-			outcome: input.outcome,
-			head_sha: input.head_sha.map(|value| value.expose().to_owned()),
-			error: input.error.map(|value| value.expose().to_owned()),
-		})
+	pub(crate) fn decode(body: WorkerJson) -> Result<CompleteInput, (StatusCode, String)> {
+		body.0.as_bytes().validate(Self).map_err(DecodeError::response)
 	}
 }
 
@@ -204,10 +163,7 @@ struct RawBatch<'a> {
 	findings: Vec<RawFinding<'a>>,
 }
 pub(crate) struct FindingsBatchDecoder;
-pub(crate) struct BatchInput {
-	protocol_version: u16,
-	findings: Vec<Finding<Agent>>,
-}
+pub(crate) type BatchInput = loupe_proto::FindingsBatch<Agent>;
 impl<'a> ValidateCarrying<&'a [u8], Worker> for FindingsBatchDecoder {
 	type Output = BatchInput;
 	type Error = DecodeError;
@@ -247,30 +203,8 @@ impl<'a> ValidateCarrying<&'a [u8], Worker> for FindingsBatchDecoder {
 	}
 }
 impl FindingsBatchDecoder {
-	pub(crate) fn decode_legacy(
-		body: WorkerJson,
-	) -> Result<loupe_proto::FindingsBatch, (StatusCode, String)> {
-		let input = body.0.as_bytes().validate_carrying(Self).map_err(DecodeError::response)?;
-		Ok(loupe_proto::FindingsBatch {
-			protocol_version: input.protocol_version,
-			findings: input
-				.findings
-				.into_iter()
-				.map(|finding| loupe_core::Finding {
-					scanner_id: finding.scanner_id.expose().to_owned(),
-					severity: finding.severity,
-					title: finding.title.expose().to_owned(),
-					description: finding.description.expose().to_owned(),
-					file_path: finding.file_path.map(|value| value.expose().to_owned()),
-					line_start: finding.line_start,
-					line_end: finding.line_end,
-					cwe: finding.cwe.map(|value| value.expose().to_owned()),
-					patch_unified: finding.patch_unified.map(|value| value.expose().to_owned()),
-					poc_unified: finding.poc_unified.map(|value| value.expose().to_owned()),
-					fingerprint: finding.fingerprint.expose().to_owned(),
-				})
-				.collect(),
-		})
+	pub(crate) fn decode(body: WorkerJson) -> Result<BatchInput, (StatusCode, String)> {
+		body.0.as_bytes().validate_carrying(Self).map_err(DecodeError::response)
 	}
 }
 
@@ -295,16 +229,62 @@ struct RawLlm<'a> {
 }
 pub(crate) struct LlmFindingDecoder;
 pub(crate) struct LlmInput {
-	protocol_version: u16,
-	severity: loupe_core::Severity,
-	title: BoundedText<policy::FindingTitle, Agent>,
-	description: BoundedText<policy::FindingDescription, Agent>,
-	file_path: RepoPath<Agent>,
-	line_start: u32,
-	line_end: u32,
-	cwe: Option<BoundedText<policy::CweText, Agent>>,
-	poc_unified: BoundedText<policy::PocUnified, Agent>,
-	fingerprint: BoundedText<policy::FindingFingerprintText, Agent>,
+	pub(crate) protocol_version: u16,
+	pub(crate) severity: loupe_core::Severity,
+	pub(crate) title: BoundedText<policy::FindingTitle, Agent>,
+	pub(crate) description: BoundedText<policy::FindingDescription, Agent>,
+	pub(crate) file_path: RepoPath<Agent>,
+	pub(crate) line_start: u32,
+	pub(crate) line_end: u32,
+	pub(crate) cwe: Option<BoundedText<policy::CweText, Agent>>,
+	pub(crate) poc_unified: BoundedText<policy::PocUnified, Agent>,
+	pub(crate) fingerprint: BoundedText<policy::FindingFingerprintText, Agent>,
+	scanner_id: BoundedText<policy::ScannerIdText, Agent>,
+}
+struct LlmTitle;
+impl Validate<&[u8], Agent> for LlmTitle {
+	type Output =
+		(BoundedText<policy::FindingTitle, Agent>, BoundedText<policy::ScannerIdText, Agent>);
+	type Error = DecodeError;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, &[u8]>, mark: Mark<'view, Agent>,
+	) -> Result<Self::Output, Self::Error> {
+		let token: &RawValue = serde_json::from_slice(input.get()).map_err(DecodeError::json)?;
+		let title = json_text(&mark, token)?;
+		// Fixed protocol metadata attached at the actual carried Agent-content
+		// decoder, not a claim that the model authored this scanner constant.
+		let scanner_id = BoundedText::new(&mark, loupe_proto::LLM_CODE_REVIEW_SCANNER_ID)?;
+		Ok((title, scanner_id))
+	}
+}
+impl LlmInput {
+	pub(crate) fn validate(&self) -> Result<(), String> {
+		loupe_proto::validate_llm_finding(&loupe_proto::LlmFindingValidation {
+			title: &self.title,
+			description: &self.description,
+			file_path: &self.file_path,
+			line_start: self.line_start,
+			line_end: self.line_end,
+			cwe: self.cwe.as_ref(),
+			poc_unified: &self.poc_unified,
+			fingerprint: self.fingerprint.expose(),
+		})
+	}
+	pub(crate) fn into_finding(self) -> Finding<Agent> {
+		Finding {
+			scanner_id: self.scanner_id,
+			severity: self.severity,
+			title: self.title,
+			description: self.description,
+			file_path: Some(self.file_path),
+			line_start: Some(self.line_start),
+			line_end: Some(self.line_end),
+			cwe: self.cwe,
+			patch_unified: None,
+			poc_unified: Some(self.poc_unified),
+			fingerprint: self.fingerprint,
+		}
+	}
 }
 impl<'a> ValidateCarrying<&'a [u8], Worker> for LlmFindingDecoder {
 	type Output = LlmInput;
@@ -313,10 +293,12 @@ impl<'a> ValidateCarrying<&'a [u8], Worker> for LlmFindingDecoder {
 		self, input: Unvalidated<'_, &'a [u8], Worker>,
 	) -> Result<Self::Output, Self::Error> {
 		let raw: RawLlm<'_> = serde_json::from_slice(input.get()).map_err(DecodeError::json)?;
+		let (title, scanner_id) = carried!(input, raw.title, LlmTitle);
 		Ok(LlmInput {
 			protocol_version: raw.protocol_version,
 			severity: raw.severity,
-			title: carried!(input, raw.title, AgentTitle),
+			title,
+			scanner_id,
 			description: carried!(input, raw.description, AgentDescription),
 			file_path: carried!(input, raw.file_path, AgentPath),
 			line_start: raw.line_start,
@@ -331,27 +313,13 @@ impl<'a> ValidateCarrying<&'a [u8], Worker> for LlmFindingDecoder {
 	}
 }
 impl LlmFindingDecoder {
-	pub(crate) fn decode_legacy(
-		body: WorkerJson,
-	) -> Result<loupe_proto::LlmFindingSubmission, (StatusCode, String)> {
-		let input = body.0.as_bytes().validate_carrying(Self).map_err(DecodeError::response)?;
-		Ok(loupe_proto::LlmFindingSubmission {
-			protocol_version: input.protocol_version,
-			severity: input.severity,
-			title: input.title.expose().to_owned(),
-			description: input.description.expose().to_owned(),
-			file_path: input.file_path.expose().to_owned(),
-			line_start: input.line_start,
-			line_end: input.line_end,
-			cwe: input.cwe.map(|value| value.expose().to_owned()),
-			poc_unified: input.poc_unified.expose().to_owned(),
-			fingerprint: input.fingerprint.expose().to_owned(),
-		})
+	pub(crate) fn decode(body: WorkerJson) -> Result<LlmInput, (StatusCode, String)> {
+		body.0.as_bytes().validate_carrying(Self).map_err(DecodeError::response)
 	}
 }
 
-// This borrows the same nested original tokens as the accepted D verdict
-// fixture; it never deserializes an internally tagged Value and reserializes it.
+// Borrow nested original tokens so carried spans refer to the request bytes,
+// without deserializing and reserializing an internally tagged Value.
 enum Outcome {
 	Confirmed,
 	Dismissed,
@@ -419,7 +387,7 @@ struct RawPatch<'a> {
 	#[serde(borrow)]
 	notes: &'a RawValue,
 }
-// Retain the envelope recursion boundary for the old internally tagged enum's
+// Retain the envelope recursion boundary for the internally tagged enum's
 // ignored-content validation. This pass occurs after bounded carried fields.
 #[derive(Deserialize)]
 struct VerdictContent {
@@ -430,12 +398,12 @@ struct VerdictContent {
 }
 pub(crate) struct VerdictSubmissionDecoder;
 impl<'a> ValidateCarrying<&'a [u8], Worker> for VerdictSubmissionDecoder {
-	type Output = (u16, loupe_core::source_migration::Verdict<Agent>);
+	type Output = (u16, loupe_core::Verdict<Agent>);
 	type Error = DecodeError;
 	fn validate(
 		self, input: Unvalidated<'_, &'a [u8], Worker>,
 	) -> Result<Self::Output, Self::Error> {
-		use loupe_core::source_migration::{Verdict, VerdictPatch};
+		use loupe_core::{Verdict, VerdictPatch};
 		let raw: RawVerdict<'_> = serde_json::from_slice(input.get()).map_err(DecodeError::json)?;
 		let text = raw.verdict.get();
 		let outcome = if text.starts_with('[') {
@@ -491,27 +459,11 @@ impl<'a> ValidateCarrying<&'a [u8], Worker> for VerdictSubmissionDecoder {
 	}
 }
 impl VerdictSubmissionDecoder {
-	pub(crate) fn decode_legacy(
+	pub(crate) fn decode(
 		body: WorkerJson,
-	) -> Result<loupe_proto::VerdictSubmission, (StatusCode, String)> {
-		use loupe_core::source_migration::Verdict;
+	) -> Result<loupe_proto::VerdictSubmission<Agent>, (StatusCode, String)> {
 		let (protocol_version, verdict) =
 			body.0.as_bytes().validate_carrying(Self).map_err(DecodeError::response)?;
-		let verdict = match verdict {
-			Verdict::Confirmed { notes, patch } => loupe_core::Verdict::Confirmed {
-				notes: notes.map(|value| value.expose().to_owned()),
-				patch: patch.map(|patch| loupe_core::VerdictPatch {
-					patch_unified: patch.patch_unified.expose().to_owned(),
-					notes: patch.notes.expose().to_owned(),
-				}),
-			},
-			Verdict::Dismissed { notes } => loupe_core::Verdict::Dismissed {
-				notes: notes.map(|value| value.expose().to_owned()),
-			},
-			Verdict::Inconclusive { reason, terminal } => {
-				loupe_core::Verdict::Inconclusive { reason: reason.expose().to_owned(), terminal }
-			},
-		};
 		Ok(loupe_proto::VerdictSubmission { protocol_version, verdict })
 	}
 }
@@ -542,20 +494,8 @@ impl Validate<&[u8], Worker> for LeaseRequestDecoder {
 	}
 }
 impl LeaseRequestDecoder {
-	/// Temporary I exit; M returns the marked fields directly to the route.
-	pub(crate) fn decode_legacy(
-		body: WorkerJson,
-	) -> Result<loupe_proto::LeaseRequest, (StatusCode, String)> {
-		let input = body.0.as_bytes().validate(Self).map_err(DecodeError::response)?;
-		Ok(loupe_proto::LeaseRequest {
-			protocol_version: input.protocol_version,
-			capabilities: input
-				.capabilities
-				.iter()
-				.map(|value| value.expose().to_owned())
-				.collect(),
-			wait_seconds: input.wait_seconds,
-		})
+	pub(crate) fn decode(body: WorkerJson) -> Result<LeaseInput, (StatusCode, String)> {
+		body.0.as_bytes().validate(Self).map_err(DecodeError::response)
 	}
 }
 
@@ -605,7 +545,7 @@ mod tests {
 
 	#[test]
 	fn nested_verdict_tokens_preserve_empty_null_and_exact_patch_bytes() {
-		use loupe_core::source_migration::Verdict;
+		use loupe_core::Verdict;
 		let body = br#"{"protocol_version":2,"verdict":{"outcome":"confirmed","notes":"","patch":{"patch_unified":"diff\r\n\ttext","notes":"Cafe\u0301"}}}"#;
 		let (_, verdict): (u16, Verdict<Agent>) =
 			worker_fixture(body).validate_carrying(VerdictSubmissionDecoder).unwrap();
@@ -622,5 +562,24 @@ mod tests {
 				worker_fixture(body).validate_carrying(VerdictSubmissionDecoder).unwrap();
 			assert!(matches!(verdict, Verdict::Dismissed { notes: None }));
 		}
+	}
+
+	#[test]
+	fn llm_closed_scanner_composition_keeps_original_agent_fields() {
+		let body = br#"{"protocol_version":2,"severity":"high","title":"  Original Caf\u0065\u0301 title  ","description":"  A sufficiently detailed original description that preserves all exact surrounding spaces and bytes.  ","file_path":"src/main.rs","line_start":1,"line_end":2,"cwe":"CWE-79","poc_unified":"--- a/src/main.rs\r\n+++ b/src/main.rs\r\n@@ -1 +1 @@\r\n+\tproof","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scanner_id":"caller-cannot-select-this"}"#;
+		let value = worker_fixture(body).validate_carrying(LlmFindingDecoder).unwrap();
+		value.validate().unwrap();
+		let finding: Finding<Agent> = value.into_finding();
+		assert_eq!(finding.scanner_id.expose(), loupe_proto::LLM_CODE_REVIEW_SCANNER_ID);
+		assert_eq!(finding.title.expose(), "  Original Cafe\u{301} title  ");
+		assert_eq!(
+			finding.description.expose(),
+			"  A sufficiently detailed original description that preserves all exact surrounding spaces and bytes.  "
+		);
+		assert_eq!(
+			finding.poc_unified.unwrap().expose(),
+			"--- a/src/main.rs\r\n+++ b/src/main.rs\r\n@@ -1 +1 @@\r\n+\tproof"
+		);
+		assert_eq!(finding.file_path.unwrap().expose(), "src/main.rs");
 	}
 }

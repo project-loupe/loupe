@@ -1,25 +1,26 @@
 //! Byte-exact inventory references, including visibly unrepresentable entries.
-use loupe_core::text::policy::Reason;
+use loupe_core::text::policy::{Reason, RevisionText};
 use loupe_core::text::{BoundedText, RepoPath, SourceRef};
+use loupe_provenance::{Agent, Db, Mark, Repo, Source};
 use rusqlite::{params, Connection, Transaction};
 
+pub use crate::ingress::InventoryRendering;
 use crate::review::{is_unique, parsed, standalone, string_enum};
 use crate::{ownership, Conflict, Error, Ownership, Result};
 string_enum!(EntryKind { Tracked => "tracked", Submodule => "submodule" });
 string_enum!(Disposition { Mapped => "mapped", Context => "context", Excluded => "excluded", Unresolved => "unresolved" });
 pub const MAX_ENTRIES: usize = 4096;
 
-#[derive(Clone)]
-pub struct InventoryPath {
-	rendering: String,
-	representable: bool,
+pub enum InventoryPath<S: Source> {
+	Representable(RepoPath<S>),
+	Unrepresentable(BoundedText<InventoryRendering, S>),
 }
-impl InventoryPath {
-	pub fn from_git_bytes(raw: &[u8]) -> Self {
+impl InventoryPath<Repo> {
+	pub fn from_git_bytes(mark: &Mark<'_, Repo>, raw: &[u8]) -> Result<Self> {
 		if let Ok(text) = std::str::from_utf8(raw)
-			&& RepoPath::new(text).is_ok()
+			&& let Ok(path) = RepoPath::new(mark, text)
 		{
-			return Self { rendering: text.to_owned(), representable: true };
+			return Ok(Self::Representable(path));
 		}
 		let mut rendering = String::new();
 		for &byte in raw {
@@ -30,42 +31,55 @@ impl InventoryPath {
 				write!(&mut rendering, "%{byte:02X}").expect("writing a String");
 			}
 		}
-		Self { rendering, representable: false }
-	}
-	pub fn expose(&self) -> &str {
-		&self.rendering
-	}
-	pub fn representable(&self) -> bool {
-		self.representable
+		Ok(Self::Unrepresentable(BoundedText::new(mark, &rendering)?))
 	}
 }
-impl std::fmt::Debug for InventoryPath {
+impl<S: Source> Clone for InventoryPath<S> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Representable(path) => Self::Representable(path.clone()),
+			Self::Unrepresentable(text) => Self::Unrepresentable(text.clone()),
+		}
+	}
+}
+impl<S: Source> InventoryPath<S> {
+	pub fn expose(&self) -> &str {
+		match self {
+			Self::Representable(path) => path.expose(),
+			Self::Unrepresentable(text) => text.expose(),
+		}
+	}
+	pub fn representable(&self) -> bool {
+		matches!(self, Self::Representable(_))
+	}
+}
+impl<S: Source> std::fmt::Debug for InventoryPath<S> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(
 			f,
 			"InventoryPath(len={}, representable={})",
-			self.rendering.len(),
-			self.representable
+			self.expose().len(),
+			self.representable()
 		)
 	}
 }
-pub struct NewEntry<'a> {
-	pub path: &'a InventoryPath,
-	pub blob_sha: Option<&'a str>,
+pub struct NewEntry<'a, PathS: Source, RevisionS: Source, ReasonS: Source> {
+	pub path: &'a InventoryPath<PathS>,
+	pub blob_sha: Option<&'a BoundedText<RevisionText, RevisionS>>,
 	pub kind: EntryKind,
 	pub disposition: Disposition,
-	pub reason: Option<&'a BoundedText<Reason>>,
+	pub reason: Option<&'a BoundedText<Reason, ReasonS>>,
 	pub highlighted: bool,
 }
 #[derive(Debug, Clone)]
 pub struct Entry {
 	pub inventory_entry_id: i64,
 	pub generation_id: i64,
-	pub path: InventoryPath,
-	pub blob_sha: Option<String>,
+	pub path: InventoryPath<Db>,
+	pub blob_sha: Option<BoundedText<RevisionText, Db>>,
 	pub kind: EntryKind,
 	pub disposition: Disposition,
-	pub reason: Option<BoundedText<Reason>>,
+	pub reason: Option<BoundedText<Reason, Db>>,
 	pub highlighted: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +92,7 @@ pub struct Inserted {
 	pub skipped: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownPaths(pub Vec<RepoPath>);
+pub struct UnknownPaths(pub Vec<RepoPath<Agent>>);
 impl std::fmt::Display for UnknownPaths {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{} references are outside the pinned inventory", self.0.len())
@@ -86,8 +100,9 @@ impl std::fmt::Display for UnknownPaths {
 }
 impl std::error::Error for UnknownPaths {}
 
-pub fn insert(
-	tx: &Transaction<'_>, repo: i64, generation: i64, entries: &[NewEntry<'_>], now: i64,
+pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
+	tx: &Transaction<'_>, repo: i64, generation: i64,
+	entries: &[NewEntry<'_, PathS, RevisionS, ReasonS>], now: i64,
 ) -> Result<Inserted> {
 	ownership::generation(tx, repo, generation, Ownership::InventoryGeneration)?;
 	if entries.len() > MAX_ENTRIES {
@@ -120,10 +135,10 @@ pub fn insert(
 	// Reserve real names first so an encoded invalid name never shadows one.
 	for entry in entries
 		.iter()
-		.filter(|e| e.path.representable)
-		.chain(entries.iter().filter(|e| !e.path.representable))
+		.filter(|e| e.path.representable())
+		.chain(entries.iter().filter(|e| !e.path.representable()))
 	{
-		let excluded = !entry.path.representable;
+		let excluded = !entry.path.representable();
 		if !excluded && entry.reason.is_some_and(|r| r.expose() == "unrepresentable-path") {
 			return Err(loupe_core::text::Error::new(
 				"disposition_reason",
@@ -147,7 +162,7 @@ pub fn insert(
 		let row = params![
 			generation,
 			entry.path.expose(),
-			entry.blob_sha,
+			entry.blob_sha.map(BoundedText::expose),
 			entry.kind.as_str(),
 			disposition.as_str(),
 			reason,
@@ -174,7 +189,7 @@ pub fn insert(
 						params![
 							generation,
 							entry.path.expose(),
-							entry.blob_sha,
+							entry.blob_sha.map(BoundedText::expose),
 							entry.kind.as_str()
 						],
 						|r| r.get::<_, bool>(0),
@@ -190,14 +205,37 @@ pub fn insert(
 	Ok(outcome)
 }
 pub fn list(conn: &Connection, generation: i64) -> Result<Vec<Entry>> {
-	Ok(conn.prepare("SELECT inventory_entry_id,generation_id,path,blob_sha,entry_kind,disposition,disposition_reason,highlighted FROM generation_inventory WHERE generation_id=?1 ORDER BY path")?.query_map([generation],|r| {
-		let reason: Option<BoundedText<Reason>> = crate::ingress::optional_reason_legacy(r,6)?;
-		let representable = reason.as_ref().is_none_or(|reason|reason.expose()!="unrepresentable-path");
- let path = InventoryPath { rendering:crate::ingress::inventory_path_legacy(r,2,representable)?,representable };
-		Ok(Entry { inventory_entry_id:r.get(0)?,generation_id:r.get(1)?,path,blob_sha:crate::ingress::optional_revision_legacy(r,3)?,kind:parsed(r,4)?,disposition:parsed(r,5)?,reason,highlighted:r.get(7)? })
-	})?.collect::<rusqlite::Result<_>>()?)
+	Ok(conn
+		.prepare(&format!(
+			"SELECT {COLUMNS} FROM generation_inventory WHERE generation_id=?1 ORDER BY path"
+		))?
+		.query_map([generation], row)?
+		.collect::<rusqlite::Result<_>>()?)
 }
-pub fn verify_refs(tx: &Transaction<'_>, generation: i64, refs: &[SourceRef]) -> Result<()> {
+const COLUMNS: &str = "inventory_entry_id,generation_id,path,blob_sha,entry_kind,disposition,disposition_reason,highlighted";
+fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
+	let reason: Option<BoundedText<Reason, Db>> = crate::ingress::optional_reason(r, 6)?;
+	let representable =
+		reason.as_ref().is_none_or(|reason| reason.expose() != "unrepresentable-path");
+	let path = crate::ingress::inventory_path(r, 2, representable)?;
+	Ok(Entry {
+		inventory_entry_id: r.get(0)?,
+		generation_id: r.get(1)?,
+		path,
+		blob_sha: crate::ingress::optional_revision(r, 3)?,
+		kind: parsed(r, 4)?,
+		disposition: parsed(r, 5)?,
+		reason,
+		highlighted: r.get(7)?,
+	})
+}
+pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
+	crate::migrations::admission::scan(conn, "generation_inventory", COLUMNS, row)?;
+	crate::migrations::admission::scan(conn, "generation_inventory", "created_at", |_| {
+		Ok::<_, rusqlite::Error>(())
+	})
+}
+pub fn verify_refs(tx: &Transaction<'_>, generation: i64, refs: &[SourceRef<Agent>]) -> Result<()> {
 	ownership::generation_repo(tx, generation)?;
 	let exists: bool = tx.query_row("SELECT inventory_digest IS NOT NULL OR EXISTS(SELECT 1 FROM generation_inventory WHERE generation_id=?1) FROM review_generations WHERE generation_id=?1",[generation],|r|r.get(0))?;
 	if !exists {
@@ -218,4 +256,4 @@ pub fn verify_refs(tx: &Transaction<'_>, generation: i64, refs: &[SourceRef]) ->
 		Err(Error::UnknownPaths(UnknownPaths(unknown)))
 	}
 }
-standalone! { insert(repo: i64, generation: i64, entries: &[NewEntry<'_>], now: i64) -> Inserted; }
+standalone! { insert<PathS, RevisionS, ReasonS>(repo: i64, generation: i64, entries: &[NewEntry<'_, PathS, RevisionS, ReasonS>], now: i64) -> Inserted; }

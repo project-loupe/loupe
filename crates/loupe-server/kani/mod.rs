@@ -17,12 +17,11 @@ fn bounded_bytes_copy(data: &[u8]) -> axum::body::Bytes {
 	axum::body::Bytes::from_static(&Box::leak(copied)[..data.len()])
 }
 
-// invariant: I1. All header byte strings of lengths 0..=44, including HTAB.
+// Bound: All header byte strings of lengths 0..=44, including HTAB.
 // Hash cryptography is excluded: this proof checks acceptance and hash-result
-// propagation. HeaderMap lookup and real hashing remain in unit/fuzz checks;
-// proving through HeaderMap timed out while expanding header-name hashing.
+// propagation. HeaderMap lookup and real hashing remain in unit/fuzz checks.
 // Bytes copying uses a same-byte, fixed-size allocation model: real BytesMut
-// refcount/pointer machinery exhausted 12 GiB. HeaderValue's byte validation
+// refcount/pointer machinery is outside this proof. HeaderValue's byte validation
 // and to_str remain real; allocator internals are covered by ordinary fuzzing.
 #[kani::proof]
 #[kani::unwind(46)]
@@ -47,7 +46,7 @@ fn parse_capability_matches_header_text_length() {
 	kani::cover!(parsed.is_some() && bytes[0] == b'\t', "horizontal tab accepted");
 }
 
-// invariant: I1. Full i64 worker/time domain, all state variants and 32-byte
+// Bound: Full i64 worker/time domain, all state variants and 32-byte
 // hashes. SQL tests separately establish that the returned row matches the
 // query hash; JobRow itself does not retain the stored capability hash.
 // ci: fast
@@ -90,10 +89,13 @@ fn capability_admits_is_sound() {
 	);
 }
 
-// invariant: I1. Every route-table row and every JobKind variant. The Unknown
+// Bound: Every route-table row and every JobKind variant. The Unknown
 // payload deliberately spells a known kind: the variant, not text, grants access.
+// All fixture spellings are at most nine bytes; unwinding assertions check
+// that this finite bound suffices for their comparisons and validation.
 // ci: fast
 #[kani::proof]
+#[kani::unwind(16)]
 fn route_kind_check_is_exhaustive() {
 	let kind: u8 = kani::any();
 	kani::assume(kind < 5);
@@ -102,7 +104,7 @@ fn route_kind_check_is_exhaustive() {
 		1 => JobKind::Verify,
 		2 => JobKind::Survey,
 		3 => JobKind::Drilldown,
-		_ => JobKind::Unknown("scan".into()),
+		_ => unknown_kind_fixture(),
 	};
 	let route: u8 = kani::any();
 	kani::assume(route < 3);
@@ -121,10 +123,31 @@ fn route_kind_check_is_exhaustive() {
 	kani::cover!(!admitted && matches!(kind, JobKind::Unknown(_)), "unknown denied");
 }
 
-// invariant: I6. One arbitrary transition over the full u64 domain. The
+// Fixed synthetic Db content keeps the deliberate Unknown("scan") variant
+// control source-bearing without changing the normal production API. This is
+// fixture authority, not an actual SQLite read or proof of text validation.
+fn unknown_kind_fixture() -> JobKind<loupe_provenance::Db> {
+	use loupe_core::text::{BoundedText, Error};
+	use loupe_provenance::{Db, Ingress, Mark, Untrusted, Unvalidated, Validate};
+	struct Unknown;
+	impl Validate<&str, Db> for Unknown {
+		type Output = JobKind<Db>;
+		type Error = Error;
+		fn validate<'view>(
+			self, value: Unvalidated<'view, &str>, mark: Mark<'view, Db>,
+		) -> Result<Self::Output, Self::Error> {
+			BoundedText::new(&mark, value.get()).map(JobKind::Unknown)
+		}
+	}
+	// SAFETY: this proof owns its synthetic original "scan" bytes and fixes Db.
+	#[allow(unsafe_code)]
+	Untrusted::new("scan", unsafe { Ingress::<Db>::new() }).validate(Unknown).unwrap()
+}
+
+// Bound: One arbitrary transition over the full u64 domain. The
 // independent conservation oracle partitions exact arithmetic: overflow of
 // either checked operation means earned credit exceeds every u64 capacity.
-// This avoids a second 128-bit multiplier (the first attempt timed out).
+// This avoids the symbolic cost of a second 128-bit multiplier.
 // Composition follows by summing successful charges; time never moves back.
 #[kani::proof]
 fn request_budget_is_monotone() {
@@ -153,7 +176,7 @@ fn request_budget_is_monotone() {
 	kani::cover!(earned.is_none(), "refill overflow saturates");
 }
 
-// invariant: I6. Full usize inputs on this 64-bit target, no assumptions or
+// Bound: Full usize inputs on this 64-bit target, no assumptions or
 // stubs. Independent u128 arithmetic checks the production append admission.
 // This proves numeric limits only: actual collection, allocation, byte debt
 // and wipe-on-drop remain separate runtime and fuzz obligations.

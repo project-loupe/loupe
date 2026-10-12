@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use loupe_core::source_migration::text::RepoPath;
+use loupe_core::text::RepoPath;
 use loupe_provenance::{Mark, Repo, Unvalidated, Validate};
 #[cfg(fuzzing)]
 pub(super) mod fuzz_support;
@@ -55,8 +55,20 @@ pub(super) struct FingerprintWindow<'a> {
 /// Host-computed digest; its narrow output is not invented Agent text.
 pub(super) struct ComputedFingerprint(String);
 impl ComputedFingerprint {
-	pub(super) fn legacy_digest(self) -> String {
-		self.0
+	pub(super) fn for_submission(&self) -> &str {
+		&self.0
+	}
+	pub(super) fn line_range(file: &str, line_start: u32, line_end: u32) -> Self {
+		Self(crate::fingerprint::compute(
+			super::SCANNER_ID,
+			file,
+			&format!("L{line_start}-L{line_end}"),
+		))
+	}
+}
+impl serde::Serialize for ComputedFingerprint {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str(&self.0)
 	}
 }
 impl Validate<&[u8], Repo> for FingerprintWindow<'_> {
@@ -81,6 +93,11 @@ pub(super) struct RepoDiffCheck {
 	status: std::process::ExitStatus,
 	diagnostic: String,
 	source: PhantomData<Repo>,
+}
+impl std::fmt::Debug for RepoDiffCheck {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("RepoDiffCheck<Repo>([redacted])")
+	}
 }
 impl Validate<std::process::Output, Repo> for RepoDiffCheckDecoder {
 	type Output = RepoDiffCheck;
@@ -112,11 +129,14 @@ impl Validate<std::process::Output, Repo> for RepoDiffCheckDecoder {
 impl RepoDiffCheck {
 	/// Existing finite sender-facing Git diagnostic egress. This preserves
 	/// rendered UTF-8 truncation; wait_with_output collection remains unbounded.
-	pub(super) fn legacy_tool_diagnostic(self) -> super::DiffCheck {
+	pub(super) fn into_outcome(self) -> super::DiffCheck {
 		if self.status.success() {
 			super::DiffCheck::Applies
 		} else {
-			super::DiffCheck::Rejects { stderr: self.diagnostic }
+			super::DiffCheck::Rejects { stderr: self }
 		}
+	}
+	pub(super) fn for_tool_response(&self) -> &str {
+		&self.diagnostic
 	}
 }

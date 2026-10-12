@@ -37,7 +37,7 @@ pub struct McpContext {
 	pub worker_binary: PathBuf,
 	pub client: Arc<ServerClient>,
 	pub bkb_mcp_path: Option<PathBuf>,
-	pub bkb_api_url: String,
+	pub bkb_api_url: crate::config::ConfiguredText,
 }
 
 /// One invocation's trusted broker. Dropping it aborts an unclaimed
@@ -176,13 +176,13 @@ mod tests {
 				"https://loupe-server:8443".parse().unwrap(),
 			)),
 			bkb_mcp_path: None,
-			bkb_api_url: DEFAULT_BKB_API_URL.into(),
+			bkb_api_url: crate::config::ConfiguredText::Builtin(DEFAULT_BKB_API_URL),
 		}
 	}
 
 	fn test_request() -> LlmRequest {
 		LlmRequest {
-			prompt: "irrelevant".into(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
 			workdir: PathBuf::from("/tmp"),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),

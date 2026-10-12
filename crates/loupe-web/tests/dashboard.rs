@@ -7,19 +7,20 @@
 //! token and the CSRF/rebinding guards, so each of those gets a test that
 //! fails if the guard is removed.
 
+mod support;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::routing::get;
 use axum::{Json, Router};
+use clap::builder::TypedValueParser;
 use loupe_proto::PROTOCOL_VERSION;
+use loupe_server::config::{HostnameParser, PathParser};
 use loupe_server::init::run_init;
 use loupe_server::reporters::github_app::testing::APP_PRIVATE_KEY_PEM;
 use loupe_server::reporters::GithubReporter;
 use loupe_server::{serve as serve_server, AppState, Config};
 use loupe_storage::Db;
-use loupe_tls::Ca;
-use loupe_web::client::AdminClient;
 use loupe_web::guard::REQUEST_HEADER;
 use loupe_web::token::HEADER_NAME as TOKEN_HEADER;
 use loupe_web::{router, Token, WebState};
@@ -112,29 +113,25 @@ impl Fixture {
 async fn bring_up() -> Fixture {
 	let stub_addr = spawn_github_stub().await;
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
+	let command = clap::Command::new("fixture");
+	let data_dir = PathParser.parse_ref(&command, None, tmp.path().as_os_str()).unwrap();
+	let hostname =
+		HostnameParser.parse_ref(&command, None, std::ffi::OsStr::new("loupe-server")).unwrap();
+	let init = run_init(&data_dir, &[hostname], None).unwrap();
 
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
-	)
-	.unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca_cert = init.layout.ca_cert.read_tls_pem().unwrap();
+	let ca_key = init.layout.ca_key.read_tls_pem().unwrap();
+	let ca = ca_cert.import_ca(&ca_key).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_cert).unwrap(),
-		),
-		server_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.server_key).unwrap(),
-		),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(
-			std::fs::read_to_string(&init.layout.ca_key).unwrap(),
-		),
+		server_cert_pem: init.layout.server_cert.read_tls_pem().unwrap(),
+		server_key_pem: init.layout.server_key.read_tls_pem().unwrap(),
+		ca_cert_pem: ca_cert,
+		ca_key_pem: ca_key,
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&format!("http://{stub_addr}")).unwrap());
 	let state = AppState::new(db, Arc::new(ca), reporter);
 	let server = serve_server(cfg, state).await.unwrap();
@@ -157,10 +154,8 @@ async fn bring_up() -> Fixture {
 		.use_rustls_tls()
 		.build()
 		.unwrap();
-	let client = AdminClient::from_parts(
-		upstream.clone(),
-		reqwest::Url::parse("https://loupe-server/").unwrap(),
-	);
+	let client =
+		support::client(upstream.clone(), reqwest::Url::parse("https://loupe-server/").unwrap());
 
 	let token = Token::generate();
 	let token_plain = token.reveal().to_owned();
@@ -233,7 +228,7 @@ async fn the_startup_url_keeps_the_token_out_of_http() {
 	assert_eq!(resp.status(), 200);
 	assert!(resp.headers().get("set-cookie").is_none(), "capabilities must not use cookies");
 
-	// The old query-string bootstrap is deliberately inert: query strings
+	// Query-string tokens are deliberately ignored: query strings
 	// are sent over HTTP and can be logged by intermediaries.
 	let resp = f.http.get(f.url(&format!("/?t={}", f.token))).send().await.unwrap();
 	assert_eq!(resp.status(), 200);
@@ -620,7 +615,7 @@ async fn upstream_errors_reach_the_browser_as_json() {
 #[tokio::test]
 async fn the_dashboard_refuses_to_bind_off_loopback() {
 	let state = {
-		let client = AdminClient::from_parts(
+		let client = support::client(
 			reqwest::Client::new(),
 			reqwest::Url::parse("https://127.0.0.1:8443").unwrap(),
 		);

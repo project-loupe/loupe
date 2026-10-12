@@ -12,7 +12,6 @@ crates/loupe-provenance/kani/mod.rs Kani harness: mints labels for symbolic inpu
 crates/loupe-provenance/src/tests.rs test fixture: mints labels for input the test made up
 crates/loupe-provenance/src/untrusted.rs declares `unsafe fn Ingress::new`, the minting contract (P3)
 crates/loupe-provenance/src/volatile.rs volatile writes that zeroise secrets (P9)
-crates/loupe-core/tests/source_migration.rs test fixture: mints labels for input the test made up
 crates/loupe-storage/tests/support/stored.rs test fixture: mints Db only for original SQLite column reads
 crates/loupe-storage/src/ingress/mod.rs actual original SQLite TEXT/BLOB reads mint Db
 crates/loupe-server/src/auth.rs mints Worker/Operator after active certificate fingerprint authentication
@@ -64,11 +63,11 @@ fuzz/src/worker_network_parsers.rs fuzz entry point: the C entry point takes a r
 fuzz/src/worker_mcp_rpc.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 crates/loupe-web/src/guard.rs actual HTTP request capture mints Browser before guard/token/route validation
 crates/loupe-web/src/ingress/server.rs actual upstream HTTP response capture mints Server before header/body validation
-crates/loupe-web/src/config/input.rs actual native argument/environment and selected PEM/file reads mint Config before named validation
+crates/loupe-web/src/config/input.rs actual native URL/path/PEM parsers and guarded PEM file reads mint Config; selection retains existing owners
 crates/loupe-worker/src/client.rs actual bounded HTTP response capture mints Server before decoding
 crates/loupe-worker/src/config.rs actual configuration file bytes mint Config before TOML decoding
 crates/loupe-worker/src/config_value_parsers.rs actual native argument and environment values mint Config before interpretation
-crates/loupe-worker/src/llm/cli_output.rs actual bounded subprocess pipe bytes mint Sandbox before decoding
+crates/loupe-worker/src/llm/cli_output.rs actual bounded subprocess pipe capture mints Sandbox; separate cfg(test/test-support) synthetic fixed Sandbox fixture grants explicit opt-in test authority
 crates/loupe-worker/src/llm/model_broker.rs actual limited request body and upstream chunks mint Sandbox and Provider before interpretation
 crates/loupe-worker/src/mcp.rs actual framed MCP records mint Sandbox; filesystem and Git observations mint Repo before interpretation
 crates/loupe-worker/src/repo_cache.rs actual cursor file bytes mint Repo before revision decoding
@@ -92,3 +91,15 @@ crates/loupe-worker/src/runner/repo_ingress/fuzz_support.rs cfg-only fixed Repo 
 fuzz/src/worker_client_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_repo_observations.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+crates/loupe-core/src/test_support.rs private unit fixtures mint Agent for synthetic policy and wire inputs
+crates/loupe-core/tests/support/marked.rs integration-only synthetic marks exercise explicit source combinations and carry fences
+crates/loupe-proto/tests/support/fixtures.rs private synthetic Server fixture for serialization and credential wire tests
+crates/loupe-server/src/config/input.rs actual native path/hostname/PEM parser callbacks and guarded PEM file reads mint Config
+crates/loupe-server/src/ingress/router_fuzz.rs cfg-only synthetic Operator registration fixture enters the actual named decoder
+crates/loupe-server/src/reporters/fixtures.rs private unit fixture mints Agent for historical report content; Db values use actual SQLite reads
+crates/loupe-server/src/test_support.rs private unit fixtures mint fixed Agent/Operator/Worker for synthetic original messages
+crates/loupe-server/tests/common/marked.rs integration-only fixed Agent/Repo/Operator fixtures preserve concrete input ownership
+crates/loupe-storage/src/ingress/refs.rs cfg-only synthetic original column fixture mints Db then calls actual stored-reference validator
+crates/loupe-storage/src/test_support.rs private fixed Agent/Db/Config/Repo fixtures for DAO and mixed-source unit controls
+fuzz/src/fixtures.rs private fixed Agent synthetic input fixture for concrete policy and constructor fuzz controls
+crates/loupe-server/kani/mod.rs Kani-only fixed synthetic Db fixture retains the known-spelling Unknown route control through actual bounded validation

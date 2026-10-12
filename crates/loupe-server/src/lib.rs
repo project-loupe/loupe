@@ -18,6 +18,8 @@ pub mod review;
 pub mod router;
 pub mod routes;
 pub mod state;
+#[cfg(test)]
+mod test_support;
 pub mod tls;
 
 pub use config::{Config, FileConfig};

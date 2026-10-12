@@ -1,6 +1,5 @@
-use loupe_core::source_migration::text::BoundedText;
-use loupe_core::source_migration::{Finding, RepoSpec};
-use loupe_core::text::{decode_json_string_bounded, policy};
+use loupe_core::text::{decode_json_string_bounded, policy, BoundedText};
+use loupe_core::{Finding, RepoSpec};
 use loupe_provenance::{Agent, Mark, Secret, Server, Unvalidated};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -210,9 +209,8 @@ pub(super) fn decode(
 		},
 		_ => return Err(DecodeError::Data("unknown response kind")),
 	};
-	// The old internally tagged response buffers its entire original envelope.
-	// Retain that envelope depth and finite-number/Unicode validation after
-	// every designated field has been carried and bounded-decoded.
+	// Validate numbers and Unicode across the entire envelope, including ignored
+	// fields, at their original depth. Bounded field decoding must happen first.
 	let _: DiscardContent = serde_json::from_slice(bytes)?;
 	Ok(result)
 }
@@ -225,51 +223,43 @@ impl DecodedLeaseResponse {
 			},
 			_ => ReviewedRevisionFact::MissingReviewedRevision,
 		};
-		crate::client::LeaseReceipt { response: self.into_legacy(), reviewed_revision }
-	}
-	/// Temporary concrete legacy exit. M moves these marked members into proto.
-	pub(super) fn into_legacy(self) -> loupe_proto::LeaseResponse {
-		match self {
+		let (response, scanner_patch) = match self {
 			Self::Empty { protocol_version } => {
-				loupe_proto::LeaseResponse::Empty { protocol_version }
+				(loupe_proto::LeaseResponse::Empty { protocol_version }, None)
 			},
 			Self::Lease(env) => {
 				let payload = match env.payload {
-					Payload::Scan { since_sha } => loupe_proto::LeasePayload::Scan {
-						since_sha: since_sha.map(|v| v.expose().to_owned()),
-					},
+					Payload::Scan { since_sha } => loupe_proto::LeasePayload::Scan { since_sha },
 					Payload::Verify { finding_id, finding, reviewed_sha } => {
 						loupe_proto::LeasePayload::Verify {
 							finding_id,
-							finding: Box::new(finding::into_legacy_finding(*finding)),
+							finding,
 							reviewed_sha: match reviewed_sha {
 								ReviewedRevisionFact::Available(value) => {
-									Some(value.text().to_owned())
+									Some(value.into_revision())
 								},
 								ReviewedRevisionFact::MissingReviewedRevision => None,
 							},
 						}
 					},
 				};
-				loupe_proto::LeaseResponse::Lease(Box::new(loupe_proto::LeaseEnvelope {
-					protocol_version: env.protocol_version,
-					job_id: env.job_id,
-					job_capability: env.job_capability,
-					repo_id: env.repo_id,
-					repo: loupe_core::RepoSpec {
-						host: env.repo.host.expose().to_owned(),
-						owner: env.repo.owner.expose().to_owned(),
-						repo: env.repo.repo.expose().to_owned(),
-						clone_url: env.repo.clone_url.expose().to_owned(),
-						branch: env.repo.branch.map(|v| v.expose().to_owned()),
-					},
-					head_branch: env.head_branch.map(|v| v.expose().to_owned()),
-					lease_expires_at: env.lease_expires_at,
-					scanner_config: env.scanner_config.into_legacy_value(),
-					github_pat: env.github_pat,
-					payload,
-				}))
+				let patch = env.scanner_config.patch;
+				let response =
+					loupe_proto::LeaseResponse::Lease(Box::new(loupe_proto::LeaseEnvelope {
+						protocol_version: env.protocol_version,
+						job_id: env.job_id,
+						job_capability: env.job_capability,
+						repo_id: env.repo_id,
+						repo: env.repo,
+						head_branch: env.head_branch,
+						lease_expires_at: env.lease_expires_at,
+						scanner_config: env.scanner_config.document,
+						github_pat: env.github_pat,
+						payload,
+					}));
+				(response, patch)
 			},
-		}
+		};
+		crate::client::LeaseReceipt { response, reviewed_revision, scanner_patch }
 	}
 }

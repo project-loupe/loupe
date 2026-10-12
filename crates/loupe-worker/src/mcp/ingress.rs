@@ -4,8 +4,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use loupe_core::source_migration::text::{BoundedText, RepoPath};
-use loupe_core::text::{decode_json_string_bounded, policy, Normalization, TextPolicy, Whitespace};
+use loupe_core::text::{
+	decode_json_string_bounded, policy, BoundedText, Normalization, RepoPath, TextPolicy,
+	Whitespace,
+};
 use loupe_core::Severity;
 use loupe_provenance::{Agent, Mark, Sandbox, Unvalidated, Validate, ValidateCarrying};
 use serde::Deserialize;
@@ -13,7 +15,7 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 
 use crate::ingress_text::{json_text, token_range, DecodeError, DiscardContent};
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 pub(super) mod fuzz_support;
 
 #[derive(Debug, thiserror::Error)]
@@ -114,13 +116,13 @@ pub(super) struct DecodedFindingArgs {
 	pub(super) cwe: Option<BoundedText<policy::CweText, Agent>>,
 }
 pub(super) struct DecodedVerdictArgs {
-	pub(super) verdict: loupe_core::source_migration::Verdict<Agent>,
+	pub(super) verdict: loupe_core::Verdict<Agent>,
 }
 pub(super) struct DecodedPatchArgs {
-	pub(super) patch: loupe_core::source_migration::VerdictPatch<Agent>,
+	pub(super) patch: loupe_core::VerdictPatch<Agent>,
 }
 
-pub(super) struct QueryText;
+pub struct QueryText;
 impl TextPolicy for QueryText {
 	const FIELD: &'static str = "query";
 	const MAX_BYTES: usize = policy::LEGACY_TEXT_MAX_BYTES;
@@ -294,7 +296,7 @@ fn arguments(
 			Arguments::ValidatePatch(carry!(u, required(&fields, "patch_unified")?, AgentPatch))
 		},
 		ToolName::Patch => Arguments::Patch(DecodedPatchArgs {
-			patch: loupe_core::source_migration::VerdictPatch {
+			patch: loupe_core::VerdictPatch {
 				patch_unified: carry!(u, required(&fields, "patch_unified")?, AgentPatch),
 				notes: carry!(u, required(&fields, "notes")?, AgentPatchNotes),
 			},
@@ -303,14 +305,14 @@ fn arguments(
 			let kind = scalar_string(required(&fields, "verdict")?)?;
 			let notes = required(&fields, "notes")?;
 			let verdict = match kind.as_str() {
-				"confirmed" => loupe_core::source_migration::Verdict::Confirmed {
+				"confirmed" => loupe_core::Verdict::Confirmed {
 					notes: Some(carry!(u, notes, AgentVerdictNotes)),
 					patch: None,
 				},
-				"dismissed" => loupe_core::source_migration::Verdict::Dismissed {
+				"dismissed" => loupe_core::Verdict::Dismissed {
 					notes: Some(carry!(u, notes, AgentVerdictNotes)),
 				},
-				"inconclusive" => loupe_core::source_migration::Verdict::Inconclusive {
+				"inconclusive" => loupe_core::Verdict::Inconclusive {
 					reason: carry!(u, notes, AgentVerdictReason),
 					terminal: false,
 				},
@@ -443,51 +445,61 @@ impl ValidateCarrying<&[u8], Sandbox> for McpRequestDecoder {
 }
 
 impl DecodedFindingArgs {
-	/// Temporary mixed-source submission projection. Scanner identity is static;
-	/// the computed digest is a host result, and neither receives an Agent mint.
-	pub(super) fn into_legacy_submission(
-		self, workdir: &std::path::Path,
-	) -> Result<loupe_proto::LlmFindingSubmission> {
-		let file = super::normalize_submitted_file(workdir, self.file.expose())?;
-		let fingerprint = super::fingerprint_for(workdir, &file, self.line_start, self.line_end);
-		Ok(loupe_proto::LlmFindingSubmission {
+	/// Retain the first owner's normalized Agent path and separate Repo membership.
+	pub(super) fn into_submission(self, workdir: &std::path::Path) -> Result<McpFindingSubmission> {
+		let membership = super::check_submitted_membership(workdir, &self.file)?;
+		let fingerprint =
+			super::fingerprint_for(workdir, self.file.expose(), self.line_start, self.line_end);
+		Ok(McpFindingSubmission {
 			protocol_version: loupe_proto::PROTOCOL_VERSION,
 			severity: self.severity,
-			title: self.title.expose().to_owned(),
-			description: self.description.expose().to_owned(),
-			file_path: file,
+			title: self.title,
+			description: self.description,
+			file_path: self.file,
 			line_start: self.line_start,
 			line_end: self.line_end,
-			cwe: self.cwe.map(|v| v.expose().to_owned()),
-			poc_unified: self.poc_unified.expose().to_owned(),
+			cwe: self.cwe,
+			poc_unified: self.poc_unified,
 			fingerprint,
+			_membership: membership,
 		})
 	}
 }
-impl DecodedVerdictArgs {
-	pub(super) fn into_legacy_submission(self) -> loupe_core::Verdict {
-		match self.verdict {
-			loupe_core::source_migration::Verdict::Confirmed { notes, patch: _ } => {
-				loupe_core::Verdict::Confirmed {
-					notes: notes.map(|v| v.expose().to_owned()),
-					patch: None,
-				}
-			},
-			loupe_core::source_migration::Verdict::Dismissed { notes } => {
-				loupe_core::Verdict::Dismissed { notes: notes.map(|v| v.expose().to_owned()) }
-			},
-			loupe_core::source_migration::Verdict::Inconclusive { reason, terminal } => {
-				loupe_core::Verdict::Inconclusive { reason: reason.expose().to_owned(), terminal }
-			},
-		}
+
+/// The computed fingerprint is host output; content remains Agent through HTTP.
+#[derive(serde::Serialize)]
+pub(crate) struct McpFindingSubmission {
+	protocol_version: u16,
+	pub(super) severity: Severity,
+	pub(super) title: BoundedText<policy::FindingTitle, Agent>,
+	pub(super) description: BoundedText<policy::FindingDescription, Agent>,
+	pub(super) file_path: RepoPath<Agent>,
+	pub(super) line_start: u32,
+	pub(super) line_end: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(super) cwe: Option<BoundedText<policy::CweText, Agent>>,
+	pub(super) poc_unified: BoundedText<policy::PocUnified, Agent>,
+	pub(super) fingerprint: super::repo_ingress::ComputedFingerprint,
+	#[serde(skip)]
+	_membership: Option<super::repo_ingress::ObservedSubmittedPath>,
+}
+impl McpFindingSubmission {
+	pub(super) fn validate(&self) -> Result<(), String> {
+		loupe_proto::validate_llm_finding(&loupe_proto::LlmFindingValidation {
+			title: &self.title,
+			description: &self.description,
+			file_path: &self.file_path,
+			line_start: self.line_start,
+			line_end: self.line_end,
+			cwe: self.cwe.as_ref(),
+			poc_unified: &self.poc_unified,
+			fingerprint: self.fingerprint.for_submission(),
+		})
 	}
 }
-impl DecodedPatchArgs {
-	pub(super) fn into_legacy_submission(self) -> loupe_core::VerdictPatch {
-		loupe_core::VerdictPatch {
-			patch_unified: self.patch.patch_unified.expose().to_owned(),
-			notes: self.patch.notes.expose().to_owned(),
-		}
+impl std::fmt::Debug for McpFindingSubmission {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("McpFindingSubmission([redacted])")
 	}
 }
 

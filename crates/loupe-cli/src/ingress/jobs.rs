@@ -31,43 +31,15 @@ struct RawJob<'a> {
 	#[serde(default, borrow)]
 	error: Option<&'a RawValue>,
 }
-enum ServerKind {
-	Scan,
-	Verify,
-	Survey,
-	Drilldown,
-	Unknown(BoundedText<JobKindName, Server>),
-}
-impl ServerKind {
-	fn legacy(self) -> JobKind {
-		match self {
-			Self::Scan => JobKind::Scan,
-			Self::Verify => JobKind::Verify,
-			Self::Survey => JobKind::Survey,
-			Self::Drilldown => JobKind::Drilldown,
-			Self::Unknown(s) => JobKind::Unknown(s.expose().to_owned()),
-		}
-	}
-}
-fn job_kind(mark: &Mark<'_, Server>, raw: &RawValue) -> Result<ServerKind> {
-	let text = kind(mark, raw)?;
-	Ok(match text.expose() {
-		"scan" => ServerKind::Scan,
-		"verify" => ServerKind::Verify,
-		"survey" => ServerKind::Survey,
-		"drilldown" => ServerKind::Drilldown,
-		_ => ServerKind::Unknown(text),
-	})
-}
-fn job_info_legacy(mark: &Mark<'_, Server>, r: RawJob<'_>) -> Result<loupe_proto::JobInfo> {
+fn job_info(mark: &Mark<'_, Server>, r: RawJob<'_>) -> Result<loupe_proto::JobInfo<Server>> {
 	Ok(loupe_proto::JobInfo {
 		job_id: r.job_id,
 		repo_id: r.repo_id,
-		kind: job_kind(mark, r.kind)?.legacy(),
+		kind: JobKind::from_text(kind(mark, r.kind)?),
 		state: r.state,
 		incremental: r.incremental,
-		since_sha: r.since_sha.map(|t| revision_legacy(mark, t)).transpose()?,
-		head_sha: r.head_sha.map(|t| revision_legacy(mark, t)).transpose()?,
+		since_sha: r.since_sha.map(|t| revision(mark, t)).transpose()?,
+		head_sha: r.head_sha.map(|t| revision(mark, t)).transpose()?,
 		parent_job_id: r.parent_job_id,
 		target_finding_id: r.target_finding_id,
 		attempts: r.attempts,
@@ -76,46 +48,48 @@ fn job_info_legacy(mark: &Mark<'_, Server>, r: RawJob<'_>) -> Result<loupe_proto
 		lease_expires_at: r.lease_expires_at,
 		started_at: r.started_at,
 		finished_at: r.finished_at,
-		error: r.error.map(|t| diagnostic_legacy(mark, t)).transpose()?,
+		error: r.error.map(|t| diagnostic(mark, t)).transpose()?,
 	})
 }
 macro_rules! job_decoder {
 	($name:ident, $validator:ident) => {
 		struct $validator;
 		impl Validate<&[u8], Server> for $validator {
-			type Output = loupe_proto::JobInfo;
+			type Output = loupe_proto::JobInfo<Server>;
 			type Error = anyhow::Error;
 			fn validate<'v>(
 				self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
 			) -> Result<Self::Output> {
 				let raw: RawJob<'_> = serde_json::from_slice(u.get()).map_err(|_| invalid())?;
-				job_info_legacy(&mark, raw)
+				job_info(&mark, raw)
 			}
 		}
-		pub(crate) fn $name(body: Untrusted<Bytes, Server>) -> Result<loupe_proto::JobInfo> {
+		pub(crate) fn $name(
+			body: Untrusted<Bytes, Server>,
+		) -> Result<loupe_proto::JobInfo<Server>> {
 			#[cfg(fuzzing)]
 			entered(Entry::$validator);
 			body.as_bytes().validate($validator)
 		}
 	};
 }
-job_decoder!(get_job_legacy, GetJob);
-job_decoder!(retry_job_legacy, RetryJob);
-job_decoder!(cancel_job_legacy, CancelJob);
+job_decoder!(get_job, GetJob);
+job_decoder!(retry_job, RetryJob);
+job_decoder!(cancel_job, CancelJob);
 struct ListJobs;
 impl Validate<&[u8], Server> for ListJobs {
-	type Output = Vec<loupe_proto::JobInfo>;
+	type Output = Vec<loupe_proto::JobInfo<Server>>;
 	type Error = anyhow::Error;
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
 	) -> Result<Self::Output> {
 		let raw: Vec<RawJob<'_>> = serde_json::from_slice(u.get()).map_err(|_| invalid())?;
-		raw.into_iter().map(|r| job_info_legacy(&mark, r)).collect()
+		raw.into_iter().map(|r| job_info(&mark, r)).collect()
 	}
 }
-pub(crate) fn list_jobs_legacy(
+pub(crate) fn list_jobs(
 	body: Untrusted<Bytes, Server>,
-) -> Result<Vec<loupe_proto::JobInfo>> {
+) -> Result<Vec<loupe_proto::JobInfo<Server>>> {
 	#[cfg(fuzzing)]
 	entered(Entry::ListJobs);
 	body.as_bytes().validate(ListJobs)

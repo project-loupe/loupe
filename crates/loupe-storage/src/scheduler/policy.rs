@@ -2,6 +2,7 @@
 use loupe_core::text::policy::Payload;
 use loupe_core::text::BoundedJson;
 use loupe_core::JobKind;
+use loupe_provenance::Source;
 use serde::{Deserialize, Serialize};
 
 use crate::{Conflict, Error, Result};
@@ -60,7 +61,7 @@ pub struct PhasePolicy {
 }
 
 impl CampaignPolicy {
-	pub fn from_snapshot(snapshot: &BoundedJson<Payload>) -> Result<Self> {
+	pub fn from_snapshot<S: Source>(snapshot: &BoundedJson<Payload, S>) -> Result<Self> {
 		let policy: Self = serde_json::from_str(snapshot.expose())
 			.map_err(|_| Error::Conflict(Conflict::CampaignPolicy))?;
 		let valid = policy.version == 1
@@ -71,7 +72,7 @@ impl CampaignPolicy {
 			&& policy.campaign_handoff_reserve < policy.campaign_max_jobs
 			&& policy.retry_backoff_base_seconds >= 1
 			&& policy.retry_backoff_base_seconds <= policy.retry_backoff_cap_seconds
-			&& [JobKind::Survey, JobKind::Drilldown, JobKind::Verify].iter().all(|kind| {
+			&& [JobKind::<S>::Survey, JobKind::Drilldown, JobKind::Verify].iter().all(|kind| {
 				let phase = policy.phase(kind).expect("known phase");
 				phase.deadline_seconds > 0
 					&& phase.submit_margin_seconds >= 0
@@ -86,7 +87,7 @@ impl CampaignPolicy {
 		}
 	}
 
-	pub fn phase(&self, kind: &JobKind) -> Result<PhasePolicy> {
+	pub fn phase<S: Source>(&self, kind: &JobKind<S>) -> Result<PhasePolicy> {
 		let (deadline_seconds, submit_margin_seconds, token_budget) = match kind {
 			JobKind::Survey => (
 				self.survey_deadline_seconds,

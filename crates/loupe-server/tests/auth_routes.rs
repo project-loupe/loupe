@@ -7,9 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_proto::{
-	RegisterWorkerRequest, RegisterWorkerResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-};
+use common::wire::{RegisterWorkerRequest, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
@@ -17,6 +15,7 @@ use loupe_tls::Ca;
 
 mod common;
 use common::{pem_to_certificate, pem_to_identity};
+use loupe_proto::RegisterWorkerResponse;
 
 fn client(ca_cert_pem: &str, cert_pem: &str, key_pem: &str, addr: SocketAddr) -> reqwest::Client {
 	reqwest::Client::builder()
@@ -42,31 +41,37 @@ async fn bring_up() -> Fixture {
 
 async fn bring_up_with_mixed_ca(mixed: bool) -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
+	let init = run_init(
+		&common::config_path(tmp.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
+	)
+	.unwrap();
 
-	let mut ca_input = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let mut ca_input = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 	if mixed {
 		ca_input.push_str(init.ca_key_pem.expose());
 	}
 	let ca =
-		Ca::from_pem(&ca_input, &std::fs::read_to_string(&init.layout.ca_key).unwrap()).unwrap();
+		Ca::from_pem(&ca_input, &std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap())
+			.unwrap();
 
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
 	let ca_cert_pem = ca_input;
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 	let admin_cert_pem = init.admin_bundle.cert_pem.clone();
 	let admin_key_pem = init.admin_bundle.key_pem.expose().to_owned();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
-		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let state = AppState::new(
 		db,
 		Arc::new(ca),

@@ -1,5 +1,7 @@
+use loupe_core::text::policy::*;
+use loupe_core::text::BoundedText;
 use loupe_core::ReportingDestination;
-use loupe_provenance::Secret;
+use loupe_provenance::{Secret, Source};
 use serde::{Deserialize, Serialize};
 
 use crate::version::PROTOCOL_VERSION;
@@ -10,15 +12,15 @@ use crate::version::PROTOCOL_VERSION;
 /// `loupe_core::ReportingDestination` referencing the resulting
 /// `pat_secret_id`. PAT material never travels back out of the server
 /// in any response.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ReportingSetup {
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
+pub enum ReportingSetup<S: Source> {
 	/// File issues on `target_owner/target_repo`. Without `github_pat`
 	/// the server files them through its configured GitHub App and
 	/// rejects the registration if no app is configured.
 	GithubIssue {
-		target_owner: String,
-		target_repo: String,
+		target_owner: BoundedText<RepoOwner, S>,
+		target_repo: BoundedText<RepoName, S>,
 		#[serde(
 			default,
 			skip_serializing_if = "Option::is_none",
@@ -29,11 +31,11 @@ pub enum ReportingSetup {
 	/// Send findings as email via the server's `sendmail` binary. No
 	/// secret material is required — the binary handles transport.
 	Email {
-		to: Vec<String>,
+		to: Vec<BoundedText<MailAddress, S>>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		from: Option<String>,
+		from: Option<BoundedText<MailAddress, S>>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		subject_prefix: Option<String>,
+		subject_prefix: Option<BoundedText<MailSubjectPrefix, S>>,
 	},
 	/// No automatic reporter. The server runs the scan, verification,
 	/// and approval pipeline as usual, but confirmed findings remain
@@ -43,17 +45,18 @@ pub enum ReportingSetup {
 }
 
 /// Body of `POST /v1/repos`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RegisterRepoRequest {
+#[derive(Debug, Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct RegisterRepoRequest<S: Source> {
 	pub protocol_version: u16,
-	pub clone_url: String,
+	pub clone_url: BoundedText<CloneUrl, S>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub branch: Option<String>,
+	pub branch: Option<BoundedText<GitBranch, S>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub scan_interval_seconds: Option<u64>,
-	pub reporting: ReportingSetup,
-	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-	pub scanner_config: serde_json::Value,
+	pub reporting: ReportingSetup<S>,
+	#[serde(skip_serializing_if = "scanner_document_is_absent")]
+	pub scanner_config: Option<crate::ScannerDocument<S>>,
 	/// Per-repo override of the verify flow. `None` (the default on
 	/// the wire) means "inherit the server's
 	/// `verification_default`". `Some(true)` / `Some(false)`
@@ -68,15 +71,22 @@ pub struct RegisterRepoRequest {
 	pub require_approval: Option<bool>,
 }
 
-impl RegisterRepoRequest {
-	pub fn new(clone_url: impl Into<String>, reporting: ReportingSetup) -> Self {
+fn scanner_document_is_absent<S: Source>(document: &Option<crate::ScannerDocument<S>>) -> bool {
+	document.as_ref().is_none_or(crate::ScannerDocument::is_null)
+}
+
+impl<S: Source> RegisterRepoRequest<S> {
+	pub fn new(
+		clone_url: BoundedText<CloneUrl, S>, reporting: ReportingSetup<S>,
+		scanner_config: Option<crate::ScannerDocument<S>>,
+	) -> Self {
 		Self {
 			protocol_version: PROTOCOL_VERSION,
-			clone_url: clone_url.into(),
+			clone_url,
 			branch: None,
 			scan_interval_seconds: None,
 			reporting,
-			scanner_config: serde_json::Value::Null,
+			scanner_config,
 			verification_enabled: None,
 			require_approval: None,
 		}
@@ -99,11 +109,12 @@ pub struct RotateRepoPatRequest {
 
 /// Body of `PUT /v1/repos/:id/reporting/github`. Omitting `github_pat`
 /// switches the repo to the server's GitHub App.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SetRepoGithubReportingRequest {
+#[derive(Debug, Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct SetRepoGithubReportingRequest<S: Source> {
 	pub protocol_version: u16,
-	pub target_owner: String,
-	pub target_repo: String,
+	pub target_owner: BoundedText<RepoOwner, S>,
+	pub target_repo: BoundedText<RepoName, S>,
 	#[serde(
 		default,
 		skip_serializing_if = "Option::is_none",
@@ -135,20 +146,24 @@ impl std::fmt::Debug for SetGithubAppRequest {
 }
 
 /// Non-secret view of the configured GitHub App.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GithubAppSummary {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct GithubAppSummary<S: Source> {
 	pub app_id: u64,
-	pub slug: String,
+	pub slug: BoundedText<GithubAppSlug, S>,
 }
+record_impls!(GithubAppSummary<S> { app_id, slug });
 
 /// Response body of `GET /v1/github-app`. `app` is `None` until an
 /// operator stores a credential.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GithubAppResponse {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct GithubAppResponse<S: Source> {
 	pub protocol_version: u16,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub app: Option<GithubAppSummary>,
+	pub app: Option<GithubAppSummary<S>>,
 }
+record_impls!(GithubAppResponse<S> { protocol_version, app });
 
 /// Body of `PATCH /v1/repos/:id`. All fields are optional — only the
 /// ones present in the JSON are applied. `disabled = Some(true)` stamps
@@ -181,11 +196,13 @@ pub struct UpdateRepoRequest {
 /// [`ReportingSummary`] rather than the storage-only
 /// `loupe_core::ReportingDestination`, so clients learn *which* reporter
 /// a repo uses without ever seeing `pat_secret_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListReposResponse {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct ListReposResponse<S: Source> {
 	pub protocol_version: u16,
-	pub repos: Vec<RepoSummary>,
+	pub repos: Vec<RepoSummary<S>>,
 }
+record_impls!(ListReposResponse<S> { protocol_version, repos });
 
 /// Which credential a GitHub issue destination files issues with.
 ///
@@ -209,27 +226,62 @@ pub enum GithubReportingAuth {
 /// is only meaningful for a PAT-backed `GithubIssue`, and the server 400s
 /// a rotation attempt against anything else — but the storage-side secret
 /// id has no meaning off the server and must never leave it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ReportingSummary {
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
+pub enum ReportingSummary<S: Source> {
 	GithubIssue {
-		target_owner: String,
-		target_repo: String,
+		target_owner: BoundedText<RepoOwner, S>,
+		target_repo: BoundedText<RepoName, S>,
 		#[serde(default)]
 		auth: GithubReportingAuth,
 	},
 	Email {
-		to: Vec<String>,
+		to: Vec<BoundedText<MailAddress, S>>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		from: Option<String>,
+		from: Option<BoundedText<MailAddress, S>>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		subject_prefix: Option<String>,
+		subject_prefix: Option<BoundedText<MailSubjectPrefix, S>>,
 	},
 	Manual,
 }
 
-impl From<&ReportingDestination> for ReportingSummary {
-	fn from(dest: &ReportingDestination) -> Self {
+impl<S: Source> Clone for ReportingSummary<S> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::GithubIssue { target_owner, target_repo, auth } => Self::GithubIssue {
+				target_owner: target_owner.clone(),
+				target_repo: target_repo.clone(),
+				auth: *auth,
+			},
+			Self::Email { to, from, subject_prefix } => Self::Email {
+				to: to.clone(),
+				from: from.clone(),
+				subject_prefix: subject_prefix.clone(),
+			},
+			Self::Manual => Self::Manual,
+		}
+	}
+}
+impl<S: Source> PartialEq for ReportingSummary<S> {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(
+				Self::GithubIssue { target_owner: a, target_repo: b, auth: c },
+				Self::GithubIssue { target_owner: x, target_repo: y, auth: z },
+			) => a == x && b == y && c == z,
+			(
+				Self::Email { to: a, from: b, subject_prefix: c },
+				Self::Email { to: x, from: y, subject_prefix: z },
+			) => a == x && b == y && c == z,
+			(Self::Manual, Self::Manual) => true,
+			_ => false,
+		}
+	}
+}
+impl<S: Source> Eq for ReportingSummary<S> {}
+
+impl<S: Source> From<&ReportingDestination<S>> for ReportingSummary<S> {
+	fn from(dest: &ReportingDestination<S>) -> Self {
 		// Destructured field-by-field on purpose: no `..` rest pattern, so
 		// adding a field to `ReportingDestination` fails to compile here
 		// and forces a deliberate "does this belong on the wire?" call
@@ -255,15 +307,16 @@ impl From<&ReportingDestination> for ReportingSummary {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoSummary {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct RepoSummary<S: Source> {
 	pub id: i64,
-	pub clone_url: String,
-	pub host: String,
-	pub owner: String,
-	pub repo: String,
+	pub clone_url: BoundedText<CloneUrl, S>,
+	pub host: BoundedText<RepoHost, S>,
+	pub owner: BoundedText<RepoOwner, S>,
+	pub repo: BoundedText<RepoName, S>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub default_branch: Option<String>,
+	pub default_branch: Option<BoundedText<GitBranch, S>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub scan_interval_seconds: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,7 +325,7 @@ pub struct RepoSummary {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub require_approval: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub last_scanned_sha: Option<String>,
+	pub last_scanned_sha: Option<BoundedText<RevisionText, S>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_scanned_at: Option<i64>,
 	pub created_at: i64,
@@ -281,17 +334,20 @@ pub struct RepoSummary {
 	/// against a newer protocol must still deserialize responses from a
 	/// server that predates it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub reporting: Option<ReportingSummary>,
+	pub reporting: Option<ReportingSummary<S>>,
 }
+record_impls!(RepoSummary<S> { id, clone_url, host, owner, repo, default_branch, scan_interval_seconds, disabled_at, verification_enabled, require_approval, last_scanned_sha, last_scanned_at, created_at, reporting });
 
 /// Body of `POST /v1/workers` (admin-only). Returns the freshly-minted
 /// client cert + key + the CA cert; this is the **only** time the client
 /// key leaves the server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegisterWorkerRequest {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct RegisterWorkerRequest<S: Source> {
 	pub protocol_version: u16,
-	pub name: String,
+	pub name: BoundedText<WorkerName, S>,
 }
+record_impls!(RegisterWorkerRequest<S> { protocol_version, name });
 
 /// The registration's private key has a single owning allocation.
 ///
@@ -317,9 +373,15 @@ pub struct RegisterWorkerResponse {
 
 #[cfg(test)]
 mod tests {
+	use loupe_provenance::Server;
 	use serde_json::json;
 
 	use super::*;
+	use crate::test_support::{scanner, text};
+	type RepoSummary = super::RepoSummary<Server>;
+	type ReportingSummary = super::ReportingSummary<Server>;
+	type ReportingSetup = super::ReportingSetup<Server>;
+	type ReportingDestination = loupe_core::ReportingDestination<Server>;
 
 	#[test]
 	fn credential_app_request_debug_redacts_private_pem() {
@@ -346,65 +408,96 @@ mod tests {
 		assert_eq!(serde_json::to_value(&request).unwrap(), wire);
 	}
 	#[test]
-	fn register_repo_request_round_trips() {
+	fn register_repo_request_preserves_every_wire_field() {
 		let req = RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
-			clone_url: "https://github.com/acme/widget.git".into(),
-			branch: Some("main".into()),
+			clone_url: text("https://github.com/acme/widget.git"),
+			branch: Some(text("main")),
 			scan_interval_seconds: Some(3600),
 			reporting: ReportingSetup::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "security".into(),
+				target_owner: text("acme"),
+				target_repo: text("security"),
 				github_pat: Some(loupe_provenance::Secret::new("ghp_xxx".into())),
 			},
-			scanner_config: json!({"regex": {"enabled": true}}),
+			scanner_config: Some(scanner(json!({"regex": {"enabled": true}}))),
 			verification_enabled: Some(true),
 			require_approval: Some(false),
 		};
 		let s = serde_json::to_string(&req).unwrap();
-		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
-		assert_eq!(req.protocol_version, back.protocol_version);
-		assert_eq!(req.clone_url, back.clone_url);
-		assert_eq!(req.branch, back.branch);
-		assert_eq!(req.scan_interval_seconds, back.scan_interval_seconds);
-		assert_eq!(req.scanner_config, back.scanner_config);
-		assert_eq!(req.verification_enabled, back.verification_enabled);
-		assert_eq!(req.require_approval, back.require_approval);
-		let (
-			ReportingSetup::GithubIssue { target_owner, target_repo, github_pat },
-			ReportingSetup::GithubIssue { target_owner: owner, target_repo: repo, github_pat: pat },
-		) = (&req.reporting, &back.reporting)
-		else {
-			panic!("expected GitHub reporting");
-		};
-		assert_eq!(target_owner, owner);
-		assert_eq!(target_repo, repo);
-		assert_eq!(github_pat.as_ref().map(Secret::expose), pat.as_ref().map(Secret::expose));
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"protocol_version":PROTOCOL_VERSION,"clone_url":"https://github.com/acme/widget.git",
+				"branch":"main","scan_interval_seconds":3600,
+				"reporting":{"kind":"github_issue","target_owner":"acme","target_repo":"security","github_pat":"ghp_xxx"},
+				"scanner_config":{"regex":{"enabled":true}},"verification_enabled":true,"require_approval":false
+			})
+		);
 		// Sanity check: the wire form does not leak `pat_secret_id`.
 		assert!(!s.contains("pat_secret_id"));
 	}
 
 	#[test]
 	fn register_repo_request_omits_inherited_verification_default() {
-		let req =
-			RegisterRepoRequest::new("https://github.com/acme/widget.git", ReportingSetup::Manual);
+		let req = RegisterRepoRequest::new(
+			text("https://github.com/acme/widget.git"),
+			ReportingSetup::Manual,
+			None,
+		);
 		let s = serde_json::to_string(&req).unwrap();
 		assert!(
 			!s.contains("verification_enabled"),
 			"verification default should be inherited unless pinned: {s}"
 		);
-		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
-		assert_eq!(back.verification_enabled, None);
+		assert_eq!(req.verification_enabled, None);
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"protocol_version":PROTOCOL_VERSION,"clone_url":"https://github.com/acme/widget.git","reporting":{"kind":"manual"}
+			})
+		);
+	}
+
+	#[test]
+	fn registration_scanner_presence_preserves_wire_omission() {
+		// None represents host absence without manufacturing a source mark.
+		// An explicitly sourced null document retains its existing omission;
+		// other sourced JSON values must survive even when false or empty.
+		for (document, expected) in [
+			(None, None),
+			(Some(scanner(serde_json::Value::Null)), None),
+			(Some(scanner(json!({}))), Some(json!({}))),
+			(Some(scanner(json!(false))), Some(json!(false))),
+		] {
+			let request = RegisterRepoRequest::new(
+				text("https://github.com/acme/widget.git"),
+				ReportingSetup::Manual,
+				document,
+			);
+			let mut wire = json!({"protocol_version":PROTOCOL_VERSION,
+				"clone_url":"https://github.com/acme/widget.git","reporting":{"kind":"manual"}});
+			if let Some(value) = expected {
+				wire["scanner_config"] = value;
+			}
+			assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+			assert_eq!(
+				serde_json::from_slice::<serde_json::Value>(
+					request.credential_json().unwrap().expose()
+				)
+				.unwrap(),
+				wire
+			);
+		}
 	}
 
 	fn summary_with_reporting(reporting: Option<ReportingSummary>) -> RepoSummary {
 		RepoSummary {
 			id: 1,
-			clone_url: "https://github.com/acme/widget.git".into(),
-			host: "github.com".into(),
-			owner: "acme".into(),
-			repo: "widget".into(),
-			default_branch: Some("main".into()),
+			clone_url: text("https://github.com/acme/widget.git"),
+			host: text("github.com"),
+			owner: text("acme"),
+			repo: text("widget"),
+			default_branch: Some(text("main")),
 			scan_interval_seconds: Some(3600),
 			disabled_at: None,
 			verification_enabled: true,
@@ -419,16 +512,16 @@ mod tests {
 	#[test]
 	fn reporting_summary_drops_the_pat_secret_id() {
 		let dest = ReportingDestination::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "tracker".into(),
+			target_owner: text("acme"),
+			target_repo: text("tracker"),
 			pat_secret_id: Some(7),
 		};
 		let summary = ReportingSummary::from(&dest);
 		assert_eq!(
 			summary,
 			ReportingSummary::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "tracker".into(),
+				target_owner: text("acme"),
+				target_repo: text("tracker"),
 				auth: GithubReportingAuth::Pat,
 			}
 		);
@@ -446,16 +539,16 @@ mod tests {
 	#[test]
 	fn reporting_summary_reports_app_mode_for_pat_less_destinations() {
 		let dest = ReportingDestination::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "tracker".into(),
+			target_owner: text("acme"),
+			target_repo: text("tracker"),
 			pat_secret_id: None,
 		};
 		let summary = ReportingSummary::from(&dest);
 		assert_eq!(
 			summary,
 			ReportingSummary::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "tracker".into(),
+				target_owner: text("acme"),
+				target_repo: text("tracker"),
 				auth: GithubReportingAuth::App,
 			}
 		);
@@ -464,84 +557,77 @@ mod tests {
 	}
 
 	#[test]
-	fn reporting_summary_without_auth_reads_as_pat() {
-		// `auth` is additive: a listing from a server predating GitHub App
-		// support omits it, and every such repo used a PAT.
-		let legacy = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"tracker"}"#;
-		let summary: ReportingSummary = serde_json::from_str(legacy).unwrap();
-		assert_eq!(
-			summary,
-			ReportingSummary::GithubIssue {
-				target_owner: "acme".into(),
-				target_repo: "tracker".into(),
-				auth: GithubReportingAuth::Pat,
-			}
-		);
+	fn reporting_auth_default_is_pat() {
+		// The CLI's named listing decoder owns omission -> default admission.
 		assert_eq!(GithubReportingAuth::default(), GithubReportingAuth::Pat);
 	}
 
 	#[test]
-	fn reporting_setup_without_a_pat_means_github_app() {
-		// Older clients always send `github_pat`; newer ones leave it out
-		// to request app-mode reporting. Both shapes must parse.
-		let with_pat = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"t","github_pat":"ghp_x"}"#;
-		let without_pat = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"t"}"#;
-		let parsed: ReportingSetup = serde_json::from_str(with_pat).unwrap();
-		assert!(
-			matches!(parsed, ReportingSetup::GithubIssue { github_pat: Some(ref p), .. } if p.expose() == "ghp_x")
-		);
-		let parsed: ReportingSetup = serde_json::from_str(without_pat).unwrap();
-		assert!(matches!(parsed, ReportingSetup::GithubIssue { github_pat: None, .. }));
-
+	fn reporting_setup_without_a_pat_omits_the_wire_field() {
+		// Server input omission/null behavior belongs to its named decoder.
 		let setup = ReportingSetup::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "t".into(),
+			target_owner: text("acme"),
+			target_repo: text("t"),
 			github_pat: None,
 		};
 		let s = serde_json::to_string(&setup).unwrap();
 		assert!(!s.contains("github_pat"), "app mode must not send a null PAT: {s}");
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"kind":"github_issue","target_owner":"acme","target_repo":"t"
+			})
+		);
 	}
 
 	#[test]
 	fn reporting_summary_preserves_email_and_manual() {
 		let email = ReportingDestination::Email {
-			to: vec!["sec@acme.test".into()],
-			from: Some("loupe@acme.test".into()),
-			subject_prefix: Some("[loupe]".into()),
+			to: vec![text("sec@acme.test")],
+			from: Some(text("loupe@acme.test")),
+			subject_prefix: Some(text("[loupe]")),
 		};
 		assert_eq!(
 			ReportingSummary::from(&email),
 			ReportingSummary::Email {
-				to: vec!["sec@acme.test".into()],
-				from: Some("loupe@acme.test".into()),
-				subject_prefix: Some("[loupe]".into()),
+				to: vec![text("sec@acme.test")],
+				from: Some(text("loupe@acme.test")),
+				subject_prefix: Some(text("[loupe]")),
 			}
 		);
 		assert_eq!(ReportingSummary::from(&ReportingDestination::Manual), ReportingSummary::Manual);
 	}
 
 	#[test]
-	fn repo_summary_round_trips_with_reporting() {
+	fn repo_summary_preserves_every_wire_field_with_reporting() {
 		let summary = summary_with_reporting(Some(ReportingSummary::GithubIssue {
-			target_owner: "acme".into(),
-			target_repo: "tracker".into(),
+			target_owner: text("acme"),
+			target_repo: text("tracker"),
 			auth: GithubReportingAuth::App,
 		}));
 		let s = serde_json::to_string(&summary).unwrap();
-		let back: RepoSummary = serde_json::from_str(&s).unwrap();
-		assert_eq!(summary, back);
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"id":1,"clone_url":"https://github.com/acme/widget.git","host":"github.com","owner":"acme","repo":"widget",
+				"default_branch":"main","scan_interval_seconds":3600,"verification_enabled":true,"created_at":42,
+				"reporting":{"kind":"github_issue","target_owner":"acme","target_repo":"tracker","auth":"app"}
+			})
+		);
 		assert!(!s.contains("pat_secret_id"));
 	}
 
 	#[test]
-	fn repo_summary_tolerates_a_response_without_reporting() {
-		// `reporting` is additive, so a client built against this protocol
-		// must still read a response from a server that never sends it.
+	fn repo_summary_omits_absent_reporting() {
+		// CLI input admission of missing reporting is checked by its named decoder.
 		let summary = summary_with_reporting(None);
 		let s = serde_json::to_string(&summary).unwrap();
 		assert!(!s.contains("reporting"), "absent reporting should not be serialized: {s}");
-		let back: RepoSummary = serde_json::from_str(&s).unwrap();
-		assert_eq!(back.reporting, None);
+		assert!(!serde_json::from_str::<serde_json::Value>(&s)
+			.unwrap()
+			.as_object()
+			.unwrap()
+			.contains_key("reporting"));
 	}
 
 	#[test]
@@ -582,20 +668,18 @@ mod tests {
 	fn set_repo_github_reporting_request_does_not_use_storage_ids() {
 		let req = SetRepoGithubReportingRequest {
 			protocol_version: PROTOCOL_VERSION,
-			target_owner: "acme".into(),
-			target_repo: "tracker".into(),
+			target_owner: text("acme"),
+			target_repo: text("tracker"),
 			github_pat: Some(loupe_provenance::Secret::new("ghp_new".into())),
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		assert!(s.contains("github_pat"));
 		assert!(!s.contains("pat_secret_id"));
-		let back: SetRepoGithubReportingRequest = serde_json::from_str(&s).unwrap();
-		assert_eq!(req.protocol_version, back.protocol_version);
-		assert_eq!(req.target_owner, back.target_owner);
-		assert_eq!(req.target_repo, back.target_repo);
 		assert_eq!(
-			req.github_pat.as_ref().map(Secret::expose),
-			back.github_pat.as_ref().map(Secret::expose)
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"protocol_version":PROTOCOL_VERSION,"target_owner":"acme","target_repo":"tracker","github_pat":"ghp_new"
+			})
 		);
 	}
 }

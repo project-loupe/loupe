@@ -31,17 +31,17 @@ pub(super) fn observe(source: &'static str, field: &'static str, bytes: &[u8]) {
 fn actual_finding_read_carries_live_whole_columns_and_keeps_audit_db() {
 	let db = crate::review_tests::fixture();
 	let finding = loupe_core::Finding {
-		scanner_id: "fixture".into(),
+		scanner_id: crate::test_support::text("fixture").unwrap(),
 		severity: loupe_core::Severity::High,
-		title: "same".into(),
-		description: "same".into(),
-		file_path: Some("src/cafe\u{301}.rs".into()),
+		title: crate::test_support::text("same").unwrap(),
+		description: crate::test_support::text("same").unwrap(),
+		file_path: Some(crate::test_support::path("src/cafe\u{301}.rs").unwrap()),
 		line_start: Some(1),
 		line_end: None,
 		cwe: None,
-		patch_unified: Some("patch\r\n\t  ".into()),
-		poc_unified: Some(String::new()),
-		fingerprint: "fixture".into(),
+		patch_unified: Some(crate::test_support::text("patch\r\n\t  ").unwrap()),
+		poc_unified: Some(crate::test_support::text("").unwrap()),
+		fingerprint: crate::test_support::text("fixture").unwrap(),
 	};
 	db.with_conn(|conn| {
 		let id = crate::findings::insert_or_ignore(conn, 1, 101, &finding, false, 0)?.unwrap();

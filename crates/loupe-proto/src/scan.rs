@@ -1,4 +1,7 @@
+use loupe_core::text::policy::{JobDiagnostic, RevisionText};
+use loupe_core::text::BoundedText;
 use loupe_core::{JobKind, JobState};
+use loupe_provenance::Source;
 use serde::{Deserialize, Serialize};
 
 /// Body of `POST /v1/repos/:id/scan` (admin).
@@ -22,17 +25,18 @@ pub struct ScanResponse {
 /// protocol still reads responses from a server that predates them. They
 /// exist so an operator surface can answer "how long did this take, who
 /// ran it, and why did it fail" without a second round-trip.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobInfo {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct JobInfo<S: Source> {
 	pub job_id: i64,
 	pub repo_id: i64,
-	pub kind: JobKind,
+	pub kind: JobKind<S>,
 	pub state: JobState,
 	pub incremental: bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub since_sha: Option<String>,
+	pub since_sha: Option<BoundedText<RevisionText, S>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub head_sha: Option<String>,
+	pub head_sha: Option<BoundedText<RevisionText, S>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_job_id: Option<i64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,14 +60,19 @@ pub struct JobInfo {
 	pub finished_at: Option<i64>,
 	/// Why a `failed` or `cancelled` job ended that way.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub error: Option<String>,
+	pub error: Option<BoundedText<JobDiagnostic, S>>,
 }
+record_impls!(JobInfo<S> { job_id, repo_id, kind, state, incremental, since_sha, head_sha, parent_job_id, target_finding_id, attempts, enqueued_at, worker_id, lease_expires_at, started_at, finished_at, error });
 
 #[cfg(test)]
 mod tests {
 	use loupe_core::{JobKind, JobState};
+	use loupe_provenance::Server;
+	use serde_json::json;
 
 	use super::*;
+	use crate::test_support::text;
+	type JobInfo = super::JobInfo<Server>;
 
 	#[test]
 	fn scan_request_defaults_incremental_false() {
@@ -93,11 +102,16 @@ mod tests {
 	}
 
 	#[test]
-	fn job_info_round_trips() {
+	fn job_info_preserves_wire_fields() {
 		let info = queued_job();
 		let s = serde_json::to_string(&info).unwrap();
-		let back: JobInfo = serde_json::from_str(&s).unwrap();
-		assert_eq!(info, back);
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"job_id":1,"repo_id":2,"kind":"scan","state":"queued",
+				"incremental":false,"attempts":0,"enqueued_at":1700000000
+			})
+		);
 	}
 
 	#[test]
@@ -106,19 +120,24 @@ mod tests {
 			job_id: 5,
 			kind: JobKind::Verify,
 			state: JobState::Leased,
-			head_sha: Some("abc123".into()),
+			head_sha: Some(text("abc123")),
 			parent_job_id: Some(1),
 			target_finding_id: Some(42),
 			enqueued_at: 1_700_000_100,
 			..queued_job()
 		};
 		let s = serde_json::to_string(&info).unwrap();
-		let back: JobInfo = serde_json::from_str(&s).unwrap();
-		assert_eq!(info, back);
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+			json!({
+				"job_id":5,"repo_id":2,"kind":"verify","state":"leased","incremental":false,
+				"head_sha":"abc123","parent_job_id":1,"target_finding_id":42,"attempts":0,"enqueued_at":1700000100
+			})
+		);
 	}
 
 	#[test]
-	fn job_info_round_trips_lease_and_failure_detail() {
+	fn job_info_preserves_lease_and_failure_wire_detail() {
 		let info = JobInfo {
 			state: JobState::Failed,
 			attempts: 3,
@@ -126,27 +145,34 @@ mod tests {
 			lease_expires_at: Some(1_700_000_600),
 			started_at: Some(1_700_000_010),
 			finished_at: Some(1_700_000_400),
-			error: Some("lease expired after max attempts".into()),
+			error: Some(text("lease expired after max attempts")),
 			..queued_job()
 		};
 		let s = serde_json::to_string(&info).unwrap();
-		let back: JobInfo = serde_json::from_str(&s).unwrap();
-		assert_eq!(info, back);
+		let back: serde_json::Value = serde_json::from_str(&s).unwrap();
 		assert_eq!(
-			back.finished_at.unwrap() - back.started_at.unwrap(),
+			back,
+			json!({"job_id":1,"repo_id":2,"kind":"scan","state":"failed",
+			"incremental":false,"attempts":3,"enqueued_at":1700000000,"worker_id":7,
+			"lease_expires_at":1700000600,"started_at":1700000010,"finished_at":1700000400,
+			"error":"lease expired after max attempts"})
+		);
+		assert_eq!(
+			back["finished_at"].as_i64().unwrap() - back["started_at"].as_i64().unwrap(),
 			390,
 			"duration is derivable"
 		);
 	}
 
 	#[test]
-	fn job_info_reads_a_response_without_lease_detail() {
-		// The lease/timing block is additive, so a payload from a server
-		// that predates it must still deserialize.
+	fn job_info_without_lease_detail_matches_the_legacy_wire_shape() {
+		// Missing-field input admission moves to the CLI's named JobInfo decoder.
 		let s = r#"{"job_id":1,"repo_id":2,"kind":"scan","state":"queued",
 			"incremental":false,"attempts":0,"enqueued_at":1700000000}"#;
-		let info: JobInfo = serde_json::from_str(s).unwrap();
-		assert_eq!(info, queued_job());
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(s).unwrap(),
+			serde_json::to_value(queued_job()).unwrap()
+		);
 	}
 
 	#[test]

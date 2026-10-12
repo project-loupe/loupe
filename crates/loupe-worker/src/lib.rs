@@ -3,11 +3,12 @@
 
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod test_support;
 
 pub mod client;
 pub mod config;
-#[cfg(fuzzing)]
-mod config_value_parsers;
+pub mod config_value_parsers;
 pub mod fingerprint;
 mod git_credentials;
 pub mod host_outcome;

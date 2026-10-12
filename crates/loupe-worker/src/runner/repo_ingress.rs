@@ -1,5 +1,5 @@
 //! Original libgit2 observations are Repo, before hex/path formatting.
-use loupe_core::source_migration::text::{BoundedText, RepoPath};
+use loupe_core::text::{BoundedText, RepoPath};
 use loupe_provenance::{Mark, Repo, Unvalidated, Validate};
 
 use crate::ingress_text::{DecodeError, RevisionText};
@@ -20,9 +20,8 @@ impl Validate<&[u8], Repo> for CheckedOutRevisionDecoder {
 	}
 }
 impl CheckedOutRevision {
-	/// Temporary concrete Repo revision exit into current ScanContext/cursor.
-	pub(super) fn legacy_revision(self) -> String {
-		self.0.expose().to_owned()
+	pub(super) fn into_revision(self) -> BoundedText<RevisionText, Repo> {
+		self.0
 	}
 }
 
@@ -59,12 +58,10 @@ impl Validate<GitlinkName<'_>, Repo> for RepositoryGitlinkPathDecoder {
 impl RepositoryGitlinkPath {
 	/// Existing repository-path diagnostic projection. Full path-log framing
 	/// remains a separate sink node; lossy display is never marked RepoPath.
-	pub(super) fn legacy_diagnostic(self) -> String {
+	pub(super) fn for_log(&self) -> std::borrow::Cow<'_, str> {
 		match self {
-			Self::Relative(path) => path.expose().to_owned(),
-			Self::UnrepresentableNative { bytes, .. } => {
-				String::from_utf8_lossy(&bytes).into_owned()
-			},
+			Self::Relative(path) => std::borrow::Cow::Borrowed(path.expose()),
+			Self::UnrepresentableNative { bytes, .. } => String::from_utf8_lossy(bytes),
 		}
 	}
 }

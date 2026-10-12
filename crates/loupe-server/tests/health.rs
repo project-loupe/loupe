@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
+use common::wire::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
@@ -24,11 +24,11 @@ async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) 
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
-		db_path: ":memory:".into(),
-		server_cert_pem: loupe_provenance::Secret::new(server_cert.cert_pem),
-		server_key_pem: server_cert.key_pem,
-		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
-		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
+		db_path: common::config_path(":memory:"),
+		server_cert_pem: common::config_pem(&server_cert.cert_pem),
+		server_key_pem: common::config_pem(server_cert.key_pem.expose()),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
 	let db = Arc::new(Db::open_in_memory(&MasterKey::for_tests()).unwrap());
 	let state = AppState::new(

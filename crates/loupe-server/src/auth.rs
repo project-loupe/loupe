@@ -45,7 +45,10 @@ impl AuthedWorker {
 	pub fn id(&self) -> i64 {
 		self.worker.id
 	}
-	pub fn name(&self) -> &str {
+	pub fn name(
+		&self,
+	) -> &loupe_core::text::BoundedText<loupe_core::text::policy::WorkerName, loupe_provenance::Db>
+	{
 		&self.worker.name
 	}
 	pub(crate) fn worker_ingress(&self) -> Option<Ingress<Worker>> {
@@ -167,7 +170,7 @@ mod tests {
 				.with_conn(|conn| {
 					Ok(workers::insert(
 						conn,
-						&format!("FAKE_AUTH_NAME_{}", kind.as_str()),
+						&crate::test_support::text(&format!("FAKE_AUTH_NAME_{}", kind.as_str())),
 						kind,
 						&cert_fingerprint(cert.0.as_ref()),
 						0,

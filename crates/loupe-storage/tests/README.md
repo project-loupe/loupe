@@ -1,35 +1,40 @@
-# Staged storage source fixtures
+# Stored source and schema controls
 
-These integration tests exercise the committed core `source-migration` API
-without replacing production DAOs. The compatibility file runs the unchanged
-read paths. The staged file reads actual SQLite TEXT values using `get_ref`,
-including a database close/reopen, and validates while those borrowed columns
-are alive.
+Production DAO signatures now retain sources. The historical fixture filenames
+`source_migration.rs` and `source_migration_baseline.rs` identify their original
+staged evidence; there is no remaining staging feature or alternate text API.
+The SQL compatibility tests preserve original bytes and close/reopen behavior.
 
-`support/stored.rs` mints Db only at its finding-row and source-ref-column
-reads. Named finding-column validators carry each original plain column's
-entire byte range to Agent; audit common names remain Db. Source refs borrow
-`RawValue` fields directly from their original SQL JSON column and carry
-checked pointer-derived spans. Neither decoded text matching nor a JSON
-reserialization locates a carried token. Test traces record live addresses
-and offsets without dereferencing expired pointers.
+`support/stored.rs` is an independent original-column fixture. It mints Db only
+at actual SQLite TEXT reads and carries designated content to Agent while the
+borrowed columns live; audit common names remain Db. Production reads use the
+private `ingress` validators instead. RawValue fields in stored reference JSON
+retain pointer-derived original spans, never decoded-text matching or JSON
+reserialization. Trace addresses are observations of live owners only.
 
-`loupe_core::text::decode_json_string_bounded` is source-neutral support shared
-with the original-message protocol fixture. Its
-first pass counts decoded UTF-8 bytes and scalars without an output allocation;
-only a successful complete preflight permits the second pass's bounded String.
-Unescaped text remains borrowed. This helper is deliberately not a generic
-typed/source decoder. Internal preflight assertions now live in core; this
-consumer retains its decoding/borrowing/cap/malformed-token checks. The parser
-fuzz join is independently required before full D acceptance.
+The source-ref controls retain raw/canonical 64 KiB caps, 32/64 entry limits,
+duplicate/unknown rejection, optional symbols, semantic symbol normalization
+and exact 512-byte repository paths. Original-message JSON string preflight
+counts UTF-8 bytes/scalars before allocation; unchanged strings stay borrowed.
+The helper itself neither labels content nor authorizes a source.
 
-The fixtures retain SourceRefs' existing raw/canonical 64 KiB limits, 32/64
-entry limits, duplicate/unknown-field rejection, optional symbol semantics,
-semantic symbol policy, and exact 512-byte repository paths. New finding/audit
-admission uses the accepted exact 2 MiB field policies and fixed read errors.
-Audit text equal to finding content still has a different source type.
+Schema v5 assigns a random 16-byte immutable report identity, distinct from the
+reusable SQLite integer row ID. Migration, close/reopen, NULL, mutation, duplicate
+fingerprint, random failure/collision and recycled-row tests distinguish these
+properties. New inserts target the repo/fingerprint conflict specifically so an
+identity collision cannot silently suppress a different finding. Schema v6
+adds the twelve designated source columns with conservative historical agent
+classification, without asserting model authorship. Audit/native/closed host
+metadata is excluded. Invalid stored content fails with fixed diagnostics.
 
-The new fixtures are acceptance and compatibility evidence, not regressions
-against an active source-aware production read path. Atomic adoption M still
-owns production signatures, source metadata migration, invalid-row behavior,
-staging deletion, and the remaining original-span owner joins.
+Typed DAO tests retain the mixed-source execution, attempt, artifact and
+verification tuples. Closed campaign policy/phase/count/pending-follow-up
+compositions have separate canonical bytes, ordering, normalization and budget
+controls. Actual server integration tests additionally compare Resolved/Survey
+stored JSON and digests; constructor-only tests do not replace those checks.
+
+The historical fixture assertions are compatibility/acceptance evidence. The
+new-row/NULL/recycled-ID cases have separately retained pre-fix assertion reds;
+source arity and mixed-input rejection are compiler acceptance controls, not
+runtime exploit or memory-erasure claims. Full source-aware joins still require
+the combined workspace, direct fuzz and final API checks.

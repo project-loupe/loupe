@@ -1,4 +1,4 @@
-use loupe_core::source_migration::text::RepoPath;
+use loupe_core::text::RepoPath;
 use loupe_core::{FindingState, Severity};
 use loupe_provenance::{Agent, ValidateCarrying};
 
@@ -105,48 +105,7 @@ struct RawList<'a> {
 	findings: Vec<RawSummary<'a>>,
 }
 
-struct Summary {
-	id: i64,
-	repo_id: i64,
-	job_id: i64,
-	scanner_id: BoundedText<policy::ScannerIdText, Agent>,
-	severity: Severity,
-	title: BoundedText<policy::FindingTitle, Agent>,
-	file_path: Option<RepoPath<Agent>>,
-	line_start: Option<u32>,
-	fingerprint: BoundedText<policy::FindingFingerprintText, Agent>,
-	state: FindingState,
-	verification_required: bool,
-	created_at: i64,
-	approved_at: Option<i64>,
-	approved_by_cn: Option<BoundedText<AuditName, Server>>,
-	rejected_at: Option<i64>,
-	rejected_by_cn: Option<BoundedText<AuditName, Server>>,
-}
-impl Summary {
-	fn legacy(self) -> loupe_proto::FindingSummary {
-		#[cfg(fuzzing)]
-		observe_summary(&self);
-		loupe_proto::FindingSummary {
-			id: self.id,
-			repo_id: self.repo_id,
-			job_id: self.job_id,
-			scanner_id: self.scanner_id.expose().to_owned(),
-			severity: self.severity,
-			title: self.title.expose().to_owned(),
-			file_path: self.file_path.map(|s| s.expose().to_owned()),
-			line_start: self.line_start,
-			fingerprint: self.fingerprint.expose().to_owned(),
-			state: self.state,
-			verification_required: self.verification_required,
-			created_at: self.created_at,
-			approved_at: self.approved_at,
-			approved_by_cn: self.approved_by_cn.map(|s| s.expose().to_owned()),
-			rejected_at: self.rejected_at,
-			rejected_by_cn: self.rejected_by_cn.map(|s| s.expose().to_owned()),
-		}
-	}
-}
+type Summary = loupe_proto::FindingSummary<Agent, Server>;
 fn summary(u: &Unvalidated<'_, &[u8], Server>, r: RawSummary<'_>) -> Result<Summary> {
 	Ok(Summary {
 		id: r.id,
@@ -183,23 +142,27 @@ impl ValidateCarrying<&[u8], Server> for ListFindings {
 		})
 	}
 }
-pub(crate) fn list_findings_legacy(
+pub(crate) fn list_findings(
 	body: Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::ListFindingsResponse> {
+) -> Result<loupe_proto::ListFindingsResponse<Agent, Server>> {
 	#[cfg(fuzzing)]
 	entered(Entry::ListFindings);
 	let list = body.as_bytes().validate_carrying(ListFindings)?;
+	#[cfg(fuzzing)]
+	for finding in &list.findings {
+		observe_summary(finding);
+	}
 	Ok(loupe_proto::ListFindingsResponse {
 		protocol_version: list.version,
-		findings: list.findings.into_iter().map(Summary::legacy).collect(),
+		findings: list.findings,
 	})
 }
-pub(crate) fn search_findings_legacy(
+pub(crate) fn search_findings(
 	body: Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::ListFindingsResponse> {
+) -> Result<loupe_proto::ListFindingsResponse<Agent, Server>> {
 	#[cfg(fuzzing)]
 	entered(Entry::SearchFindings);
-	list_findings_legacy(body)
+	list_findings(body)
 }
 
 #[derive(Deserialize)]
@@ -287,15 +250,17 @@ impl ValidateCarrying<&[u8], Server> for GetFinding {
 		})
 	}
 }
-pub(crate) fn get_finding_legacy(
+pub(crate) fn get_finding(
 	body: Untrusted<Bytes, Server>,
-) -> Result<loupe_proto::FindingDetail> {
+) -> Result<loupe_proto::FindingDetail<Agent, Server>> {
 	#[cfg(fuzzing)]
 	entered(Entry::GetFinding);
 	let d = body.as_bytes().validate_carrying(GetFinding)?;
 	#[cfg(fuzzing)]
 	observe_detail(&d);
-	let s = d.summary.legacy();
+	#[cfg(fuzzing)]
+	observe_summary(&d.summary);
+	let s = d.summary;
 	Ok(loupe_proto::FindingDetail {
 		protocol_version: d.version,
 		id: s.id,
@@ -304,13 +269,13 @@ pub(crate) fn get_finding_legacy(
 		scanner_id: s.scanner_id,
 		severity: s.severity,
 		title: s.title,
-		description: d.description.expose().to_owned(),
+		description: d.description,
 		file_path: s.file_path,
 		line_start: s.line_start,
 		line_end: d.line_end,
-		cwe: d.cwe.map(|s| s.expose().to_owned()),
-		patch_unified: d.patch.map(|s| s.expose().to_owned()),
-		poc_unified: d.poc.map(|s| s.expose().to_owned()),
+		cwe: d.cwe,
+		patch_unified: d.patch,
+		poc_unified: d.poc,
 		fingerprint: s.fingerprint,
 		state: s.state,
 		verification_required: s.verification_required,
@@ -393,11 +358,13 @@ fn observe_detail(d: &Detail) {
 	}
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // Consumed by the library fixture, not the binary sharing this module.
 pub(crate) fn reset_observations() {
 	OBSERVED.with(|s| s.borrow_mut().clear());
 	TYPED.with(|s| s.borrow_mut().clear());
 }
 #[cfg(fuzzing)]
+#[allow(dead_code)] // Consumed by the library fixture, not the binary sharing this module.
 pub(crate) fn take_observations() -> (Vec<(usize, usize)>, Vec<FieldObservation>) {
 	(
 		OBSERVED.with(|s| std::mem::take(&mut *s.borrow_mut())),

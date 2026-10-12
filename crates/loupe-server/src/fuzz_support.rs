@@ -6,9 +6,11 @@ pub use crate::ingress::transport_fuzz::{collect_operator, Collection};
 mod router_fixture;
 pub use router_fixture::{leased_heartbeat, request_route, RequestCase, RequestObservation};
 
-pub use crate::ingress::jobs::fuzz::{worker_request, WorkerRequest};
+pub use crate::ingress::jobs::fuzz::{worker_request, worker_value, WorkerRequest, WorkerValue};
 pub use crate::ingress::query::fuzz::{job_query, operator_search, worker_search};
-pub use crate::ingress::registry::fuzz::{operator_request, OperatorRequest};
+pub use crate::ingress::registry::fuzz::{
+	operator_request, operator_value, OperatorRequest, OperatorValue,
+};
 
 pub type Decoded = Result<serde_json::Value, (u16, String)>;
 
@@ -54,3 +56,9 @@ pub use crate::reporters::ingress_fuzz::{
 	app as reporter_app, installation as reporter_installation, issue as reporter_issue,
 	label as reporter_label,
 };
+
+/// Historical pure clone-URL grammar fixture. Actual Operator coverage is
+/// `operator_request(RegisterRepo, ..)`; this observation creates no labelled value.
+pub fn legacy_clone_url(url: &str) -> Option<(String, String, String)> {
+	crate::routes::repos::parse_github_clone_url(url)
+}

@@ -1,4 +1,5 @@
 //! The ordinary Reporter ceiling is independent of the token endpoint's 256 KiB cap.
+mod common;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
@@ -6,7 +7,7 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Router;
-use loupe_core::{Finding, ReportingDestination, Severity};
+use loupe_core::{Finding, Severity};
 use loupe_provenance::Secret;
 use loupe_server::reporters::github_app::GithubAppKey;
 use loupe_server::reporters::{GithubReporter, ReportFinding, Reporter, ReporterCredential};
@@ -59,27 +60,7 @@ fn key() -> GithubAppKey {
 }
 
 fn repo() -> RepoRow {
-	RepoRow {
-		id: 1,
-		clone_url: "https://github.com/example/repo.git".into(),
-		host: "github.com".into(),
-		owner: "example".into(),
-		repo: "repo".into(),
-		default_branch: None,
-		scan_interval_seconds: None,
-		scanner_config: serde_json::Value::Null,
-		reporting: ReportingDestination::GithubIssue {
-			target_owner: "example".into(),
-			target_repo: "repo".into(),
-			pat_secret_id: None,
-		},
-		verification_enabled: false,
-		require_approval: None,
-		last_scanned_sha: None,
-		last_scanned_at: None,
-		created_at: 0,
-		disabled_at: None,
-	}
+	common::reporter_repo()
 }
 
 fn finding() -> ReportFinding {
@@ -87,17 +68,17 @@ fn finding() -> ReportFinding {
 		id: 1,
 		reviewed_revision: None,
 		finding: Finding {
-			scanner_id: "fixture".into(),
+			scanner_id: common::marked::agent::text("fixture"),
 			severity: Severity::High,
-			title: "title".into(),
-			description: "description".into(),
+			title: common::marked::agent::text("title"),
+			description: common::marked::agent::text("description"),
 			file_path: None,
 			line_start: None,
 			line_end: None,
 			cwe: None,
 			patch_unified: None,
 			poc_unified: None,
-			fingerprint: "fixture".into(),
+			fingerprint: common::marked::agent::text("fixture"),
 		},
 	}
 }
@@ -152,7 +133,7 @@ async fn response_for(stage: Stage, wire: Wire, payload: Vec<u8>) -> anyhow::Res
 	let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 	let reporter = GithubReporter::with_base(&format!("http://{address}")).unwrap();
 	let result = if matches!(stage, Stage::Metadata) {
-		reporter.verify_app(&key()).await.map(|app| format!("{}:{}", app.id, app.slug))
+		reporter.verify_app(&key()).await.map(|app| format!("{}:{}", app.id, app.slug.expose()))
 	} else {
 		let credential = if matches!(stage, Stage::Installation) {
 			ReporterCredential::GithubApp(Box::new(key()))
@@ -256,7 +237,8 @@ async fn metadata_from_raw_response(payload_size: usize, truncate: bool) -> anyh
 		Ok::<_, std::io::Error>(())
 	});
 	let reporter = GithubReporter::with_base(&format!("http://{address}")).unwrap();
-	let result = reporter.verify_app(&key()).await.map(|app| format!("{}:{}", app.id, app.slug));
+	let result =
+		reporter.verify_app(&key()).await.map(|app| format!("{}:{}", app.id, app.slug.expose()));
 	server.abort();
 	let _ = server.await;
 	result
