@@ -288,6 +288,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `core_canonical` | Independent sorted serialization, reordered/whitespace-equivalent JSON, idempotence, bounded output and BLAKE3 digest |
 | `core_state_machine` | Independent adjacency/precedence tables, terminal exits only through documented operator retries; SQL permutation/scope invariant covered in storage tests |
 | `core_text_bounded` | All ten policies: exact admission, raw/normalized caps, NFC, character categories, whitespace and metadata-only diagnostics |
+| `core_text_exact` | All 17 source-aware exact policies: independent admission, decoded caps, unchanged UTF-8/wire bytes, named policy combinations and redacted diagnostics |
 | `core_text_ident` | Four policies: independent byte recognizers, length/spacing limits, exact spelling and metadata-only diagnostics |
 | `core_text_json` | Duplicate-preserving reference tree, depth/node/byte budgets, composed key/leaf rules, entry-point equivalence and redaction |
 | `core_text_repo_path` | Strict path invariants and independent legacy DTO/MCP acceptance, preserving documented disagreements |
@@ -446,7 +447,10 @@ separate fixture directory keeps arbitrary entrypoint names from colliding
 with the package installation. Flag-shaped values remain operands in the
 oracle; the target does not mistake those values for security options.
 
-All 34 main-surface S1 targets plus smoke are registered. Each real target has
+All 34 main-surface S1 targets plus smoke are registered. S3 additionally
+registers `core_text_exact` for the marked exact-text policies. Its temporary
+`source-migration` dependency is removed at atomic source adoption; the target
+and its independent oracle remain. Each real target has
 a retained corpus, a clean short campaign and a detected guard mutation.
 The broader ingress gaps below remain separate from this named target set.
 

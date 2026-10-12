@@ -8,11 +8,11 @@ rust-version = "1.88"
 [dependencies]
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
-loupe-core = { path = "../crates/loupe-core" }
+loupe-core = { path = "../crates/loupe-core", features = ["source-migration"] }
 loupe-cli = { path = "../crates/loupe-cli" }
 loupe-http = { path = "../crates/loupe-http" }
 loupe-proto = { path = "../crates/loupe-proto" }
-loupe-provenance = { path = "../crates/loupe-provenance" }
+loupe-provenance = { path = "../crates/loupe-provenance", features = ["ingress"] }
 loupe-server = { path = "../crates/loupe-server" }
 loupe-storage = { path = "../crates/loupe-storage" }
 loupe-tls = { path = "../crates/loupe-tls" }

@@ -1,0 +1,5 @@
+--- a/café.rs
++++ b/café.rs
+@@ -1 +1 @@
+-old
++new  

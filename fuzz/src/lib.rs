@@ -14,6 +14,7 @@ pub mod cli_render;
 pub mod core_canonical;
 pub mod core_state_machine;
 pub mod core_text_bounded;
+pub mod core_text_exact;
 pub mod core_text_ident;
 pub mod core_text_json;
 pub mod core_text_repo_path;

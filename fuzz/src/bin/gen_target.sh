@@ -17,6 +17,7 @@ GEN_TEST cli_render
 GEN_TEST core_canonical
 GEN_TEST core_state_machine
 GEN_TEST core_text_bounded
+GEN_TEST core_text_exact
 GEN_TEST core_text_ident
 GEN_TEST core_text_json
 GEN_TEST core_text_repo_path
