@@ -2,9 +2,7 @@
 # The gate. `ci/check.sh` runs what every commit must pass; `--full`
 # adds the slow parts that run per section of work and in CI.
 #
-# Steps marked "not enabled yet" are switched on by the stage that
-# introduces what they check (Stage S2: Kani; Stage S3: the unsafe
-# allow-list and the derived-Debug gate).
+# The derived-Debug gate is enabled as the source-labelled holders land.
 set -eu
 cd "$(dirname "$0")/.."
 . ci/env.sh
@@ -45,19 +43,14 @@ while read -r m has_lib; do
 done < "$SCRATCH/packages"
 
 say "unsafe code only where listed"
-if [ "${LOUPE_GATE_UNSAFE:-0}" = 1 ]; then
-	# Minting a provenance label is `unsafe` (loupe-provenance practice
-	# P3): the compiler finds every site, and this decides where they
-	# may be.
-	gate_unsafe_allow . || { echo "unsafe code outside ci/unsafe-allow.txt"; exit 1; }
-	gate_lints ./Cargo.toml ./fuzz/Cargo.toml || { echo "a package does not deny unsafe code"; exit 1; }
-	gate_no_tool_deps . || exit 1
-	gate_sources . || { echo "a source the checks cannot see"; exit 1; }
-	# The gates above must reject every known bypass form.
-	ci/gate-selftest.sh
-else
-	echo "not enabled yet (LOUPE_GATE_UNSAFE=1 once loupe-provenance lands)"
-fi
+# Minting a provenance label is `unsafe` (loupe-provenance practice P3):
+# the compiler finds every site, and this decides where they may be.
+gate_unsafe_allow . || { echo "unsafe code outside ci/unsafe-allow.txt"; exit 1; }
+gate_lints ./Cargo.toml ./fuzz/Cargo.toml || { echo "a package does not deny unsafe code"; exit 1; }
+gate_no_tool_deps . || exit 1
+gate_sources . || { echo "a source the checks cannot see"; exit 1; }
+# The gates above must reject every known bypass form on every check.
+ci/gate-selftest.sh
 
 say "no derived Debug on content-holding types without a reason"
 # Types that may hold agent, repository, sandbox or secret bytes

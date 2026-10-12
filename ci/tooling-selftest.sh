@@ -29,9 +29,22 @@ fixture() {
 	CASE=$TEST_ROOT/$1
 	mkdir -p "$CASE/repo" "$CASE/bin" "$CASE/state" "$CASE/local" "$CASE/locks"
 	cp -a "$SOURCE" "$CASE/repo/ci"
+	# These tests exercise check.sh's orchestration with fake compiler tools.
+	# The real compiler bypass probes run separately in ci/gate-selftest.sh.
+	# shellcheck disable=SC2016 # The generated script expands its own FIXTURE.
+	printf '#!/bin/sh\n: > "$FIXTURE/state/minting-selftest"\n' > "$CASE/repo/ci/gate-selftest.sh"
+	printf '# No unsafe files in this fixture.\n' > "$CASE/repo/ci/unsafe-allow.txt"
+	printf '# No build scripts in this fixture.\n' > "$CASE/repo/ci/build-scripts.txt"
 	printf '# No no-verdict harnesses in this fixture.\n' > "$CASE/repo/ci/kani-no-verdict.txt"
 	mkdir -p "$CASE/repo/crates/loupe-worker/src"
 	mkdir -p "$CASE/repo/fuzz/src/bin" "$CASE/repo/fuzz/runners" "$CASE/repo/fuzz/test_cases/alpha"
+	for manifest in "$CASE/repo/Cargo.toml" "$CASE/repo/fuzz/Cargo.toml"; do
+		printf '[workspace.lints.rust]\nunsafe_code = "deny"\n' > "$manifest"
+	done
+	for member in loupe-cli loupe-core loupe-unrelated; do
+		mkdir -p "$CASE/repo/crates/$member"
+		printf '[lints]\nworkspace = true\n' > "$CASE/repo/crates/$member/Cargo.toml"
+	done
 	printf 'GEN_TEST alpha\nGEN_TEST beta\n' > "$CASE/repo/fuzz/src/bin/gen_target.sh"
 	: > "$CASE/repo/fuzz/test_cases/alpha/empty"
 	cat > "$CASE/bin/git" <<'STUB'
@@ -89,7 +102,7 @@ if [[ $1 == metadata ]]; then
 			exit 0
 		fi
 	fi
-	printf '%s\n' '{"packages":[{"id":"a","name":"loupe-cli","targets":[{"kind":["bin"]}]},{"id":"b","name":"loupe-core","targets":[{"kind":["lib"]}]},{"id":"outside","name":"loupe-unrelated","targets":[{"kind":["lib"]}]}],"workspace_members":["a","b"]}'
+	printf '{"packages":[{"id":"a","name":"loupe-cli","manifest_path":"%s/repo/crates/loupe-cli/Cargo.toml","targets":[{"kind":["bin"]}]},{"id":"b","name":"loupe-core","manifest_path":"%s/repo/crates/loupe-core/Cargo.toml","targets":[{"kind":["lib"]}]},{"id":"outside","name":"loupe-unrelated","manifest_path":"%s/repo/crates/loupe-unrelated/Cargo.toml","targets":[{"kind":["lib"]}]}],"workspace_members":["a","b"]}\n' "$FIXTURE" "$FIXTURE" "$FIXTURE"
 	exit 0
 fi
 if [[ $1 == check && "$*" == *'loupe-cli --lib'* ]]; then exit 18; fi
@@ -224,6 +237,25 @@ metadata_tools)
 		fi
 		grep -q "a product crate depends on a tool crate:.*$tool" "$CASE/output" || fail 'tool dependency failed for an unrelated reason'
 	done
+	;;
+minting_default)
+	fixture minting_default
+	unset LOUPE_GATE_UNSAFE
+	"$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1 || fail 'clean minting fixture rejected'
+	printf 'pub unsafe fn unlisted() {}\n' > "$CASE/repo/crates/loupe-worker/src/unlisted.rs"
+	for setting in unset zero; do
+		if [[ $setting == zero ]]; then export LOUPE_GATE_UNSAFE=0; fi
+		if "$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1; then
+			fail "default gate accepted unlisted unsafe code ($setting)"
+		fi
+		grep -q 'not in ci/unsafe-allow.txt: crates/loupe-worker/src/unlisted.rs' "$CASE/output" || {
+			cat "$CASE/output"
+			fail 'minting gate failed for an unrelated reason'
+		}
+	done
+	rm "$CASE/repo/crates/loupe-worker/src/unlisted.rs"
+	"$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1 || fail 'clean fixture rejected with legacy opt-out'
+	[[ -f $CASE/state/minting-selftest ]] || fail 'compiler bypass self-tests were omitted'
 	;;
 forward_env)
 	fixture forward_env
@@ -504,7 +536,7 @@ kani_cleanup_stubborn)
 	done
 	;;
 all)
-	for name in env metadata metadata_error metadata_uncached metadata_dependency_error metadata_tools forward_env generated_staged generated_changes generated_ci short_lock kill_after target_dir default_targets empty_targets singleton cleanup failure find timeout kani kani_failure kani_cleanup kani_singleton kani_slots kani_slot_cap kani_memory_cap kani_memory_arg_cap kani_required kani_lower_limits kani_stubbing kani_verdict kani_harness_cleanup kani_cleanup_stubborn; do
+	for name in env metadata metadata_error metadata_uncached metadata_dependency_error metadata_tools minting_default forward_env generated_staged generated_changes generated_ci short_lock kill_after target_dir default_targets empty_targets singleton cleanup failure find timeout kani kani_failure kani_cleanup kani_singleton kani_slots kani_slot_cap kani_memory_cap kani_memory_arg_cap kani_required kani_lower_limits kani_stubbing kani_verdict kani_harness_cleanup kani_cleanup_stubborn; do
 		"$SCRIPT_DIR/tooling-selftest.sh" "$name"
 	done
 	;;

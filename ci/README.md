@@ -14,6 +14,11 @@ and nightly; Kani needs `cargo-kani`. `ci/tooling-selftest.sh` exercises
 the scripts with disposable fixtures and stub tools, without compiling or
 starting a real campaign. It checks member selection, locks, status reporting,
 build paths, retry behavior, and shutdown of spawned processes.
+Every normal check also enforces the unsafe-code allowlist, package lint
+inheritance, visible Rust sources and build scripts, and the absence of fuzz
+dependencies in product crates. `ci/gate-selftest.sh` exercises real compiler
+bypass attempts on each run. These checks are mandatory; the former
+`LOUPE_GATE_UNSAFE` opt-in no longer controls them.
 The normal gate also rejects production calls or qualified references to
 `forward_env` until sandbox values carry provenance. It strips Rust comments
 and literals and skips explicitly `#[cfg(test)]`-gated items; calls after a
