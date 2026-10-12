@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `loupe-web` — a local operator dashboard for `loupe-server`.
 //!
 //! # Shape

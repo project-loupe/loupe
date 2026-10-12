@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Shared response transport budget for worker, CLI, and web clients.
 //!
 //! This crate handles bytes only. Callers retain protocol checks, error

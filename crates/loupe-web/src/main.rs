@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Thin wrapper: parse args, init tracing, serve. The interesting parts
 //! live in the library so integration tests can reach them.
 

@@ -930,6 +930,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "loupe-provenance"
+version = "0.1.0"
+
+[[package]]
 name = "loupe-server"
 version = "0.1.0"
 dependencies = [

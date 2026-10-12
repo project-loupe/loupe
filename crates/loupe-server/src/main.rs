@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

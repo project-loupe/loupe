@@ -5,6 +5,7 @@ members = [
     "crates/loupe-core",
     "crates/loupe-http",
     "crates/loupe-proto",
+    "crates/loupe-provenance",
     "crates/loupe-server",
     "crates/loupe-storage",
     "crates/loupe-tls",
@@ -24,7 +25,7 @@ categories = ["development-tools"]
 publish = ["crates-io"]
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [workspace.lints.clippy]

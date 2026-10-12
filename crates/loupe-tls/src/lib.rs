@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! mTLS helpers for loupe: in-memory CA, server/client config builders,
 //! and a deterministic cert fingerprint used as the lookup key in the
 //! `workers` table.

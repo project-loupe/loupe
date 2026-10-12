@@ -1,0 +1,26 @@
+[package]
+name = "loupe-provenance"
+version = "0.1.0"
+description = "Provenance labels: untrusted-input wrappers, validation gate and secret wrapper"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+keywords = ["security", "provenance", "no-std"]
+categories = ["no-std"]
+
+[features]
+default = []
+# Enables `Ingress::new`. Only ingress modules and test harnesses may
+# enable it; see the `Ingress` safety contract. The
+# feature documents intent; the `unsafe fn` and ci/unsafe-allow.txt
+# enforce it.
+ingress = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Wire-format DTOs for loupe.
 //!
 //! Every DTO request and response carries a `protocol_version: u16` so

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! SQLite storage layer for loupe.
 //!
 //! The schema is defined as an ordered list of migrations in `migrations`.

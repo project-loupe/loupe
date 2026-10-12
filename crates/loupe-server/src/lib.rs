@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `loupe-server` library surface.
 //!
 //! Exposed for integration tests; the binary in `main.rs` is a thin

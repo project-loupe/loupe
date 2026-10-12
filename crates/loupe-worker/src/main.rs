@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Entry point for the loupe scan/verify worker.
 //!
 //! Worker and internal helper modes are selected via subcommands:

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `loupectl` — operator CLI for loupe-server.
 //!
 //! Authenticates with the admin client cert minted by `loupe-server

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `loupe-worker` library surface.
 
 #[cfg(test)]

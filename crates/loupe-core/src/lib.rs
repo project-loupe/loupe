@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Shared domain types for loupe.
 //!
 //! These types are the lingua franca between `loupe-server`, `loupe-worker`,
