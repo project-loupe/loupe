@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! `loupectl` — operator CLI for loupe-server.
 //!
 //! Authenticates with the admin client cert minted by `loupe-server
@@ -16,9 +16,10 @@ use loupe_proto::{
 	RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse, SetGithubAppRequest,
 	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
-use loupe_provenance::Secret;
 
+mod config_input;
 mod credential_request;
+mod ingress;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe operator CLI")]
@@ -31,25 +32,25 @@ struct Cli {
 
 #[derive(Debug, Args)]
 struct ConnArgs {
-	#[arg(long, env = "LOUPE_SERVER_URL")]
+	#[arg(long, env = "LOUPE_SERVER_URL", value_parser = config_input::UrlLegacy)]
 	server_url: Option<reqwest::Url>,
-	#[arg(long, env = "LOUPE_CA_CERT")]
+	#[arg(long, env = "LOUPE_CA_CERT", value_parser = config_input::PathLegacy)]
 	ca_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	ca_cert_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_ADMIN_CERT")]
+	#[arg(long, env = "LOUPE_ADMIN_CERT", value_parser = config_input::PathLegacy)]
 	admin_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	admin_cert_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	admin_cert_pem_b64: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_ADMIN_KEY")]
+	#[arg(long, env = "LOUPE_ADMIN_KEY", value_parser = config_input::PathLegacy)]
 	admin_key: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	admin_key_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	admin_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
@@ -90,11 +91,11 @@ struct GithubAppSetArgs {
 	/// page. Read from LOUPE_GITHUB_APP_KEY if omitted. Alternatively
 	/// pass the PEM itself via LOUPE_GITHUB_APP_KEY_PEM or, base64
 	/// encoded, via LOUPE_GITHUB_APP_KEY_PEM_B64.
-	#[arg(long, env = "LOUPE_GITHUB_APP_KEY")]
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY", value_parser = config_input::PathLegacy)]
 	private_key_file: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	private_key_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM_B64", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	private_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
@@ -127,23 +128,23 @@ struct RepoRotatePatArgs {
 	id: i64,
 	/// Replacement PAT for this repo's GitHub issue reporter. Read
 	/// from LOUPE_TRACKER_PAT if omitted.
-	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
-	pat: String,
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true, value_parser = config_input::Pat)]
+	pat: config_input::PatInput,
 }
 
 #[derive(Debug, Args)]
 struct RepoSetGithubReportingArgs {
 	id: i64,
-	#[arg(long)]
+	#[arg(long, value_parser = config_input::OwnerLegacy)]
 	target_owner: String,
-	#[arg(long)]
+	#[arg(long, value_parser = config_input::RepoLegacy)]
 	target_repo: String,
 	/// PAT for the target tracker repo. Read from LOUPE_TRACKER_PAT if
 	/// not supplied. Omit both to report through the server's GitHub
 	/// App instead; switching an existing PAT-backed repo this way drops
 	/// its stored PAT.
-	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
-	pat: Option<String>,
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true, value_parser = config_input::Pat)]
+	pat: Option<config_input::PatInput>,
 }
 
 #[derive(Debug, Args)]
@@ -183,19 +184,19 @@ struct RepoUpdateArgs {
 
 #[derive(Debug, Args)]
 struct RepoAddArgs {
-	#[arg(long)]
+	#[arg(long, value_parser = config_input::CloneUrlLegacy)]
 	clone_url: String,
-	#[arg(long)]
+	#[arg(long, value_parser = config_input::BranchLegacy)]
 	branch: Option<String>,
 	#[arg(long)]
 	scan_interval_seconds: Option<u64>,
 	/// Owner of the tracker repo where findings get filed. Required
 	/// unless `--no-reporting` is set.
-	#[arg(long, required_unless_present = "no_reporting")]
+	#[arg(long, required_unless_present = "no_reporting", value_parser = config_input::OwnerLegacy)]
 	target_owner: Option<String>,
 	/// Tracker repo name where findings get filed. Required unless
 	/// `--no-reporting` is set.
-	#[arg(long, required_unless_present = "no_reporting")]
+	#[arg(long, required_unless_present = "no_reporting", value_parser = config_input::RepoLegacy)]
 	target_repo: Option<String>,
 	/// PAT with Issues write access on the target tracker. Read from the
 	/// env var `LOUPE_TRACKER_PAT` if not supplied — never echo it on
@@ -203,8 +204,8 @@ struct RepoAddArgs {
 	/// var) to report through the server's GitHub App instead, which is
 	/// the default; the server rejects the registration if no app is
 	/// configured.
-	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
-	pat: Option<String>,
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true, value_parser = config_input::Pat)]
+	pat: Option<config_input::PatInput>,
 	/// Skip configuring an automatic reporter. Findings still go
 	/// through the full scan + verification + approval pipeline.
 	/// Confirmed findings remain `confirmed` so operators can configure
@@ -244,9 +245,9 @@ enum WorkerCmd {
 
 #[derive(Debug, Args)]
 struct WorkerRegisterArgs {
-	#[arg(long)]
+	#[arg(long, value_parser = config_input::WorkerNameLegacy)]
 	name: String,
-	#[arg(long, conflicts_with = "emit_env")]
+	#[arg(long, conflicts_with = "emit_env", value_parser = config_input::PathLegacy)]
 	out: Option<PathBuf>,
 	/// Print sourceable LOUPE_WORKER_* env assignments instead of JSON.
 	#[arg(long, default_value_t = false)]
@@ -282,6 +283,7 @@ enum FindingCmd {
 		repo_id: i64,
 		/// One or more space-separated keywords. Quote the whole
 		/// thing if your shell would split on spaces.
+		#[arg(value_parser = config_input::SearchLegacy)]
 		query: String,
 		#[arg(long, default_value_t = 20)]
 		limit: i64,
@@ -370,23 +372,23 @@ enum CertCmd {
 struct CertMintServerArgs {
 	/// DNS name to include in the server certificate SAN. Repeat for
 	/// every hostname clients will use.
-	#[arg(long = "hostname", required = true)]
+	#[arg(long = "hostname", required = true, value_parser = config_input::HostnameLegacy)]
 	hostnames: Vec<String>,
-	#[arg(long, default_value = "loupe-server")]
+	#[arg(long, default_value = "loupe-server", value_parser = config_input::CommonNameLegacy)]
 	common_name: String,
 	#[arg(long, default_value_t = false)]
 	emit_env: bool,
-	#[arg(long, env = "LOUPE_CA_CERT")]
+	#[arg(long, env = "LOUPE_CA_CERT", value_parser = config_input::PathLegacy)]
 	ca_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	ca_cert_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_CA_KEY")]
+	#[arg(long, env = "LOUPE_CA_KEY", value_parser = config_input::PathLegacy)]
 	ca_key: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	ca_key_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true, value_parser = config_input::PemLegacy)]
 	ca_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
@@ -527,7 +529,7 @@ async fn github_app_set(
 	)
 	.send()
 	.await?;
-	server_response(resp, "configure GitHub App").await?;
+	ingress::discard(server_response(resp, "configure GitHub App").await?)?;
 	println!("github app {} configured", a.app_id);
 	Ok(())
 }
@@ -535,7 +537,7 @@ async fn github_app_set(
 async fn github_app_show(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
 	let resp = client.get(url(base, "/v1/github-app")).send().await?;
 	let body: GithubAppResponse =
-		serde_json::from_slice(&server_response(resp, "show GitHub App").await?)?;
+		ingress::show_github_app_legacy(server_response(resp, "show GitHub App").await?)?;
 	match body.app {
 		Some(app) => println!("app_id={} slug={}", app.app_id, TerminalText(&app.slug)),
 		None => println!("no GitHub App configured"),
@@ -545,7 +547,7 @@ async fn github_app_show(client: &reqwest::Client, base: &reqwest::Url) -> Resul
 
 async fn github_app_clear(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
 	let resp = client.delete(url(base, "/v1/github-app")).send().await?;
-	server_response(resp, "clear GitHub App").await?;
+	ingress::discard(server_response(resp, "clear GitHub App").await?)?;
 	println!("github app cleared");
 	Ok(())
 }
@@ -598,14 +600,14 @@ fn pem_from_env_or_file(
 			.with_context(|| format!("decoding base64 {label} PEM"));
 	}
 	let path = path.context(missing)?;
-	loupe_tls::read_pem_file(path).with_context(|| format!("reading {label} at {}", path.display()))
+	config_input::read_pem(path).with_context(|| format!("reading {label} at {}", path.display()))
 }
 
 fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
 	base.join(path).expect("path is always valid")
 }
 
-async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
+fn register_repo_request_legacy(a: RepoAddArgs) -> RegisterRepoRequest {
 	let require_approval = match (a.require_approval, a.no_require_approval) {
 		(true, false) => Some(true),
 		(false, true) => Some(false),
@@ -624,10 +626,10 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 			// so the unwrap is structurally safe.
 			target_owner: a.target_owner.expect("clap enforces target_owner"),
 			target_repo: a.target_repo.expect("clap enforces target_repo"),
-			github_pat: a.pat.map(Secret::new),
+			github_pat: a.pat.map(config_input::PatInput::into_pat),
 		}
 	};
-	let req = RegisterRepoRequest {
+	RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: a.clone_url,
 		branch: a.branch,
@@ -636,13 +638,17 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		scanner_config: serde_json::Value::Null,
 		verification_enabled,
 		require_approval,
-	};
+	}
+}
+
+async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
+	let req = register_repo_request_legacy(a);
 	let resp =
 		credential_request::with_body(client.post(url(base, "/v1/repos")), req.credential_json()?)
 			.send()
 			.await?;
 	let body: RegisterRepoResponse =
-		serde_json::from_slice(&server_response(resp, "register repo").await?)?;
+		ingress::register_repo(server_response(resp, "register repo").await?)?;
 	println!("repo_id={}", body.repo_id);
 	Ok(())
 }
@@ -654,7 +660,7 @@ async fn repo_list(
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
 	let resp = req.send().await?;
 	let body: ListReposResponse =
-		serde_json::from_slice(&server_response(resp, "list repos").await?)?;
+		ingress::list_repos_legacy(server_response(resp, "list repos").await?)?;
 	if as_json {
 		println!("{}", repo_list_json(&body)?);
 		return Ok(());
@@ -706,7 +712,7 @@ fn reporting_label(reporting: Option<&ReportingSummary>) -> String {
 
 async fn repo_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.delete(url(base, &format!("/v1/repos/{id}"))).send().await?;
-	server_response(resp, "remove repo").await?;
+	ingress::discard(server_response(resp, "remove repo").await?)?;
 	Ok(())
 }
 
@@ -737,7 +743,7 @@ async fn repo_update(
 		inherit_require_approval: a.inherit_approval,
 	};
 	let resp = client.patch(url(base, &format!("/v1/repos/{}", a.id))).json(&req).send().await?;
-	server_response(resp, "update repo").await?;
+	ingress::discard(server_response(resp, "update repo").await?)?;
 	Ok(())
 }
 
@@ -745,34 +751,39 @@ async fn repo_rotate_pat(
 	client: &reqwest::Client, base: &reqwest::Url, a: RepoRotatePatArgs,
 ) -> Result<()> {
 	let req =
-		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: Secret::new(a.pat) };
+		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: a.pat.into_pat() };
 	let resp = credential_request::with_body(
 		client.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id))),
 		req.credential_json()?,
 	)
 	.send()
 	.await?;
-	server_response(resp, "rotate repo PAT").await?;
+	ingress::discard(server_response(resp, "rotate repo PAT").await?)?;
 	Ok(())
 }
 
 async fn repo_set_github_reporting(
 	client: &reqwest::Client, base: &reqwest::Url, a: RepoSetGithubReportingArgs,
 ) -> Result<()> {
-	let req = SetRepoGithubReportingRequest {
-		protocol_version: PROTOCOL_VERSION,
-		target_owner: a.target_owner,
-		target_repo: a.target_repo,
-		github_pat: a.pat.map(Secret::new),
-	};
+	let id = a.id;
+	let req = set_reporting_request_legacy(a);
 	let resp = credential_request::with_body(
-		client.put(url(base, &format!("/v1/repos/{}/reporting/github", a.id))),
+		client.put(url(base, &format!("/v1/repos/{id}/reporting/github"))),
 		req.credential_json()?,
 	)
 	.send()
 	.await?;
-	server_response(resp, "set GitHub reporting").await?;
+	ingress::discard(server_response(resp, "set GitHub reporting").await?)?;
 	Ok(())
+}
+
+fn set_reporting_request_legacy(a: RepoSetGithubReportingArgs) -> SetRepoGithubReportingRequest {
+	SetRepoGithubReportingRequest {
+		protocol_version: PROTOCOL_VERSION,
+		target_owner: a.target_owner,
+		target_repo: a.target_repo,
+		github_pat: a.pat.map(config_input::PatInput::into_pat),
+	}
 }
 
 async fn repo_scan(
@@ -783,9 +794,13 @@ async fn repo_scan(
 		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental })
 		.send()
 		.await?;
-	let body: ScanResponse = serde_json::from_slice(&server_response(resp, "scan").await?)?;
+	let body: ScanResponse = ingress::scan_repo(server_response(resp, "scan").await?)?;
 	println!("job_id={}", body.job_id);
 	Ok(())
+}
+
+fn register_worker_request_legacy(name: String) -> RegisterWorkerRequest {
+	RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name }
 }
 
 async fn worker_register(
@@ -793,11 +808,11 @@ async fn worker_register(
 ) -> Result<()> {
 	let resp = client
 		.post(url(base, "/v1/workers"))
-		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: a.name })
+		.json(&register_worker_request_legacy(a.name))
 		.send()
 		.await?;
 	let bundle: RegisterWorkerResponse =
-		serde_json::from_slice(&server_response(resp, "register worker").await?)?;
+		ingress::register_worker_bundle_legacy(server_response(resp, "register worker").await?)?;
 	if a.emit_env {
 		for (name, value) in worker_env_assignments(base, &bundle)? {
 			println!("{name}={}", value.expose());
@@ -912,7 +927,7 @@ fn server_cert_env_assignments(
 
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.delete(url(base, &format!("/v1/workers/{id}"))).send().await?;
-	server_response(resp, "remove worker").await?;
+	ingress::discard(server_response(resp, "remove worker").await?)?;
 	Ok(())
 }
 
@@ -920,7 +935,7 @@ async fn job_list(client: &reqwest::Client, base: &reqwest::Url, limit: Option<i
 	let req = client.get(url(base, "/v1/jobs"));
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
 	let resp = req.send().await?;
-	let jobs: Vec<JobInfo> = serde_json::from_slice(&server_response(resp, "list jobs").await?)?;
+	let jobs: Vec<JobInfo> = ingress::list_jobs_legacy(server_response(resp, "list jobs").await?)?;
 	for j in jobs.into_iter().rev() {
 		println!(
 			"{:>4}\trepo={}\tkind={:?}\tstate={:?}\tattempts={}\thead={:?}",
@@ -932,21 +947,21 @@ async fn job_list(client: &reqwest::Client, base: &reqwest::Url, limit: Option<i
 
 async fn job_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/jobs/{id}"))).send().await?;
-	let job: JobInfo = serde_json::from_slice(&server_response(resp, "get job").await?)?;
+	let job: JobInfo = ingress::get_job_legacy(server_response(resp, "get job").await?)?;
 	println!("{}", serde_json::to_string_pretty(&job)?);
 	Ok(())
 }
 
 async fn job_retry(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/jobs/{id}/retry"))).send().await?;
-	let job: JobInfo = serde_json::from_slice(&server_response(resp, "retry job").await?)?;
+	let job: JobInfo = ingress::retry_job_legacy(server_response(resp, "retry job").await?)?;
 	println!("job_id={} state={:?} attempts={}", job.job_id, job.state, job.attempts);
 	Ok(())
 }
 
 async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/jobs/{id}/cancel"))).send().await?;
-	let job: JobInfo = serde_json::from_slice(&server_response(resp, "cancel job").await?)?;
+	let job: JobInfo = ingress::cancel_job_legacy(server_response(resp, "cancel job").await?)?;
 	println!("job_id={} state={:?} attempts={}", job.job_id, job.state, job.attempts);
 	Ok(())
 }
@@ -958,7 +973,7 @@ async fn finding_list(
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
 	let resp = req.send().await?;
 	let body: ListFindingsResponse =
-		serde_json::from_slice(&server_response(resp, "list findings").await?)?;
+		ingress::list_findings_legacy(server_response(resp, "list findings").await?)?;
 	for f in body.findings.into_iter().rev() {
 		println!("{}", render::finding_list_row(&f));
 	}
@@ -971,7 +986,7 @@ async fn finding_search(
 	let url = url(base, &format!("/v1/repos/{repo_id}/findings/search"));
 	let resp = client.get(url).query(&[("q", query), ("limit", &limit.to_string())]).send().await?;
 	let body: ListFindingsResponse =
-		serde_json::from_slice(&server_response(resp, "search findings").await?)?;
+		ingress::search_findings_legacy(server_response(resp, "search findings").await?)?;
 	if body.findings.is_empty() {
 		println!("(no matches)");
 		return Ok(());
@@ -987,7 +1002,7 @@ async fn finding_show(
 ) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/findings/{id}"))).send().await?;
 	let detail: FindingDetail =
-		serde_json::from_slice(&server_response(resp, "get finding").await?)?;
+		ingress::get_finding_legacy(server_response(resp, "get finding").await?)?;
 	if as_json {
 		println!("{}", serde_json::to_string_pretty(&detail)?);
 	} else {
@@ -998,7 +1013,7 @@ async fn finding_show(
 
 async fn finding_approve(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/findings/{id}/approve"))).send().await?;
-	server_response(resp, "approve finding").await?;
+	ingress::discard(server_response(resp, "approve finding").await?)?;
 	Ok(())
 }
 
@@ -1006,7 +1021,7 @@ async fn finding_retry_report(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64,
 ) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/findings/{id}/retry-report"))).send().await?;
-	server_response(resp, "retry report").await?;
+	ingress::discard(server_response(resp, "retry report").await?)?;
 	Ok(())
 }
 
@@ -1022,7 +1037,7 @@ async fn finding_retry_verify(
 	};
 	let resp = client.post(url(base, "/v1/findings/retry-verify")).json(&req).send().await?;
 	let body: RetryVerifyResponse =
-		serde_json::from_slice(&server_response(resp, "retry verify").await?)?;
+		ingress::retry_verification(server_response(resp, "retry verify").await?)?;
 	let label = if body.dry_run { "would_revive" } else { "revived" };
 	println!(
 		"dry_run={} matched={} {}={} requeued_jobs={} created_jobs={} left_queued_or_leased={}",
@@ -1039,22 +1054,19 @@ async fn finding_retry_verify(
 
 async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))).send().await?;
-	server_response(resp, "reject finding").await?;
+	ingress::discard(server_response(resp, "reject finding").await?)?;
 	Ok(())
 }
 
 /// Bound successful and error bodies before decoding or displaying them.
-async fn server_response(resp: reqwest::Response, action: &str) -> Result<bytes::Bytes> {
-	let status = resp.status();
-	let bytes = loupe_http::read_response_bytes(resp)
-		.await
-		.map_err(|error| anyhow::anyhow!("{action}: server returned {status}: {error}"))?;
-	if !status.is_success() {
-		anyhow::bail!("{action}: {status} — {}", String::from_utf8_lossy(&bytes));
-	}
-	Ok(bytes)
+async fn server_response(
+	resp: reqwest::Response, action: &'static str,
+) -> Result<loupe_provenance::Untrusted<bytes::Bytes, loupe_provenance::Server>> {
+	ingress::receive(resp, action).await
 }
 
+#[cfg(test)]
+mod ingress_tests;
 #[cfg(test)]
 mod response_tests;
 
@@ -1157,7 +1169,7 @@ mod tests {
 			panic!("expected repo rotate-pat command");
 		};
 		assert_eq!(args.id, 7);
-		assert_eq!(args.pat, "ghp_replacement");
+		assert_eq!(args.pat.expose(), "ghp_replacement");
 	}
 
 	#[test]
@@ -1222,7 +1234,7 @@ mod tests {
 		assert_eq!(args.id, 7);
 		assert_eq!(args.target_owner, "acme");
 		assert_eq!(args.target_repo, "tracker");
-		assert_eq!(args.pat.as_deref(), Some("ghp_replacement"));
+		assert_eq!(args.pat.as_ref().map(config_input::PatInput::expose), Some("ghp_replacement"));
 	}
 
 	#[test]
@@ -1243,7 +1255,7 @@ mod tests {
 		let Cmd::Repo(RepoCmd::SetGithubReporting(args)) = cli.cmd else {
 			panic!("expected repo set-github-reporting command");
 		};
-		assert_eq!(args.pat, None, "no --pat means GitHub App mode");
+		assert!(args.pat.is_none(), "no --pat means GitHub App mode");
 	}
 
 	#[test]
@@ -1266,7 +1278,7 @@ mod tests {
 			panic!("expected repo add command");
 		};
 		assert_eq!(args.target_owner.as_deref(), Some("acme"));
-		assert_eq!(args.pat, None, "no --pat means GitHub App mode");
+		assert!(args.pat.is_none(), "no --pat means GitHub App mode");
 		assert!(!args.no_reporting);
 	}
 

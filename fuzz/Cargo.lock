@@ -960,6 +960,7 @@ dependencies = [
  "loupe-provenance",
  "loupe-tls",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]

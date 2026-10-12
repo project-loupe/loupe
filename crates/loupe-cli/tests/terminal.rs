@@ -7,6 +7,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PAYLOAD: &str = "visible-é\u{1b}[2J\r\u{85}\t\nforged-row";
+const ADMITTED: &str = " visible-é *markup* ";
 
 async fn command(args: &[&str], status: &str, body: String) -> Output {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -57,8 +58,8 @@ fn assert_safe_line(bytes: &[u8], fields: usize) {
 
 fn findings() -> String {
 	json!({"protocol_version": 2, "findings": [{
-		"id": 1, "repo_id": 2, "job_id": 3, "scanner_id": PAYLOAD,
-		"severity": "high", "title": PAYLOAD, "file_path": PAYLOAD,
+		"id": 1, "repo_id": 2, "job_id": 3, "scanner_id": ADMITTED,
+		"severity": "high", "title": ADMITTED, "file_path": ADMITTED,
 		"line_start": 1, "fingerprint": "fixture", "state": "confirmed",
 		"verification_required": false, "created_at": 0
 	}]})
@@ -66,14 +67,14 @@ fn findings() -> String {
 }
 
 #[tokio::test]
-async fn finding_list_escapes_terminal_controls() {
+async fn finding_list_preserves_admitted_text() {
 	let output = command(&["finding", "list", "2"], "200 OK", findings()).await;
 	assert!(output.status.success(), "{:?}", output.stderr);
 	assert_safe_line(&output.stdout, 7);
 }
 
 #[tokio::test]
-async fn finding_search_escapes_terminal_controls() {
+async fn finding_search_preserves_admitted_text() {
 	let output = command(&["finding", "search", "2", "query"], "200 OK", findings()).await;
 	assert!(output.status.success(), "{:?}", output.stderr);
 	assert_safe_line(&output.stdout, 5);
@@ -87,11 +88,11 @@ async fn server_errors_escape_terminal_controls() {
 }
 
 #[tokio::test]
-async fn repository_listing_escapes_terminal_controls() {
+async fn repository_listing_preserves_admitted_text() {
 	let body = json!({"protocol_version": 2, "repos": [{
-		"id": 1, "clone_url": "https://example.test/repo", "host": PAYLOAD,
-		"owner": PAYLOAD, "repo": PAYLOAD, "verification_enabled": false,
-		"created_at": 0, "reporting": {"kind": "email", "to": [PAYLOAD]}
+		"id": 1, "clone_url": "https://example.test/repo", "host": ADMITTED,
+		"owner": ADMITTED, "repo": ADMITTED, "verification_enabled": false,
+		"created_at": 0, "reporting": {"kind": "email", "to": [ADMITTED]}
 	}]})
 	.to_string();
 	let output = command(&["repo", "list"], "200 OK", body).await;
@@ -100,8 +101,8 @@ async fn repository_listing_escapes_terminal_controls() {
 }
 
 #[tokio::test]
-async fn github_app_slug_escapes_terminal_controls() {
-	let body = json!({"protocol_version": 2, "app": {"app_id": 1, "slug": PAYLOAD}}).to_string();
+async fn github_app_slug_preserves_admitted_text() {
+	let body = json!({"protocol_version": 2, "app": {"app_id": 1, "slug": ADMITTED}}).to_string();
 	let output = command(&["github-app", "show"], "200 OK", body).await;
 	assert!(output.status.success(), "{:?}", output.stderr);
 	assert_safe_line(&output.stdout, 0);

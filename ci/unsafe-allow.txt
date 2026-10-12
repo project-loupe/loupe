@@ -21,6 +21,8 @@ crates/loupe-server/src/main.rs actual CLI/environment/file owners mint Config b
 crates/loupe-server/src/reporters/ingress.rs actual bounded GitHub HTTP responses mint Reporter before parsing
 crates/loupe-server/src/reporters/github_app.rs actual guarded GitHub token responses mint Reporter before parsing
 crates/loupe-server/src/ingress/jobs.rs test fixture: mints Worker for original synthetic messages
+crates/loupe-cli/src/config_input.rs actual Clap argv/environment values and guarded native PEM file reads mint Config
+crates/loupe-cli/src/ingress/mod.rs actual guarded server HTTP response bytes mint Server
 crates/loupe-proto/tests/support/verdict.rs test fixture: mints Worker for original messages the test made up
 fuzz/src/smoke.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_bounded.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

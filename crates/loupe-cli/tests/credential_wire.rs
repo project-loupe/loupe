@@ -120,8 +120,7 @@ async fn actual_credential_commands_preserve_wire_contracts() {
 		assert!(headers.starts_with(&format!("{method_path} HTTP/1.1\r\n")));
 		let headers = headers.to_lowercase();
 		assert!(headers.contains("\r\ncontent-type: application/json\r\n"));
-		// loupectl currently carries the version in its DTO body, without
-		// a separate header. Preserve that behavior at this ownership boundary.
+		// loupectl carries the version in its DTO body, without a separate header.
 		assert_eq!(body, expected);
 	}
 	let (_, body) = capture(
@@ -131,4 +130,18 @@ async fn actual_credential_commands_preserve_wire_contracts() {
 	)
 	.await;
 	assert_eq!(body, json!({"protocol_version":2,"target_owner":"acme","target_repo":"issues"}));
+}
+
+#[tokio::test]
+async fn explicit_pat_overrides_environment_without_changing_bytes() {
+	const EMPTY: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+	for explicit in ["", " argv-\"\\\n\r\tNFD-e\u{301} "] {
+		let (_, body) = capture(
+			&["repo", "rotate-pat", "7", "--pat", explicit],
+			Some("ENV_PAT_SHOULD_NOT_WIN"),
+			EMPTY,
+		)
+		.await;
+		assert_eq!(body, json!({"protocol_version":2,"github_pat":explicit}));
+	}
 }
