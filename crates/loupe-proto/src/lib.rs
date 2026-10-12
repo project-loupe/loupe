@@ -12,6 +12,7 @@ mod job_io;
 mod lease;
 mod registry;
 mod scan;
+mod secret_serde;
 mod version;
 
 pub use findings_admin::{

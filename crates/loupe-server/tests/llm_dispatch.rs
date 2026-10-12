@@ -154,7 +154,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_pat".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_pat".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),

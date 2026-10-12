@@ -1,27 +1,52 @@
+use std::sync::Arc;
+
 use loupe_core::{Finding, RepoSpec};
-use serde::{Deserialize, Serialize};
+use loupe_provenance::Secret;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Opaque, single-lease capability issued by loupe-server.
 ///
-/// The custom `Debug` implementation prevents accidental disclosure in
-/// logs while serde still carries the value over the mTLS lease response.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct JobCapability(String);
+/// Cloning shares one secret owner across the lease's host tasks. Formatting
+/// is redacted; serialization deliberately delivers the bearer over mTLS.
+pub struct JobCapability(Arc<Secret<String>>);
 
 impl JobCapability {
 	pub fn from_secret(value: impl Into<String>) -> Self {
-		Self(value.into())
+		Self(Arc::new(Secret::new(value.into())))
 	}
 
 	pub fn expose_secret(&self) -> &str {
-		&self.0
+		self.0.expose()
+	}
+}
+
+impl Clone for JobCapability {
+	fn clone(&self) -> Self {
+		Self(Arc::clone(&self.0))
 	}
 }
 
 impl std::fmt::Debug for JobCapability {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("JobCapability([REDACTED])")
+		f.write_str("[redacted]")
+	}
+}
+
+impl std::fmt::Display for JobCapability {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+
+impl Serialize for JobCapability {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str(self.expose_secret())
+	}
+}
+
+impl<'de> Deserialize<'de> for JobCapability {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		String::deserialize(deserializer).map(Self::from_secret)
 	}
 }
 
@@ -45,7 +70,7 @@ pub struct LeaseRequest {
 /// the queue is empty / no job matches the worker's capabilities (`Empty`).
 /// We carry the variant inside the body rather than relying on HTTP status
 /// codes because intermediaries strip / mangle them often enough.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LeaseResponse {
 	Lease(Box<LeaseEnvelope>),
@@ -57,7 +82,7 @@ pub enum LeaseResponse {
 /// `payload` discriminates between scan and verify so that, for verify
 /// jobs, the target finding travels alongside the repo spec without
 /// inflating every scan-job response with optional finding fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LeaseEnvelope {
 	pub protocol_version: u16,
 	pub job_id: i64,
@@ -74,8 +99,12 @@ pub struct LeaseEnvelope {
 	/// before this point or the server reaper will reclaim the job.
 	pub lease_expires_at: i64,
 	pub scanner_config: serde_json::Value,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub github_pat: Option<String>,
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "crate::secret_serde::optional"
+	)]
+	pub github_pat: Option<Secret<String>>,
 	pub payload: LeasePayload,
 }
 
@@ -112,13 +141,29 @@ mod tests {
 		}
 	}
 
+	fn assert_same_lease(expected: &LeaseEnvelope, actual: &LeaseEnvelope) {
+		assert_eq!(expected.protocol_version, actual.protocol_version);
+		assert_eq!(expected.job_id, actual.job_id);
+		assert_eq!(expected.job_capability.expose_secret(), actual.job_capability.expose_secret());
+		assert_eq!(expected.repo_id, actual.repo_id);
+		assert_eq!(expected.repo, actual.repo);
+		assert_eq!(expected.head_branch, actual.head_branch);
+		assert_eq!(expected.lease_expires_at, actual.lease_expires_at);
+		assert_eq!(expected.scanner_config, actual.scanner_config);
+		assert_eq!(
+			expected.github_pat.as_ref().map(Secret::expose),
+			actual.github_pat.as_ref().map(Secret::expose),
+		);
+		assert_eq!(expected.payload, actual.payload);
+	}
+
 	#[test]
 	fn empty_response_round_trips() {
 		let r = LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION };
 		let s = serde_json::to_string(&r).unwrap();
 		assert!(s.contains(r#""kind":"empty""#));
 		let back: LeaseResponse = serde_json::from_str(&s).unwrap();
-		assert_eq!(r, back);
+		assert!(matches!(back, LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
 	}
 
 	#[test]
@@ -135,10 +180,13 @@ mod tests {
 			github_pat: None,
 			payload: LeasePayload::Scan { since_sha: Some("abc123".into()) },
 		};
-		let r = LeaseResponse::Lease(Box::new(env.clone()));
+		let r = LeaseResponse::Lease(Box::new(env));
 		let s = serde_json::to_string(&r).unwrap();
 		let back: LeaseResponse = serde_json::from_str(&s).unwrap();
-		assert_eq!(r, back);
+		let (LeaseResponse::Lease(expected), LeaseResponse::Lease(actual)) = (&r, &back) else {
+			panic!("expected scan leases");
+		};
+		assert_same_lease(expected, actual);
 	}
 
 	#[test]
@@ -174,7 +222,7 @@ mod tests {
 		};
 		let s = serde_json::to_string(&env).unwrap();
 		let back: LeaseEnvelope = serde_json::from_str(&s).unwrap();
-		assert_eq!(env, back);
+		assert_same_lease(&env, &back);
 		// Sanity-check the discriminator is the verify kind.
 		match back.payload {
 			LeasePayload::Verify { finding_id, finding: f, reviewed_sha } => {

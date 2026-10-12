@@ -1,11 +1,12 @@
 //! Byte zero selects one of 36 public DTO types; the rest is raw JSON.
 //! Inputs are capped at 512 KiB, allowing report-budget and PoC boundaries.
-//! Capability equality uses subtle; the product's ordinary Eq is not invoked
-//! on secrets. Other fields still use the DTO's derived PartialEq.
+//! Credential equality uses subtle; other fields retain explicit comparisons
+//! when their enclosing DTO no longer derives PartialEq.
 
 use std::fmt::Debug;
 
 use loupe_proto::*;
+use loupe_provenance::Secret;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -31,8 +32,31 @@ fn capability(value: &JobCapability, back: &JobCapability) {
 		bool::from(value.expose_secret().as_bytes().ct_eq(back.expose_secret().as_bytes())),
 		"capability changed during wire round trip"
 	);
-	assert_eq!(format!("{value:?}"), "JobCapability([REDACTED])");
-	assert_eq!(format!("{back:?}"), "JobCapability([REDACTED])");
+	assert_eq!(format!("{value:?}"), "[redacted]");
+	assert_eq!(format!("{back:?}"), "[redacted]");
+	assert_eq!(format!("{value}"), "[redacted]");
+	assert_eq!(format!("{back}"), "[redacted]");
+}
+
+fn secret(value: &Secret<String>, back: &Secret<String>) {
+	assert!(
+		bool::from(value.expose().as_bytes().ct_eq(back.expose().as_bytes())),
+		"PAT changed during wire round trip"
+	);
+}
+
+fn optional_secret(value: &Option<Secret<String>>, back: &Option<Secret<String>>) {
+	match (value, back) {
+		(Some(value), Some(back)) => secret(value, back),
+		(None, None) => {},
+		_ => panic!("PAT presence changed during wire round trip"),
+	}
+}
+
+fn scrub_pat(value: &mut Option<Secret<String>>) {
+	if value.is_some() {
+		*value = Some(Secret::new("fixed PAT debug baseline".into()));
+	}
 }
 
 fn scrub_envelope(value: &mut LeaseEnvelope) {
@@ -41,6 +65,51 @@ fn scrub_envelope(value: &mut LeaseEnvelope) {
 	// Only the capability changes. A coincidental secret match in another
 	// public field cannot cause a false positive in this comparison.
 	assert_eq!(debug, format!("{value:?}"), "envelope Debug exposes capability");
+	let debug = format!("{value:?}");
+	scrub_pat(&mut value.github_pat);
+	assert_eq!(debug, format!("{value:?}"), "envelope Debug exposes PAT");
+}
+
+fn envelope(value: &mut LeaseEnvelope, back: &mut LeaseEnvelope) {
+	capability(&value.job_capability, &back.job_capability);
+	optional_secret(&value.github_pat, &back.github_pat);
+	assert_eq!(value.protocol_version, back.protocol_version);
+	assert_eq!(value.job_id, back.job_id);
+	assert_eq!(value.repo_id, back.repo_id);
+	assert_eq!(value.repo, back.repo);
+	assert_eq!(value.head_branch, back.head_branch);
+	assert_eq!(value.lease_expires_at, back.lease_expires_at);
+	assert_eq!(value.scanner_config, back.scanner_config);
+	assert_eq!(value.payload, back.payload);
+	scrub_envelope(value);
+	scrub_envelope(back);
+}
+
+fn reporting(value: &mut ReportingSetup, back: &mut ReportingSetup) {
+	let before = (format!("{value:?}"), format!("{back:?}"));
+	match (&mut *value, &mut *back) {
+		(
+			ReportingSetup::GithubIssue { target_owner, target_repo, github_pat },
+			ReportingSetup::GithubIssue { target_owner: owner, target_repo: repo, github_pat: pat },
+		) => {
+			assert_eq!(target_owner, owner);
+			assert_eq!(target_repo, repo);
+			optional_secret(github_pat, pat);
+			scrub_pat(github_pat);
+			scrub_pat(pat);
+		},
+		(
+			ReportingSetup::Email { to, from, subject_prefix },
+			ReportingSetup::Email { to: back_to, from: back_from, subject_prefix: back_prefix },
+		) => {
+			assert_eq!(to, back_to);
+			assert_eq!(from, back_from);
+			assert_eq!(subject_prefix, back_prefix);
+		},
+		(ReportingSetup::Manual, ReportingSetup::Manual) => {},
+		_ => panic!("reporting setup variant changed during wire round trip"),
+	}
+	assert_eq!(before, (format!("{value:?}"), format!("{back:?}")), "reporting Debug exposes PAT");
 }
 
 pub fn do_test(data: &[u8]) {
@@ -52,21 +121,19 @@ pub fn do_test(data: &[u8]) {
 		0 => roundtrip::<LeaseRequest>(raw),
 		1 => {
 			if let Some((mut value, mut back)) = decode::<LeaseResponse>(raw) {
-				if let (LeaseResponse::Lease(a), LeaseResponse::Lease(b)) = (&mut value, &mut back)
-				{
-					capability(&a.job_capability, &b.job_capability);
-					scrub_envelope(a);
-					scrub_envelope(b);
+				match (&mut value, &mut back) {
+					(LeaseResponse::Lease(a), LeaseResponse::Lease(b)) => envelope(a, b),
+					(
+						LeaseResponse::Empty { protocol_version: a },
+						LeaseResponse::Empty { protocol_version: b },
+					) => assert_eq!(a, b),
+					_ => panic!("lease response variant changed during wire round trip"),
 				}
-				assert_eq!(value, back, "lease response round trip changed a field");
 			}
 		},
 		2 => {
 			if let Some((mut value, mut back)) = decode::<LeaseEnvelope>(raw) {
-				capability(&value.job_capability, &back.job_capability);
-				scrub_envelope(&mut value);
-				scrub_envelope(&mut back);
-				assert_eq!(value, back, "lease envelope round trip changed a field");
+				envelope(&mut value, &mut back);
 			}
 		},
 		3 => roundtrip::<LeasePayload>(raw),
@@ -88,11 +155,60 @@ pub fn do_test(data: &[u8]) {
 		10 => roundtrip::<ScanRequest>(raw),
 		11 => roundtrip::<ScanResponse>(raw),
 		12 => roundtrip::<JobInfo>(raw),
-		13 => roundtrip::<ReportingSetup>(raw),
-		14 => roundtrip::<RegisterRepoRequest>(raw),
+		13 => {
+			if let Some((mut value, mut back)) = decode::<ReportingSetup>(raw) {
+				reporting(&mut value, &mut back);
+			}
+		},
+		14 => {
+			if let Some((mut value, mut back)) = decode::<RegisterRepoRequest>(raw) {
+				assert_eq!(value.protocol_version, back.protocol_version);
+				assert_eq!(value.clone_url, back.clone_url);
+				assert_eq!(value.branch, back.branch);
+				assert_eq!(value.scan_interval_seconds, back.scan_interval_seconds);
+				assert_eq!(value.scanner_config, back.scanner_config);
+				assert_eq!(value.verification_enabled, back.verification_enabled);
+				assert_eq!(value.require_approval, back.require_approval);
+				let before = (format!("{value:?}"), format!("{back:?}"));
+				reporting(&mut value.reporting, &mut back.reporting);
+				assert_eq!(
+					before,
+					(format!("{value:?}"), format!("{back:?}")),
+					"registration Debug exposes PAT"
+				);
+			}
+		},
 		15 => roundtrip::<RegisterRepoResponse>(raw),
-		16 => roundtrip::<RotateRepoPatRequest>(raw),
-		17 => roundtrip::<SetRepoGithubReportingRequest>(raw),
+		16 => {
+			if let Some((mut value, mut back)) = decode::<RotateRepoPatRequest>(raw) {
+				assert_eq!(value.protocol_version, back.protocol_version);
+				secret(&value.github_pat, &back.github_pat);
+				let before = (format!("{value:?}"), format!("{back:?}"));
+				value.github_pat = Secret::new("fixed PAT debug baseline".into());
+				back.github_pat = Secret::new("fixed PAT debug baseline".into());
+				assert_eq!(
+					before,
+					(format!("{value:?}"), format!("{back:?}")),
+					"rotation Debug exposes PAT"
+				);
+			}
+		},
+		17 => {
+			if let Some((mut value, mut back)) = decode::<SetRepoGithubReportingRequest>(raw) {
+				assert_eq!(value.protocol_version, back.protocol_version);
+				assert_eq!(value.target_owner, back.target_owner);
+				assert_eq!(value.target_repo, back.target_repo);
+				optional_secret(&value.github_pat, &back.github_pat);
+				let before = (format!("{value:?}"), format!("{back:?}"));
+				scrub_pat(&mut value.github_pat);
+				scrub_pat(&mut back.github_pat);
+				assert_eq!(
+					before,
+					(format!("{value:?}"), format!("{back:?}")),
+					"reporting update Debug exposes PAT"
+				);
+			}
+		},
 		18 => roundtrip::<SetGithubAppRequest>(raw),
 		19 => roundtrip::<GithubAppSummary>(raw),
 		20 => roundtrip::<GithubAppResponse>(raw),

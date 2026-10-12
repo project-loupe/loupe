@@ -28,6 +28,7 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 loupe-core = { version = "0.1.0", path = "../loupe-core" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
 loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 rustls = { workspace = true }

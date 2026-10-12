@@ -165,7 +165,7 @@ async fn admin_can_register_list_and_delete_a_repo() {
 		reporting: ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_secret_value".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_secret_value".into())),
 		},
 		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
 		verification_enabled: Some(true),
@@ -255,7 +255,7 @@ async fn repo_listing_reports_reporter_kind_without_secrets() {
 			ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_do_not_leak".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_do_not_leak".into())),
 			},
 		),
 		(
@@ -363,7 +363,7 @@ async fn admin_can_rotate_a_repo_github_pat() {
 		ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_old".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_old".into())),
 		},
 	)
 	.await;
@@ -381,8 +381,10 @@ async fn admin_can_rotate_a_repo_github_pat() {
 	};
 	assert_eq!(secret_value(&f.db, old_secret_id).unwrap(), b"ghp_old");
 
-	let req =
-		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: "ghp_new".into() };
+	let req = RotateRepoPatRequest {
+		protocol_version: PROTOCOL_VERSION,
+		github_pat: loupe_provenance::Secret::new("ghp_new".into()),
+	};
 	let resp = admin
 		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
 		.json(&req)
@@ -415,8 +417,10 @@ async fn rotating_pat_requires_github_issue_reporting() {
 	let f = bring_up().await;
 	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
 	let repo_id = create_repo(&admin, ReportingSetup::Manual).await;
-	let req =
-		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: "ghp_new".into() };
+	let req = RotateRepoPatRequest {
+		protocol_version: PROTOCOL_VERSION,
+		github_pat: loupe_provenance::Secret::new("ghp_new".into()),
+	};
 
 	let resp = admin
 		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
@@ -447,7 +451,7 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: "acme".into(),
 		target_repo: "tracker".into(),
-		github_pat: Some("ghp_first".into()),
+		github_pat: Some(loupe_provenance::Secret::new("ghp_first".into())),
 	};
 	let resp = admin
 		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
@@ -474,7 +478,7 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: "acme".into(),
 		target_repo: "new-tracker".into(),
-		github_pat: Some("ghp_second".into()),
+		github_pat: Some(loupe_provenance::Secret::new("ghp_second".into())),
 	};
 	let resp = admin
 		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
@@ -516,7 +520,7 @@ async fn registering_with_non_https_clone_url_400s() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "a".into(),
 				target_repo: "b".into(),
-				github_pat: Some("ghp".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
@@ -609,7 +613,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_old".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_old".into())),
 		},
 	)
 	.await;
@@ -654,7 +658,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
 		.json(&RotateRepoPatRequest {
 			protocol_version: PROTOCOL_VERSION,
-			github_pat: "ghp_x".into(),
+			github_pat: loupe_provenance::Secret::new("ghp_x".into()),
 		})
 		.send()
 		.await
@@ -669,7 +673,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: "acme".into(),
 		target_repo: "tracker".into(),
-		github_pat: Some("ghp_back".into()),
+		github_pat: Some(loupe_provenance::Secret::new("ghp_back".into())),
 	};
 	let resp = admin
 		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
@@ -733,7 +737,7 @@ async fn app_mode_destinations_honor_the_owner_allowlist() {
 		ReportingSetup::GithubIssue {
 			target_owner: "evilcorp".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_scoped".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_scoped".into())),
 		},
 	)
 	.await;

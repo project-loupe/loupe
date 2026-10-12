@@ -105,7 +105,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "x".into(),
 				target_repo: "y".into(),
-				github_pat: Some("ghp".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),

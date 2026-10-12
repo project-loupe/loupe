@@ -161,7 +161,7 @@ async fn register_repo(
 		ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: target_repo.into(),
-			github_pat: Some("ghp_test_pat".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_test_pat".into())),
 		},
 	)
 	.await
@@ -479,7 +479,7 @@ async fn manual_repo_can_add_reporting_and_retry_confirmed_findings() {
 			protocol_version: PROTOCOL_VERSION,
 			target_owner: "acme".into(),
 			target_repo: "late-target".into(),
-			github_pat: Some("ghp_late_pat".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_late_pat".into())),
 		})
 		.send()
 		.await

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use loupe_provenance::Secret;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
@@ -171,7 +172,7 @@ impl RepoCache {
 	/// while the caller is using it. Concurrent calls for the same
 	/// `key` are serialised so two leases don't race the clone/fetch.
 	pub async fn ensure_repo(
-		self: &Arc<Self>, key: &RepoKey, clone_url: &str, token: Option<&str>,
+		self: &Arc<Self>, key: &RepoKey, clone_url: &str, token: Option<&Arc<Secret<String>>>,
 	) -> Result<EnsuredRepo> {
 		let path = self.repo_path(key);
 		let lock = self.repo_lock(key);
@@ -180,10 +181,12 @@ impl RepoCache {
 		if path.exists() {
 			info!(host = %key.host, owner = %key.owner, repo = %key.repo, "fetching repo updates");
 			let fp = path.clone();
-			let ft = token.map(String::from);
+			let ft = token.map(Arc::clone);
 			let started = std::time::Instant::now();
-			let res =
-				tokio::task::spawn_blocking(move || Self::fetch_bare(&fp, ft.as_deref())).await?;
+			let res = tokio::task::spawn_blocking(move || {
+				Self::fetch_bare(&fp, ft.as_ref().map(|token| token.expose().as_str()))
+			})
+			.await?;
 			match res {
 				Ok(()) => {
 					info!(
@@ -233,7 +236,7 @@ impl RepoCache {
 	/// when a checkout discovers the cache lacks a required commit
 	/// even after the normal refresh path completed.
 	pub async fn reclone_repo(
-		self: &Arc<Self>, key: &RepoKey, clone_url: &str, token: Option<&str>,
+		self: &Arc<Self>, key: &RepoKey, clone_url: &str, token: Option<&Arc<Secret<String>>>,
 	) -> Result<EnsuredRepo> {
 		let path = self.repo_path(key);
 		let lock = self.repo_lock(key);
@@ -267,12 +270,16 @@ impl RepoCache {
 		Ok(EnsuredRepo { path, _pin: pin })
 	}
 
-	async fn do_clone(&self, path: &Path, clone_url: &str, token: Option<&str>) -> Result<()> {
+	async fn do_clone(
+		&self, path: &Path, clone_url: &str, token: Option<&Arc<Secret<String>>>,
+	) -> Result<()> {
 		let path = path.to_owned();
 		let clone_url = clone_url.to_owned();
-		let token = token.map(String::from);
-		tokio::task::spawn_blocking(move || Self::clone_bare(&path, &clone_url, token.as_deref()))
-			.await??;
+		let token = token.map(Arc::clone);
+		tokio::task::spawn_blocking(move || {
+			Self::clone_bare(&path, &clone_url, token.as_ref().map(|token| token.expose().as_str()))
+		})
+		.await??;
 		Ok(())
 	}
 

@@ -890,6 +890,7 @@ dependencies = [
  "loupe-core",
  "loupe-http",
  "loupe-proto",
+ "loupe-provenance",
  "loupe-tls",
  "reqwest",
  "serde_json",
@@ -924,6 +925,7 @@ name = "loupe-proto"
 version = "0.1.0"
 dependencies = [
  "loupe-core",
+ "loupe-provenance",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -949,6 +951,7 @@ dependencies = [
  "hyper-util",
  "loupe-core",
  "loupe-proto",
+ "loupe-provenance",
  "loupe-storage",
  "loupe-tls",
  "loupe-worker",
@@ -1044,6 +1047,7 @@ dependencies = [
  "loupe-core",
  "loupe-http",
  "loupe-proto",
+ "loupe-provenance",
  "loupe-server",
  "loupe-storage",
  "loupe-tls",

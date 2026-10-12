@@ -137,9 +137,9 @@ impl Runner {
 	) -> Result<(Option<String>, usize)> {
 		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
 		let clone_url = env.repo.clone_url.clone();
-		let github_pat = env.github_pat.clone();
+		let github_pat = env.github_pat.map(Arc::new);
 		let mut ensured =
-			self.cache.ensure_repo(&key, &env.repo.clone_url, env.github_pat.as_deref()).await?;
+			self.cache.ensure_repo(&key, &env.repo.clone_url, github_pat.as_ref()).await?;
 		// `ensured` (and its pin) lives until the end of this fn; the
 		// repo cache won't evict the bare clone while the worktree
 		// alternate is still in use.
@@ -157,38 +157,37 @@ impl Runner {
 					.await?;
 					return Ok((None, 0));
 				};
-				let (workdir, head_sha) =
-					match checkout_revision(&ensured.path, &reviewed_sha).await {
-						Ok(ok) => ok,
-						Err(first_error) => {
-							tracing::warn!(
-								job_id = env.job_id,
-								finding_id,
-								reviewed_sha = %reviewed_sha,
-								error = %first_error,
-								"verify revision missing from refreshed cache; re-cloning",
-							);
-							drop(ensured);
-							ensured = self
-								.cache
-								.reclone_repo(&key, &clone_url, github_pat.as_deref())
+				let (workdir, head_sha) = match checkout_revision(&ensured.path, &reviewed_sha)
+					.await
+				{
+					Ok(ok) => ok,
+					Err(first_error) => {
+						tracing::warn!(
+							job_id = env.job_id,
+							finding_id,
+							reviewed_sha = %reviewed_sha,
+							error = %first_error,
+							"verify revision missing from refreshed cache; re-cloning",
+						);
+						drop(ensured);
+						ensured =
+							self.cache.reclone_repo(&key, &clone_url, github_pat.as_ref()).await?;
+						match checkout_revision(&ensured.path, &reviewed_sha).await {
+							Ok(ok) => ok,
+							Err(second_error) => {
+								self.submit_revision_unavailable_verdict(
+									env.job_id,
+									&env.job_capability,
+									finding_id,
+									Some(&reviewed_sha),
+									&second_error.to_string(),
+								)
 								.await?;
-							match checkout_revision(&ensured.path, &reviewed_sha).await {
-								Ok(ok) => ok,
-								Err(second_error) => {
-									self.submit_revision_unavailable_verdict(
-										env.job_id,
-										&env.job_capability,
-										finding_id,
-										Some(&reviewed_sha),
-										&second_error.to_string(),
-									)
-									.await?;
-									return Ok((Some(reviewed_sha), 0));
-								},
-							}
-						},
-					};
+								return Ok((Some(reviewed_sha), 0));
+							},
+						}
+					},
+				};
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
@@ -266,7 +265,7 @@ impl Runner {
 							drop(ensured);
 							ensured = self
 								.cache
-								.reclone_repo(&key, &clone_url, github_pat.as_deref())
+								.reclone_repo(&key, &clone_url, github_pat.as_ref())
 								.await?;
 							checkout_latest(&ensured.path, env.head_branch.as_deref()).await?
 						},

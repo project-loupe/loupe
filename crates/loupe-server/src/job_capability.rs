@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use loupe_core::{JobKind, JobState};
 use loupe_proto::{JobCapability, JOB_CAPABILITY_HEADER, JOB_CAPABILITY_TOKEN_CHARS};
+use loupe_provenance::Zeroise;
 use loupe_storage::jobs::{self, JobRow};
 use rand_core::{OsRng, RngCore};
 
@@ -31,9 +32,10 @@ impl AuthorizedJob {
 pub(crate) fn issue() -> (JobCapability, [u8; 32]) {
 	let mut random = [0u8; 32];
 	OsRng.fill_bytes(&mut random);
-	let token = URL_SAFE_NO_PAD.encode(random);
-	let hash = *blake3::hash(token.as_bytes()).as_bytes();
-	(JobCapability::from_secret(token), hash)
+	let token = JobCapability::from_secret(URL_SAFE_NO_PAD.encode(random.as_slice()));
+	random.zeroise();
+	let hash = *blake3::hash(token.expose_secret().as_bytes()).as_bytes();
+	(token, hash)
 }
 
 /// Parse the capability header without requiring a live lease.

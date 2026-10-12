@@ -3,13 +3,36 @@
 //! over mTLS.
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use loupe_http::read_response_bytes;
 use loupe_proto::{
 	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
 	JobCapability, LeaseRequest, LeaseResponse, ListFindingsResponse, LlmFindingSubmission,
 	VerdictSubmission, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
+use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use reqwest::Url;
+
+/// Named authentication handoff: Bytes keeps this shared secret owner alive
+/// through header clones. HTTP/TLS encoding and kernel copies are not covered
+/// by the original Secret allocation's wipe-on-drop guarantee.
+struct CapabilityHeader(JobCapability);
+
+impl AsRef<[u8]> for CapabilityHeader {
+	fn as_ref(&self) -> &[u8] {
+		self.0.expose_secret().as_bytes()
+	}
+}
+
+impl TryFrom<CapabilityHeader> for HeaderValue {
+	type Error = InvalidHeaderValue;
+
+	fn try_from(value: CapabilityHeader) -> Result<Self, Self::Error> {
+		let mut header = Self::from_maybe_shared(Bytes::from_owner(value))?;
+		header.set_sensitive(true);
+		Ok(header)
+	}
+}
 
 pub struct ServerClient {
 	http: reqwest::Client,
@@ -168,7 +191,8 @@ impl ServerClient {
 	fn with_job_capability(
 		&self, req: reqwest::RequestBuilder, job_capability: &JobCapability,
 	) -> reqwest::RequestBuilder {
-		self.with_protocol(req).header(JOB_CAPABILITY_HEADER, job_capability.expose_secret())
+		self.with_protocol(req)
+			.header(JOB_CAPABILITY_HEADER, CapabilityHeader(job_capability.clone()))
 	}
 }
 
@@ -220,6 +244,73 @@ mod tests {
 	use tokio::net::TcpListener;
 
 	use super::*;
+
+	const HEADER_CAPABILITY: &str = "worker-header-debug-sentinel-49f0b21";
+
+	fn request_with_capability() -> reqwest::Request {
+		let client =
+			ServerClient::from_parts(reqwest::Client::new(), "http://127.0.0.1/".parse().unwrap());
+		let capability = JobCapability::from_secret(HEADER_CAPABILITY);
+		client
+			.with_job_capability(client.http.post(client.url("/v1/jobs/17/heartbeat")), &capability)
+			.build()
+			.unwrap()
+	}
+
+	#[test]
+	fn capability_header_is_sensitive_and_preserves_wire_value() {
+		let request = request_with_capability();
+		let header = &request.headers()[JOB_CAPABILITY_HEADER];
+		assert_eq!(header.to_str().unwrap(), HEADER_CAPABILITY);
+		assert!(header.is_sensitive(), "job capability header must be marked sensitive");
+	}
+
+	#[test]
+	fn capability_header_debug_does_not_disclose_bearer() {
+		let request = request_with_capability();
+		assert!(
+			!format!("{:?}", request.headers()).contains(HEADER_CAPABILITY),
+			"worker request header Debug disclosed the job capability"
+		);
+		assert!(
+			!format!("{request:?}").contains(HEADER_CAPABILITY),
+			"worker request Debug disclosed the job capability"
+		);
+	}
+
+	#[test]
+	fn capability_header_retains_shared_storage_across_clones() {
+		let client =
+			ServerClient::from_parts(reqwest::Client::new(), "http://127.0.0.1/".parse().unwrap());
+		let capability = JobCapability::from_secret(HEADER_CAPABILITY);
+		let original_storage = capability.expose_secret().as_ptr();
+		let request = client
+			.with_job_capability(client.http.post(client.url("/v1/jobs/17/heartbeat")), &capability)
+			.build()
+			.unwrap();
+		let header = request.headers()[JOB_CAPABILITY_HEADER].clone();
+		assert_eq!(
+			header.as_bytes().as_ptr(),
+			original_storage,
+			"capability header must retain the original secret allocation"
+		);
+		drop(request);
+		drop(capability);
+		assert_eq!(header.to_str().unwrap(), HEADER_CAPABILITY);
+	}
+
+	#[test]
+	fn capability_header_rejects_invalid_bytes_without_disclosure() {
+		let client =
+			ServerClient::from_parts(reqwest::Client::new(), "http://127.0.0.1/".parse().unwrap());
+		let capability = JobCapability::from_secret(format!("{HEADER_CAPABILITY}\r\ninvalid"));
+		let error = client
+			.with_job_capability(client.http.post(client.url("/v1/jobs/17/heartbeat")), &capability)
+			.build()
+			.unwrap_err();
+		assert!(!format!("{error:?}").contains(HEADER_CAPABILITY));
+		assert!(!error.to_string().contains(HEADER_CAPABILITY));
+	}
 
 	#[tokio::test]
 	async fn server_error_includes_response_body() {

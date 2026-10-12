@@ -16,6 +16,7 @@ use loupe_proto::{
 	RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse, SetGithubAppRequest,
 	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
+use loupe_provenance::Secret;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe operator CLI")]
@@ -633,7 +634,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 			// so the unwrap is structurally safe.
 			target_owner: a.target_owner.expect("clap enforces target_owner"),
 			target_repo: a.target_repo.expect("clap enforces target_repo"),
-			github_pat: a.pat,
+			github_pat: a.pat.map(Secret::new),
 		}
 	};
 	let req = RegisterRepoRequest {
@@ -750,7 +751,8 @@ async fn repo_update(
 async fn repo_rotate_pat(
 	client: &reqwest::Client, base: &reqwest::Url, a: RepoRotatePatArgs,
 ) -> Result<()> {
-	let req = RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: a.pat };
+	let req =
+		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: Secret::new(a.pat) };
 	let resp = client
 		.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id)))
 		.json(&req)
@@ -767,7 +769,7 @@ async fn repo_set_github_reporting(
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: a.target_owner,
 		target_repo: a.target_repo,
-		github_pat: a.pat,
+		github_pat: a.pat.map(Secret::new),
 	};
 	let resp = client
 		.put(url(base, &format!("/v1/repos/{}/reporting/github", a.id)))

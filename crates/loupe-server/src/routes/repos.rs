@@ -97,7 +97,11 @@ pub async fn create(
 	let parsed = parse_github_clone_url(&req.clone_url)
 		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https or file URL".into()))?;
 	if let ReportingSetup::GithubIssue { target_owner, github_pat, .. } = &req.reporting {
-		check_github_credential(&state, target_owner, github_pat.as_deref())?;
+		check_github_credential(
+			&state,
+			target_owner,
+			github_pat.as_ref().map(|pat| pat.expose().as_str()),
+		)?;
 	}
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
@@ -117,7 +121,7 @@ pub async fn create(
 								&tx,
 								SecretKind::GithubPat,
 								&secret_label,
-								github_pat.as_bytes(),
+								github_pat.expose().as_bytes(),
 								now,
 							)?)
 						},
@@ -247,7 +251,7 @@ pub async fn rotate_github_pat(
 			format!("unsupported protocol_version {}", req.protocol_version),
 		));
 	}
-	if req.github_pat.trim().is_empty() {
+	if req.github_pat.expose().trim().is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "github PAT must not be empty".into()));
 	}
 
@@ -291,7 +295,7 @@ pub async fn rotate_github_pat(
 				&tx,
 				SecretKind::GithubPat,
 				&secret_label,
-				req.github_pat.as_bytes(),
+				req.github_pat.expose().as_bytes(),
 				now,
 			)?;
 			let new_reporting = ReportingDestination::GithubIssue {
@@ -339,7 +343,11 @@ pub async fn set_github_reporting(
 	if target_repo.is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "target_repo must not be empty".into()));
 	}
-	check_github_credential(&state, &target_owner, req.github_pat.as_deref())?;
+	check_github_credential(
+		&state,
+		&target_owner,
+		req.github_pat.as_ref().map(|pat| pat.expose().as_str()),
+	)?;
 
 	let row = state
 		.db
@@ -370,7 +378,7 @@ pub async fn set_github_reporting(
 						&tx,
 						SecretKind::GithubPat,
 						&secret_label,
-						github_pat.as_bytes(),
+						github_pat.expose().as_bytes(),
 						now_secs,
 					)?)
 				},

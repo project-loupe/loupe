@@ -1,4 +1,5 @@
 use loupe_core::ReportingDestination;
+use loupe_provenance::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::version::PROTOCOL_VERSION;
@@ -9,7 +10,7 @@ use crate::version::PROTOCOL_VERSION;
 /// `loupe_core::ReportingDestination` referencing the resulting
 /// `pat_secret_id`. PAT material never travels back out of the server
 /// in any response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReportingSetup {
 	/// File issues on `target_owner/target_repo`. Without `github_pat`
@@ -18,8 +19,12 @@ pub enum ReportingSetup {
 	GithubIssue {
 		target_owner: String,
 		target_repo: String,
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		github_pat: Option<String>,
+		#[serde(
+			default,
+			skip_serializing_if = "Option::is_none",
+			with = "crate::secret_serde::optional"
+		)]
+		github_pat: Option<Secret<String>>,
 	},
 	/// Send findings as email via the server's `sendmail` binary. No
 	/// secret material is required — the binary handles transport.
@@ -38,7 +43,7 @@ pub enum ReportingSetup {
 }
 
 /// Body of `POST /v1/repos`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterRepoRequest {
 	pub protocol_version: u16,
 	pub clone_url: String,
@@ -85,21 +90,26 @@ pub struct RegisterRepoResponse {
 }
 
 /// Body of `POST /v1/repos/:id/reporting/github-pat`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RotateRepoPatRequest {
 	pub protocol_version: u16,
-	pub github_pat: String,
+	#[serde(with = "crate::secret_serde::string")]
+	pub github_pat: Secret<String>,
 }
 
 /// Body of `PUT /v1/repos/:id/reporting/github`. Omitting `github_pat`
 /// switches the repo to the server's GitHub App.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SetRepoGithubReportingRequest {
 	pub protocol_version: u16,
 	pub target_owner: String,
 	pub target_repo: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub github_pat: Option<String>,
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "crate::secret_serde::optional"
+	)]
+	pub github_pat: Option<Secret<String>>,
 }
 
 /// Body of `PUT /v1/github-app`. Carries the app's private key inline,
@@ -297,7 +307,7 @@ mod tests {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "security".into(),
-				github_pat: Some("ghp_xxx".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_xxx".into())),
 			},
 			scanner_config: json!({"regex": {"enabled": true}}),
 			verification_enabled: Some(true),
@@ -305,7 +315,23 @@ mod tests {
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
-		assert_eq!(req, back);
+		assert_eq!(req.protocol_version, back.protocol_version);
+		assert_eq!(req.clone_url, back.clone_url);
+		assert_eq!(req.branch, back.branch);
+		assert_eq!(req.scan_interval_seconds, back.scan_interval_seconds);
+		assert_eq!(req.scanner_config, back.scanner_config);
+		assert_eq!(req.verification_enabled, back.verification_enabled);
+		assert_eq!(req.require_approval, back.require_approval);
+		let (
+			ReportingSetup::GithubIssue { target_owner, target_repo, github_pat },
+			ReportingSetup::GithubIssue { target_owner: owner, target_repo: repo, github_pat: pat },
+		) = (&req.reporting, &back.reporting)
+		else {
+			panic!("expected GitHub reporting");
+		};
+		assert_eq!(target_owner, owner);
+		assert_eq!(target_repo, repo);
+		assert_eq!(github_pat.as_ref().map(Secret::expose), pat.as_ref().map(Secret::expose));
 		// Sanity check: the wire form does not leak `pat_secret_id`.
 		assert!(!s.contains("pat_secret_id"));
 	}
@@ -414,7 +440,7 @@ mod tests {
 		let without_pat = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"t"}"#;
 		let parsed: ReportingSetup = serde_json::from_str(with_pat).unwrap();
 		assert!(
-			matches!(parsed, ReportingSetup::GithubIssue { github_pat: Some(ref p), .. } if p == "ghp_x")
+			matches!(parsed, ReportingSetup::GithubIssue { github_pat: Some(ref p), .. } if p.expose() == "ghp_x")
 		);
 		let parsed: ReportingSetup = serde_json::from_str(without_pat).unwrap();
 		assert!(matches!(parsed, ReportingSetup::GithubIssue { github_pat: None, .. }));
@@ -488,13 +514,14 @@ mod tests {
 	fn rotate_repo_pat_request_does_not_use_storage_ids() {
 		let req = RotateRepoPatRequest {
 			protocol_version: PROTOCOL_VERSION,
-			github_pat: "ghp_new".into(),
+			github_pat: loupe_provenance::Secret::new("ghp_new".into()),
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		assert!(s.contains("github_pat"));
 		assert!(!s.contains("pat_secret_id"));
 		let back: RotateRepoPatRequest = serde_json::from_str(&s).unwrap();
-		assert_eq!(req, back);
+		assert_eq!(req.protocol_version, back.protocol_version);
+		assert_eq!(req.github_pat.expose(), back.github_pat.expose());
 	}
 
 	#[test]
@@ -503,12 +530,18 @@ mod tests {
 			protocol_version: PROTOCOL_VERSION,
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_new".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_new".into())),
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		assert!(s.contains("github_pat"));
 		assert!(!s.contains("pat_secret_id"));
 		let back: SetRepoGithubReportingRequest = serde_json::from_str(&s).unwrap();
-		assert_eq!(req, back);
+		assert_eq!(req.protocol_version, back.protocol_version);
+		assert_eq!(req.target_owner, back.target_owner);
+		assert_eq!(req.target_repo, back.target_repo);
+		assert_eq!(
+			req.github_pat.as_ref().map(Secret::expose),
+			back.github_pat.as_ref().map(Secret::expose)
+		);
 	}
 }

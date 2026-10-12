@@ -363,7 +363,7 @@ fn build_lease_envelope(
 		.ok_or_else(|| anyhow::anyhow!("repo {} for leased job not found", row.repo_id))?;
 	// No clone-side credential is stored separately. We deliberately do
 	// not ship the reporting PAT to the worker.
-	let github_pat: Option<String> = None;
+	let github_pat = None;
 
 	let payload = match row.kind {
 		JobKind::Scan => LeasePayload::Scan { since_sha: row.since_sha.clone() },

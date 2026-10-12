@@ -114,7 +114,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 		reporting: ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp".into())),
 		},
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: Some(false),
@@ -148,7 +148,7 @@ async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
 		reporting: ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: target_repo.into(),
-			github_pat: Some("ghp".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp".into())),
 		},
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: Some(false),
@@ -219,6 +219,38 @@ async fn lease_verify_job(worker: &reqwest::Client) -> LeaseEnvelope {
 		LeaseResponse::Lease(env) => *env,
 		LeaseResponse::Empty { .. } => panic!("verify queue should not be empty"),
 	}
+}
+
+#[tokio::test]
+async fn cloned_capability_authenticates_after_lease_owner_drops() {
+	let f = bring_up_with_repo_and_worker().await;
+	let queued = enqueue_scan(&f, f.repo_id).await;
+	let client = loupe_worker::ServerClient::from_parts(
+		f.worker.clone(),
+		"https://loupe-server/".parse().unwrap(),
+	);
+	let response = client.lease(vec!["scan:secrets".into()], 0).await.unwrap();
+	let LeaseResponse::Lease(lease) = response else { panic!("expected queued lease") };
+	assert_eq!(lease.job_id, queued.job_id);
+	let capability = lease.job_capability.clone();
+	drop(lease);
+
+	let heartbeat = client.heartbeat(queued.job_id, &capability).await.unwrap();
+	assert_eq!(heartbeat.protocol_version, PROTOCOL_VERSION);
+	let wrong = loupe_proto::JobCapability::from_secret("0".repeat(43));
+	let error = client.heartbeat(queued.job_id, &wrong).await.unwrap_err();
+	assert!(error.to_string().contains("403"), "wrong capability must fail authentication");
+
+	let worker2 = register_worker(&f, "capability-other-worker").await;
+	let other =
+		loupe_worker::ServerClient::from_parts(worker2, "https://loupe-server/".parse().unwrap());
+	let error = other.heartbeat(queued.job_id, &capability).await.unwrap_err();
+	assert!(error.to_string().contains("403"), "capability must remain bound to its worker");
+
+	let second_handle = capability.clone();
+	drop(capability);
+	client.heartbeat(queued.job_id, &second_handle).await.unwrap();
+	f.handle.shutdown().await;
 }
 
 async fn submit_finding(worker: &reqwest::Client, env: &LeaseEnvelope, finding: Finding) {

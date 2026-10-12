@@ -189,7 +189,7 @@ async fn run_flow(
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_pat".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_pat".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(true),

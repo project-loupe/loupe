@@ -12,6 +12,7 @@ loupe-core = { path = "../crates/loupe-core" }
 loupe-cli = { path = "../crates/loupe-cli" }
 loupe-http = { path = "../crates/loupe-http" }
 loupe-proto = { path = "../crates/loupe-proto" }
+loupe-provenance = { path = "../crates/loupe-provenance" }
 loupe-server = { path = "../crates/loupe-server" }
 loupe-storage = { path = "../crates/loupe-storage" }
 loupe-tls = { path = "../crates/loupe-tls" }

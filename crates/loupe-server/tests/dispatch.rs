@@ -223,7 +223,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_test_pat_value".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_test_pat_value".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
@@ -386,7 +386,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_test_pat_value".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_test_pat_value".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
