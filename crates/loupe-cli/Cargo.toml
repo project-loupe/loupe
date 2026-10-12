@@ -16,6 +16,7 @@ name = "loupectl"
 path = "src/main.rs"
 
 [dependencies]
+bytes = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }

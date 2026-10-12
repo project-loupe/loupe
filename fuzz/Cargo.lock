@@ -952,6 +952,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "loupe-core",
  "loupe-http",
@@ -1025,7 +1026,9 @@ dependencies = [
 name = "loupe-http"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "loupe-provenance",
  "reqwest",
  "thiserror 2.0.21",
 ]

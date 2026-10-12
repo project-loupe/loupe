@@ -886,6 +886,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bytes",
  "clap",
  "loupe-core",
  "loupe-http",
@@ -914,7 +915,9 @@ dependencies = [
 name = "loupe-http"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "loupe-provenance",
  "reqwest",
  "thiserror 2.0.18",
  "tokio",

@@ -207,7 +207,7 @@ fn build_identity(cert_pem: &str, key_pem: &str) -> Result<reqwest::Identity> {
 		.map_err(|e| anyhow!("building reqwest identity from PEM: {e}"))
 }
 
-async fn ensure_ok(resp: reqwest::Response) -> Result<Vec<u8>> {
+async fn ensure_ok(resp: reqwest::Response) -> Result<Bytes> {
 	if !resp.status().is_success() {
 		let status = resp.status();
 		let bytes = read_response_bytes(resp)

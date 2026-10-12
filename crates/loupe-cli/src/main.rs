@@ -1046,7 +1046,7 @@ async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) 
 }
 
 /// Bound successful and error bodies before decoding or displaying them.
-async fn server_response(resp: reqwest::Response, action: &str) -> Result<Vec<u8>> {
+async fn server_response(resp: reqwest::Response, action: &str) -> Result<bytes::Bytes> {
 	let status = resp.status();
 	let bytes = loupe_http::read_response_bytes(resp)
 		.await
