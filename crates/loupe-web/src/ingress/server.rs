@@ -72,6 +72,8 @@ impl Validate<&HeaderMap, Server> for DashboardServerHeader {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, &HeaderMap>, _: Mark<'v, Server>,
 	) -> Result<(), Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ServerHeader);
 		let value = raw.get().get(PROTOCOL_VERSION_HEADER).ok_or(Failure::MissingProtocol)?;
 		let version = value
 			.to_str()
@@ -112,7 +114,16 @@ impl ServerText {
 			}
 			Some(Bytes::from_owner(buffer))
 		};
-		Ok(Self { original: original.clone(), replacement, source: PhantomData })
+		let text = Self { original: original.clone(), replacement, source: PhantomData };
+		#[cfg(fuzzing)]
+		crate::fuzz_support::record(crate::fuzz_support::Observation::ServerText {
+			original_len: text.original.len(),
+			original_hash: *blake3::hash(&text.original).as_bytes(),
+			shared_pointer: text.original.as_ptr() == original.as_ptr(),
+			replacement_len: text.replacement.as_ref().map(Bytes::len),
+			text_len: text.text().len(),
+		});
+		Ok(text)
 	}
 	fn text(&self) -> &str {
 		// Both branches were admitted above; this conversion cannot allocate.
@@ -133,6 +144,8 @@ impl Validate<Bytes, Server> for DashboardServerJson {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, Bytes>, mark: Mark<'v, Server>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ServerJson);
 		let text = ServerText::decode(raw.get(), &mark)?;
 		if text.text().trim().is_empty() {
 			return Ok(None);
@@ -143,6 +156,10 @@ impl Validate<Bytes, Server> for DashboardServerJson {
 }
 impl ServerJson {
 	fn into_response_legacy(self, status: StatusCode) -> Result<Response, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::record(crate::fuzz_support::Observation::ServerJsonDebug(format!(
+			"{self:?}"
+		)));
 		let bytes = json::encode_server(self.0.text().as_bytes()).map_err(|_| Failure::Encoding)?;
 		Ok((status, [(axum::http::header::CONTENT_TYPE, "application/json")], bytes)
 			.into_response())
@@ -162,6 +179,8 @@ impl Validate<Bytes, Server> for DashboardServerDiagnostic {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, Bytes>, mark: Mark<'v, Server>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ServerDiagnostic);
 		Ok(ServerDiagnostic { text: ServerText::decode(raw.get(), &mark)?, status: self.0 })
 	}
 }
@@ -240,6 +259,8 @@ pub(crate) async fn receive(response: reqwest::Response) -> Result<Outcome, Fail
 		Untrusted::new(response.headers(), token).validate(DashboardServerHeader)?;
 	}
 	let failure_status = (!status.is_success()).then_some(status);
+	#[cfg(fuzzing)]
+	crate::fuzz_support::hit(crate::fuzz_support::Entry::ServerCollect);
 	let bytes = loupe_http::read_response_bytes(response).await.map_err(|error| match error {
 		loupe_http::ResponseBodyError::TooLarge => Failure::BodyTooLarge(failure_status),
 		loupe_http::ResponseBodyError::Transport(_) => Failure::BodyRead(failure_status),

@@ -33,9 +33,16 @@
 //! ```compile_fail,E0603
 //! use loupe_web::ingress::BrowserRequest;
 //! ```
+//!
+//! Fuzz observations do not provide a normal-build decoder or mint API:
+//! ```compile_fail,E0432
+//! use loupe_web::fuzz_support;
+//! ```
 
 pub mod client;
 pub mod config;
+#[cfg(fuzzing)]
+pub mod fuzz_support;
 pub mod guard;
 mod ingress;
 pub mod routes;

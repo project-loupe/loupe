@@ -21,6 +21,9 @@ loupe-tls = { path = "../crates/loupe-tls" }
 loupe-worker = { path = "../crates/loupe-worker" }
 loupe-web = { path = "../crates/loupe-web" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+mime = "0.3"
+percent-encoding = "2.3"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time"] }

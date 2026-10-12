@@ -42,6 +42,8 @@ pub mod tls_fingerprint;
 pub mod tls_input;
 pub mod tls_pem;
 pub mod web_api;
+pub mod web_server_response;
+mod web_support;
 pub mod worker_broker_policy;
 pub mod worker_broker_usage;
 pub mod worker_config;

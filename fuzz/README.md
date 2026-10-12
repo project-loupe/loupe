@@ -332,7 +332,8 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_sandbox_args` | Exact namespace/safety flags, supervisor framing, explicit environment names and bind operands, including flag-shaped values |
 | `worker_server_response` | Actual client methods over chunked HTTP, typed response admission, exact byte budget and bounded errors |
 | `worker_source_discovery` | Actual manifest/glob/exclusion parsing, canonical containment, sorted unique paths and complete known-fixture selection |
-| `web_api` | Actual browser guards, no upstream call on rejected headers, JSON-enclosed diagnostics and bounded responses |
+| `web_api` | Actual Browser guards, six optional body owners, query/path forwarding and Config callbacks; exact unknown/duplicate/PAT semantics, no upstream call on rejection, stream caps and live cleanup |
+| `web_server_response` | Actual private forwarding over HTTP; protocol/status precedence, 16 MiB collection, lossy UTF-8 expansion, exact diagnostics and source-owner lifetime |
 
 `storage_source_refs` takes one policy byte (even: 32 items, odd: 64),
 followed by JSON reference bytes. Inputs up to 128 KiB exercise both sides of
@@ -490,6 +491,13 @@ bubblewrap separators, explicit environment variables and binary binds. A
 separate fixture directory keeps arbitrary entrypoint names from colliding
 with the package installation. Flag-shaped values remain operands in the
 oracle; the target does not mistake those values for security options.
+
+The web targets share a persistent loopback fixture, use iteration-local
+observations of actual private owners, and join every sender task. The request
+target covers Browser router input and concrete Config callbacks; the response
+target reaches the actual private AdminClient forwarding consumer. Their
+[boundary contract](../crates/loupe-web/DIRECT-COVERAGE.md) records recipes,
+independent oracles and the limits of the cleanup and transport observations.
 
 All 34 main-surface S1 targets plus smoke are registered. S3 additionally
 registers `core_text_exact` for the marked exact-text policies and `tls_input`

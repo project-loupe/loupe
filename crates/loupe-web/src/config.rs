@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser};
 mod input;
+#[cfg(fuzzing)]
+pub(crate) use input::{fuzz_parse, fuzz_selected};
 
 /// Default listen port. Deliberately not adjacent to the server's 8443:
 /// this is a different kind of endpoint and should not look like one.

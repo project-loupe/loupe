@@ -108,6 +108,8 @@ impl Validate<(&HeaderMap, &Method), Browser> for BrowserGuard<'_> {
 		self, u: Unvalidated<'v, (&HeaderMap, &Method)>, _: Mark<'v, Browser>,
 	) -> Result<(), GuardFailure> {
 		let (headers, method) = *u.get();
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::Guard);
 		if !host_is_allowed(headers, self.0) {
 			return Err(GuardFailure::Host);
 		}

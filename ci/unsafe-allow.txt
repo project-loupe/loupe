@@ -84,3 +84,4 @@ crates/loupe-server/src/ingress/registry_fuzz.rs fixed Operator fixture: synthet
 crates/loupe-server/src/ingress/query_fuzz.rs fixed Worker/Operator query fixtures: original synthetic Uri only in cfg(fuzzing)
 fuzz/src/server_ingress_requests.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/server_ingress_transport.rs fuzz entry point: actual router and guarded collector controls
+fuzz/src/web_server_response.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

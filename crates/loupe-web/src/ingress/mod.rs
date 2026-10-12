@@ -76,6 +76,8 @@ impl Validate<&HeaderMap, Browser> for DashboardTokenCheck<'_> {
 		self, u: Unvalidated<'v, &HeaderMap>, _: Mark<'v, Browser>,
 	) -> Result<(), Failure> {
 		let presented = u.get().get(crate::token::HEADER_NAME).and_then(|h| h.to_str().ok());
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::Token);
 		if presented.is_some_and(|s| self.0.matches(s)) {
 			Ok(())
 		} else {
@@ -88,6 +90,8 @@ impl Validate<&str, Browser> for BrowserPath {
 	type Output = i64;
 	type Error = Failure;
 	fn validate<'v>(self, u: Unvalidated<'v, &str>, _: Mark<'v, Browser>) -> Result<i64, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::Path);
 		u.get().parse().map_err(|_| Failure::Path)
 	}
 }
@@ -109,6 +113,8 @@ impl Validate<&Uri, Browser> for LimitDecoder {
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &Uri>, _: Mark<'v, Browser>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::Limit);
 		Query::<crate::routes::api::LimitQuery>::try_from_uri(u.get())
 			.map(|q| q.limit)
 			.map_err(|_| Failure::Query)

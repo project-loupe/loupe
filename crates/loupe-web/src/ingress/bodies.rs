@@ -40,8 +40,13 @@ macro_rules! owner {
 			fn validate<'v>(
 				self, u: Unvalidated<'v, Bytes>, _: Mark<'v, Browser>,
 			) -> Result<Self::Output, Failure> {
+				#[cfg(fuzzing)]
+				crate::fuzz_support::hit(crate::fuzz_support::Entry::$validator);
 				json::admit(u.get())?;
-				Ok($name(Document::Present(u.get().clone(), PhantomData)))
+				let owner = $name(Document::Present(u.get().clone(), PhantomData));
+				#[cfg(fuzzing)]
+				owner.observe(Some(u.get()));
+				Ok(owner)
 			}
 		}
 		impl FromRequest<WebState> for $name {
@@ -71,7 +76,31 @@ macro_rules! owner {
 			}
 		}
 		impl $name {
+			#[cfg(fuzzing)]
+			fn observe(&self, original: Option<&Bytes>) {
+				let (absent, original_len, shared_pointer) = match &self.0 {
+					Document::Absent => (true, 0, original.is_none()),
+					Document::Present(bytes, _) => (
+						false,
+						bytes.len(),
+						original.is_some_and(|raw| {
+							raw.as_ptr() == bytes.as_ptr() && raw.len() == bytes.len()
+						}),
+					),
+				};
+				crate::fuzz_support::record(crate::fuzz_support::Observation::Body {
+					owner: crate::fuzz_support::Entry::$validator,
+					absent,
+					original_len,
+					shared_pointer,
+					debug: format!("{self:?}"),
+				});
+			}
 			pub(crate) fn into_upstream_legacy(self) -> Result<Bytes, Failure> {
+				#[cfg(fuzzing)]
+				if matches!(self.0, Document::Absent) {
+					self.observe(None);
+				}
 				self.0.into_upstream_legacy()
 			}
 		}

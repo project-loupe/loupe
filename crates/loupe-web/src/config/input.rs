@@ -32,6 +32,8 @@ fn clap_error(error: Failure) -> clap::Error {
 struct ConfigUrl(reqwest::Url, PhantomData<Config>);
 impl ConfigUrl {
 	fn into_url_legacy(self) -> reqwest::Url {
+		#[cfg(fuzzing)]
+		observe(crate::fuzz_support::Entry::ConfigUrl, self.0.as_str().as_bytes(), None);
 		self.0
 	}
 }
@@ -42,6 +44,8 @@ impl Validate<&OsStr, Config> for WebServerUrlDecoder {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, &OsStr>, _: Mark<'v, Config>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ConfigUrl);
 		let url = raw.get().to_str().ok_or(Failure::NativeUtf8)?;
 		reqwest::Url::parse(url).map(|url| ConfigUrl(url, PhantomData)).map_err(|_| Failure::Url)
 	}
@@ -65,6 +69,12 @@ impl TypedValueParser for UrlParser {
 struct ConfigPath(PathBuf, PhantomData<Config>);
 impl ConfigPath {
 	fn into_path_legacy(self) -> PathBuf {
+		#[cfg(fuzzing)]
+		observe(
+			crate::fuzz_support::Entry::ConfigPath,
+			self.0.as_os_str().as_encoded_bytes(),
+			None,
+		);
 		self.0
 	}
 }
@@ -75,6 +85,8 @@ impl Validate<&OsStr, Config> for WebHostPathDecoder {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, &OsStr>, _: Mark<'v, Config>,
 	) -> Result<Self::Output, Self::Error> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ConfigPath);
 		Ok(ConfigPath(PathBuf::from(raw.get()), PhantomData))
 	}
 }
@@ -97,6 +109,12 @@ impl TypedValueParser for PathParser {
 struct ConfigPem(PemInput, PhantomData<Config>);
 impl ConfigPem {
 	fn into_input_legacy(self) -> PemInput {
+		#[cfg(fuzzing)]
+		observe(
+			crate::fuzz_support::Entry::ConfigPem,
+			self.0.expose().as_bytes(),
+			Some(format!("{:?}", self.0)),
+		);
 		self.0
 	}
 }
@@ -107,6 +125,8 @@ impl Validate<&OsStr, Config> for WebPemInputDecoder {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, &OsStr>, _: Mark<'v, Config>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ConfigPem);
 		let text = raw.get().to_str().ok_or(Failure::NativeUtf8)?;
 		Ok(ConfigPem(PemInput::from(text), PhantomData))
 	}
@@ -130,6 +150,12 @@ impl TypedValueParser for PemParser {
 struct ConfigTlsPem(Secret<String>, PhantomData<Config>);
 impl ConfigTlsPem {
 	fn move_legacy(self) -> Secret<String> {
+		#[cfg(fuzzing)]
+		observe(
+			crate::fuzz_support::Entry::ConfigSelected,
+			self.0.expose().as_bytes(),
+			Some(format!("{:?}", self.0)),
+		);
 		self.0
 	}
 }
@@ -140,6 +166,8 @@ impl Validate<&str, Config> for WebBase64PemDecoder {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, &str>, _: Mark<'v, Config>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ConfigBase64);
 		loupe_tls::decode_pem_base64(raw.get().trim())
 			.map(|pem| ConfigTlsPem(pem, PhantomData))
 			.map_err(|_| Failure::Base64)
@@ -152,6 +180,8 @@ impl Validate<&PemInput, Config> for WebRawPemDecoder {
 	fn validate<'v>(
 		self, raw: Unvalidated<'v, &PemInput>, _: Mark<'v, Config>,
 	) -> Result<Self::Output, Self::Error> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ConfigRaw);
 		Ok(ConfigTlsPem((*raw.get()).clone().into_pem(), PhantomData))
 	}
 }
@@ -163,6 +193,8 @@ impl Validate<&str, Config> for WebTlsPemEgress {
 		self, _: Unvalidated<'v, &str>, _: Mark<'v, Config>,
 	) -> Result<(), Self::Error> {
 		// TLS performs PEM grammar admission; web adds no text cap or normalization.
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::ConfigFile);
 		Ok(())
 	}
 }
@@ -171,8 +203,72 @@ impl WebTlsPemEgress {
 		Untrusted::new(pem.expose().as_str(), token)
 			.validate(Self)
 			.unwrap_or_else(|never| match never {});
+		#[cfg(fuzzing)]
+		observe(
+			crate::fuzz_support::Entry::ConfigSelected,
+			pem.expose().as_bytes(),
+			Some(format!("{pem:?}")),
+		);
 		pem
 	}
+}
+
+#[cfg(fuzzing)]
+fn observe(owner: crate::fuzz_support::Entry, bytes: &[u8], debug: Option<String>) {
+	crate::fuzz_support::record(crate::fuzz_support::Observation::ConfigValue {
+		owner,
+		bytes: bytes.to_vec(),
+		pointer: bytes.as_ptr() as usize,
+		debug,
+	});
+}
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_parse(
+	parser: crate::fuzz_support::ConfigParser, value: &OsStr,
+) -> Result<Vec<u8>, String> {
+	let command = clap::Command::new("web-native-fixture");
+	match parser {
+		crate::fuzz_support::ConfigParser::Url => {
+			UrlParser.parse_ref(&command, None, value).map(|url| url.as_str().as_bytes().to_vec())
+		},
+		crate::fuzz_support::ConfigParser::Path => PathParser
+			.parse_ref(&command, None, value)
+			.map(|path| path.as_os_str().as_encoded_bytes().to_vec()),
+		crate::fuzz_support::ConfigParser::Pem => {
+			PemParser.parse_ref(&command, None, value).map(|pem| pem.expose().as_bytes().to_vec())
+		},
+	}
+	.map_err(|error| error.to_string())
+}
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_selected(
+	raw: Option<&str>, base64: Option<&str>, path: Option<&std::path::Path>,
+) -> Result<Vec<u8>, String> {
+	let path = path.map(std::path::Path::to_path_buf);
+	selected(
+		&raw.map(PemInput::from),
+		&base64.map(PemInput::from),
+		path.as_ref(),
+		"missing fixture PEM source",
+	)
+	.map(|pem| {
+		assert_eq!(format!("{pem:?}"), "[redacted]");
+		assert_eq!(format!("{pem}"), "[redacted]");
+		observe(
+			crate::fuzz_support::Entry::ConfigSelected,
+			pem.expose().as_bytes(),
+			Some(format!("{pem:?}")),
+		);
+		pem.expose().as_bytes().to_vec()
+	})
+	.map_err(|error| {
+		let display = error.to_string();
+		for cause in error.chain() {
+			assert_eq!(cause.to_string(), display, "selected Config error retained a source");
+		}
+		display
+	})
 }
 /// Existing public ConnArgs fields are temporary I exits. Selection is a real
 /// Config read too, including direct programmatic ConnArgs construction.

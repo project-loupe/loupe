@@ -13,15 +13,17 @@ use super::Failure;
 pub(super) struct Buffer {
 	allocation: Box<[u8]>,
 	used: usize,
-	#[cfg(test)]
+	#[cfg(any(test, fuzzing))]
 	audit: Option<audit::Audit>,
 }
 impl Buffer {
 	pub(super) fn new(capacity: usize) -> Self {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::record(crate::fuzz_support::Observation::BufferAllocation(capacity));
 		Self {
 			allocation: vec![0; capacity].into_boxed_slice(),
 			used: 0,
-			#[cfg(test)]
+			#[cfg(any(test, fuzzing))]
 			audit: audit::CURRENT.with(|a| a.borrow().clone()),
 		}
 	}
@@ -42,9 +44,9 @@ impl AsRef<[u8]> for Buffer {
 impl Drop for Buffer {
 	fn drop(&mut self) {
 		self.allocation.zeroise();
-		#[cfg(test)]
+		#[cfg(any(test, fuzzing))]
 		if let Some(audit) = &self.audit {
-			audit.lock().unwrap().push((
+			audit.lock().unwrap_or_else(|_| panic!("web drop audit poisoned")).push((
 				self.allocation.len(),
 				self.used,
 				self.allocation.iter().all(|b| *b == 0),
@@ -53,14 +55,18 @@ impl Drop for Buffer {
 	}
 }
 
-#[cfg(test)]
-pub(super) mod audit {
+#[cfg(any(test, fuzzing))]
+pub(crate) mod audit {
 	pub(crate) type Audit = std::sync::Arc<std::sync::Mutex<Vec<(usize, usize, bool)>>>;
 	thread_local! {pub(super) static CURRENT:std::cell::RefCell<Option<Audit>>=const{std::cell::RefCell::new(None)};}
 	pub(crate) fn start() -> Audit {
 		let audit = Audit::default();
 		CURRENT.with(|a| *a.borrow_mut() = Some(audit.clone()));
 		audit
+	}
+	#[cfg(fuzzing)]
+	pub(crate) fn stop() {
+		CURRENT.with(|a| *a.borrow_mut() = None);
 	}
 }
 

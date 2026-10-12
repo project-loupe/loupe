@@ -97,6 +97,8 @@ impl Validate<&Uri, Browser> for JobsDecoder {
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &Uri>, mark: Mark<'v, Browser>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::Jobs);
 		preflight(u.get(), &["state", "kind"])?;
 		let raw = Query::<crate::routes::api::JobsQuery>::try_from_uri(u.get())
 			.map_err(|_| Failure::Query)?
@@ -116,6 +118,15 @@ impl Validate<&Uri, Browser> for JobsDecoder {
 }
 impl BrowserJobs {
 	pub(crate) fn into_pairs_legacy(self) -> Vec<(&'static str, String)> {
+		#[cfg(fuzzing)]
+		{
+			if let Some(text) = &self.state {
+				crate::fuzz_support::browser_text(crate::fuzz_support::BrowserField::State, text);
+			}
+			if let Some(text) = &self.kind {
+				crate::fuzz_support::browser_text(crate::fuzz_support::BrowserField::Kind, text);
+			}
+		}
 		let mut pairs = Vec::new();
 		if let Some(limit) = self.limit {
 			pairs.push(("limit", limit.to_string()));
@@ -140,6 +151,8 @@ impl Validate<&Uri, Browser> for SearchDecoder {
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &Uri>, mark: Mark<'v, Browser>,
 	) -> Result<Self::Output, Failure> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::hit(crate::fuzz_support::Entry::Search);
 		preflight(u.get(), &["q"])?;
 		let raw = Query::<crate::routes::api::SearchQuery>::try_from_uri(u.get())
 			.map_err(|_| Failure::Query)?
@@ -152,6 +165,8 @@ impl Validate<&Uri, Browser> for SearchDecoder {
 }
 impl BrowserSearch {
 	pub(crate) fn into_pairs_legacy(self) -> Vec<(&'static str, String)> {
+		#[cfg(fuzzing)]
+		crate::fuzz_support::browser_text(crate::fuzz_support::BrowserField::Search, &self.query);
 		let mut pairs = vec![("q", self.query.expose().to_owned())];
 		if let Some(limit) = self.limit {
 			pairs.push(("limit", limit.to_string()));
@@ -172,6 +187,11 @@ macro_rules! extractor {
 }
 extractor!(BrowserJobs, JobsDecoder);
 extractor!(BrowserSearch, SearchDecoder);
+
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_budget(encoded: &str) -> bool {
+	decoded_budget(encoded).is_ok()
+}
 
 #[cfg(test)]
 mod tests {

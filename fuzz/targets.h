@@ -29,6 +29,7 @@ void tls_fingerprint_run(const unsigned char* data, size_t data_len);
 void tls_input_run(const unsigned char* data, size_t data_len);
 void tls_pem_run(const unsigned char* data, size_t data_len);
 void web_api_run(const unsigned char* data, size_t data_len);
+void web_server_response_run(const unsigned char* data, size_t data_len);
 void worker_broker_policy_run(const unsigned char* data, size_t data_len);
 void worker_broker_usage_run(const unsigned char* data, size_t data_len);
 void worker_config_run(const unsigned char* data, size_t data_len);
