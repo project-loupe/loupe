@@ -36,6 +36,9 @@ exact_texts! {
 	ScannerIdText, "scanner_id", false;
 	CweText, "cwe", false;
 	FindingFingerprintText, "finding_fingerprint", false;
+	WorkerName, "worker_name", false;
+	LeaseCapabilityName, "lease_capability_name", false;
+	GithubAppSlug, "github_app_slug", false;
 	RepoHost, "repo_host", false;
 	RepoOwner, "repo_owner", false;
 	RepoName, "repo_name", false;
