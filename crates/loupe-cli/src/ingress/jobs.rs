@@ -93,6 +93,8 @@ macro_rules! job_decoder {
 			}
 		}
 		pub(crate) fn $name(body: Untrusted<Bytes, Server>) -> Result<loupe_proto::JobInfo> {
+			#[cfg(fuzzing)]
+			entered(Entry::$validator);
 			body.as_bytes().validate($validator)
 		}
 	};
@@ -114,5 +116,7 @@ impl Validate<&[u8], Server> for ListJobs {
 pub(crate) fn list_jobs_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<Vec<loupe_proto::JobInfo>> {
+	#[cfg(fuzzing)]
+	entered(Entry::ListJobs);
 	body.as_bytes().validate(ListJobs)
 }

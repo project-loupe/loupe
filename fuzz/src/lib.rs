@@ -10,7 +10,11 @@ compile_error!("Fuzz targets need cfg=fuzzing");
 
 pub mod utils;
 
+mod cli_common;
+pub mod cli_config_input;
+pub mod cli_ingress_response;
 pub mod cli_render;
+mod cli_response_oracle;
 pub mod core_canonical;
 pub mod core_json_string;
 pub mod core_state_machine;

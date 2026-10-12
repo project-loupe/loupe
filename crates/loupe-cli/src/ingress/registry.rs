@@ -41,6 +41,8 @@ impl Validate<&[u8], Server> for ShowGithubApp {
 pub(crate) fn show_github_app_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::GithubAppResponse> {
+	#[cfg(fuzzing)]
+	entered(Entry::ShowApp);
 	body.as_bytes().validate(ShowGithubApp)
 }
 
@@ -125,6 +127,8 @@ impl Validate<&[u8], Server> for ListRepos {
 pub(crate) fn list_repos_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::ListReposResponse> {
+	#[cfg(fuzzing)]
+	entered(Entry::ListRepos);
 	body.as_bytes().validate(ListRepos)
 }
 
@@ -178,6 +182,8 @@ impl Validate<&[u8], Server> for RegisterWorker {
 pub(crate) fn register_worker_bundle_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::RegisterWorkerResponse> {
+	#[cfg(fuzzing)]
+	entered(Entry::RegisterWorker);
 	let r = body.as_bytes().validate(RegisterWorker)?;
 	Ok(loupe_proto::RegisterWorkerResponse {
 		protocol_version: r.version,

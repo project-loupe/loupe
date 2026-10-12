@@ -1,8 +1,8 @@
 //! Tests at the actual CLI argument/HTTP boundaries.
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
+use crate::ingress::test_support::{received, respond};
 
 const PAT: &str = "FAKE_CLI_ARG_PAT_abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -45,20 +45,6 @@ fn repo_rotate_argument_debug_keeps_pat_secret() {
 #[test]
 fn repo_reporting_argument_debug_keeps_pat_secret() {
 	assert_pat_redacted("set-github-reporting");
-}
-
-async fn respond(body: Vec<u8>) -> (reqwest::Url, tokio::task::JoinHandle<()>) {
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = listener.local_addr().unwrap();
-	let task = tokio::spawn(async move {
-		let (mut socket, _) = listener.accept().await.unwrap();
-		let mut request = [0; 4096];
-		assert!(socket.read(&mut request).await.unwrap() > 0);
-		let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nX-Loupe-Protocol: deliberately-invalid\r\nConnection: close\r\n\r\n", body.len());
-		socket.write_all(headers.as_bytes()).await.unwrap();
-		socket.write_all(&body).await.unwrap();
-	});
-	(reqwest::Url::parse(&format!("http://{addr}/")).unwrap(), task)
 }
 
 fn summary() -> Value {
@@ -186,17 +172,6 @@ fn original_response_schema_controls() {
 	let nested = format!("{}0{}", "[".repeat(140), "]".repeat(140));
 	let unknown = format!(r#"{{"protocol_version":2,"ignored":{nested}}}"#);
 	assert!(serde_json::from_str::<GithubAppResponse>(&unknown).is_ok());
-}
-
-/// Test traffic enters through the production collector and its sole Server mint.
-pub(crate) async fn received(
-	raw: &[u8],
-) -> loupe_provenance::Untrusted<bytes::Bytes, loupe_provenance::Server> {
-	let (base, task) = respond(raw.to_vec()).await;
-	let response = reqwest::Client::new().get(base).send().await.unwrap();
-	let body = ingress::receive(response, "fixture").await.unwrap();
-	task.await.unwrap();
-	body
 }
 
 #[tokio::test]

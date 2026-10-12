@@ -293,6 +293,8 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | Target | Assertions |
 |---|---|
 | `cli_render` | Control escaping, exact visible text, intentional ANSI styling, row/column integrity and extreme timestamps |
+| `cli_config_input` | Actual twelve native Clap callbacks; independent exact text admission, closed default without mint, native path bytes, uncapped PEM/PAT input and live PAT sharing/export/formatter observations |
+| `cli_ingress_response` | Actual thirteen response decoders plus discard; independent old DTO schema and field policies, original-token append ledger, Agent versus Server typed observations, reporting depth/tags, exact optional/positional/credential outputs |
 | `core_canonical` | Independent sorted serialization, reordered/whitespace-equivalent JSON, idempotence, bounded output and BLAKE3 digest |
 | `core_state_machine` | Independent adjacency/precedence tables, terminal exits only through documented operator retries; SQL permutation/scope invariant covered in storage tests |
 | `core_text_bounded` | All ten policies: exact admission, raw/normalized caps, NFC, character categories, whitespace and metadata-only diagnostics |

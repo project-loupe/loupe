@@ -76,3 +76,6 @@ crates/loupe-worker/src/runner.rs actual libgit2 path and OID observations mint 
 crates/loupe-worker/src/scanners/regex_secrets.rs actual file bytes and native walk path mint Repo before scanning
 crates/loupe-worker/src/source_discovery.rs actual Cargo manifest and native discovery observations mint Repo before interpretation
 crates/loupe-worker/src/mcp/legacy_test_api.rs test-only fixed Sandbox fixture enters the actual MCP decoder
+crates/loupe-cli/src/fuzz_support.rs cfg-only fixed Server response fixture mint; no normal API or arbitrary source decoder
+fuzz/src/cli_config_input.rs C fuzz entry borrows the runner-provided readable input slice
+fuzz/src/cli_ingress_response.rs C fuzz entry borrows the runner-provided readable input slice

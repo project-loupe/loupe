@@ -16,6 +16,8 @@ use loupe_provenance::{Config, Ingress, Mark, Secret, Untrusted, Unvalidated, Va
 // domain interpretation. Tests pass synthetic argv through the same callbacks.
 #[allow(unsafe_code)]
 fn argument(value: &OsStr) -> Untrusted<&OsStr, Config> {
+	#[cfg(fuzzing)]
+	MINTS.with(|count| count.set(count.get() + 1));
 	// SAFETY: this borrowed native value is supplied by Clap's argv/env reader.
 	Untrusted::new(value, unsafe { Ingress::new() })
 }
@@ -64,8 +66,13 @@ macro_rules! text_parser {
 			fn parse_ref(
 				&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
 			) -> Result<String, clap::Error> {
+				#[cfg(fuzzing)]
+				entered(stringify!($parser));
 				// Explicit temporary Config-text legacy exit; M removes it.
-				Ok(argument(value).validate($validator)?.expose().to_owned())
+				let typed = argument(value).validate($validator)?;
+				#[cfg(fuzzing)]
+				observe_text(&typed);
+				Ok(typed.expose().to_owned())
 			}
 		}
 	};
@@ -90,6 +97,8 @@ impl TypedValueParser for CommonNameLegacy {
 	fn parse_ref_(
 		&self, c: &clap::Command, a: Option<&clap::Arg>, value: &OsStr, source: ValueSource,
 	) -> Result<String, clap::Error> {
+		#[cfg(fuzzing)]
+		entered("CommonNameLegacy");
 		if source == ValueSource::DefaultValue {
 			Ok("loupe-server".to_owned())
 		} else {
@@ -116,6 +125,8 @@ impl TypedValueParser for PathLegacy {
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
 	) -> Result<PathBuf, clap::Error> {
+		#[cfg(fuzzing)]
+		entered("PathLegacy");
 		Ok(argument(value).validate(PathInput)?.0)
 	}
 }
@@ -139,6 +150,8 @@ impl TypedValueParser for UrlLegacy {
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
 	) -> Result<reqwest::Url, clap::Error> {
+		#[cfg(fuzzing)]
+		entered("UrlLegacy");
 		Ok(argument(value).validate(UrlInput)?.0)
 	}
 }
@@ -162,6 +175,8 @@ impl TypedValueParser for PemLegacy {
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
 	) -> Result<Self::Value, clap::Error> {
+		#[cfg(fuzzing)]
+		entered("PemLegacy");
 		Ok(argument(value).validate(PemArgument)?.0)
 	}
 }
@@ -210,10 +225,13 @@ impl TypedValueParser for Pat {
 	fn parse_ref(
 		&self, _: &clap::Command, _: Option<&clap::Arg>, value: &OsStr,
 	) -> Result<Self::Value, clap::Error> {
+		#[cfg(fuzzing)]
+		entered("Pat");
 		argument(value).validate(PatArgument)
 	}
 }
 
+#[cfg_attr(fuzzing, allow(dead_code))] // Direct callback fuzzing does not read files.
 struct PemRead;
 impl Validate<&str, Config> for PemRead {
 	type Output = ();
@@ -227,11 +245,95 @@ impl Validate<&str, Config> for PemRead {
 	}
 }
 #[allow(unsafe_code)]
+#[cfg_attr(fuzzing, allow(dead_code))] // Actual file source join stays in runtime tests.
 pub(super) fn read_pem(path: &std::path::Path) -> anyhow::Result<Secret<String>> {
 	let owner = loupe_tls::read_pem_file(path)?;
 	// SAFETY: exact still-live text returned by this actual Config PEM file read.
 	Untrusted::new(owner.expose().as_str(), unsafe { Ingress::new() }).validate(PemRead)?;
 	Ok(owner)
+}
+
+#[cfg(fuzzing)]
+thread_local! {static MINTS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};}
+#[cfg(fuzzing)]
+thread_local! {
+	static CALLBACKS:std::cell::RefCell<Vec<&'static str>>=const{std::cell::RefCell::new(Vec::new())};
+	static TYPED_TEXT:std::cell::RefCell<Vec<String>>=const{std::cell::RefCell::new(Vec::new())};
+}
+#[cfg(fuzzing)]
+fn entered(name: &'static str) {
+	CALLBACKS.with(|v| v.borrow_mut().push(name));
+}
+#[cfg(fuzzing)]
+fn observe_text<P: TextPolicy>(text: &BoundedText<P, Config>) {
+	TYPED_TEXT.with(|v| v.borrow_mut().push(text.expose().to_owned()));
+}
+#[cfg(fuzzing)]
+pub(super) fn take_callbacks() -> (Vec<&'static str>, Vec<String>) {
+	(
+		CALLBACKS.with(|v| std::mem::take(&mut *v.borrow_mut())),
+		TYPED_TEXT.with(|v| std::mem::take(&mut *v.borrow_mut())),
+	)
+}
+#[cfg(fuzzing)]
+pub(super) fn reset_mints() {
+	MINTS.with(|s| s.set(0));
+	let _ = take_callbacks();
+}
+#[cfg(fuzzing)]
+pub(super) fn mints() -> usize {
+	MINTS.with(std::cell::Cell::get)
+}
+#[cfg(fuzzing)]
+#[derive(Debug)]
+pub struct PatObservation {
+	pub shared: bool,
+	pub redacted: bool,
+	pub survived: String,
+	pub exports: Vec<String>,
+	pub unique_moves: bool,
+	pub shared_copy: bool,
+}
+#[cfg(fuzzing)]
+pub(super) fn observe_pat(input: PatInput, actions: &[u8]) -> PatObservation {
+	let pointer = input.0.expose().as_ptr();
+	let mut redacted =
+		[format!("{input:?}"), format!("{input:#?}"), format!("{input}"), format!("{input:#}")]
+			.iter()
+			.all(|s| s == "[redacted]");
+	let clone = input.clone();
+	let mut shared = Arc::ptr_eq(&input.0, &clone.0) && pointer == clone.0.expose().as_ptr();
+	drop(input);
+	let survived = clone.0.expose().to_owned();
+	let fallback = clone.clone().into_pat();
+	let shared_copy = survived.is_empty() || fallback.expose().as_ptr() != pointer;
+	let mut exports = vec![fallback.expose().to_owned()];
+	let mut handles = vec![clone];
+	for action in actions.iter().take(32) {
+		match action % 4 {
+			0 if handles.len() < 16 => {
+				let next = handles[0].clone();
+				shared &= Arc::ptr_eq(&handles[0].0, &next.0);
+				handles.push(next);
+			},
+			1 if handles.len() > 1 => {
+				handles.pop();
+			},
+			2 => {
+				exports.push(handles[0].clone().into_pat().expose().to_owned());
+			},
+			_ => {
+				redacted &= format!("{:?}", handles[0]) == "[redacted]";
+			},
+		}
+	}
+	while handles.len() > 1 {
+		handles.pop();
+	}
+	let unique = handles.pop().unwrap_or_else(|| unreachable!()).into_pat();
+	let unique_moves = unique.expose().as_ptr() == pointer;
+	exports.push(unique.expose().to_owned());
+	PatObservation { shared, redacted, survived, exports, unique_moves, shared_copy }
 }
 
 #[cfg(test)]

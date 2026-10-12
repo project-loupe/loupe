@@ -12,7 +12,13 @@ mod findings;
 mod jobs;
 mod registry;
 mod reporting;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(super) use findings::{get_finding_legacy, list_findings_legacy, search_findings_legacy};
+#[cfg(fuzzing)]
+pub(crate) use findings::{reset_observations, take_observations};
+#[cfg(fuzzing)]
+pub use findings::{Field, FieldObservation, FieldSource};
 pub(super) use jobs::{cancel_job_legacy, get_job_legacy, list_jobs_legacy, retry_job_legacy};
 pub(super) use registry::{
 	list_repos_legacy, register_worker_bundle_legacy, show_github_app_legacy,
@@ -22,9 +28,40 @@ fn invalid() -> anyhow::Error {
 	anyhow!("server response violates schema or field policy")
 }
 
+// Record the function actually entered, independently of the fixture selector.
+#[cfg(fuzzing)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+	ShowApp,
+	RegisterRepo,
+	ListRepos,
+	ScanRepo,
+	RegisterWorker,
+	ListJobs,
+	GetJob,
+	RetryJob,
+	CancelJob,
+	ListFindings,
+	SearchFindings,
+	GetFinding,
+	RetryVerification,
+	DiscardSuccess,
+}
+#[cfg(fuzzing)]
+thread_local! { static ENTRIES: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) }; }
+#[cfg(fuzzing)]
+fn entered(entry: Entry) {
+	ENTRIES.with(|entries| entries.borrow_mut().push(entry));
+}
+#[cfg(fuzzing)]
+pub(crate) fn take_entries() -> Vec<Entry> {
+	ENTRIES.with(|entries| std::mem::take(&mut *entries.borrow_mut()))
+}
+
 #[cfg(test)]
 thread_local! { static RECEIVED_ALLOCATION: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0,0)) }; }
 
+#[cfg_attr(fuzzing, allow(dead_code))] // The direct fixture bypasses HTTP collection.
 #[allow(unsafe_code)]
 pub(super) async fn receive(
 	resp: reqwest::Response, action: &'static str,
@@ -42,6 +79,7 @@ pub(super) async fn receive(
 	}
 	Ok(received)
 }
+#[cfg_attr(fuzzing, allow(dead_code))] // Status/error-body integration stays in real HTTP tests.
 struct ServerDiagnostic {
 	status: reqwest::StatusCode,
 	action: &'static str,
@@ -69,6 +107,8 @@ macro_rules! scalar_decoder {
 			}
 		}
 		pub(super) fn $name(body: Untrusted<Bytes, Server>) -> Result<$output> {
+			#[cfg(fuzzing)]
+			entered(Entry::$validator);
 			body.as_bytes().validate($validator)
 		}
 	};
@@ -153,5 +193,7 @@ impl Validate<&[u8], Server> for DiscardSuccess {
 	}
 }
 pub(super) fn discard(body: Untrusted<Bytes, Server>) -> Result<()> {
+	#[cfg(fuzzing)]
+	entered(Entry::DiscardSuccess);
 	body.as_bytes().validate(DiscardSuccess)
 }

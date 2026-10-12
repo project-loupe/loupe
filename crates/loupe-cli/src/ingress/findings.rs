@@ -12,11 +12,11 @@ fn span<'a>(
 		(token.get().as_ptr() as usize).checked_sub(bytes.as_ptr() as usize).ok_or_else(invalid)?;
 	let end = start.checked_add(token.get().len()).ok_or_else(invalid)?;
 	let value = u.carry::<Agent>(start..end).ok_or_else(invalid)?;
-	#[cfg(test)]
+	#[cfg(any(test, fuzzing))]
 	OBSERVED.with(|seen| seen.borrow_mut().push((start, end)));
 	Ok(value)
 }
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 thread_local! { pub(super) static OBSERVED: std::cell::RefCell<Vec<(usize,usize)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 
 macro_rules! agent_field {
@@ -125,6 +125,8 @@ struct Summary {
 }
 impl Summary {
 	fn legacy(self) -> loupe_proto::FindingSummary {
+		#[cfg(fuzzing)]
+		observe_summary(&self);
 		loupe_proto::FindingSummary {
 			id: self.id,
 			repo_id: self.repo_id,
@@ -184,6 +186,8 @@ impl ValidateCarrying<&[u8], Server> for ListFindings {
 pub(crate) fn list_findings_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::ListFindingsResponse> {
+	#[cfg(fuzzing)]
+	entered(Entry::ListFindings);
 	let list = body.as_bytes().validate_carrying(ListFindings)?;
 	Ok(loupe_proto::ListFindingsResponse {
 		protocol_version: list.version,
@@ -193,6 +197,8 @@ pub(crate) fn list_findings_legacy(
 pub(crate) fn search_findings_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::ListFindingsResponse> {
+	#[cfg(fuzzing)]
+	entered(Entry::SearchFindings);
 	list_findings_legacy(body)
 }
 
@@ -284,7 +290,11 @@ impl ValidateCarrying<&[u8], Server> for GetFinding {
 pub(crate) fn get_finding_legacy(
 	body: Untrusted<Bytes, Server>,
 ) -> Result<loupe_proto::FindingDetail> {
+	#[cfg(fuzzing)]
+	entered(Entry::GetFinding);
 	let d = body.as_bytes().validate_carrying(GetFinding)?;
+	#[cfg(fuzzing)]
+	observe_detail(&d);
 	let s = d.summary.legacy();
 	Ok(loupe_proto::FindingDetail {
 		protocol_version: d.version,
@@ -312,10 +322,93 @@ pub(crate) fn get_finding_legacy(
 	})
 }
 
+#[cfg(fuzzing)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Field {
+	Scanner,
+	Title,
+	Fingerprint,
+	Path,
+	Description,
+	Cwe,
+	Patch,
+	Poc,
+	ApprovedBy,
+	RejectedBy,
+}
+#[cfg(fuzzing)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FieldSource {
+	Agent,
+	Server,
+}
+#[cfg(fuzzing)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FieldObservation {
+	pub field: Field,
+	pub source: FieldSource,
+	pub text: String,
+}
+#[cfg(fuzzing)]
+thread_local! {static TYPED:std::cell::RefCell<Vec<FieldObservation>>=const{std::cell::RefCell::new(Vec::new())};}
+#[cfg(fuzzing)]
+fn record(field: Field, source: FieldSource, text: &str) {
+	TYPED.with(|s| s.borrow_mut().push(FieldObservation { field, source, text: text.to_owned() }));
+}
+#[cfg(fuzzing)]
+fn observe_summary(s: &Summary) {
+	fn agent<P: TextPolicy>(field: Field, text: &BoundedText<P, Agent>) {
+		record(field, FieldSource::Agent, text.expose());
+	}
+	agent(Field::Scanner, &s.scanner_id);
+	agent(Field::Title, &s.title);
+	agent(Field::Fingerprint, &s.fingerprint);
+	if let Some(path) = &s.file_path {
+		let path: &RepoPath<Agent> = path;
+		record(Field::Path, FieldSource::Agent, path.expose());
+	}
+	for (field, text) in
+		[(Field::ApprovedBy, &s.approved_by_cn), (Field::RejectedBy, &s.rejected_by_cn)]
+	{
+		if let Some(text) = text {
+			let text: &BoundedText<AuditName, Server> = text;
+			record(field, FieldSource::Server, text.expose());
+		}
+	}
+}
+#[cfg(fuzzing)]
+fn observe_detail(d: &Detail) {
+	fn agent<P: TextPolicy>(field: Field, text: &BoundedText<P, Agent>) {
+		record(field, FieldSource::Agent, text.expose());
+	}
+	agent(Field::Description, &d.description);
+	if let Some(text) = &d.cwe {
+		agent(Field::Cwe, text);
+	}
+	if let Some(text) = &d.patch {
+		agent(Field::Patch, text);
+	}
+	if let Some(text) = &d.poc {
+		agent(Field::Poc, text);
+	}
+}
+#[cfg(fuzzing)]
+pub(crate) fn reset_observations() {
+	OBSERVED.with(|s| s.borrow_mut().clear());
+	TYPED.with(|s| s.borrow_mut().clear());
+}
+#[cfg(fuzzing)]
+pub(crate) fn take_observations() -> (Vec<(usize, usize)>, Vec<FieldObservation>) {
+	(
+		OBSERVED.with(|s| std::mem::take(&mut *s.borrow_mut())),
+		TYPED.with(|s| std::mem::take(&mut *s.borrow_mut())),
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::ingress_tests::received;
+	use crate::ingress::test_support::received;
 
 	#[tokio::test]
 	async fn carries_original_array_tokens_and_keeps_audit_as_server() {
