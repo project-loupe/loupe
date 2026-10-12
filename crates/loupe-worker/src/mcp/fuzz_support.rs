@@ -16,7 +16,15 @@ pub struct SessionOutcome {
 
 impl FuzzSession {
 	pub fn new(client: Arc<ServerClient>, workdir: PathBuf, verify: bool) -> Self {
+		Self::with_mode(client, workdir, verify, crate::llm::prompt::DataMode::Delimited)
+	}
+	pub fn with_mode(
+		client: Arc<ServerClient>, workdir: PathBuf, verify: bool,
+		mode: crate::llm::prompt::DataMode,
+	) -> Self {
 		Self(Arc::new(Session {
+			tool_boundary: crate::llm::prompt::JobToolBoundary::from_test_bytes([0x11; 16]),
+			data_mode: mode,
 			client,
 			workdir,
 			job_capability: JobCapability::from_secret("fuzz-capability"),

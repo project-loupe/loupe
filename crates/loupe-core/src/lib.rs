@@ -14,7 +14,7 @@ pub use pending_follow_up::{FollowUpTrigger, PendingFollowUp, ReviewIntent};
 pub use scanner::ScannerDocument;
 pub mod canonical;
 /// Immutable recipe/behavior contract recorded on review generations and jobs.
-pub const WORKFLOW_CONTRACT_VERSION: i64 = 1;
+pub const WORKFLOW_CONTRACT_VERSION: i64 = 2;
 mod error;
 mod finding;
 mod finding_state;

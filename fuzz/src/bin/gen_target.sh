@@ -53,6 +53,7 @@ GEN_TEST worker_mcp_rpc
 GEN_TEST worker_mcp_submission
 GEN_TEST worker_network_host
 GEN_TEST worker_network_parsers
+GEN_TEST worker_prompt_render
 GEN_TEST worker_regex_secrets
 GEN_TEST worker_repo_cache
 GEN_TEST worker_repo_observations

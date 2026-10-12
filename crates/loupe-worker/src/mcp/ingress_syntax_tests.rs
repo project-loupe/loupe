@@ -3,6 +3,7 @@ use super::*;
 
 fn context(workdir: &Path) -> McpSessionContext {
 	McpSessionContext {
+		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		client: Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),
 			"http://127.0.0.1:1/".parse().unwrap(),

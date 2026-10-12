@@ -18,10 +18,12 @@
 //! [`build_verifier_backend`].
 
 pub mod claude_cli;
+mod cli_stdin;
 pub mod codex_cli;
 pub mod mcp;
 pub mod model_broker;
 pub mod model_proxy;
+pub mod prompt;
 pub mod prompts;
 
 use std::ffi::OsString;
@@ -184,6 +186,7 @@ pub fn extract_json_object(text: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
+	pub tool_boundary: prompt::JobToolBoundary,
 	pub prompt: prompts::Prompt,
 	/// Read-only working directory the backend may inspect (e.g. the
 	/// scanned worktree).

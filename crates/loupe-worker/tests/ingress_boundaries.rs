@@ -111,6 +111,7 @@ fn worker_file_config_rejects_new_text_cap() {
 
 fn context() -> McpSessionContext {
 	McpSessionContext {
+		tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 		client: Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),
 			"http://127.0.0.1:1/".parse().unwrap(),

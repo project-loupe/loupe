@@ -62,7 +62,7 @@ impl Scanner for LlmVerifierScanner {
 		// it needs to decide whether the report holds up. The MCP
 		// server's `query_prior_findings` / `get_finding_by_id`
 		// tools cover everything else.
-		let prompt = Prompt::verification(ctx.finding_id, &ctx.finding);
+		let prompt = Prompt::verification(ctx.finding_id, &ctx.finding)?;
 
 		// `finding_id` + `job_id` are what flip the MCP server into
 		// verify mode — the verify-mode tool catalog
@@ -71,6 +71,7 @@ impl Scanner for LlmVerifierScanner {
 		// startup if it sees only `--finding-id`, so passing both
 		// here is load-bearing.
 		let req = LlmRequest {
+			tool_boundary: ctx.tool_boundary,
 			prompt,
 			workdir: ctx.workdir.clone(),
 			timeout: crate::llm::DEFAULT_REQUEST_TIMEOUT,
@@ -109,6 +110,7 @@ mod tests {
 			panic!("verify")
 		};
 		VerifyContext {
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 			workdir: PathBuf::from("/tmp"),
 			repo_id: 1,
 			job_id: 42,
@@ -125,7 +127,7 @@ mod tests {
 	async fn original_report_contains_prefixed_finding_id() {
 		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
 			assert!(
-				req.prompt.for_cli_argument().contains("\"id\":\"LUP-7\""),
+				req.prompt.expose().contains("\"id\":\"LUP-7\""),
 				"original report must identify the finding as LUP-7"
 			);
 			Ok(String::new())

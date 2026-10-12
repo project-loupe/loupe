@@ -2,6 +2,53 @@
 //! Run only through ci/kani.sh; host discovery and JSON wire parsing remain
 //! exercised by their integration tests and S1 fuzz targets.
 
+// invariant: I4, I6. Proves the actual byte-level candidate selector over two
+// original payloads of 0..=40 bytes and all three full 128-bit draws. Each
+// payload can contain an entire 32-byte hex boundary. Tags/Marked/JSON join
+// this core through unit and fuzz checks; no claim about model obedience.
+#[cfg(kani)]
+#[kani::proof]
+// 33 exceeds the longest actual loop (32-byte comparison); window scans
+// have at most nine entries, hex encoding sixteen and retries three.
+#[kani::unwind(33)]
+fn boundary_never_occurs_in_content_of_a_rendered_block() {
+	use crate::llm::prompt::{contains_boundary, select_boundary};
+	let first: [u8; 40] = kani::any();
+	let second: [u8; 40] = kani::any();
+	let first_len: u8 = kani::any();
+	let second_len: u8 = kani::any();
+	kani::assume(first_len <= 40 && second_len <= 40);
+	let payloads = [&first[..usize::from(first_len)], &second[..usize::from(second_len)]];
+	let candidates: [[u8; 16]; 3] = kani::any();
+	let mut draws = 0;
+	let mut collision = false;
+	let result = select_boundary(
+		|| {
+			let candidate = candidates[draws];
+			draws += 1;
+			Ok(candidate)
+		},
+		|boundary| {
+			let found = contains_boundary(payloads[0], boundary)
+				|| contains_boundary(payloads[1], boundary);
+			collision |= found;
+			found
+		},
+	);
+	assert!(draws <= 3);
+	if let Ok(boundary) = result {
+		for payload in payloads {
+			for start in 0..payload.len().saturating_sub(31) {
+				assert!(payload[start..start + 32] != boundary);
+			}
+		}
+	}
+	kani::cover!(result.is_ok() && first_len > 0, "nonempty successful selection");
+	kani::cover!(collision, "complete boundary collision detected");
+	kani::cover!(result.is_ok() && draws > 1, "retry succeeds");
+	kani::cover!(result.is_err() && draws == 3, "three collisions reject");
+}
+
 // Full-usize numeric containment only: actual allocation identity and the
 // borrowed RawValue/source carry remain runtime, type and direct fuzz checks.
 #[cfg(kani)]

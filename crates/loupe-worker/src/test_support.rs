@@ -22,6 +22,7 @@ pub(crate) fn scan_context(workdir: &Path, head: &str) -> crate::ScanContext {
 	std::fs::create_dir_all(cache.repo_path(&key)).unwrap();
 	cache.write_cursor(&key, head).unwrap();
 	crate::ScanContext {
+		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		workdir: workdir.to_owned(),
 		repo: env.repo,
 		repo_id: env.repo_id,

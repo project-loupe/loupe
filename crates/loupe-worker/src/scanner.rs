@@ -45,6 +45,7 @@ pub trait Scanner: Send + Sync {
 }
 
 pub struct ScanContext {
+	pub tool_boundary: crate::llm::prompt::JobToolBoundary,
 	pub workdir: PathBuf,
 	pub repo: RepoSpec<Server>,
 	/// Server-side repo id from the lease envelope. Used by LLM
@@ -64,6 +65,7 @@ pub struct ScanContext {
 }
 
 pub struct VerifyContext {
+	pub tool_boundary: crate::llm::prompt::JobToolBoundary,
 	pub workdir: PathBuf,
 	pub repo: RepoSpec<Server>,
 	pub repo_id: i64,

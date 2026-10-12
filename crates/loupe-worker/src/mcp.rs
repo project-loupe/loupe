@@ -44,7 +44,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 pub(crate) use ingress::McpFindingSubmission;
 pub use ingress::QueryText;
-use loupe_core::format_finding_id;
 #[cfg(test)]
 use loupe_core::Severity;
 use loupe_proto::JobCapability;
@@ -127,20 +126,6 @@ pub fn normalize_path_component_rules(file: &str) -> Result<String> {
 	Ok(rel.to_string_lossy().into_owned())
 }
 
-/// Format a finding's location as `path:line[-end]` for human display
-/// in MCP tool text output. Used for both `query_prior_findings`
-/// summaries (which lack `line_end`) and `get_finding_by_id` detail
-/// views — `line_end` is only rendered when it strictly exceeds
-/// `line_start` to keep "1:5-5" out of the output.
-fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option<u32>) -> String {
-	match (path, line_start, line_end) {
-		(Some(p), Some(s), Some(e)) if e > s => format!("{p}:{s}-{e}"),
-		(Some(p), Some(s), _) => format!("{p}:{s}"),
-		(Some(p), None, _) => p.to_owned(),
-		_ => "(no location)".into(),
-	}
-}
-
 /// Per-call session state that flows into every tool handler. Built
 /// once at `run_stdio_server` start from CLI args. Discovery-mode
 /// fields are immutable; verify-mode state lives behind a mutex
@@ -148,6 +133,8 @@ fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option
 /// across multiple tool calls and the second-call locks need to
 /// consult what the first call set.
 struct Session {
+	tool_boundary: crate::llm::prompt::JobToolBoundary,
+	data_mode: crate::llm::prompt::DataMode,
 	client: Arc<ServerClient>,
 	job_capability: JobCapability,
 	repo_id: i64,
@@ -263,6 +250,7 @@ struct RpcError {
 /// posts `complete(failed)` and the validating-deadline reaper
 /// later marks the verdict inconclusive.
 pub struct McpSessionContext {
+	pub tool_boundary: crate::llm::prompt::JobToolBoundary,
 	pub client: Arc<ServerClient>,
 	pub job_capability: JobCapability,
 	pub repo_id: i64,
@@ -290,6 +278,8 @@ where
 		(None, _) => None,
 	};
 	let session = Arc::new(Session {
+		tool_boundary: context.tool_boundary,
+		data_mode: crate::llm::prompt::DataMode::Delimited,
 		client: context.client,
 		job_capability: context.job_capability,
 		repo_id: context.repo_id,
@@ -715,11 +705,20 @@ async fn handle_decoded_tool_call(
 					session.repo_id,
 					&args.query,
 					args.limit,
+					session.tool_boundary,
+					session.data_mode,
 				)
 				.await
 			},
 			ingress::Arguments::Get(finding_id) => {
-				get_finding_by_id(&session.client, &session.job_capability, finding_id).await
+				get_finding_by_id(
+					&session.client,
+					&session.job_capability,
+					finding_id,
+					session.tool_boundary,
+					session.data_mode,
+				)
+				.await
 			},
 			ingress::Arguments::Finding(args) => tool_submit_finding(session, args).await,
 			ingress::Arguments::Poc(diff) => {
@@ -782,78 +781,47 @@ fn check_tool_protocol_version(args: &Value) -> Result<()> {
 
 async fn get_finding_by_id(
 	client: &Arc<ServerClient>, job_capability: &JobCapability, id: i64,
+	boundary: crate::llm::prompt::JobToolBoundary, mode: crate::llm::prompt::DataMode,
 ) -> Result<String> {
 	let detail = client
 		.get_finding(id, job_capability)
 		.await
 		.with_context(|| format!("calling /v1/findings/{id}"))?;
-	let loc = format_location(
-		detail.file_path.as_ref().map(|v| v.expose()),
-		detail.line_start,
-		detail.line_end,
-	);
-	let mut out = String::with_capacity(detail.description.expose().len() + 256);
-	let _ = std::fmt::Write::write_fmt(
-		&mut out,
-		format_args!(
-			"Finding {} [{:?}] state={} {}\n{}\n",
-			format_finding_id(detail.id),
-			detail.severity,
-			detail.state,
-			loc,
-			detail.title.expose(),
-		),
-	);
-	if let Some(cwe) = &detail.cwe {
-		let _ = std::fmt::Write::write_fmt(&mut out, format_args!("CWE: {}\n", cwe.expose()));
-	}
-	out.push_str("\nDescription:\n");
-	out.push_str(detail.description.expose());
-	if let Some(poc) = &detail.poc_unified {
-		out.push_str("\n\nProof of concept (unified diff):\n");
-		out.push_str(poc.expose());
-	}
-	if let Some(patch) = &detail.patch_unified {
-		out.push_str("\n\nSuggested fix (unified diff):\n");
-		out.push_str(patch.expose());
-	}
-	Ok(out)
+	let rendered = (|| {
+		let mut builder = crate::llm::prompt::PromptBuilder::new("").mode(mode);
+		builder.prior_detail(&detail)?;
+		builder.render_fixed(boundary)
+	})();
+	rendered.map(crate::llm::prompt::Prompt::into_tool_text).map_err(
+		|_: crate::llm::prompt::PromptError| {
+			anyhow::anyhow!("tool response cannot be safely framed")
+		},
+	)
 }
 
 async fn query_prior_findings(
 	client: &Arc<ServerClient>, job_capability: &JobCapability, repo_id: i64,
 	query: &loupe_core::text::BoundedText<QueryText, Agent>, limit: i64,
+	boundary: crate::llm::prompt::JobToolBoundary, mode: crate::llm::prompt::DataMode,
 ) -> Result<String> {
 	let resp = client
 		.search_findings(repo_id, job_capability, query, limit)
 		.await
 		.context("calling /v1/repos/:id/findings/search")?;
-	let query = query.expose();
-
-	if resp.findings.is_empty() {
-		return Ok(format!(
-			"No prior findings on repo {repo_id} match `{query}`. Treat this as a novel finding."
-		));
-	}
-	let mut out = String::with_capacity(512);
-	out.push_str(&format!(
-		"{} prior finding(s) on repo {repo_id} match `{query}`:\n\n",
-		resp.findings.len()
-	));
-	for f in &resp.findings {
-		// Search summaries don't include line_end; pass None so the
-		// helper renders `path:line` instead of falling through.
-		let loc = format_location(f.file_path.as_ref().map(|v| v.expose()), f.line_start, None);
-		out.push_str(&format!(
-			"- {} [{:?}] state={} {} — {}\n",
-			format_finding_id(f.id),
-			f.severity,
-			f.state,
-			loc,
-			f.title.expose(),
-		));
-	}
-	Ok(out)
+	let rendered = (|| {
+		let mut builder = crate::llm::prompt::PromptBuilder::new("").mode(mode);
+		if resp.findings.is_empty() {
+			builder.instruction("No prior findings match. Treat this as a novel finding.\n")?;
+		}
+		builder.data("query", query)?;
+		builder.prior_summaries(repo_id, &resp.findings)?;
+		builder.render_fixed(boundary)
+	})();
+	rendered.map(crate::llm::prompt::Prompt::into_tool_text).map_err(
+		|_: crate::llm::prompt::PromptError| {
+			anyhow::anyhow!("tool response cannot be safely framed")
+		},
+	)
 }
 
 /// Build a mixed-source submission from `submit_finding` arguments.
@@ -1208,12 +1176,46 @@ fn fingerprint_for(
 }
 
 async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> Result<()> {
-	let line = serde_json::to_string(resp)?;
+	// Tool content and original request IDs are separately bounded. JSON can
+	// expand each input byte at most sixfold; count the concrete envelope first.
+	const RESPONSE_LIMIT: usize =
+		6 * (crate::llm::prompt::MAX_TOOL_TEXT_BYTES + 16 * 1024 * 1024) + 4096;
+	let mut counted = ResponseWriter { bytes: None, len: 0, limit: RESPONSE_LIMIT };
+	serde_json::to_writer(&mut counted, resp)?;
+	let mut bytes = Vec::new();
+	bytes
+		.try_reserve_exact(counted.len)
+		.map_err(|_| anyhow::anyhow!("MCP response allocation failed"))?;
+	let mut writer = ResponseWriter { bytes: Some(bytes), len: 0, limit: counted.len };
+	serde_json::to_writer(&mut writer, resp)?;
+	let line = writer.bytes.ok_or_else(|| anyhow::anyhow!("MCP response unavailable"))?;
 	tracing::debug!(response_bytes = line.len(), "loupe-mcp: sending response");
-	w.write_all(line.as_bytes()).await?;
+	w.write_all(&line).await?;
 	w.write_all(b"\n").await?;
 	w.flush().await?;
 	Ok(())
+}
+
+struct ResponseWriter {
+	bytes: Option<Vec<u8>>,
+	len: usize,
+	limit: usize,
+}
+impl std::io::Write for ResponseWriter {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		self.len = self
+			.len
+			.checked_add(bytes.len())
+			.filter(|n| *n <= self.limit)
+			.ok_or_else(|| std::io::Error::other("MCP response size exceeded"))?;
+		if let Some(out) = &mut self.bytes {
+			out.extend_from_slice(bytes);
+		}
+		Ok(bytes.len())
+	}
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
 }
 
 /// End-of-session flush for verify mode: take the buffered verdict
@@ -1285,6 +1287,9 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 #[cfg(test)]
 mod security_tests;
 
+#[cfg(test)]
+mod prompt_baseline_tests;
+
 #[cfg(fuzzing)]
 pub mod fuzz_support;
 
@@ -1340,7 +1345,12 @@ mod tests {
 			.await
 			.unwrap();
 		task.abort();
-		assert!(text.contains("- LUP-1234 [High]"), "search must return prefixed IDs: {text}");
+		let data: Value = serde_json::from_str(crate::llm::prompts::prompt_baseline_tests::block(
+			&text, "findings", "agent",
+		))
+		.unwrap();
+		assert_eq!(data["findings"][0]["id"], "LUP-1234", "search must return prefixed IDs");
+		assert_eq!(data["findings"][0]["severity"], "high");
 	}
 
 	#[tokio::test]
@@ -1351,10 +1361,12 @@ mod tests {
 			.await
 			.expect("legacy numeric IDs must still work");
 		task.abort();
-		assert!(
-			text.starts_with("Finding LUP-1234 [High]"),
-			"detail must return a prefixed ID: {text}"
-		);
+		let data: Value = serde_json::from_str(crate::llm::prompts::prompt_baseline_tests::block(
+			&text, "finding", "agent",
+		))
+		.unwrap();
+		assert_eq!(data["id"], "LUP-1234", "detail must return a prefixed ID");
+		assert_eq!(data["severity"], "high");
 		assert!(text.contains("See upstream issue #1234."), "real GitHub references must survive");
 	}
 
@@ -1366,7 +1378,12 @@ mod tests {
 			.await
 			.expect("prefixed IDs must resolve through the numeric HTTP endpoint");
 		task.abort();
-		assert!(text.starts_with("Finding LUP-1234 [High]"), "detail: {text}");
+		let data: Value = serde_json::from_str(crate::llm::prompts::prompt_baseline_tests::block(
+			&text, "finding", "agent",
+		))
+		.unwrap();
+		assert_eq!(data["id"], "LUP-1234");
+		assert_eq!(data["severity"], "high");
 	}
 
 	#[tokio::test]
@@ -1521,6 +1538,8 @@ mod tests {
 		let stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 		let (workdir, submission) = valid_local_submission();
 		let session = Arc::new(Session {
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			data_mode: crate::llm::prompt::DataMode::Delimited,
 			client: Arc::new(ServerClient::from_parts(
 				reqwest::Client::new(),
 				base.parse().unwrap(),
@@ -1559,6 +1578,8 @@ mod tests {
 	async fn oversized_report_is_rejected_by_the_mcp_broker() {
 		let (workdir, submission) = valid_local_submission();
 		let session = Arc::new(Session {
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			data_mode: crate::llm::prompt::DataMode::Delimited,
 			client: Arc::new(ServerClient::from_parts(
 				reqwest::Client::new(),
 				"http://127.0.0.1:1".parse().unwrap(),
@@ -1697,6 +1718,8 @@ mod tests {
 			"http://invalid.example/".parse().unwrap(),
 		));
 		Arc::new(Session {
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			data_mode: crate::llm::prompt::DataMode::Delimited,
 			client,
 			job_capability: JobCapability::from_secret("test-capability"),
 			repo_id: 1,

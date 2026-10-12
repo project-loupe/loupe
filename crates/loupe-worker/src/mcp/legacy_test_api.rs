@@ -1,4 +1,4 @@
-//! Preserve the existing handler controls while feeding their fixture Values
+//! Exercise handler controls by feeding their fixture Values
 //! through the production raw-record decoder. This is not a production bridge.
 
 use super::*;
@@ -51,13 +51,29 @@ pub(super) async fn tool_query_prior_findings(
 	let ingress::Arguments::Query(args) = arguments("query_prior_findings", args)? else {
 		unreachable!()
 	};
-	query_prior_findings(client, capability, repo_id, &args.query, args.limit).await
+	query_prior_findings(
+		client,
+		capability,
+		repo_id,
+		&args.query,
+		args.limit,
+		crate::llm::prompt::JobToolBoundary::new()?,
+		crate::llm::prompt::DataMode::Delimited,
+	)
+	.await
 }
 pub(super) async fn tool_get_finding_by_id(
 	client: &Arc<ServerClient>, capability: &JobCapability, args: &Value,
 ) -> Result<String> {
 	let ingress::Arguments::Get(id) = arguments("get_finding_by_id", args)? else { unreachable!() };
-	get_finding_by_id(client, capability, id).await
+	get_finding_by_id(
+		client,
+		capability,
+		id,
+		crate::llm::prompt::JobToolBoundary::new()?,
+		crate::llm::prompt::DataMode::Delimited,
+	)
+	.await
 }
 pub(super) async fn tool_submit_verdict(session: &Arc<Session>, args: &Value) -> Result<String> {
 	let ingress::Arguments::Verdict(args) = arguments("submit_verdict", args)? else {

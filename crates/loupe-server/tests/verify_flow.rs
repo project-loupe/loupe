@@ -265,7 +265,7 @@ async fn run_flow(
 		let http = http_for_stub.clone();
 		let server_client = server_client_for_stub.clone();
 		async move {
-			if req.prompt.for_cli_argument().contains("independent second opinion") {
+			if req.prompt.expose().contains("independent second opinion") {
 				let job_id = req.job_id.expect("verify sessions must carry a job_id");
 				let job_capability =
 					req.job_capability.expect("verify sessions must carry a job capability");

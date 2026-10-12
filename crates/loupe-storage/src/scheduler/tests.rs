@@ -1,6 +1,6 @@
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::BoundedJson;
-use loupe_core::{JobKind, JobState};
+use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 use rusqlite::params;
 
 use super::*;
@@ -96,7 +96,7 @@ fn phase_enqueue_checks_shape_ownership_and_round_trips_columns() {
 			assert_eq!(row.token_budget, Some(100));
 			assert_eq!(row.scheduling_band, Some(Band::Normal));
 			assert_eq!(row.recipe.as_ref().map(BoundedJson::expose), Some(recipe.expose()));
-			assert_eq!(row.workflow_contract_version, Some(1));
+			assert_eq!(row.workflow_contract_version, Some(WORKFLOW_CONTRACT_VERSION));
 			assert!(matches!(
 				enqueue_phase(tx, &new, 1),
 				Err(Error::Conflict(Conflict::ActiveDrilldown))

@@ -462,9 +462,14 @@ leads; only stale-closed identities can create a successor.
 
 ### Text and digest boundaries
 
-`loupe-core::text` provides private, policy-bound values. Agent-authored
-strings enter the new DAOs only through these validated types; commit SHAs,
-IDs, times, capability hashes, and captured binary content are host inputs.
+`loupe-core::text` provides private, policy-bound values with a source type.
+Named ingress validators retain original input spans and attach their actual
+source; designated finding content carried through worker, sandbox, server or
+database input remains `Agent`. Repository paths and Git revisions retain
+`Repo`, configuration retains `Config`, and database metadata retains `Db`.
+Source labels remain on DTOs and domain values through storage and rendering;
+validation does not make their text trusted. IDs, times and capability hashes
+are separate scalar or guarded host values.
 Proof-command `argv` and `env_names` are agent-authored requests: they pass
 the payload policy *before* the host executes them, so the recorded command
 is byte-for-byte the executed one (an argument with a control character or
@@ -503,12 +508,32 @@ repository; artifact length and hash are copied from that blob.
 
 Text validation does not prevent prompt injection expressed as ordinary
 prose. Newtypes have redacted `Debug`; rendering requires explicit
-`.expose()`. Future sinks must label untrusted content and use a structured
-boundary or a per-render random boundary of at least 128 bits verified
-absent from that content. A fixed sentinel is not collision-safe. Logs use
-redacted values, UI isolates bidirectional text, reports escape Markdown,
-and CLI rendering escapes controls. Searching for formatting sites is an
-audit aid, not proof of these guarantees.
+`.expose()`. The worker's `PromptBuilder` accepts static instructions and
+source-labelled text, JSON and paths. Its closed finding projections select
+the content required by verification and prior-finding tools without exposing
+audit fields. Output is bounded to 16 MiB and 64 parts before allocation.
+
+Initial prompt renders draw 128-bit random boundaries and reject a candidate
+found in any original or encoded data field. Three collisions or unavailable
+entropy fail rendering. Delimited mode retains exact bytes; Marked mode
+doubles literal U+241E and inserts U+241E followed by a period after every
+32 original Unicode scalars when more remain. The inverse recovers exact
+UTF-8, including CRLF and decomposed Unicode.
+
+The runner creates a separate tool boundary once per job and carries it
+through every file invocation and MCP session. Prior-finding tool results
+use this fixed boundary and return a fixed error on collision. Their existing
+JSON-RPC envelope, repository scope and result limits remain enforced.
+Both CLI adapters write complete prompts to stdin while draining output;
+failed writes, cancellation and timeout close stdin and reap the child.
+Prompts do not enter process arguments.
+
+These boundaries establish data framing and provenance, not model obedience.
+Files read directly by external CLI tools and BKB results remain outside this
+renderer. The boundary-selection Kani harness exhausted its bounded attempts
+and is explicitly listed as no verdict; runtime and fuzz evidence are not a
+substitute proof. CLI terminal rendering separately escapes control characters.
+Searching for formatting sites is an audit aid, not proof of sink safety.
 
 The future phase endpoints must enforce HTTP body caps before
 deserialization, validate payload field semantics and job-specific

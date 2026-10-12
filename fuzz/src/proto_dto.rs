@@ -1,7 +1,7 @@
 //! Byte zero selects one of 36 DTO contexts; the rest is raw JSON.
 //! Inputs are capped at 512 KiB, allowing report-budget and PoC boundaries.
-//! Credential equality uses subtle; other fields retain explicit comparisons
-//! when their enclosing DTO no longer derives PartialEq.
+//! Credential equality uses subtle; explicit field comparisons avoid requiring
+//! PartialEq on credential-bearing DTOs.
 //! Source-bearing DTOs enter through their actual named consumer. Standalone
 //! fragments are put in a fixed synthetic enclosing message before admission;
 //! this is not a public generic Deserialize path or an HTTP coverage claim.
@@ -464,10 +464,9 @@ fn submission_allowed(value: &LlmFindingSubmission) -> bool {
 }
 
 // Independent lexical recognizer for the Unix Path::components behavior the
-// validator currently accepts: inner dots and repeated/trailing slashes fold,
+// validator accepts: inner dots and repeated/trailing slashes fold,
 // a leading dot component or any parent component does not. NUL and backslash
-// are ordinary bytes here; this target records existing behavior, not a policy
-// change. Keep a platform-equivalent fallback for non-Unix corpus replay.
+// are ordinary bytes here. Non-Unix replay uses the platform's path components.
 #[cfg(unix)]
 fn relative_path_allowed(path: &str) -> bool {
 	!path.trim().is_empty()

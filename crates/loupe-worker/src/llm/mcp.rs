@@ -62,6 +62,7 @@ impl McpBroker {
 			request.job_capability.clone().context("MCP request is missing its job capability")?;
 		let job_id = request.job_id;
 		let finding_id = request.finding_id;
+		let tool_boundary = request.tool_boundary;
 		if finding_id.is_some() && job_id.is_none() {
 			anyhow::bail!("verify-mode MCP broker requires both finding_id and job_id");
 		}
@@ -93,6 +94,7 @@ impl McpBroker {
 			let (read, write) = stream.into_split();
 			crate::mcp::run_stream_server(
 				crate::mcp::McpSessionContext {
+					tool_boundary,
 					client,
 					job_capability,
 					repo_id,
@@ -182,7 +184,8 @@ mod tests {
 
 	fn test_request() -> LlmRequest {
 		LlmRequest {
-			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
 			workdir: PathBuf::from("/tmp"),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),

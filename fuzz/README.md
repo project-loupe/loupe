@@ -329,6 +329,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_mcp_submission` | Actual original-record finding projection, independent lexical admission, containment, symlink rejection, unchanged ranges and snippet clamping |
 | `worker_network_host` | RFC 1123 hostname boundaries, IPv4 acceptance and complete allowlist/public nft rule templates |
 | `worker_network_parsers` | Actual PID, uid_map, route and address parsers, typed-serde PID forms, identity-pair and complete-set checks |
+| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits |
 | `worker_regex_secrets` | Actual scanner walk and Repo finding observation, native path admission with legitimate siblings, independent matches/lines/hash and redacted Debug |
 | `worker_repo_cache` | Actual Repo cursor decoder and file reads, independent exact policy and caps, plus git origin status/UTF-8/whitespace behavior |
 | `worker_repo_observations` | Six actual private Repo validators: native paths, file bytes, fingerprint windows, Git diagnostics, binary OIDs and gitlink bytes |
@@ -382,6 +383,13 @@ cover valid fixture paths and line ranges, finding fields, tool identifiers,
 notifications, protocol refusal, verdict/patch ordering and closed log schemas.
 The corpus retains ordinary and side-fixture files, inside/outside symlinks,
 malformed requests, and the two former fixture-path oracle counterexamples.
+
+`worker_prompt_render` uses raw UTF-8 payload bytes and keeps the shared
+injection inputs in `test_cases/worker_prompt_render/injection-*`. Prompt and
+MCP checks share those original fixtures and the independent inverse oracle;
+they compare decoded values without treating JSON spelling as payload bytes.
+The generated runner registers this target for corpus replay and continuous
+campaign rotation through the same target list as the other worker targets.
 
 `worker_mcp_submission` consumes little-endian u32 start/end lines, a
 little-endian u16 path length capped at 2048 bytes, UTF-8 path bytes and the

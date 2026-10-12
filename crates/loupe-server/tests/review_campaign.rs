@@ -1,6 +1,6 @@
 mod common;
 use loupe_core::text::policy::Payload;
-use loupe_core::{JobKind, JobState};
+use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 use loupe_server::review::campaign::{self, KindHint, OpenCampaign, Opened, RequestedRef};
 use loupe_server::review::policy::ReviewPolicy;
 use loupe_storage::{campaigns, generations, jobs, transaction, Conflict, Db, Error};
@@ -136,6 +136,7 @@ fn open_pins_only_known_commits_and_freezes_policy() {
 				let job = jobs::get(tx, job)?.unwrap();
 				assert_eq!(job.kind, JobKind::Survey);
 				assert_eq!(job.generation_id, row.generation_id);
+				assert_eq!(job.workflow_contract_version, Some(WORKFLOW_CONTRACT_VERSION));
 				assert_eq!(job.token_budget, Some(123));
 				assert_eq!(job.state, JobState::Queued);
 				Ok(())
@@ -299,7 +300,7 @@ fn bootstrap_abandons_all_building_leftovers_without_relaxing_retire() {
 					repo_id: 1,
 					predecessor_generation_id: None,
 					commit_sha: &common::marked::repo::text(SHA),
-					workflow_contract_version: 1,
+					workflow_contract_version: WORKFLOW_CONTRACT_VERSION,
 				},
 				0,
 			)?;
@@ -310,7 +311,7 @@ fn bootstrap_abandons_all_building_leftovers_without_relaxing_retire() {
 					repo_id: 1,
 					predecessor_generation_id: None,
 					commit_sha: &common::marked::repo::text(OTHER),
-					workflow_contract_version: 1,
+					workflow_contract_version: WORKFLOW_CONTRACT_VERSION,
 				},
 				0,
 			)?;
@@ -348,10 +349,11 @@ fn bootstrap_abandons_all_building_leftovers_without_relaxing_retire() {
 #[test]
 fn pin_selects_active_continuation_or_matching_successor() {
 	for (active_sha, active_version, reuse_successor, expected_same) in [
-		(SHA, 1, false, true),
-		(SHA, 2, false, false),
-		(OLD, 1, false, false),
-		(OLD, 1, true, false),
+		(SHA, WORKFLOW_CONTRACT_VERSION, false, true),
+		(OLD, WORKFLOW_CONTRACT_VERSION, false, false),
+		(OLD, WORKFLOW_CONTRACT_VERSION, true, false),
+		// The pre-framing workflow must not be reused for the same commit.
+		(SHA, 1, false, false),
 	] {
 		let db = fixture();
 		db.with_conn(|c| {
@@ -375,7 +377,7 @@ fn pin_selects_active_continuation_or_matching_successor() {
 							repo_id: 1,
 							predecessor_generation_id: Some(active),
 							commit_sha: &common::marked::repo::text(SHA),
-							workflow_contract_version: 1,
+							workflow_contract_version: WORKFLOW_CONTRACT_VERSION,
 						},
 						1,
 					)?)
@@ -391,6 +393,10 @@ fn pin_selects_active_continuation_or_matching_successor() {
 				let row = campaigns::get(tx, campaign)?.unwrap();
 				assert_eq!(row.recipe, campaigns::Recipe::Incremental);
 				let generation = row.generation_id.unwrap();
+				assert_eq!(
+					generations::get(tx, generation)?.unwrap().workflow_contract_version,
+					WORKFLOW_CONTRACT_VERSION
+				);
 				assert_eq!(generation == active, expected_same);
 				if let Some(successor) = successor {
 					assert_eq!(generation, successor);
@@ -420,7 +426,7 @@ fn recipe_selection_uses_only_an_active_baseline() {
 			let db = fixture();
 			db.with_conn(|c|transaction::immediate(c,|tx| {
 				if let Some(state)=state {
-					tx.execute("INSERT INTO review_generations(repo_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES(1,?2,?1,1,0)",rusqlite::params![state, SHA])?;
+					tx.execute("INSERT INTO review_generations(repo_id,generation_commit_sha,state,workflow_contract_version,created_at) VALUES(1,?2,?1,?3,0)",rusqlite::params![state, SHA, WORKFLOW_CONTRACT_VERSION])?;
 				}
 				let reference = common::marked::operator::text("main");let mut new=request(RequestedRef::Branch(&reference));new.kind_hint=hint;
 				let (campaign,job)=created(campaign::open(tx,&new,&ReviewPolicy::default(),0)?);

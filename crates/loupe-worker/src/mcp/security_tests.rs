@@ -27,6 +27,7 @@ fn subscriber(capture: Capture) -> impl tracing::Subscriber + Send + Sync {
 
 fn context(workdir: &Path) -> McpSessionContext {
 	McpSessionContext {
+		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		client: Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),
 			"http://127.0.0.1:1/".parse().unwrap(),
@@ -104,6 +105,8 @@ async fn rejected_arguments_never_reach_tool_failure_logs() {
 	let workdir = tempfile::tempdir().unwrap();
 	let context = context(workdir.path());
 	let session = Arc::new(Session {
+		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+		data_mode: crate::llm::prompt::DataMode::Delimited,
 		client: context.client,
 		job_capability: context.job_capability,
 		repo_id: 1,

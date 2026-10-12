@@ -173,6 +173,7 @@ impl Runner {
 		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 		cancel: CancellationToken,
 	) -> Result<(Option<CompletionRevision>, usize)> {
+		let tool_boundary = crate::llm::prompt::JobToolBoundary::new()?;
 		let key =
 			RepoKey::new(env.repo.host.expose(), env.repo.owner.expose(), env.repo.repo.expose());
 		let clone_url = env.repo.clone_url.clone();
@@ -246,6 +247,7 @@ impl Runner {
 					);
 				}
 				let vctx = VerifyContext {
+					tool_boundary,
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
 					repo_id: env.repo_id,
@@ -344,6 +346,7 @@ impl Runner {
 					);
 				}
 				let ctx = ScanContext {
+					tool_boundary,
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
 					repo_id: env.repo_id,

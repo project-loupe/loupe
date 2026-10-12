@@ -18,6 +18,8 @@ mod ingress;
 #[cfg(fuzzing)]
 pub use ingress::fuzz_support;
 #[cfg(test)]
+pub(crate) use ingress::fuzz_support;
+#[cfg(test)]
 pub(crate) use ingress::fuzz_support::lease_fixture as test_lease;
 #[cfg(any(test, fuzzing))]
 pub(crate) use ingress::fuzz_support::scanner_patch_fixture as test_scanner_patch;

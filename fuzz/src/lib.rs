@@ -56,6 +56,7 @@ pub mod worker_mcp_rpc;
 pub mod worker_mcp_submission;
 pub mod worker_network_host;
 pub mod worker_network_parsers;
+pub mod worker_prompt_render;
 pub mod worker_regex_secrets;
 pub mod worker_repo_cache;
 pub mod worker_repo_observations;

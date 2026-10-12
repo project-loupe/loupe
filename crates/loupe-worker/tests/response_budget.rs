@@ -135,6 +135,7 @@ async fn all_worker_response_paths_reject_malformed_dtos() {
 			// The query owner is admitted from the original MCP request. The
 			// same client search response decoder must still reject this DTO.
 			let context = loupe_worker::mcp::McpSessionContext {
+				tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 				client: std::sync::Arc::new(client),
 				job_capability: capability.clone(),
 				repo_id: 1,

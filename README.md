@@ -68,6 +68,16 @@ Before installing, the host needs:
   compatibility alias. The key is consumed by the worker-host broker and
   is never passed to the Codex sandbox.
   See https://github.com/openai/codex for install instructions.
+
+  Both backends receive prompts through stdin. Host instructions are static;
+  finding content and repository paths enter labelled data blocks with checked
+  random boundaries. Each job also has one fixed boundary for prior-finding
+  tool results. A collision or oversized prompt fails closed. This contains
+  Loupe's rendered data and keeps it out of process arguments; it does not
+  guarantee that a model ignores hostile prose or cover files read directly
+  by external tools. See [Text and digest boundaries](ARCH.md#text-and-digest-boundaries)
+  for the source types, output limits and verification scope.
+
 - **`bkb-mcp`** (optional) on PATH on workers scanning bitcoin /
   lightning / cashu codebases. When the binary is present at startup,
   the discovery agent's per-call MCP config gets a second server

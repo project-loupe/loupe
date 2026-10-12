@@ -1,6 +1,6 @@
 //! Backend that shells out to the `claude` CLI.
 //!
-//! Runs `claude --dangerously-skip-permissions -p "$prompt"` inside the
+//! Runs `claude --dangerously-skip-permissions -p` with the prompt on stdin in the
 //! bubblewrap sandbox so the agent can read the worktree at `/workdir`
 //! but can't write to it or persist any state across invocations. The
 //! `--dangerously-skip-permissions` flag is acceptable here only
@@ -24,7 +24,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tokio::time::timeout;
 
-use super::cli_output::{collect_cli_output, MAX_CLI_OUTPUT_BYTES};
+use super::cli_output::MAX_CLI_OUTPUT_BYTES;
 use super::mcp::{
 	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
@@ -211,7 +211,7 @@ impl LlmBackend for ClaudeCliBackend {
 			workdir = %req.workdir.display(),
 			model = %self.agent.model.for_operation(),
 			effort = %self.agent.effort.for_operation(),
-			prompt_chars = req.prompt.for_cli_argument().chars().count(),
+			prompt_chars = req.prompt.expose().chars().count(),
 			timeout_ms = req.timeout.as_millis() as u64,
 			"claude-cli: invoking",
 		);
@@ -304,7 +304,7 @@ impl LlmBackend for ClaudeCliBackend {
 			_ => None,
 		};
 
-		let mut agent_args = claude_invocation_args(&self.agent, req.prompt.for_cli_argument());
+		let mut agent_args = claude_invocation_args(&self.agent);
 		if _mcp_scratch.is_some() {
 			agent_args.extend(claude_mcp_args().into_iter().map(str::to_owned));
 		}
@@ -319,35 +319,17 @@ impl LlmBackend for ClaudeCliBackend {
 		};
 		#[cfg(not(test))]
 		let mut cmd = build_model_proxied_command(&sandbox, &self.bin, &agent_args);
-		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+		cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		cmd.kill_on_drop(true);
 
 		let mut child = cmd
 			.spawn()
 			.with_context(|| format!("spawning `{}` (is the claude CLI installed?)", self.bin))?;
 
-		let stdout_handle = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-		let stderr_handle = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
-
-		let cancel = req.cancel.clone();
-		let run_outcome = timeout(req.timeout, async {
-			let wait_fut = async {
-				tokio::select! {
-					biased;
-					_ = cancel.cancelled() => {
-						let _ = child.kill().await;
-						Err(anyhow!("cancelled"))
-					}
-					res = child.wait() => res.map_err(Into::into),
-				}
-			};
-			let (status, stdout, stderr) = tokio::join!(
-				wait_fut,
-				collect_cli_output(stdout_handle),
-				collect_cli_output(stderr_handle),
-			);
-			Result::<_>::Ok((status?, stdout?, stderr?))
-		})
+		let run_outcome = timeout(
+			req.timeout,
+			super::cli_stdin::drive(&mut child, &req.prompt, req.cancel.clone()),
+		)
 		.await;
 
 		// `kill_on_drop` only sends the signal. Explicitly kill and wait
@@ -389,13 +371,14 @@ impl LlmBackend for ClaudeCliBackend {
 			None => Ok(()),
 		};
 
-		let (status, stdout, stderr) = match run_outcome {
-			Ok(inner) => inner?,
-			Err(_) => return Err(anyhow!("claude CLI timed out after {:?}", req.timeout)),
-		};
+		let super::cli_stdin::CliRun { status, stdout, stderr, stdin_failed, killed_for_stdin } =
+			match run_outcome {
+				Ok(inner) => inner?,
+				Err(_) => return Err(anyhow!("claude CLI timed out after {:?}", req.timeout)),
+			};
 
 		let output_truncated = stdout.truncated || stderr.truncated;
-		if !status.success() {
+		if !status.success() && !killed_for_stdin {
 			let stderr_text = stderr.diagnostic();
 			let stdout_text = stdout.diagnostic();
 			tracing::debug!(
@@ -419,6 +402,9 @@ impl LlmBackend for ClaudeCliBackend {
 				max_chars: MAX_CLI_DIAGNOSTIC_CHARS,
 			}
 			.into());
+		}
+		if stdin_failed {
+			return Err(anyhow!("CLI prompt stdin delivery failed"));
 		}
 		// Reported last: a CLI failure explains a broker failure, so the
 		// CLI diagnostic is the more useful error to surface.
@@ -485,7 +471,7 @@ fn build_model_proxied_command(
 	cmd
 }
 
-fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
+fn claude_invocation_args(agent: &CliModelConfig) -> Vec<String> {
 	vec![
 		"--dangerously-skip-permissions".to_owned(),
 		"--model".to_owned(),
@@ -494,13 +480,18 @@ fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
 		agent.effort.for_operation().to_owned(),
 		"--no-session-persistence".to_owned(),
 		"-p".to_owned(),
-		prompt.to_owned(),
 	]
 }
 
 #[cfg(test)]
-mod tests {
+type PromptTestBackend = ClaudeCliBackend;
 
+#[cfg(test)]
+#[path = "prompt_delivery_tests.rs"]
+mod prompt_delivery_tests;
+
+#[cfg(test)]
+mod tests {
 	#[cfg(unix)]
 	async fn run_output_fixture(
 		stdout_bytes: usize, stderr_bytes: usize, exit_code: u8,
@@ -519,7 +510,8 @@ mod tests {
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let result = backend
 			.run(LlmRequest {
-				prompt: crate::llm::prompts::Prompt::instruction("fixture"),
+				tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+				prompt: crate::llm::prompts::Prompt::instruction("fixture").unwrap(),
 				workdir: workdir.path().to_owned(),
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
@@ -622,7 +614,7 @@ mod tests {
 			.unwrap_or(false)
 	}
 
-	fn test_model_broker(worker_binary: impl Into<PathBuf>) -> ModelBrokerContext {
+	pub(super) fn test_model_broker(worker_binary: impl Into<PathBuf>) -> ModelBrokerContext {
 		ModelBrokerContext::new(
 			worker_binary.into(),
 			"http://127.0.0.1:9".parse().unwrap(),
@@ -708,7 +700,8 @@ mod tests {
 			.with_network_disabled_for_tests()
 			.with_model_broker_context(model_broker);
 		let req = LlmRequest {
-			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -727,7 +720,7 @@ mod tests {
 	}
 
 	#[cfg(unix)]
-	fn sh_single_quote(path: &Path) -> String {
+	pub(super) fn sh_single_quote(path: &Path) -> String {
 		format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 	}
 
@@ -781,7 +774,8 @@ mod tests {
 		let backend = ClaudeCliBackend::with_bin("loupe-worker-no-such-bin")
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -819,7 +813,8 @@ mod tests {
 			.with_sandbox_disabled_for_tests()
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: crate::llm::prompts::Prompt::instruction("irrelevant"),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_millis(500),
 			cancel: CancellationToken::new(),
@@ -851,17 +846,14 @@ mod tests {
 
 	#[test]
 	fn invocation_args_include_configured_model_and_effort() {
-		let args = claude_invocation_args(
-			&CliModelConfig {
-				model: crate::config::ConfiguredText::Builtin("claude-test"),
-				effort: crate::config::ConfiguredText::Builtin("xhigh"),
-			},
-			"hello",
-		);
+		let args = claude_invocation_args(&CliModelConfig {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("xhigh"),
+		});
 
 		assert!(args.windows(2).any(|w| w == ["--model", "claude-test"]));
 		assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
 		assert!(args.iter().any(|arg| arg == "--no-session-persistence"));
-		assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
+		assert_eq!(args.last().map(String::as_str), Some("-p"));
 	}
 }

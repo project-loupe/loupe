@@ -100,6 +100,7 @@ impl Scanner for LlmCodeReviewScanner {
 				ctx.repo_id,
 				ctx.job_id,
 				ctx.job_capability.clone(),
+				ctx.tool_boundary,
 				self.bkb_hint,
 				&ctx.cancel,
 			)
@@ -144,7 +145,8 @@ impl LlmCodeReviewScanner {
 	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[DiscoveredSourcePath], repo_id: i64,
-		job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
+		job_id: i64, job_capability: loupe_proto::JobCapability,
+		tool_boundary: crate::llm::prompt::JobToolBoundary, bkb_hint: &'static str,
 		cancel: &CancellationToken,
 	) -> (usize, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
@@ -170,6 +172,7 @@ impl LlmCodeReviewScanner {
 					repo_id,
 					job_id,
 					job_capability,
+					tool_boundary,
 					bkb_hint,
 					cancel,
 				)
@@ -199,18 +202,26 @@ impl LlmCodeReviewScanner {
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &DiscoveredSourcePath, cfg: &ScannerConfig,
-	repo_id: i64, job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
+	repo_id: i64, job_id: i64, job_capability: loupe_proto::JobCapability,
+	tool_boundary: crate::llm::prompt::JobToolBoundary, bkb_hint: &'static str,
 	cancel: CancellationToken,
 ) -> FileOutcome {
 	let Some(path) = file.for_prompt() else {
 		tracing::warn!("llm-code-review: skipped unrepresentable native source path");
 		return FileOutcome::SkippedNative;
 	};
-	let prompt = Prompt::discovery(path, bkb_hint);
+	let prompt = match Prompt::discovery(path, bkb_hint) {
+		Ok(prompt) => prompt,
+		Err(error) => {
+			tracing::warn!(%error, "could not render discovery prompt");
+			return FileOutcome::Failed;
+		},
+	};
 	let rel = path.expose();
 	tracing::info!(file = %rel, "llm-code-review: launching agent session");
 	let started = std::time::Instant::now();
 	let req = LlmRequest {
+		tool_boundary,
 		prompt,
 		workdir: workdir.to_path_buf(),
 		timeout: cfg.per_request_timeout,
@@ -319,13 +330,19 @@ mod tests {
 
 		let calls = Arc::new(AtomicUsize::new(0));
 		let calls_for_stub = calls.clone();
-		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+		let ctx = make_ctx(tmp.path());
+		let expected_boundary = ctx.tool_boundary;
+		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+			assert_eq!(
+				req.tool_boundary, expected_boundary,
+				"all file invocations retain the job boundary"
+			);
 			calls_for_stub.fetch_add(1, Ordering::SeqCst);
 			Ok(String::new())
 		}));
 		let scanner = LlmCodeReviewScanner::new(backend);
 
-		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
+		let findings = scanner.scan(&ctx).await.unwrap();
 		assert!(findings.is_empty(), "scanner returns no findings — submissions go via MCP");
 		assert_eq!(
 			calls.load(Ordering::SeqCst),
