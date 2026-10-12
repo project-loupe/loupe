@@ -293,13 +293,26 @@ pub struct RegisterWorkerRequest {
 	pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The registration's private key has a single owning allocation.
+///
+/// ```compile_fail,E0599
+/// fn duplicate(response: loupe_proto::RegisterWorkerResponse) {
+///     let _copy = response.clone();
+/// }
+/// ```
+///
+/// ```
+/// let metadata: fn(&loupe_proto::RegisterWorkerResponse) -> i64 = |response| response.worker_id;
+/// ```
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterWorkerResponse {
 	pub protocol_version: u16,
 	pub worker_id: i64,
 	pub client_cert_pem: String,
-	pub client_key_pem: String,
-	pub ca_cert_pem: String,
+	#[serde(with = "crate::secret_serde::string")]
+	pub client_key_pem: loupe_provenance::Secret<String>,
+	#[serde(with = "crate::secret_serde::string")]
+	pub ca_cert_pem: loupe_provenance::Secret<String>,
 }
 
 #[cfg(test)]
@@ -537,12 +550,18 @@ mod tests {
 			protocol_version: PROTOCOL_VERSION,
 			worker_id: 17,
 			client_cert_pem: "-----BEGIN CERTIFICATE-----\n...".into(),
-			client_key_pem: "-----BEGIN PRIVATE KEY-----\n...".into(),
-			ca_cert_pem: "-----BEGIN CERTIFICATE-----\n...".into(),
+			client_key_pem: loupe_provenance::Secret::new(
+				"-----BEGIN PRIVATE KEY-----\n...".into(),
+			),
+			ca_cert_pem: loupe_provenance::Secret::new("-----BEGIN CERTIFICATE-----\n...".into()),
 		};
 		let s = serde_json::to_string(&resp).unwrap();
 		let back: RegisterWorkerResponse = serde_json::from_str(&s).unwrap();
-		assert_eq!(resp, back);
+		assert_eq!(resp.protocol_version, back.protocol_version);
+		assert_eq!(resp.worker_id, back.worker_id);
+		assert_eq!(resp.client_cert_pem, back.client_cert_pem);
+		assert_eq!(resp.client_key_pem.expose(), back.client_key_pem.expose());
+		assert_eq!(resp.ca_cert_pem.expose(), back.ca_cert_pem.expose());
 	}
 
 	#[test]
@@ -578,5 +597,33 @@ mod tests {
 			req.github_pat.as_ref().map(Secret::expose),
 			back.github_pat.as_ref().map(Secret::expose)
 		);
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use super::*;
+
+	#[test]
+	fn tls_consumer_worker_registration_debug_redacts_private_pem() {
+		let response: RegisterWorkerResponse = serde_json::from_str(r#"{"protocol_version":1,"worker_id":42,"client_cert_pem":"public-client-cert","client_key_pem":"FAKE_REGISTERED_TLS_PRIVATE","ca_cert_pem":"public-ca-cert"}"#).unwrap();
+		for rendered in [format!("{response:?}"), format!("{response:#?}")] {
+			assert!(rendered.contains("public-client-cert"));
+			assert!(rendered.contains("42"));
+			assert!(
+				!rendered.contains("FAKE_REGISTERED_TLS_PRIVATE"),
+				"registration Debug disclosed the private key"
+			);
+		}
+	}
+
+	#[test]
+	fn worker_registration_wire_preserves_all_pem_bytes_and_metadata() {
+		let wire = serde_json::json!({"protocol_version": 1, "worker_id": 42,
+			"client_cert_pem": "public-client-cert\n", "client_key_pem": "FAKE_PRIVATE_\"\\\n💡", "ca_cert_pem": "public-ca-cert\n"});
+		let response: RegisterWorkerResponse = serde_json::from_value(wire.clone()).unwrap();
+		assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+		let pretty = serde_json::to_string_pretty(&response).unwrap();
+		assert_eq!(serde_json::from_str::<serde_json::Value>(&pretty).unwrap(), wire);
 	}
 }

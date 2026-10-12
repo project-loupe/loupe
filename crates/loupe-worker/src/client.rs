@@ -43,13 +43,10 @@ impl ServerClient {
 	pub fn new(
 		server_cert_pem: &str, client_cert_pem: &str, client_key_pem: &str, base: Url,
 	) -> Result<Self> {
-		let identity = build_identity(client_cert_pem, client_key_pem)?;
-		let root = reqwest::Certificate::from_pem(server_cert_pem.as_bytes())
-			.context("parsing server CA PEM")?;
+		let tls =
+			loupe_tls::reqwest_client_config(client_cert_pem, client_key_pem, server_cert_pem)?;
 		let http = reqwest::Client::builder()
-			.add_root_certificate(root)
-			.identity(identity)
-			.use_rustls_tls()
+			.use_preconfigured_tls(tls)
 			.build()
 			.context("building reqwest client")?;
 		Ok(Self { http, base })
@@ -194,17 +191,6 @@ impl ServerClient {
 		self.with_protocol(req)
 			.header(JOB_CAPABILITY_HEADER, CapabilityHeader(job_capability.clone()))
 	}
-}
-
-fn build_identity(cert_pem: &str, key_pem: &str) -> Result<reqwest::Identity> {
-	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
-	combined.push_str(cert_pem);
-	if !cert_pem.ends_with('\n') {
-		combined.push('\n');
-	}
-	combined.push_str(key_pem);
-	reqwest::Identity::from_pem(combined.as_bytes())
-		.map_err(|e| anyhow!("building reqwest identity from PEM: {e}"))
 }
 
 async fn ensure_ok(resp: reqwest::Response) -> Result<Bytes> {
@@ -356,5 +342,123 @@ mod tests {
 			stream.write_all(response.as_bytes()).await.expect("write test response");
 		});
 		Url::parse(&format!("http://{addr}/")).expect("test server URL")
+	}
+}
+
+#[cfg(test)]
+mod tls_constructor_controls {
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use loupe_tls::Ca;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	use super::*;
+
+	fn application_client(ca: &str, cert: &str, key: &str) -> anyhow::Result<reqwest::Client> {
+		Ok(ServerClient::new(ca, cert, key, "https://localhost/".parse().unwrap())?.http)
+	}
+
+	async fn exchange(
+		http: reqwest::Client, mut config: rustls::ServerConfig,
+	) -> (bool, Option<(Vec<u8>, Vec<Vec<u8>>)>) {
+		config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let mut task = tokio::spawn(async move {
+			let (socket, _) = listener.accept().await.unwrap();
+			let Ok(mut tls) =
+				tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(socket).await
+			else {
+				return None;
+			};
+			let alpn = tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec();
+			let chain = tls
+				.get_ref()
+				.1
+				.peer_certificates()
+				.unwrap_or_default()
+				.iter()
+				.map(|cert| cert.to_vec())
+				.collect();
+			let mut request = Vec::new();
+			while !request.ends_with(b"\r\n\r\n") {
+				let mut byte = [0u8; 1];
+				if tls.read_exact(&mut byte).await.is_err() || request.len() == 16 * 1024 {
+					return None;
+				}
+				request.push(byte[0]);
+			}
+			if tls
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+				.await
+				.is_err()
+			{
+				return None;
+			}
+			let _ = tls.shutdown().await;
+			Some((alpn, chain))
+		});
+		let success = tokio::time::timeout(Duration::from_secs(5), async {
+			let response = http.get(format!("https://localhost:{port}/")).send().await?;
+			let body = response.bytes().await?;
+			Ok::<_, reqwest::Error>(body == b"ok".as_slice())
+		})
+		.await
+		.is_ok_and(|result| result.unwrap_or(false));
+		let peer = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+			Ok(result) => result.unwrap(),
+			Err(_) => {
+				task.abort();
+				let _ = task.await;
+				None
+			},
+		};
+		(success, peer)
+	}
+
+	#[tokio::test]
+	async fn actual_constructor_preserves_mtls_http11_chain_and_mixed_roots() {
+		let ca = Ca::new("throwaway-application-ca").unwrap();
+		let server = ca.mint_server("server", &["localhost".into()]).unwrap();
+		let client = ca.mint_client("client").unwrap();
+		let unused = ca.mint_client("unused").unwrap();
+		let roots = format!("{}{}", unused.key_pem.expose(), ca.cert_pem());
+		let chain = format!("{}{}", client.cert_pem, ca.cert_pem());
+		let expected: Vec<_> = rustls_pemfile::certs(&mut chain.as_bytes())
+			.map(|cert| cert.unwrap().to_vec())
+			.collect();
+		let http = application_client(&roots, &chain, client.key_pem.expose()).unwrap();
+		let config =
+			loupe_tls::server_config(&server.cert_pem, server.key_pem.expose(), ca.cert_pem())
+				.unwrap();
+		let (success, peer) = exchange(http, config).await;
+		assert!(success, "actual application client must complete mutual TLS");
+		let (alpn, observed) = peer.unwrap();
+		assert_eq!(alpn, b"http/1.1");
+		assert_eq!(observed, expected);
+	}
+
+	#[tokio::test]
+	async fn actual_constructor_rejects_wrong_ca_hostname_and_mismatched_key() {
+		let ca = Ca::new("throwaway-application-ca").unwrap();
+		let foreign = Ca::new("throwaway-foreign-ca").unwrap();
+		let client = ca.mint_client("client").unwrap();
+		let wrong = ca.mint_client("wrong-key").unwrap();
+		assert!(
+			application_client(ca.cert_pem(), &client.cert_pem, wrong.key_pem.expose()).is_err()
+		);
+		for (host, roots) in [("localhost", foreign.cert_pem()), ("wrong-host", ca.cert_pem())] {
+			let server = ca.mint_server("server", &[host.into()]).unwrap();
+			let http =
+				application_client(roots, &client.cert_pem, client.key_pem.expose()).unwrap();
+			let config =
+				loupe_tls::server_config(&server.cert_pem, server.key_pem.expose(), ca.cert_pem())
+					.unwrap();
+			assert!(
+				!exchange(http, config).await.0,
+				"verification must reject wrong trust or hostname"
+			);
+		}
 	}
 }

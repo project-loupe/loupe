@@ -50,7 +50,7 @@ async fn capture(args: &[&str], credential: Option<&str>, response: &str) -> (St
 		.env("LOUPE_SERVER_URL", format!("http://{addr}"))
 		.env("LOUPE_CA_CERT_PEM", ca.cert_pem())
 		.env("LOUPE_ADMIN_CERT_PEM", admin.cert_pem)
-		.env("LOUPE_ADMIN_KEY_PEM", admin.key_pem);
+		.env("LOUPE_ADMIN_KEY_PEM", admin.key_pem.expose());
 	if let Some(credential) = credential {
 		command.env("LOUPE_TRACKER_PAT", credential).env("LOUPE_GITHUB_APP_KEY_PEM", credential);
 	}

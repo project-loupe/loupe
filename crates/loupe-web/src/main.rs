@@ -20,10 +20,12 @@ async fn main() -> Result<()> {
 	let base = cli.conn.server_url()?;
 	let client = AdminClient::new(
 		base.clone(),
-		&cli.conn.ca_pem()?,
-		&cli.conn.admin_cert_pem()?,
-		&cli.conn.admin_key_pem()?,
+		cli.conn.ca_pem()?.expose(),
+		cli.conn.admin_cert_pem()?.expose(),
+		cli.conn.admin_key_pem()?.expose(),
 	)?;
+	// Argument PEM is no longer needed after the client owns its signer.
+	drop(cli.conn);
 
 	// Fail fast on a broken upstream rather than serving a dashboard whose
 	// every action errors. `/v1/health` needs no auth, so this checks

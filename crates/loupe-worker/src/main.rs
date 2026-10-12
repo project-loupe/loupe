@@ -86,21 +86,21 @@ struct RunArgs {
 	/// CA cert PEM content. When set, this takes precedence over
 	/// --ca-cert / LOUPE_CA_CERT.
 	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<String>,
+	ca_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<String>,
+	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 	/// Worker client cert PEM content. When set, this takes precedence
 	/// over --cert / LOUPE_WORKER_CERT.
 	#[arg(long, env = "LOUPE_WORKER_CERT_PEM", hide_env_values = true)]
-	cert_pem: Option<String>,
+	cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_WORKER_CERT_PEM_B64", hide_env_values = true)]
-	cert_pem_b64: Option<String>,
+	cert_pem_b64: Option<loupe_tls::PemInput>,
 	/// Worker client private-key PEM content. When set, this takes
 	/// precedence over --key / LOUPE_WORKER_KEY.
 	#[arg(long, env = "LOUPE_WORKER_KEY_PEM", hide_env_values = true)]
-	key_pem: Option<String>,
+	key_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_WORKER_KEY_PEM_B64", hide_env_values = true)]
-	key_pem_b64: Option<String>,
+	key_pem_b64: Option<loupe_tls::PemInput>,
 	/// Where to keep cached bare clones.
 	#[arg(long, env = "LOUPE_CACHE_DIR")]
 	cache_dir: Option<PathBuf>,
@@ -276,11 +276,13 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	)?;
 
 	let client = Arc::new(ServerClient::new(
-		&tls.ca_cert_pem,
-		&tls.cert_pem,
-		&tls.key_pem,
+		tls.ca_cert_pem.expose(),
+		tls.cert_pem.expose(),
+		tls.key_pem.expose(),
 		server_url.clone(),
 	)?);
+	// The persistent client owns its signer; retire controllable PEM now.
+	drop(tls);
 	let worker_binary =
 		std::env::current_exe().context("resolving the loupe-worker binary path")?;
 	let cache = Arc::new(RepoCache::new(
@@ -547,15 +549,16 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 }
 
 struct WorkerTls {
-	ca_cert_pem: String,
-	cert_pem: String,
-	key_pem: String,
+	ca_cert_pem: loupe_provenance::Secret<String>,
+	cert_pem: loupe_provenance::Secret<String>,
+	key_pem: loupe_provenance::Secret<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn read_worker_tls(
-	ca_cert_pem: Option<String>, ca_cert_pem_b64: Option<String>, cert_pem: Option<String>,
-	cert_pem_b64: Option<String>, key_pem: Option<String>, key_pem_b64: Option<String>,
+	ca_cert_pem: Option<loupe_tls::PemInput>, ca_cert_pem_b64: Option<loupe_tls::PemInput>,
+	cert_pem: Option<loupe_tls::PemInput>, cert_pem_b64: Option<loupe_tls::PemInput>,
+	key_pem: Option<loupe_tls::PemInput>, key_pem_b64: Option<loupe_tls::PemInput>,
 	ca_cert: Option<PathBuf>, cert: Option<PathBuf>, key: Option<PathBuf>,
 ) -> Result<WorkerTls> {
 	let env_pem_present = has_value(&ca_cert_pem)
@@ -593,37 +596,34 @@ fn read_worker_tls(
 		cert.context("--cert / LOUPE_WORKER_CERT is required unless LOUPE_WORKER_CERT_PEM is set")?;
 	let key =
 		key.context("--key / LOUPE_WORKER_KEY is required unless LOUPE_WORKER_KEY_PEM is set")?;
-	let ca_cert_pem = std::fs::read_to_string(&ca_cert)
+	let ca_cert_pem = loupe_tls::read_pem_file(&ca_cert)
 		.with_context(|| format!("reading CA cert at {}", ca_cert.display()))?;
-	let cert_pem = std::fs::read_to_string(&cert)
+	let cert_pem = loupe_tls::read_pem_file(&cert)
 		.with_context(|| format!("reading worker cert at {}", cert.display()))?;
-	let key_pem = std::fs::read_to_string(&key)
+	let key_pem = loupe_tls::read_pem_file(&key)
 		.with_context(|| format!("reading worker key at {}", key.display()))?;
 	Ok(WorkerTls { ca_cert_pem, cert_pem, key_pem })
 }
 
-fn has_value(value: &Option<String>) -> bool {
-	value.as_deref().is_some_and(|s| !s.is_empty())
+fn has_value(value: &Option<loupe_tls::PemInput>) -> bool {
+	value.as_ref().is_some_and(|s| !s.expose().is_empty())
 }
 
 fn required_pem_env(
-	value: Option<String>, value_b64: Option<String>, name: &'static str, b64_name: &'static str,
-) -> Result<String> {
-	if let Some(value) = value.filter(|s| !s.is_empty()) {
-		return Ok(value);
+	value: Option<loupe_tls::PemInput>, value_b64: Option<loupe_tls::PemInput>, name: &'static str,
+	b64_name: &'static str,
+) -> Result<loupe_provenance::Secret<String>> {
+	if let Some(value) = value.filter(|s| !s.expose().is_empty()) {
+		return Ok(value.into_pem());
 	}
-	if let Some(value_b64) = value_b64.filter(|s| !s.is_empty()) {
-		return decode_pem_b64(b64_name, &value_b64);
+	if let Some(value_b64) = value_b64.filter(|s| !s.expose().is_empty()) {
+		return decode_pem_b64(b64_name, value_b64.expose());
 	}
 	anyhow::bail!("{name} or {b64_name} is required when any worker TLS PEM env var is set")
 }
 
-fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
-	use base64::Engine as _;
-	let bytes = base64::engine::general_purpose::STANDARD
-		.decode(pem_b64.trim())
-		.with_context(|| format!("decoding {label}"))?;
-	String::from_utf8(bytes).with_context(|| format!("{label} did not decode to valid UTF-8"))
+fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<loupe_provenance::Secret<String>> {
+	loupe_tls::decode_pem_base64(pem_b64.trim()).with_context(|| format!("decoding {label}"))
 }
 
 /// Initialise tracing. Defaults to the human-readable formatter; set
@@ -688,31 +688,40 @@ mod tests {
 
 		let tls = read_worker_tls(
 			None,
-			Some(b64(ca)),
+			Some(b64(ca).into()),
 			None,
-			Some(b64(cert)),
+			Some(b64(cert).into()),
 			None,
-			Some(b64(key)),
+			Some(b64(key).into()),
 			None,
 			None,
 			None,
 		)
 		.unwrap();
 
-		assert_eq!(tls.ca_cert_pem, ca);
-		assert_eq!(tls.cert_pem, cert);
-		assert_eq!(tls.key_pem, key);
+		assert_eq!(tls.ca_cert_pem.expose(), ca);
+		assert_eq!(tls.cert_pem.expose(), cert);
+		assert_eq!(tls.key_pem.expose(), key);
 	}
 
 	#[test]
 	fn read_worker_tls_requires_complete_env_tuple() {
 		let ca = "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n";
 
-		let err =
-			match read_worker_tls(None, Some(b64(ca)), None, None, None, None, None, None, None) {
-				Ok(_) => panic!("partial env TLS should be rejected"),
-				Err(e) => e,
-			};
+		let err = match read_worker_tls(
+			None,
+			Some(b64(ca).into()),
+			None,
+			None,
+			None,
+			None,
+			None,
+			None,
+			None,
+		) {
+			Ok(_) => panic!("partial env TLS should be rejected"),
+			Err(e) => e,
+		};
 
 		assert!(err.to_string().contains("LOUPE_WORKER_CERT_PEM"));
 	}
@@ -769,5 +778,141 @@ mod tests {
 			replace_model_base_url(OsString::from("unrelated"), "http://127.0.0.1:3210"),
 			OsString::from("unrelated"),
 		);
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use base64::Engine as _;
+
+	use super::*;
+
+	#[test]
+	fn tls_consumer_worker_options_debug_redacts_raw_and_encoded_tls_inputs() {
+		let sentinel = "FAKE_WORKER_TLS_OPTION";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(sentinel);
+		let mut leaks = Vec::new();
+		for flag in [
+			"--ca-cert-pem",
+			"--cert-pem",
+			"--key-pem",
+			"--ca-cert-pem-b64",
+			"--cert-pem-b64",
+			"--key-pem-b64",
+		] {
+			let value = if flag.ends_with("-b64") { &encoded } else { sentinel };
+			let cli = Cli::try_parse_from(["loupe-worker", flag, value]).unwrap();
+			if [format!("{cli:?}"), format!("{cli:#?}")].iter().any(|text| text.contains(value)) {
+				leaks.push(flag);
+			}
+		}
+		assert!(leaks.is_empty(), "worker option Debug disclosed inputs at {leaks:?}");
+	}
+
+	#[test]
+	fn tls_consumer_worker_loaded_owners_redact_mixed_certificates_and_keys() {
+		let tls = read_worker_tls(
+			Some("FAKE_MIXED_CA_TLS".into()),
+			None,
+			Some("FAKE_MIXED_CERT_TLS".into()),
+			None,
+			Some("FAKE_WORKER_KEY_TLS".into()),
+			None,
+			None,
+			None,
+			None,
+		)
+		.unwrap();
+		for value in [&tls.ca_cert_pem, &tls.cert_pem, &tls.key_pem] {
+			for rendered in [
+				format!("{value:?}"),
+				format!("{value:#?}"),
+				format!("{value}"),
+				format!("{value:#}"),
+			] {
+				assert_eq!(rendered, "[redacted]", "loaded TLS owner must redact every formatter");
+			}
+		}
+	}
+
+	#[test]
+	fn tls_consumer_worker_invalid_utf8_error_does_not_retain_private_bytes() {
+		let bytes = b"FAKE_INVALID_WORKER_TLS\xff";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+		let error = decode_pem_b64("worker key", &encoded).unwrap_err();
+		let rendered: String = format!("{error:#?}").split_whitespace().collect();
+		let reflected: String = format!("bytes:{bytes:?}").split_whitespace().collect();
+		assert!(!rendered.contains(&reflected), "invalid UTF-8 error retained private input bytes");
+	}
+
+	#[test]
+	fn worker_tls_loader_preserves_complete_env_rule_and_file_fallback() {
+		let dir = tempfile::tempdir().unwrap();
+		let ca = dir.path().join("ca");
+		let cert = dir.path().join("cert");
+		let key = dir.path().join("key");
+		for (path, value) in [(&ca, "FILE_CA"), (&cert, "FILE_CERT"), (&key, "FILE_KEY")] {
+			std::fs::write(path, value).unwrap();
+		}
+		let tls = read_worker_tls(
+			Some(String::new().into()),
+			None,
+			None,
+			Some(String::new().into()),
+			None,
+			None,
+			Some(ca.clone()),
+			Some(cert.clone()),
+			Some(key.clone()),
+		)
+		.unwrap();
+		assert_eq!(
+			(tls.ca_cert_pem.expose(), tls.cert_pem.expose(), tls.key_pem.expose()),
+			(&"FILE_CA".to_owned(), &"FILE_CERT".to_owned(), &"FILE_KEY".to_owned())
+		);
+		assert!(
+			read_worker_tls(
+				Some("RAW_CA".into()),
+				None,
+				None,
+				None,
+				None,
+				None,
+				Some(ca.clone()),
+				Some(cert.clone()),
+				Some(key.clone())
+			)
+			.is_err(),
+			"partial env must not mix with complete files"
+		);
+		let tls = read_worker_tls(
+			Some("RAW_CA".into()),
+			Some("invalid%%%".into()),
+			Some("RAW_CERT".into()),
+			Some("invalid%%%".into()),
+			Some("RAW_KEY".into()),
+			Some("invalid%%%".into()),
+			Some(ca.clone()),
+			Some(cert.clone()),
+			Some(key.clone()),
+		)
+		.unwrap();
+		assert_eq!(
+			(tls.ca_cert_pem.expose(), tls.cert_pem.expose(), tls.key_pem.expose()),
+			(&"RAW_CA".to_owned(), &"RAW_CERT".to_owned(), &"RAW_KEY".to_owned())
+		);
+		std::fs::write(&key, b"invalid\xff").unwrap();
+		assert!(read_worker_tls(
+			None,
+			None,
+			None,
+			None,
+			None,
+			None,
+			Some(ca),
+			Some(cert),
+			Some(key)
+		)
+		.is_err());
 	}
 }

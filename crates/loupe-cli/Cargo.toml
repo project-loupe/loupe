@@ -29,5 +29,11 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
+
 [lints]
 workspace = true

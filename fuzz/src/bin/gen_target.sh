@@ -34,6 +34,7 @@ GEN_TEST storage_identity
 GEN_TEST storage_policy_snapshot
 GEN_TEST storage_source_refs
 GEN_TEST tls_fingerprint
+GEN_TEST tls_input
 GEN_TEST tls_pem
 GEN_TEST web_api
 GEN_TEST worker_broker_policy

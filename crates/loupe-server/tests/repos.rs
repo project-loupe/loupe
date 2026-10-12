@@ -90,15 +90,15 @@ async fn bring_up_with(
 	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
 	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
 	let admin_cert_pem = init.admin_bundle.cert_pem.clone();
-	let admin_key_pem = init.admin_bundle.key_pem.clone();
+	let admin_key_pem = init.admin_bundle.key_pem.expose().to_owned();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
+		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(

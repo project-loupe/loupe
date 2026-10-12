@@ -90,8 +90,8 @@ pub struct InitOutput {
 	pub layout: DataDirLayout,
 	pub server_bundle: CertBundle,
 	pub admin_bundle: CertBundle,
-	pub ca_cert_pem: String,
-	pub ca_key_pem: String,
+	pub ca_cert_pem: loupe_provenance::Secret<String>,
+	pub ca_key_pem: loupe_provenance::Secret<String>,
 	/// The master key the SQLCipher database is sealed under.
 	/// Either the caller-supplied one (from `LOUPE_MASTER_KEY`) or
 	/// the one init just minted. Useful for integration tests that
@@ -141,11 +141,11 @@ pub fn run_init_with_options(
 
 	if options.persist_secrets {
 		write_secret(&layout.ca_cert, ca.cert_pem().as_bytes())?;
-		write_secret(&layout.ca_key, ca.key_pem().as_bytes())?;
+		write_secret(&layout.ca_key, ca.key_pem().expose().as_bytes())?;
 		write_secret(&layout.server_cert, server.cert_pem.as_bytes())?;
-		write_secret(&layout.server_key, server.key_pem.as_bytes())?;
+		write_secret(&layout.server_key, server.key_pem.expose().as_bytes())?;
 		write_secret(&layout.admin_cert, admin.cert_pem.as_bytes())?;
-		write_secret(&layout.admin_key, admin.key_pem.as_bytes())?;
+		write_secret(&layout.admin_key, admin.key_pem.expose().as_bytes())?;
 	}
 
 	let (master_key, minted_master_key) = match caller_key {
@@ -170,12 +170,13 @@ pub fn run_init_with_options(
 	db.with_conn(|c| Ok(workers::insert(c, "admin", WorkerKind::Admin, &fingerprint, now)?))
 		.context("recording admin in workers table")?;
 
+	let (ca_cert_pem, ca_key_pem) = ca.into_pem();
 	Ok(InitOutput {
 		layout,
 		server_bundle: server,
 		admin_bundle: admin,
-		ca_cert_pem: ca.cert_pem().to_owned(),
-		ca_key_pem: ca.key_pem().to_owned(),
+		ca_cert_pem,
+		ca_key_pem,
 		master_key,
 		minted_master_key,
 		persisted_secrets: options.persist_secrets,
@@ -250,7 +251,7 @@ mod tests {
 
 		// Admin bundle must be parseable as a real cert.
 		assert!(out.admin_bundle.cert_pem.contains("BEGIN CERTIFICATE"));
-		assert!(out.admin_bundle.key_pem.contains("PRIVATE KEY"));
+		assert!(out.admin_bundle.key_pem.expose().contains("PRIVATE KEY"));
 
 		// Admin must be in the workers table — re-open the DB with the
 		// same key to read it back.

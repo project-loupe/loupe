@@ -32,6 +32,7 @@ pub mod storage_identity;
 pub mod storage_policy_snapshot;
 pub mod storage_source_refs;
 pub mod tls_fingerprint;
+pub mod tls_input;
 pub mod tls_pem;
 pub mod web_api;
 pub mod worker_broker_policy;

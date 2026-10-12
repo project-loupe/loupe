@@ -88,10 +88,10 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
+		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(
@@ -103,7 +103,8 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 	let addr = handle.local_addr;
 	std::mem::forget(tmp);
 
-	let admin = client(&ca_cert_pem, &init.admin_bundle.cert_pem, &init.admin_bundle.key_pem, addr);
+	let admin =
+		client(&ca_cert_pem, &init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose(), addr);
 
 	// Register a repo via the admin route, so we hit the real path.
 	let req = RegisterRepoRequest {
@@ -134,7 +135,8 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 		.unwrap();
 	assert_eq!(resp.status(), 201);
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
-	let worker = client(&ca_cert_pem, &bundle.client_cert_pem, &bundle.client_key_pem, addr);
+	let worker =
+		client(&ca_cert_pem, &bundle.client_cert_pem, bundle.client_key_pem.expose(), addr);
 
 	Fixture { handle, addr, db, admin, worker, repo_id, ca_cert_pem }
 }
@@ -170,7 +172,7 @@ async fn register_worker(f: &Fixture, name: &str) -> reqwest::Client {
 		.unwrap();
 	assert_eq!(resp.status(), 201);
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
-	client(&f.ca_cert_pem, &bundle.client_cert_pem, &bundle.client_key_pem, f.addr)
+	client(&f.ca_cert_pem, &bundle.client_cert_pem, bundle.client_key_pem.expose(), f.addr)
 }
 
 async fn enqueue_scan(f: &Fixture, repo_id: i64) -> ScanResponse {

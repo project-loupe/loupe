@@ -1,0 +1,5 @@
+# Deliberately public, unregistered parser/format compatibility credentials.
+!throwaway-rsa-pkcs1.pem
+!throwaway-rsa-pkcs8.pem
+!throwaway-ec-sec1.pem
+!throwaway-ec-pkcs8.pem

@@ -50,7 +50,7 @@ pub async fn create(
 		worker_id: id,
 		client_cert_pem: bundle.cert_pem,
 		client_key_pem: bundle.key_pem,
-		ca_cert_pem: state.ca.cert_pem().to_owned(),
+		ca_cert_pem: loupe_provenance::Secret::new(state.ca.cert_pem().to_owned()),
 	};
 	super::credential_response::worker(&resp)
 }

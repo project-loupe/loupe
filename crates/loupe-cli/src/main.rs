@@ -36,21 +36,21 @@ struct ConnArgs {
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<String>,
+	ca_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<String>,
+	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_ADMIN_CERT")]
 	admin_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true)]
-	admin_cert_pem: Option<String>,
+	admin_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true)]
-	admin_cert_pem_b64: Option<String>,
+	admin_cert_pem_b64: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_ADMIN_KEY")]
 	admin_key: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true)]
-	admin_key_pem: Option<String>,
+	admin_key_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true)]
-	admin_key_pem_b64: Option<String>,
+	admin_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,9 +93,9 @@ struct GithubAppSetArgs {
 	#[arg(long, env = "LOUPE_GITHUB_APP_KEY")]
 	private_key_file: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM", hide_env_values = true)]
-	private_key_pem: Option<String>,
+	private_key_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM_B64", hide_env_values = true)]
-	private_key_pem_b64: Option<String>,
+	private_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -379,15 +379,15 @@ struct CertMintServerArgs {
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<String>,
+	ca_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<String>,
+	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_CA_KEY")]
 	ca_key: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
-	ca_key_pem: Option<String>,
+	ca_key_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
-	ca_key_pem_b64: Option<String>,
+	ca_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
 #[tokio::main]
@@ -519,7 +519,7 @@ async fn github_app_set(
 	let req = SetGithubAppRequest {
 		protocol_version: PROTOCOL_VERSION,
 		app_id: a.app_id,
-		private_key_pem: loupe_provenance::Secret::new(private_key_pem),
+		private_key_pem,
 	};
 	let resp = credential_request::with_body(
 		client.put(url(base, "/v1/github-app")),
@@ -582,40 +582,23 @@ fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
 		c.admin_key.as_ref(),
 		"admin key missing — set LOUPE_ADMIN_KEY_PEM, LOUPE_ADMIN_KEY_PEM_B64, or LOUPE_ADMIN_KEY",
 	)?;
-	let mut combined = String::with_capacity(cert.len() + key.len() + 1);
-	combined.push_str(&cert);
-	if !cert.ends_with('\n') {
-		combined.push('\n');
-	}
-	combined.push_str(&key);
-
-	let identity =
-		reqwest::Identity::from_pem(combined.as_bytes()).context("parsing admin identity")?;
-	let root = reqwest::Certificate::from_pem(ca.as_bytes()).context("parsing CA cert")?;
-	reqwest::Client::builder()
-		.add_root_certificate(root)
-		.identity(identity)
-		.use_rustls_tls()
-		.build()
-		.context("building reqwest client")
+	let tls = loupe_tls::reqwest_client_config(cert.expose(), key.expose(), ca.expose())?;
+	reqwest::Client::builder().use_preconfigured_tls(tls).build().context("building reqwest client")
 }
 
 fn pem_from_env_or_file(
-	label: &str, pem: &Option<String>, pem_b64: &Option<String>, path: Option<&PathBuf>,
-	missing: &'static str,
-) -> Result<String> {
-	if let Some(pem) = pem.as_deref().filter(|s| !s.is_empty()) {
-		return Ok(pem.to_owned());
+	label: &str, pem: &Option<loupe_tls::PemInput>, pem_b64: &Option<loupe_tls::PemInput>,
+	path: Option<&PathBuf>, missing: &'static str,
+) -> Result<loupe_provenance::Secret<String>> {
+	if let Some(pem) = pem.as_ref().filter(|s| !s.expose().is_empty()) {
+		return Ok(pem.clone().into_pem());
 	}
-	if let Some(pem_b64) = pem_b64.as_deref().filter(|s| !s.is_empty()) {
-		use base64::Engine as _;
-		let bytes = base64::engine::general_purpose::STANDARD
-			.decode(pem_b64.trim())
-			.with_context(|| format!("decoding base64 {label} PEM"))?;
-		return String::from_utf8(bytes).with_context(|| format!("{label} PEM is not valid UTF-8"));
+	if let Some(pem_b64) = pem_b64.as_ref().filter(|s| !s.expose().is_empty()) {
+		return loupe_tls::decode_pem_base64(pem_b64.expose().trim())
+			.with_context(|| format!("decoding base64 {label} PEM"));
 	}
 	let path = path.context(missing)?;
-	std::fs::read_to_string(path).with_context(|| format!("reading {label} at {}", path.display()))
+	loupe_tls::read_pem_file(path).with_context(|| format!("reading {label} at {}", path.display()))
 }
 
 fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
@@ -816,21 +799,21 @@ async fn worker_register(
 	let bundle: RegisterWorkerResponse =
 		serde_json::from_slice(&server_response(resp, "register worker").await?)?;
 	if a.emit_env {
-		for (name, value) in worker_env_assignments(base, &bundle) {
-			println!("{name}={value}");
+		for (name, value) in worker_env_assignments(base, &bundle)? {
+			println!("{name}={}", value.expose());
 		}
 		return Ok(());
 	}
-	let serialised = serde_json::to_string_pretty(&bundle)?;
+	let serialised = bundle.credential_json_pretty()?;
 	if let Some(path) = a.out {
-		write_secret_file(&path, serialised.as_bytes())?;
+		write_secret_file(&path, serialised.expose())?;
 		println!(
 			"worker_id={} bundle written to {}",
 			bundle.worker_id,
 			TerminalText(&path.to_string_lossy())
 		);
 	} else {
-		println!("{serialised}");
+		print_credential_json(serialised.expose())?;
 	}
 	Ok(())
 }
@@ -865,36 +848,37 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
 
 fn worker_env_assignments(
 	base: &reqwest::Url, bundle: &RegisterWorkerResponse,
-) -> Vec<(&'static str, String)> {
-	vec![
-		("LOUPE_SERVER_URL", base.as_str().to_owned()),
-		("LOUPE_WORKER_CA_CERT_PEM_B64", b64(&bundle.ca_cert_pem)),
-		("LOUPE_WORKER_CERT_PEM_B64", b64(&bundle.client_cert_pem)),
-		("LOUPE_WORKER_KEY_PEM_B64", b64(&bundle.client_key_pem)),
-	]
-}
-
-fn b64(value: &str) -> String {
-	use base64::Engine as _;
-	base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+) -> Result<Vec<(&'static str, loupe_provenance::Secret<String>)>> {
+	Ok(vec![
+		("LOUPE_SERVER_URL", loupe_provenance::Secret::new(base.as_str().to_owned())),
+		(
+			"LOUPE_WORKER_CA_CERT_PEM_B64",
+			loupe_tls::encode_pem_base64(bundle.ca_cert_pem.expose())?,
+		),
+		("LOUPE_WORKER_CERT_PEM_B64", loupe_tls::encode_pem_base64(&bundle.client_cert_pem)?),
+		("LOUPE_WORKER_KEY_PEM_B64", loupe_tls::encode_pem_base64(bundle.client_key_pem.expose())?),
+	])
 }
 
 fn cert_mint_server(a: CertMintServerArgs) -> Result<()> {
 	let bundle = mint_server_cert(&a)?;
 	if a.emit_env {
-		for (name, value) in server_cert_env_assignments(&bundle) {
-			println!("{name}={value}");
+		for (name, value) in server_cert_env_assignments(&bundle)? {
+			println!("{name}={}", value.expose());
 		}
 		return Ok(());
 	}
 
-	println!(
-		"{}",
-		serde_json::to_string_pretty(&serde_json::json!({
-			"server_cert_pem": bundle.cert_pem,
-			"server_key_pem": bundle.key_pem,
-		}))?
-	);
+	let json = loupe_proto::server_certificate_json_pretty(&bundle.cert_pem, &bundle.key_pem)?;
+	print_credential_json(json.expose())?;
+	Ok(())
+}
+
+fn print_credential_json(bytes: &[u8]) -> Result<()> {
+	use std::io::Write;
+	let mut stdout = std::io::stdout().lock();
+	stdout.write_all(bytes)?;
+	stdout.write_all(b"\n")?;
 	Ok(())
 }
 
@@ -913,15 +897,17 @@ fn mint_server_cert(a: &CertMintServerArgs) -> Result<loupe_tls::CertBundle> {
 		a.ca_key.as_ref(),
 		"CA key missing — set LOUPE_CA_KEY_PEM, LOUPE_CA_KEY_PEM_B64, or LOUPE_CA_KEY",
 	)?;
-	let ca = loupe_tls::Ca::from_pem(&ca_cert, &ca_key)?;
+	let ca = loupe_tls::Ca::from_pem(ca_cert.expose(), ca_key.expose())?;
 	ca.mint_server(&a.common_name, &a.hostnames)
 }
 
-fn server_cert_env_assignments(bundle: &loupe_tls::CertBundle) -> Vec<(&'static str, String)> {
-	vec![
-		("LOUPE_SERVER_CERT_PEM_B64", b64(&bundle.cert_pem)),
-		("LOUPE_SERVER_KEY_PEM_B64", b64(&bundle.key_pem)),
-	]
+fn server_cert_env_assignments(
+	bundle: &loupe_tls::CertBundle,
+) -> Result<Vec<(&'static str, loupe_provenance::Secret<String>)>> {
+	Ok(vec![
+		("LOUPE_SERVER_CERT_PEM_B64", loupe_tls::encode_pem_base64(&bundle.cert_pem)?),
+		("LOUPE_SERVER_KEY_PEM_B64", loupe_tls::encode_pem_base64(bundle.key_pem.expose())?),
+	])
 }
 
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
@@ -1082,11 +1068,12 @@ mod tests {
 	fn pem_b64_env_wins_over_file_path() {
 		let file = std::env::temp_dir().join("loupectl-test-path-that-should-not-be-read.pem");
 		let pem = "-----BEGIN CERTIFICATE-----\nfrom-env\n-----END CERTIFICATE-----\n";
-		let pem_b64 = b64(pem);
+		let pem_b64: loupe_tls::PemInput =
+			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem).into();
 
 		let got =
 			pem_from_env_or_file("CA cert", &None, &Some(pem_b64), Some(&file), "missing").unwrap();
-		assert_eq!(got, pem);
+		assert_eq!(got.expose(), pem);
 	}
 
 	#[test]
@@ -1454,40 +1441,40 @@ mod tests {
 			common_name: "loupe-server".into(),
 			emit_env: true,
 			ca_cert: None,
-			ca_cert_pem: Some(ca.cert_pem().to_owned()),
+			ca_cert_pem: Some(ca.cert_pem().to_owned().into()),
 			ca_cert_pem_b64: None,
 			ca_key: None,
-			ca_key_pem: Some(ca.key_pem().to_owned()),
+			ca_key_pem: Some(ca.key_pem().expose().to_owned().into()),
 			ca_key_pem_b64: None,
 		};
 
 		let bundle = mint_server_cert(&args).unwrap();
 		assert!(bundle.cert_pem.contains("BEGIN CERTIFICATE"));
-		assert!(bundle.key_pem.contains("PRIVATE KEY"));
+		assert!(bundle.key_pem.expose().contains("PRIVATE KEY"));
 	}
 
 	#[test]
 	fn server_cert_env_assignments_are_single_line_and_decode_to_bundle() {
 		let bundle = loupe_tls::CertBundle {
 			cert_pem: "server\ncert\n".into(),
-			key_pem: "server\nkey\n".into(),
+			key_pem: loupe_provenance::Secret::new("server\nkey\n".into()),
 		};
 
-		let assignments = server_cert_env_assignments(&bundle);
+		let assignments = server_cert_env_assignments(&bundle).unwrap();
 		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
 		assert_eq!(names, vec!["LOUPE_SERVER_CERT_PEM_B64", "LOUPE_SERVER_KEY_PEM_B64"]);
 		for (name, value) in &assignments {
-			assert!(!value.is_empty(), "{name} value must be present");
-			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+			assert!(!value.expose().is_empty(), "{name} value must be present");
+			assert!(!value.expose().contains('\n'), "{name} value must fit dotenv/env-file syntax");
 		}
 
 		use base64::Engine as _;
 		let decoded_cert =
-			base64::engine::general_purpose::STANDARD.decode(&assignments[0].1).unwrap();
+			base64::engine::general_purpose::STANDARD.decode(assignments[0].1.expose()).unwrap();
 		assert_eq!(String::from_utf8(decoded_cert).unwrap(), bundle.cert_pem);
 		let decoded_key =
-			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
-		assert_eq!(String::from_utf8(decoded_key).unwrap(), bundle.key_pem);
+			base64::engine::general_purpose::STANDARD.decode(assignments[1].1.expose()).unwrap();
+		assert_eq!(String::from_utf8(decoded_key).unwrap().as_str(), bundle.key_pem.expose());
 	}
 
 	#[test]
@@ -1496,12 +1483,12 @@ mod tests {
 		let bundle = RegisterWorkerResponse {
 			protocol_version: PROTOCOL_VERSION,
 			worker_id: 42,
-			ca_cert_pem: "ca\ncert\n".into(),
+			ca_cert_pem: loupe_provenance::Secret::new("ca\ncert\n".into()),
 			client_cert_pem: "worker\ncert\n".into(),
-			client_key_pem: "worker\nkey\n".into(),
+			client_key_pem: loupe_provenance::Secret::new("worker\nkey\n".into()),
 		};
 
-		let assignments = worker_env_assignments(&base, &bundle);
+		let assignments = worker_env_assignments(&base, &bundle).unwrap();
 		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
 		assert_eq!(
 			names,
@@ -1513,14 +1500,27 @@ mod tests {
 			]
 		);
 		for (name, value) in &assignments {
-			assert!(!value.is_empty(), "{name} value must be present");
-			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+			assert!(!value.expose().is_empty(), "{name} value must be present");
+			assert!(!value.expose().contains('\n'), "{name} value must fit dotenv/env-file syntax");
 		}
 
 		use base64::Engine as _;
 		let decoded_ca =
-			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
-		assert_eq!(String::from_utf8(decoded_ca).unwrap(), bundle.ca_cert_pem);
+			base64::engine::general_purpose::STANDARD.decode(assignments[1].1.expose()).unwrap();
+		assert_eq!(String::from_utf8(decoded_ca).unwrap().as_str(), bundle.ca_cert_pem.expose());
+		for ((_, encoded), expected) in assignments
+			.iter()
+			.skip(2)
+			.zip([&bundle.client_cert_pem, bundle.client_key_pem.expose()])
+		{
+			let decoded =
+				base64::engine::general_purpose::STANDARD.decode(encoded.expose()).unwrap();
+			assert_eq!(
+				decoded,
+				expected.as_bytes(),
+				"every exported worker PEM must retain its bytes"
+			);
+		}
 	}
 
 	#[test]
@@ -1598,5 +1598,260 @@ mod tests {
 		assert!(rendered.contains("\"auth\": \"app\""), "missing app auth marker in:\n{rendered}");
 		assert!(rendered.contains("\"auth\": \"pat\""), "missing pat auth marker in:\n{rendered}");
 		assert!(rendered.contains("\"kind\": \"github_issue\""), "missing kind in:\n{rendered}");
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use base64::Engine as _;
+
+	use super::*;
+
+	#[test]
+	fn tls_consumer_cli_options_debug_redacts_raw_and_encoded_tls_inputs() {
+		let sentinel = "FAKE_CLI_TLS_OPTION";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(sentinel);
+		let mut leaks = Vec::new();
+		for flag in [
+			"--ca-cert-pem",
+			"--admin-cert-pem",
+			"--admin-key-pem",
+			"--ca-cert-pem-b64",
+			"--admin-cert-pem-b64",
+			"--admin-key-pem-b64",
+		] {
+			let value = if flag.ends_with("-b64") { &encoded } else { sentinel };
+			let cli = Cli::try_parse_from(["loupectl", flag, value, "repo", "list"]).unwrap();
+			if [format!("{cli:?}"), format!("{cli:#?}")].iter().any(|text| text.contains(value)) {
+				leaks.push(flag);
+			}
+		}
+		for flag in ["--ca-cert-pem", "--ca-key-pem", "--ca-cert-pem-b64", "--ca-key-pem-b64"] {
+			let value = if flag.ends_with("-b64") { &encoded } else { sentinel };
+			let cli = Cli::try_parse_from([
+				"loupectl",
+				"cert",
+				"mint-server",
+				"--hostname",
+				"localhost",
+				flag,
+				value,
+			])
+			.unwrap();
+			if [format!("{cli:?}"), format!("{cli:#?}")].iter().any(|text| text.contains(value)) {
+				leaks.push(flag);
+			}
+		}
+		assert!(leaks.is_empty(), "CLI option Debug disclosed inputs at {leaks:?}");
+	}
+
+	#[test]
+	fn tls_consumer_cli_loaded_pem_is_redacted() {
+		let value = pem_from_env_or_file(
+			"key",
+			&Some("FAKE_LOADED_CLI_TLS".into()),
+			&None,
+			None,
+			"missing",
+		)
+		.unwrap();
+		for rendered in
+			[format!("{value:?}"), format!("{value:#?}"), format!("{value}"), format!("{value:#}")]
+		{
+			assert_eq!(rendered, "[redacted]", "loaded TLS owner must redact every formatter");
+		}
+	}
+
+	#[test]
+	fn tls_consumer_cli_invalid_utf8_error_does_not_retain_private_bytes() {
+		let bytes = b"FAKE_INVALID_CLI_TLS\xff";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+		let error =
+			pem_from_env_or_file("key", &None, &Some(encoded.into()), None, "missing").unwrap_err();
+		let rendered: String = format!("{error:#?}").split_whitespace().collect();
+		let reflected: String = format!("bytes:{bytes:?}").split_whitespace().collect();
+		assert!(!rendered.contains(&reflected), "invalid UTF-8 error retained private input bytes");
+	}
+
+	#[test]
+	fn cli_tls_loader_preserves_precedence_empty_fallback_and_errors() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("tls-input");
+		std::fs::write(&path, "FILE_TLS").unwrap();
+		let encoded = base64::engine::general_purpose::STANDARD.encode("B64_TLS");
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				&Some("RAW_TLS".into()),
+				&Some("invalid%%%".into()),
+				Some(&path),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"RAW_TLS"
+		);
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				&Some(String::new().into()),
+				&Some(format!(" \n{encoded}\n ").into()),
+				Some(&path),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"B64_TLS"
+		);
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				&Some(String::new().into()),
+				&Some(String::new().into()),
+				Some(&path),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"FILE_TLS"
+		);
+		assert!(pem_from_env_or_file(
+			"key",
+			&None,
+			&Some("invalid%%%".into()),
+			Some(&path),
+			"missing"
+		)
+		.is_err());
+		std::fs::write(&path, b"invalid\xff").unwrap();
+		assert!(pem_from_env_or_file("key", &None, &None, Some(&path), "missing").is_err());
+		assert!(pem_from_env_or_file("key", &None, &None, None, "missing").is_err());
+	}
+}
+
+#[cfg(test)]
+mod tls_constructor_controls {
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use loupe_tls::Ca;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	use super::*;
+
+	fn application_client(ca: &str, cert: &str, key: &str) -> anyhow::Result<reqwest::Client> {
+		let cli = Cli::try_parse_from(vec![
+			"loupectl".to_owned(),
+			"--server-url=https://localhost/".to_owned(),
+			format!("--ca-cert-pem={ca}"),
+			format!("--admin-cert-pem={cert}"),
+			format!("--admin-key-pem={key}"),
+			"repo".to_owned(),
+			"list".to_owned(),
+		])?;
+		build_client(&cli.conn)
+	}
+
+	async fn exchange(
+		http: reqwest::Client, mut config: rustls::ServerConfig,
+	) -> (bool, Option<(Vec<u8>, Vec<Vec<u8>>)>) {
+		config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let mut task = tokio::spawn(async move {
+			let (socket, _) = listener.accept().await.unwrap();
+			let Ok(mut tls) =
+				tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(socket).await
+			else {
+				return None;
+			};
+			let alpn = tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec();
+			let chain = tls
+				.get_ref()
+				.1
+				.peer_certificates()
+				.unwrap_or_default()
+				.iter()
+				.map(|cert| cert.to_vec())
+				.collect();
+			let mut request = Vec::new();
+			while !request.ends_with(b"\r\n\r\n") {
+				let mut byte = [0u8; 1];
+				if tls.read_exact(&mut byte).await.is_err() || request.len() == 16 * 1024 {
+					return None;
+				}
+				request.push(byte[0]);
+			}
+			if tls
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+				.await
+				.is_err()
+			{
+				return None;
+			}
+			let _ = tls.shutdown().await;
+			Some((alpn, chain))
+		});
+		let success = tokio::time::timeout(Duration::from_secs(5), async {
+			let response = http.get(format!("https://localhost:{port}/")).send().await?;
+			let body = response.bytes().await?;
+			Ok::<_, reqwest::Error>(body == b"ok".as_slice())
+		})
+		.await
+		.is_ok_and(|result| result.unwrap_or(false));
+		let peer = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+			Ok(result) => result.unwrap(),
+			Err(_) => {
+				task.abort();
+				let _ = task.await;
+				None
+			},
+		};
+		(success, peer)
+	}
+
+	#[tokio::test]
+	async fn actual_constructor_preserves_mtls_http11_chain_and_mixed_roots() {
+		let ca = Ca::new("throwaway-application-ca").unwrap();
+		let server = ca.mint_server("server", &["localhost".into()]).unwrap();
+		let client = ca.mint_client("client").unwrap();
+		let unused = ca.mint_client("unused").unwrap();
+		let roots = format!("{}{}", unused.key_pem.expose(), ca.cert_pem());
+		let chain = format!("{}{}", client.cert_pem, ca.cert_pem());
+		let expected: Vec<_> = rustls_pemfile::certs(&mut chain.as_bytes())
+			.map(|cert| cert.unwrap().to_vec())
+			.collect();
+		let http = application_client(&roots, &chain, client.key_pem.expose()).unwrap();
+		let config =
+			loupe_tls::server_config(&server.cert_pem, server.key_pem.expose(), ca.cert_pem())
+				.unwrap();
+		let (success, peer) = exchange(http, config).await;
+		assert!(success, "actual application client must complete mutual TLS");
+		let (alpn, observed) = peer.unwrap();
+		assert_eq!(alpn, b"http/1.1");
+		assert_eq!(observed, expected);
+	}
+
+	#[tokio::test]
+	async fn actual_constructor_rejects_wrong_ca_hostname_and_mismatched_key() {
+		let ca = Ca::new("throwaway-application-ca").unwrap();
+		let foreign = Ca::new("throwaway-foreign-ca").unwrap();
+		let client = ca.mint_client("client").unwrap();
+		let wrong = ca.mint_client("wrong-key").unwrap();
+		assert!(
+			application_client(ca.cert_pem(), &client.cert_pem, wrong.key_pem.expose()).is_err()
+		);
+		for (host, roots) in [("localhost", foreign.cert_pem()), ("wrong-host", ca.cert_pem())] {
+			let server = ca.mint_server("server", &[host.into()]).unwrap();
+			let http =
+				application_client(roots, &client.cert_pem, client.key_pem.expose()).unwrap();
+			let config =
+				loupe_tls::server_config(&server.cert_pem, server.key_pem.expose(), ca.cert_pem())
+					.unwrap();
+			assert!(
+				!exchange(http, config).await.0,
+				"verification must reject wrong trust or hostname"
+			);
+		}
 	}
 }

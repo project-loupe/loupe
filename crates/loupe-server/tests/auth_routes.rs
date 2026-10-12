@@ -37,29 +37,34 @@ struct Fixture {
 }
 
 async fn bring_up() -> Fixture {
+	bring_up_with_mixed_ca(false).await
+}
+
+async fn bring_up_with_mixed_ca(mixed: bool) -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
 	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
 
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
-	)
-	.unwrap();
+	let mut ca_input = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	if mixed {
+		ca_input.push_str(init.ca_key_pem.expose());
+	}
+	let ca =
+		Ca::from_pem(&ca_input, &std::fs::read_to_string(&init.layout.ca_key).unwrap()).unwrap();
 
 	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
 	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca_cert_pem = ca_input;
 	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
 	let admin_cert_pem = init.admin_bundle.cert_pem.clone();
-	let admin_key_pem = init.admin_bundle.key_pem.clone();
+	let admin_key_pem = init.admin_bundle.key_pem.expose().to_owned();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
+		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let state = AppState::new(
@@ -73,6 +78,49 @@ async fn bring_up() -> Fixture {
 	std::mem::forget(tmp); // keep the dir alive across the test; it's in tmpfs anyway
 
 	Fixture { handle, addr, ca_cert_pem, admin_cert_pem, admin_key_pem }
+}
+
+#[tokio::test]
+async fn registration_http_preserves_mixed_ca_export_and_guarded_dto() {
+	let f = bring_up_with_mixed_ca(true).await;
+	assert!(f.ca_cert_pem.contains("BEGIN PRIVATE KEY"));
+	let admin = client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
+	let response = admin
+		.post("https://loupe-server/v1/workers")
+		.json(&RegisterWorkerRequest {
+			protocol_version: PROTOCOL_VERSION,
+			name: "mixed-ca-worker".into(),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 201);
+	assert_eq!(response.headers()["content-type"], "application/json");
+	assert_eq!(response.headers()[PROTOCOL_VERSION_HEADER], PROTOCOL_VERSION.to_string());
+	let bundle: RegisterWorkerResponse = response.json().await.unwrap();
+	assert_eq!(bundle.ca_cert_pem.expose(), &f.ca_cert_pem);
+	assert_eq!(bundle.protocol_version, PROTOCOL_VERSION);
+	assert!(bundle.worker_id > 0);
+	assert_eq!(format!("{:?}", bundle.client_key_pem), "[redacted]");
+	assert_eq!(format!("{:?}", bundle.ca_cert_pem), "[redacted]");
+	let encoded = bundle.credential_json_pretty().unwrap();
+	let back: RegisterWorkerResponse = serde_json::from_slice(encoded.expose()).unwrap();
+	assert_eq!(back.client_key_pem.expose(), bundle.client_key_pem.expose());
+	assert_eq!(back.client_cert_pem, bundle.client_cert_pem);
+	assert_eq!(back.ca_cert_pem.expose(), bundle.ca_cert_pem.expose());
+	assert_eq!(back.worker_id, bundle.worker_id);
+	let worker = client(
+		bundle.ca_cert_pem.expose(),
+		&bundle.client_cert_pem,
+		bundle.client_key_pem.expose(),
+		f.addr,
+	);
+	let response = worker.get("https://loupe-server/v1/whoami").send().await.unwrap();
+	assert!(response.status().is_success());
+	let body: serde_json::Value = response.json().await.unwrap();
+	assert_eq!(body["kind"], "worker");
+	assert_eq!(body["name"], "mixed-ca-worker");
+	f.handle.shutdown().await;
 }
 
 #[tokio::test]
@@ -109,7 +157,8 @@ async fn admin_mints_worker_then_revokes_it() {
 	assert!(bundle.client_cert_pem.contains("BEGIN CERTIFICATE"));
 
 	// New worker can hit /v1/whoami and resolves as kind=worker.
-	let worker = client(&f.ca_cert_pem, &bundle.client_cert_pem, &bundle.client_key_pem, f.addr);
+	let worker =
+		client(&f.ca_cert_pem, &bundle.client_cert_pem, bundle.client_key_pem.expose(), f.addr);
 	let resp = worker.get("https://loupe-server/v1/whoami").send().await.unwrap();
 	assert!(resp.status().is_success());
 	let body: serde_json::Value = resp.json().await.unwrap();
@@ -151,7 +200,7 @@ async fn unknown_client_cert_is_rejected_at_auth() {
 
 	let intruder = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&f.ca_cert_pem))
-		.identity(pem_to_identity(&foreign.cert_pem, &foreign.key_pem))
+		.identity(pem_to_identity(&foreign.cert_pem, foreign.key_pem.expose()))
 		.resolve("loupe-server", f.addr)
 		.use_rustls_tls()
 		.build()

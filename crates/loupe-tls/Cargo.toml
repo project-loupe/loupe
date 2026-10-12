@@ -13,13 +13,20 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-rcgen = { workspace = true }
+base64 = { workspace = true }
+loupe-provenance = { path = "../loupe-provenance" }
+pem = { workspace = true }
+rcgen = { workspace = true, features = ["zeroize"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+webpki-roots = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 

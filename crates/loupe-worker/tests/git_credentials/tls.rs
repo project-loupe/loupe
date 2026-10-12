@@ -43,7 +43,8 @@ impl TlsGit {
 		let certs = rustls_pemfile::certs(&mut cert.cert_pem.as_bytes())
 			.collect::<Result<Vec<_>, _>>()
 			.unwrap();
-		let key = rustls_pemfile::private_key(&mut cert.key_pem.as_bytes()).unwrap().unwrap();
+		let key =
+			rustls_pemfile::private_key(&mut cert.key_pem.expose().as_bytes()).unwrap().unwrap();
 		let config = rustls::ServerConfig::builder()
 			.with_no_client_auth()
 			.with_single_cert(certs, key)

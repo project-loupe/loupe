@@ -7,14 +7,24 @@ use serde::Deserialize;
 /// Server configuration. Populated by `loupe-server`'s clap parser; lives
 /// here so integration tests can construct one directly without going
 /// through env / CLI.
-#[derive(Debug, Clone)]
+///
+/// ```compile_fail,E0599
+/// fn duplicate(config: loupe_server::Config) {
+///     let _copy = config.clone();
+/// }
+/// ```
+///
+/// ```
+/// let metadata: fn(&loupe_server::Config) -> std::net::SocketAddr = |config| config.bind_addr;
+/// ```
+#[derive(Debug)]
 pub struct Config {
 	pub bind_addr: SocketAddr,
 	pub db_path: PathBuf,
-	pub server_cert_pem: String,
-	pub server_key_pem: String,
-	pub ca_cert_pem: String,
-	pub ca_key_pem: String,
+	pub server_cert_pem: loupe_provenance::Secret<String>,
+	pub server_key_pem: loupe_provenance::Secret<String>,
+	pub ca_cert_pem: loupe_provenance::Secret<String>,
+	pub ca_key_pem: loupe_provenance::Secret<String>,
 }
 
 /// Wire shape of `config.toml`. All fields are optional so an operator
@@ -270,5 +280,52 @@ mod tests {
 			msg.contains("allowed_target_owners must list at least one owner or be omitted"),
 			"got: {msg}"
 		);
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use super::*;
+
+	#[test]
+	fn server_config_accepts_mixed_certificate_and_ca_inputs() {
+		let ca = loupe_tls::Ca::new("throwaway-config-ca").unwrap();
+		let server = ca.mint_server("server", &["localhost".into()]).unwrap();
+		let unused = ca.mint_client("unused").unwrap();
+		let cfg = Config {
+			bind_addr: "127.0.0.1:0".parse().unwrap(),
+			db_path: "unused".into(),
+			server_cert_pem: loupe_provenance::Secret::new(format!(
+				"{}{}",
+				unused.key_pem.expose(),
+				server.cert_pem
+			)),
+			server_key_pem: server.key_pem,
+			ca_cert_pem: loupe_provenance::Secret::new(format!(
+				"{}{}",
+				ca.cert_pem(),
+				unused.key_pem.expose()
+			)),
+			ca_key_pem: loupe_provenance::Secret::new(ca.key_pem().expose().to_owned()),
+		};
+		assert!(crate::tls::build(&cfg).is_ok());
+	}
+
+	#[test]
+	fn tls_consumer_config_debug_redacts_keys_and_mixed_certificate_inputs() {
+		let cfg = Config {
+			bind_addr: "127.0.0.1:8443".parse().unwrap(),
+			db_path: "public-database-path".into(),
+			server_cert_pem: loupe_provenance::Secret::new(
+				"public-cert\nFAKE_MIXED_SERVER_PRIVATE".into(),
+			),
+			server_key_pem: loupe_provenance::Secret::new("FAKE_SERVER_PRIVATE".into()),
+			ca_cert_pem: loupe_provenance::Secret::new("public-ca\nFAKE_MIXED_CA_PRIVATE".into()),
+			ca_key_pem: loupe_provenance::Secret::new("FAKE_CA_PRIVATE".into()),
+		};
+		for rendered in [format!("{cfg:?}"), format!("{cfg:#?}")] {
+			assert!(rendered.contains("public-database-path"));
+			assert!(!rendered.contains("FAKE_"), "Config Debug disclosed private TLS input");
+		}
 	}
 }

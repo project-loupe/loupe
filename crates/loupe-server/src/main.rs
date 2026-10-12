@@ -74,35 +74,35 @@ struct ServeArgs {
 	/// Server certificate PEM content. When set, this takes precedence
 	/// over --server-cert / LOUPE_SERVER_CERT.
 	#[arg(long, env = "LOUPE_SERVER_CERT_PEM", hide_env_values = true)]
-	server_cert_pem: Option<String>,
+	server_cert_pem: Option<loupe_tls::PemInput>,
 	/// Base64-encoded server certificate PEM content. Used when
 	/// LOUPE_SERVER_CERT_PEM is unset.
 	#[arg(long, env = "LOUPE_SERVER_CERT_PEM_B64", hide_env_values = true)]
-	server_cert_pem_b64: Option<String>,
+	server_cert_pem_b64: Option<loupe_tls::PemInput>,
 	/// Server private-key PEM content. When set, this takes precedence
 	/// over --server-key / LOUPE_SERVER_KEY.
 	#[arg(long, env = "LOUPE_SERVER_KEY_PEM", hide_env_values = true)]
-	server_key_pem: Option<String>,
+	server_key_pem: Option<loupe_tls::PemInput>,
 	/// Base64-encoded server private-key PEM content. Used when
 	/// LOUPE_SERVER_KEY_PEM is unset.
 	#[arg(long, env = "LOUPE_SERVER_KEY_PEM_B64", hide_env_values = true)]
-	server_key_pem_b64: Option<String>,
+	server_key_pem_b64: Option<loupe_tls::PemInput>,
 	/// Internal CA certificate PEM content. When set, this takes
 	/// precedence over --ca-cert / LOUPE_CA_CERT.
 	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<String>,
+	ca_cert_pem: Option<loupe_tls::PemInput>,
 	/// Base64-encoded internal CA certificate PEM content. Used when
 	/// LOUPE_CA_CERT_PEM is unset.
 	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<String>,
+	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 	/// Internal CA private-key PEM content. When set, this takes
 	/// precedence over --ca-key / LOUPE_CA_KEY.
 	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
-	ca_key_pem: Option<String>,
+	ca_key_pem: Option<loupe_tls::PemInput>,
 	/// Base64-encoded internal CA private-key PEM content. Used when
 	/// LOUPE_CA_KEY_PEM is unset.
 	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
-	ca_key_pem_b64: Option<String>,
+	ca_key_pem_b64: Option<loupe_tls::PemInput>,
 	/// Path to a file containing the database master key (64 hex
 	/// characters, optionally trailing newline — the shape
 	/// `loupe-server init` writes). Used only when `LOUPE_MASTER_KEY`
@@ -147,7 +147,7 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 	)
 	.with_context(|| format!("initialising data dir {}", args.data_dir.display()))?;
 	if args.emit_env {
-		print_init_env(&out);
+		print_init_env(&out)?;
 		return Ok(());
 	}
 	let layout = DataDirLayout::at(&args.data_dir);
@@ -175,39 +175,32 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 	println!();
 	println!("admin client key (saved to {}):", layout.admin_key.display());
 	println!("KEEP THIS SECRET — written once, never re-derivable.");
-	println!("{}", out.admin_bundle.key_pem.trim_end());
+	println!("{}", out.admin_bundle.key_pem.expose().trim_end());
 	Ok(())
 }
 
-fn print_init_env(out: &loupe_server::init::InitOutput) {
-	for (name, value) in init_env_assignments(out) {
+fn print_init_env(out: &loupe_server::init::InitOutput) -> Result<()> {
+	for (name, value) in init_env_assignments(out)? {
 		println!("{name}={}", value.expose());
 	}
+	Ok(())
 }
 
 fn init_env_assignments(
 	out: &loupe_server::init::InitOutput,
-) -> impl Iterator<Item = (&'static str, loupe_provenance::Secret<String>)> + '_ {
-	// Guard each encoded allocation and retire it after its one export.
-	std::iter::once_with(|| ("LOUPE_MASTER_KEY", out.master_key.to_hex())).chain(
-		[
-			("LOUPE_SERVER_CERT_PEM_B64", &out.server_bundle.cert_pem),
-			("LOUPE_SERVER_KEY_PEM_B64", &out.server_bundle.key_pem),
-			("LOUPE_CA_CERT_PEM_B64", &out.ca_cert_pem),
-			("LOUPE_CA_KEY_PEM_B64", &out.ca_key_pem),
-			("LOUPE_ADMIN_CERT_PEM_B64", &out.admin_bundle.cert_pem),
-			("LOUPE_ADMIN_KEY_PEM_B64", &out.admin_bundle.key_pem),
-		]
-		.into_iter()
-		.map(|(name, value)| (name, b64(value))),
-	)
-}
-
-fn b64(value: &str) -> loupe_provenance::Secret<String> {
-	use base64::Engine as _;
-	loupe_provenance::Secret::new(
-		base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
-	)
+) -> Result<Vec<(&'static str, loupe_provenance::Secret<String>)>> {
+	let mut assignments = vec![("LOUPE_MASTER_KEY", out.master_key.to_hex())];
+	for (name, value) in [
+		("LOUPE_SERVER_CERT_PEM_B64", &out.server_bundle.cert_pem),
+		("LOUPE_SERVER_KEY_PEM_B64", out.server_bundle.key_pem.expose()),
+		("LOUPE_CA_CERT_PEM_B64", out.ca_cert_pem.expose()),
+		("LOUPE_CA_KEY_PEM_B64", out.ca_key_pem.expose()),
+		("LOUPE_ADMIN_CERT_PEM_B64", &out.admin_bundle.cert_pem),
+		("LOUPE_ADMIN_KEY_PEM_B64", out.admin_bundle.key_pem.expose()),
+	] {
+		assignments.push((name, loupe_tls::encode_pem_base64(value)?));
+	}
+	Ok(assignments)
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -279,7 +272,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		"CA key missing — set LOUPE_CA_KEY_PEM, LOUPE_CA_KEY_PEM_B64, pass --ca-key, set LOUPE_CA_KEY, or [paths].ca_key",
 	)?;
 
-	let ca = Ca::from_pem(&ca_cert_pem, &ca_key_pem).context("rebuilding CA from PEM")?;
+	let ca = Ca::from_pem(ca_cert_pem.expose(), ca_key_pem.expose())
+		.context("rebuilding CA from PEM")?;
 
 	let cfg = Config {
 		bind_addr,
@@ -363,27 +357,25 @@ fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
 }
 
 fn pem_from_env_or_file(
-	label: &str, pem: Option<String>, pem_b64: Option<String>, path: Option<PathBuf>,
-	missing: &'static str,
-) -> Result<String> {
-	if let Some(pem) = pem.filter(|s| !s.is_empty()) {
+	label: &str, pem: Option<loupe_tls::PemInput>, pem_b64: Option<loupe_tls::PemInput>,
+	path: Option<PathBuf>, missing: &'static str,
+) -> Result<loupe_provenance::Secret<String>> {
+	if let Some(pem) = pem.filter(|s| !s.expose().is_empty()) {
 		tracing::info!(%label, "loupe-server: TLS PEM loaded from environment");
-		return Ok(pem);
+		return Ok(pem.into_pem());
 	}
-	if let Some(pem_b64) = pem_b64.filter(|s| !s.is_empty()) {
+	if let Some(pem_b64) = pem_b64.filter(|s| !s.expose().is_empty()) {
 		tracing::info!(%label, "loupe-server: TLS PEM loaded from base64 environment");
-		return decode_pem_b64(label, &pem_b64);
+		return decode_pem_b64(label, pem_b64.expose());
 	}
 	let path = path.context(missing)?;
-	std::fs::read_to_string(&path).with_context(|| format!("reading {label} at {}", path.display()))
+	loupe_tls::read_pem_file(&path)
+		.with_context(|| format!("reading {label} at {}", path.display()))
 }
 
-fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
-	use base64::Engine as _;
-	let bytes = base64::engine::general_purpose::STANDARD
-		.decode(pem_b64.trim())
-		.with_context(|| format!("decoding base64 {label} PEM"))?;
-	String::from_utf8(bytes).with_context(|| format!("{label} PEM is not valid UTF-8"))
+fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<loupe_provenance::Secret<String>> {
+	loupe_tls::decode_pem_base64(pem_b64.trim())
+		.with_context(|| format!("decoding base64 {label} PEM"))
 }
 
 fn parse_master_key_hex(s: &str) -> Result<MasterKey> {
@@ -444,7 +436,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let assignments: Vec<_> = init_env_assignments(&out).collect();
+		let assignments: Vec<_> = init_env_assignments(&out).unwrap();
 		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
 		assert_eq!(
 			names,
@@ -479,15 +471,131 @@ mod tests {
 			base64::engine::general_purpose::STANDARD.decode(assignments[1].1.expose()).unwrap();
 		assert_eq!(String::from_utf8(server_cert).unwrap(), out.server_bundle.cert_pem);
 		for ((_, encoded), expected) in assignments.iter().skip(2).zip([
-			&out.server_bundle.key_pem,
-			&out.ca_cert_pem,
-			&out.ca_key_pem,
+			out.server_bundle.key_pem.expose(),
+			out.ca_cert_pem.expose(),
+			out.ca_key_pem.expose(),
 			&out.admin_bundle.cert_pem,
-			&out.admin_bundle.key_pem,
+			out.admin_bundle.key_pem.expose(),
 		]) {
 			let decoded =
 				base64::engine::general_purpose::STANDARD.decode(encoded.expose()).unwrap();
 			assert_eq!(decoded, expected.as_bytes(), "export bytes must be preserved");
 		}
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use base64::Engine as _;
+
+	use super::*;
+
+	#[test]
+	fn tls_consumer_server_options_debug_redacts_raw_and_encoded_tls_inputs() {
+		let sentinel = "FAKE_SERVER_TLS_OPTION";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(sentinel);
+		let mut leaks = Vec::new();
+		for flag in [
+			"--server-cert-pem",
+			"--server-key-pem",
+			"--ca-cert-pem",
+			"--ca-key-pem",
+			"--server-cert-pem-b64",
+			"--server-key-pem-b64",
+			"--ca-cert-pem-b64",
+			"--ca-key-pem-b64",
+		] {
+			let value = if flag.ends_with("-b64") { &encoded } else { sentinel };
+			let cli = Cli::try_parse_from(["loupe-server", "serve", flag, value]).unwrap();
+			if [format!("{cli:?}"), format!("{cli:#?}")].iter().any(|text| text.contains(value)) {
+				leaks.push(flag);
+			}
+		}
+		assert!(leaks.is_empty(), "server option Debug disclosed inputs at {leaks:?}");
+	}
+
+	#[test]
+	fn tls_consumer_server_loaded_pem_is_redacted() {
+		let loaded = pem_from_env_or_file(
+			"key",
+			Some("FAKE_LOADED_SERVER_TLS".into()),
+			None,
+			None,
+			"missing",
+		)
+		.unwrap();
+		for rendered in [
+			format!("{loaded:?}"),
+			format!("{loaded:#?}"),
+			format!("{loaded}"),
+			format!("{loaded:#}"),
+		] {
+			assert_eq!(rendered, "[redacted]", "loaded TLS owner must redact every formatter");
+		}
+	}
+
+	#[test]
+	fn tls_consumer_server_invalid_utf8_error_does_not_retain_private_bytes() {
+		let bytes = b"FAKE_INVALID_SERVER_TLS\xff";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+		let error = decode_pem_b64("server key", &encoded).unwrap_err();
+		let rendered: String = format!("{error:#?}").split_whitespace().collect();
+		let reflected: String = format!("bytes:{bytes:?}").split_whitespace().collect();
+		assert!(!rendered.contains(&reflected), "invalid UTF-8 error retained private input bytes");
+	}
+
+	#[test]
+	fn server_tls_loader_preserves_precedence_empty_fallback_and_errors() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("tls-input");
+		std::fs::write(&path, "FILE_TLS").unwrap();
+		let encoded = base64::engine::general_purpose::STANDARD.encode("B64_TLS");
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				Some("RAW_TLS".into()),
+				Some("invalid%%%".into()),
+				Some(path.clone()),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"RAW_TLS"
+		);
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				Some(String::new().into()),
+				Some(format!(" \n{encoded}\n ").into()),
+				Some(path.clone()),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"B64_TLS"
+		);
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				Some(String::new().into()),
+				Some(String::new().into()),
+				Some(path.clone()),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"FILE_TLS"
+		);
+		assert!(pem_from_env_or_file(
+			"key",
+			None,
+			Some("invalid%%%".into()),
+			Some(path.clone()),
+			"missing"
+		)
+		.is_err());
+		std::fs::write(&path, b"invalid\xff").unwrap();
+		assert!(pem_from_env_or_file("key", None, None, Some(path), "missing").is_err());
+		assert!(pem_from_env_or_file("key", None, None, None, "missing").is_err());
 	}
 }

@@ -894,8 +894,12 @@ dependencies = [
  "loupe-provenance",
  "loupe-tls",
  "reqwest",
+ "rustls",
+ "rustls-pemfile",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1002,13 +1006,20 @@ name = "loupe-tls"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "loupe-provenance",
+ "pem",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
@@ -1028,10 +1039,13 @@ dependencies = [
  "loupe-tls",
  "rand_core 0.6.4",
  "reqwest",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1396,6 +1410,7 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+ "zeroize",
 ]
 
 [[package]]

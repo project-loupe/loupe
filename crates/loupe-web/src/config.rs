@@ -51,23 +51,23 @@ pub struct ConnArgs {
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	pub ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
-	pub ca_cert_pem: Option<String>,
+	pub ca_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
-	pub ca_cert_pem_b64: Option<String>,
+	pub ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 
 	#[arg(long, env = "LOUPE_ADMIN_CERT")]
 	pub admin_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true)]
-	pub admin_cert_pem: Option<String>,
+	pub admin_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true)]
-	pub admin_cert_pem_b64: Option<String>,
+	pub admin_cert_pem_b64: Option<loupe_tls::PemInput>,
 
 	#[arg(long, env = "LOUPE_ADMIN_KEY")]
 	pub admin_key: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true)]
-	pub admin_key_pem: Option<String>,
+	pub admin_key_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true)]
-	pub admin_key_pem_b64: Option<String>,
+	pub admin_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
 /// Reject any non-loopback bind address.
@@ -99,7 +99,7 @@ impl ConnArgs {
 	}
 
 	/// Read the CA cert PEM.
-	pub fn ca_pem(&self) -> Result<String> {
+	pub fn ca_pem(&self) -> Result<loupe_provenance::Secret<String>> {
 		pem_from_env_or_file(
 			"CA cert",
 			&self.ca_cert_pem,
@@ -110,7 +110,7 @@ impl ConnArgs {
 	}
 
 	/// Read the admin client cert PEM.
-	pub fn admin_cert_pem(&self) -> Result<String> {
+	pub fn admin_cert_pem(&self) -> Result<loupe_provenance::Secret<String>> {
 		pem_from_env_or_file(
 			"admin cert",
 			&self.admin_cert_pem,
@@ -122,7 +122,7 @@ impl ConnArgs {
 	}
 
 	/// Read the admin client key PEM.
-	pub fn admin_key_pem(&self) -> Result<String> {
+	pub fn admin_key_pem(&self) -> Result<loupe_provenance::Secret<String>> {
 		pem_from_env_or_file(
 			"admin key",
 			&self.admin_key_pem,
@@ -135,21 +135,18 @@ impl ConnArgs {
 }
 
 fn pem_from_env_or_file(
-	label: &str, pem: &Option<String>, pem_b64: &Option<String>, path: Option<&PathBuf>,
-	missing: &'static str,
-) -> Result<String> {
-	if let Some(pem) = pem.as_deref().filter(|s| !s.is_empty()) {
-		return Ok(pem.to_owned());
+	label: &str, pem: &Option<loupe_tls::PemInput>, pem_b64: &Option<loupe_tls::PemInput>,
+	path: Option<&PathBuf>, missing: &'static str,
+) -> Result<loupe_provenance::Secret<String>> {
+	if let Some(pem) = pem.as_ref().filter(|s| !s.expose().is_empty()) {
+		return Ok(pem.clone().into_pem());
 	}
-	if let Some(pem_b64) = pem_b64.as_deref().filter(|s| !s.is_empty()) {
-		use base64::Engine as _;
-		let bytes = base64::engine::general_purpose::STANDARD
-			.decode(pem_b64.trim())
-			.with_context(|| format!("decoding base64 {label} PEM"))?;
-		return String::from_utf8(bytes).with_context(|| format!("{label} PEM is not valid UTF-8"));
+	if let Some(pem_b64) = pem_b64.as_ref().filter(|s| !s.expose().is_empty()) {
+		return loupe_tls::decode_pem_base64(pem_b64.expose().trim())
+			.with_context(|| format!("decoding base64 {label} PEM"));
 	}
 	let path = path.context(missing)?;
-	std::fs::read_to_string(path).with_context(|| format!("reading {label} at {}", path.display()))
+	loupe_tls::read_pem_file(path).with_context(|| format!("reading {label} at {}", path.display()))
 }
 
 #[cfg(test)]
@@ -191,7 +188,7 @@ mod tests {
 			admin_key_pem: None,
 			admin_key_pem_b64: None,
 		};
-		assert_eq!(args.ca_pem().unwrap(), "RAW");
+		assert_eq!(args.ca_pem().unwrap().expose(), "RAW");
 	}
 
 	#[test]
@@ -208,7 +205,7 @@ mod tests {
 			admin_key_pem: None,
 			admin_key_pem_b64: None,
 		};
-		assert_eq!(args.ca_pem().unwrap(), "BASE64");
+		assert_eq!(args.ca_pem().unwrap().expose(), "BASE64");
 	}
 
 	#[test]
@@ -234,5 +231,128 @@ mod tests {
 	#[test]
 	fn default_bind_is_loopback() {
 		assert!(ensure_loopback(default_bind()).is_ok());
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use base64::Engine as _;
+
+	use super::*;
+
+	#[test]
+	fn tls_consumer_web_options_debug_redacts_raw_and_encoded_tls_inputs() {
+		let sentinel = "FAKE_WEB_TLS_OPTION";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(sentinel);
+		let mut leaks = Vec::new();
+		for flag in [
+			"--ca-cert-pem",
+			"--admin-cert-pem",
+			"--admin-key-pem",
+			"--ca-cert-pem-b64",
+			"--admin-cert-pem-b64",
+			"--admin-key-pem-b64",
+		] {
+			let value = if flag.ends_with("-b64") { &encoded } else { sentinel };
+			let cli = Cli::try_parse_from(["loupe-web", flag, value]).unwrap();
+			if [format!("{cli:?}"), format!("{cli:#?}")].iter().any(|text| text.contains(value)) {
+				leaks.push(flag);
+			}
+		}
+		assert!(leaks.is_empty(), "web option Debug disclosed inputs at {leaks:?}");
+	}
+
+	#[test]
+	fn tls_consumer_web_loaded_pem_is_redacted() {
+		let cli = Cli::try_parse_from([
+			"loupe-web",
+			"--ca-cert-pem",
+			"FAKE_MIXED_WEB_CA",
+			"--admin-cert-pem",
+			"FAKE_MIXED_WEB_CERT",
+			"--admin-key-pem",
+			"FAKE_WEB_KEY",
+		])
+		.unwrap();
+		for value in [
+			cli.conn.ca_pem().unwrap(),
+			cli.conn.admin_cert_pem().unwrap(),
+			cli.conn.admin_key_pem().unwrap(),
+		] {
+			for rendered in [
+				format!("{value:?}"),
+				format!("{value:#?}"),
+				format!("{value}"),
+				format!("{value:#}"),
+			] {
+				assert_eq!(rendered, "[redacted]", "loaded TLS owner must redact every formatter");
+			}
+		}
+	}
+
+	#[test]
+	fn tls_consumer_web_invalid_utf8_error_does_not_retain_private_bytes() {
+		let bytes = b"FAKE_INVALID_WEB_TLS\xff";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+		let cli = Cli::try_parse_from(["loupe-web", "--admin-key-pem-b64", &encoded]).unwrap();
+		let error = cli.conn.admin_key_pem().unwrap_err();
+		let rendered: String = format!("{error:#?}").split_whitespace().collect();
+		let reflected: String = format!("bytes:{bytes:?}").split_whitespace().collect();
+		assert!(!rendered.contains(&reflected), "invalid UTF-8 error retained private input bytes");
+	}
+
+	#[test]
+	fn web_tls_loader_preserves_precedence_empty_fallback_and_errors() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("tls-input");
+		std::fs::write(&path, "FILE_TLS").unwrap();
+		let encoded = base64::engine::general_purpose::STANDARD.encode("B64_TLS");
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				&Some("RAW_TLS".into()),
+				&Some("invalid%%%".into()),
+				Some(&path),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"RAW_TLS"
+		);
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				&Some(String::new().into()),
+				&Some(format!(" \n{encoded}\n ").into()),
+				Some(&path),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"B64_TLS"
+		);
+		assert_eq!(
+			pem_from_env_or_file(
+				"key",
+				&Some(String::new().into()),
+				&Some(String::new().into()),
+				Some(&path),
+				"missing"
+			)
+			.unwrap()
+			.expose(),
+			"FILE_TLS"
+		);
+		assert!(pem_from_env_or_file(
+			"key",
+			&None,
+			&Some("invalid%%%".into()),
+			Some(&path),
+			"missing"
+		)
+		.is_err());
+		std::fs::write(&path, b"invalid\xff").unwrap();
+		assert!(pem_from_env_or_file("key", &None, &None, Some(&path), "missing").is_err());
+		assert!(pem_from_env_or_file("key", &None, &None, None, "missing").is_err());
 	}
 }

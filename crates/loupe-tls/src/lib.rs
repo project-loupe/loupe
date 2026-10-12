@@ -11,8 +11,11 @@
 mod ca;
 mod config;
 mod fingerprint;
+mod input;
 mod provider;
+mod secret;
 
 pub use ca::{Ca, CertBundle};
-pub use config::{client_config, server_config};
+pub use config::{client_config, reqwest_client_config, server_config};
 pub use fingerprint::cert_fingerprint;
+pub use input::{decode_pem_base64, encode_pem_base64, read_pem_file, PemInput};

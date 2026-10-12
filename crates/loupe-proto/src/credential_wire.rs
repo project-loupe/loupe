@@ -47,6 +47,21 @@ impl RegisterWorkerResponse {
 	}
 }
 
+/// Encode the operator's server certificate bundle with its existing two-field
+/// pretty JSON shape. Retain the returned owner through deliberate file/stdout
+/// export; certificate input can itself be a mixed PEM bundle.
+pub fn server_certificate_json_pretty(
+	server_cert_pem: &str, server_key_pem: &Secret<String>,
+) -> serde_json::Result<Secret<Vec<u8>>> {
+	#[derive(Serialize)]
+	struct ServerCertificate<'a> {
+		server_cert_pem: &'a str,
+		#[serde(serialize_with = "crate::secret_serde::string::serialize")]
+		server_key_pem: &'a Secret<String>,
+	}
+	encode(&ServerCertificate { server_cert_pem, server_key_pem }, true)
+}
+
 struct Count(usize);
 
 impl Write for Count {

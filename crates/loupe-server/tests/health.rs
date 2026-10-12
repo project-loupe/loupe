@@ -20,15 +20,15 @@ async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) 
 	let server_cert = ca.mint_server("loupe-server", &["loupe-server".into()]).unwrap();
 	let client_cert = ca.mint_client("admin").unwrap();
 	let ca_cert_pem = ca.cert_pem().to_owned();
-	let ca_key_pem = ca.key_pem().to_owned();
+	let ca_key_pem = ca.key_pem().expose().to_owned();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: ":memory:".into(),
-		server_cert_pem: server_cert.cert_pem,
+		server_cert_pem: loupe_provenance::Secret::new(server_cert.cert_pem),
 		server_key_pem: server_cert.key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
 	};
 	let db = Arc::new(Db::open_in_memory(&MasterKey::for_tests()).unwrap());
 	let state = AppState::new(
@@ -43,7 +43,7 @@ async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) 
 
 	let client = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&client_cert.cert_pem, &client_cert.key_pem))
+		.identity(pem_to_identity(&client_cert.cert_pem, client_cert.key_pem.expose()))
 		.resolve("loupe-server", local)
 		.use_rustls_tls()
 		.build()
@@ -103,7 +103,7 @@ async fn server_rejects_client_with_foreign_cert() {
 
 	let intruder = reqwest::Client::builder()
 		.danger_accept_invalid_certs(true) // skip server-cert verification — we only care about *our* identity being rejected
-		.identity(pem_to_identity(&foreign_cert.cert_pem, &foreign_cert.key_pem))
+		.identity(pem_to_identity(&foreign_cert.cert_pem, foreign_cert.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()

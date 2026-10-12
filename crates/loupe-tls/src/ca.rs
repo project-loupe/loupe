@@ -1,17 +1,31 @@
 use anyhow::{Context, Result};
+use loupe_provenance::Secret;
 use rcgen::{
 	BasicConstraints, CertificateParams, DistinguishedName, DnType, GeneralSubtree, IsCa, KeyPair,
 	KeyUsagePurpose, SanType,
 };
 
-/// PEM-encoded cert + key. The key is plaintext PEM; callers are
-/// responsible for keeping it safe (envelope-encrypted in the `secrets`
-/// table on the server side, on-disk under restrictive perms on the
-/// worker side).
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::secret::{export_key, RcgenKey};
+
+/// PEM-encoded cert + guarded private key. Deliberate exports borrow the
+/// key through `expose`; its current allocation is wiped on drop. Callers
+/// remain responsible for encrypted storage and restrictive file permissions.
+///
+/// ```
+/// let ca = loupe_tls::Ca::new("test-ca").unwrap();
+/// let bundle = ca.mint_client("test-client").unwrap();
+/// assert!(bundle.cert_pem.contains("BEGIN CERTIFICATE"));
+/// ```
+///
+/// ```compile_fail,E0599
+/// let ca = loupe_tls::Ca::new("test-ca").unwrap();
+/// let bundle = ca.mint_client("test-client").unwrap();
+/// let duplicated = bundle.clone();
+/// ```
+#[derive(Debug)]
 pub struct CertBundle {
 	pub cert_pem: String,
-	pub key_pem: String,
+	pub key_pem: Secret<String>,
 }
 
 /// In-memory certificate authority used to mint client and server certs.
@@ -21,14 +35,14 @@ pub struct CertBundle {
 /// envelope-encrypted `secrets` row on startup).
 pub struct Ca {
 	cert: rcgen::Certificate,
-	key: KeyPair,
-	cert_pem: String,
-	key_pem: String,
+	key: RcgenKey,
+	cert_pem: Secret<String>,
+	key_pem: Secret<String>,
 }
 
 impl Ca {
 	pub fn new(common_name: &str) -> Result<Self> {
-		let key = KeyPair::generate().context("generating CA key pair")?;
+		let key = RcgenKey(KeyPair::generate().context("generating CA key pair")?);
 		let mut params = CertificateParams::default();
 		params.distinguished_name = {
 			let mut dn = DistinguishedName::new();
@@ -42,27 +56,57 @@ impl Ca {
 			KeyUsagePurpose::CrlSign,
 			KeyUsagePurpose::DigitalSignature,
 		];
-		let cert = params.self_signed(&key).context("self-signing CA cert")?;
-		let cert_pem = cert.pem();
-		let key_pem = key.serialize_pem();
+		let cert = params.self_signed(&key.0).context("self-signing CA cert")?;
+		let cert_pem = Secret::new(cert.pem());
+		let key_pem = export_key(&key)?;
 		Ok(Self { cert, key, cert_pem, key_pem })
 	}
 
 	pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
-		let key = KeyPair::from_pem(key_pem).context("parsing CA key PEM")?;
-		let params =
-			CertificateParams::from_ca_cert_pem(cert_pem).context("parsing CA cert PEM")?;
+		// Preserve rcgen's first-block, PKCS#8 import grammar while taking
+		// ownership of the decoder's DER immediately. Its parser scratch and
+		// opaque ring state are outside the controlled-buffer guarantee.
+		let der = Secret::new(
+			pem::parse(key_pem)
+				.map_err(|_| anyhow::anyhow!("invalid CA private key PEM"))?
+				.into_contents(),
+		);
+		let key = RcgenKey(
+			KeyPair::try_from(der.expose().as_slice())
+				.map_err(|_| anyhow::anyhow!("invalid CA private key"))?,
+		);
+		// The certificate argument is also tag-neutral first-block PEM input:
+		// it can decode private DER before X.509 parsing rejects it. Own that
+		// completed allocation here instead of leaving it inside rcgen's helper.
+		let cert_der = Secret::new(
+			pem::parse(cert_pem)
+				.map_err(|_| anyhow::anyhow!("invalid CA certificate PEM"))?
+				.into_contents(),
+		);
+		let params = CertificateParams::from_ca_cert_der(&cert_der.expose().as_slice().into())
+			.map_err(|_| anyhow::anyhow!("invalid CA certificate"))?;
 		validate_imported_oids(&params).context("validating imported CA certificate OIDs")?;
-		let cert = params.self_signed(&key).context("re-binding CA cert to key pair")?;
-		Ok(Self { cert_pem: cert_pem.to_owned(), key_pem: key_pem.to_owned(), cert, key })
+		let cert = params.self_signed(&key.0).context("re-binding CA cert to key pair")?;
+		Ok(Self {
+			cert_pem: Secret::new(cert_pem.to_owned()),
+			key_pem: Secret::new(key_pem.to_owned()),
+			cert,
+			key,
+		})
 	}
 
 	pub fn cert_pem(&self) -> &str {
-		&self.cert_pem
+		self.cert_pem.expose()
 	}
 
-	pub fn key_pem(&self) -> &str {
+	pub fn key_pem(&self) -> &Secret<String> {
 		&self.key_pem
+	}
+
+	/// Retire this authority into its exact original PEM owners for deliberate
+	/// persistence/export. Imported certificate bundles may include private data.
+	pub fn into_pem(self) -> (Secret<String>, Secret<String>) {
+		(self.cert_pem, self.key_pem)
 	}
 
 	/// Mint a client cert. The cert's CN is `name`; subject-alt-names are
@@ -80,7 +124,7 @@ impl Ca {
 	}
 
 	fn mint(&self, common_name: &str, hostnames: &[String], is_server: bool) -> Result<CertBundle> {
-		let key = KeyPair::generate().context("generating leaf key pair")?;
+		let key = RcgenKey(KeyPair::generate().context("generating leaf key pair")?);
 		let mut params = CertificateParams::new(hostnames.to_vec()).context("new leaf params")?;
 		params.distinguished_name = {
 			let mut dn = DistinguishedName::new();
@@ -96,8 +140,9 @@ impl Ca {
 		} else {
 			vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth]
 		};
-		let cert = params.signed_by(&key, &self.cert, &self.key).context("signing leaf cert")?;
-		Ok(CertBundle { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
+		let cert =
+			params.signed_by(&key.0, &self.cert, &self.key.0).context("signing leaf cert")?;
+		Ok(CertBundle { cert_pem: cert.pem(), key_pem: export_key(&key)? })
 	}
 }
 
@@ -147,6 +192,63 @@ mod tests {
 	use rcgen::{CustomExtension, SanType};
 
 	use super::*;
+
+	#[test]
+	fn retained_mixed_ca_certificate_has_a_guarded_owner() {
+		let ca = Ca::new("retained-ca").unwrap();
+		let mixed = format!("{}{}", ca.cert_pem(), ca.key_pem().expose());
+		let loaded = Ca::from_pem(&mixed, ca.key_pem().expose()).unwrap();
+		assert_eq!(loaded.cert_pem(), mixed, "preserve the exact accepted input");
+		assert_eq!(format!("{:?}", loaded.cert_pem), "[redacted]");
+	}
+
+	fn assert_private_pem_formatting(
+		key: &(impl std::fmt::Debug + std::fmt::Display), private_pem: &str,
+	) {
+		// Generated keys are throwaway test material. Do not print their bytes
+		// in assertion diagnostics: report which formatter disclosed them.
+		let private_line = private_pem.lines().nth(1).expect("private PEM body");
+		let formats = [
+			("Debug", format!("{key:?}")),
+			("alternate Debug", format!("{key:#?}")),
+			("Display", format!("{key}")),
+			("alternate Display", format!("{key:#}")),
+		];
+		let leaks: Vec<_> = formats
+			.iter()
+			.filter(|(_, text)| text.contains(private_line))
+			.map(|(name, _)| *name)
+			.collect();
+		assert!(leaks.is_empty(), "private PEM bytes were disclosed by {leaks:?}");
+		for (_, text) in formats {
+			assert_eq!(text, "[redacted]");
+		}
+	}
+
+	#[test]
+	fn tls_secret_ca_private_pem_formatting_is_redacted() {
+		let ca = Ca::new("throwaway-formatting-ca").unwrap();
+		assert_private_pem_formatting(&ca.key_pem, ca.key_pem.expose());
+	}
+
+	#[test]
+	fn tls_secret_bundle_private_pem_formatting_is_redacted() {
+		let ca = Ca::new("throwaway-formatting-ca").unwrap();
+		let bundle = ca.mint_client("throwaway-formatting-client").unwrap();
+		assert_private_pem_formatting(&bundle.key_pem, bundle.key_pem.expose());
+	}
+
+	#[test]
+	fn tls_secret_bundle_debug_preserves_cert_and_redacts_private_pem() {
+		let ca = Ca::new("throwaway-formatting-ca").unwrap();
+		let bundle = ca.mint_client("throwaway-formatting-client").unwrap();
+		let rendered = format!("{bundle:?}");
+		assert!(rendered.contains(&format!("{:?}", bundle.cert_pem)), "public cert is retained");
+		assert!(
+			!rendered.contains(bundle.key_pem.expose().lines().nth(1).unwrap()),
+			"bundle Debug disclosed private PEM bytes"
+		);
+	}
 
 	fn cert_with_oid(oid: &[u64], location: &str) -> (String, String) {
 		let key = KeyPair::generate().unwrap();
@@ -239,7 +341,7 @@ mod tests {
 		let ca = Ca::new("loupe-test-ca").unwrap();
 		let cert_pem = include_str!("../tests/fixtures/invalid-subject-oid.pem");
 		assert!(
-			Ca::from_pem(cert_pem, ca.key_pem()).is_err(),
+			Ca::from_pem(cert_pem, ca.key_pem().expose()).is_err(),
 			"invalid subject OID must be rejected"
 		);
 	}
@@ -248,9 +350,32 @@ mod tests {
 	fn round_trips_through_pem() {
 		let ca = Ca::new("loupe-test-ca").unwrap();
 		let cert_pem = ca.cert_pem().to_owned();
-		let key_pem = ca.key_pem().to_owned();
-		let reloaded = Ca::from_pem(&cert_pem, &key_pem).unwrap();
+		let key_pem = ca.key_pem().expose();
+		let reloaded = Ca::from_pem(&cert_pem, key_pem).unwrap();
 		assert_eq!(reloaded.cert_pem(), cert_pem);
+		assert_eq!(reloaded.key_pem().expose(), key_pem);
+	}
+
+	#[test]
+	fn private_pem_exports_match_rcgen_and_import_preserves_bytes() {
+		let ca = Ca::new("throwaway-export-ca").unwrap();
+		assert!(
+			*ca.key_pem().expose() == ca.key.0.serialize_pem(),
+			"CA export matches rcgen bytes"
+		);
+		for bundle in [
+			ca.mint_client("client").unwrap(),
+			ca.mint_server("server", &["localhost".into()]).unwrap(),
+		] {
+			let key = KeyPair::from_pem(bundle.key_pem.expose()).unwrap();
+			assert!(
+				*bundle.key_pem.expose() == key.serialize_pem(),
+				"leaf export matches rcgen bytes"
+			);
+		}
+		let crlf = ca.key_pem().expose().replace('\n', "\r\n");
+		let imported = Ca::from_pem(ca.cert_pem(), &crlf).unwrap();
+		assert!(*imported.key_pem().expose() == crlf, "import preserves original PEM bytes");
 	}
 
 	#[test]
@@ -258,7 +383,7 @@ mod tests {
 		let ca = Ca::new("loupe-test-ca").unwrap();
 		let client = ca.mint_client("worker-1").unwrap();
 		assert!(client.cert_pem.contains("BEGIN CERTIFICATE"));
-		assert!(client.key_pem.contains("PRIVATE KEY"));
+		assert!(client.key_pem.expose().contains("PRIVATE KEY"));
 
 		let server = ca.mint_server("loupe-server", &["localhost".into()]).unwrap();
 		assert!(server.cert_pem.contains("BEGIN CERTIFICATE"));

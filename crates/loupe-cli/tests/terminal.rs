@@ -32,7 +32,7 @@ async fn command(args: &[&str], status: &str, body: String) -> Output {
 			.env("LOUPE_SERVER_URL", format!("http://{address}"))
 			.env("LOUPE_CA_CERT_PEM", ca.cert_pem())
 			.env("LOUPE_ADMIN_CERT_PEM", client.cert_pem)
-			.env("LOUPE_ADMIN_KEY_PEM", client.key_pem)
+			.env("LOUPE_ADMIN_KEY_PEM", client.key_pem.expose())
 			.env("NO_COLOR", "1")
 			.args(args)
 			.output(),

@@ -16,6 +16,7 @@ mod scan;
 mod secret_serde;
 mod version;
 
+pub use credential_wire::server_certificate_json_pretty;
 pub use findings_admin::{
 	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyRequest, RetryVerifyResponse,
 };

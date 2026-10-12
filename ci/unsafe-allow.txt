@@ -26,6 +26,7 @@ fuzz/src/storage_identity.rs fuzz entry point: the C entry point takes a raw poi
 fuzz/src/proto_dto.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_version.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/tls_fingerprint.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/tls_input.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/tls_pem.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/server_capability_header.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/server_config.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

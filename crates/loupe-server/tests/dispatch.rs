@@ -189,10 +189,10 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
+		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
@@ -207,7 +207,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	// Admin client
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -254,7 +254,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -357,10 +357,10 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: loupe_provenance::Secret::new(server_cert_pem),
+		server_key_pem: loupe_provenance::Secret::new(server_key_pem),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(ca_key_pem),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
@@ -370,7 +370,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -409,7 +409,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let worker = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -589,10 +589,16 @@ async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: std::fs::read_to_string(&init.layout.server_cert).unwrap(),
-		server_key_pem: std::fs::read_to_string(&init.layout.server_key).unwrap(),
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem: std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+		server_cert_pem: loupe_provenance::Secret::new(
+			std::fs::read_to_string(&init.layout.server_cert).unwrap(),
+		),
+		server_key_pem: loupe_provenance::Secret::new(
+			std::fs::read_to_string(&init.layout.server_key).unwrap(),
+		),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(
+			std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+		),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
@@ -602,7 +608,7 @@ async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
 
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -663,7 +669,7 @@ async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -753,10 +759,16 @@ async fn dispatch_refuses_app_mode_targets_outside_the_owner_allowlist() {
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem: std::fs::read_to_string(&init.layout.server_cert).unwrap(),
-		server_key_pem: std::fs::read_to_string(&init.layout.server_key).unwrap(),
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem: std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+		server_cert_pem: loupe_provenance::Secret::new(
+			std::fs::read_to_string(&init.layout.server_cert).unwrap(),
+		),
+		server_key_pem: loupe_provenance::Secret::new(
+			std::fs::read_to_string(&init.layout.server_key).unwrap(),
+		),
+		ca_cert_pem: loupe_provenance::Secret::new(ca_cert_pem.clone()),
+		ca_key_pem: loupe_provenance::Secret::new(
+			std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+		),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
@@ -766,7 +778,7 @@ async fn dispatch_refuses_app_mode_targets_outside_the_owner_allowlist() {
 	let addr = server.local_addr;
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()

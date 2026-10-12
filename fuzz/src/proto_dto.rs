@@ -233,7 +233,22 @@ pub fn do_test(data: &[u8]) {
 		24 => roundtrip::<ReportingSummary>(raw),
 		25 => roundtrip::<RepoSummary>(raw),
 		26 => roundtrip::<RegisterWorkerRequest>(raw),
-		27 => roundtrip::<RegisterWorkerResponse>(raw),
+		27 => {
+			if let Some((mut value, mut back)) = decode::<RegisterWorkerResponse>(raw) {
+				assert_eq!(value.protocol_version, back.protocol_version);
+				assert_eq!(value.worker_id, back.worker_id);
+				assert_eq!(value.client_cert_pem, back.client_cert_pem);
+				secret(&value.client_key_pem, &back.client_key_pem);
+				secret(&value.ca_cert_pem, &back.ca_cert_pem);
+				for response in [&mut value, &mut back] {
+					let before = format!("{response:?}");
+					response.client_key_pem =
+						Secret::new("fixed private-key debug baseline".into());
+					response.ca_cert_pem = Secret::new("fixed mixed-CA debug baseline".into());
+					assert_eq!(before, format!("{response:?}"), "registration Debug exposes PEM");
+				}
+			}
+		},
 		28 => roundtrip::<ListFindingsResponse>(raw),
 		29 => roundtrip::<RetryVerifyRequest>(raw),
 		30 => roundtrip::<RetryVerifyResponse>(raw),

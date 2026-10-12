@@ -65,3 +65,16 @@ fn finishing_transfers_the_original_allocation() {
 	assert_eq!(format!("{value:?}"), "[redacted]");
 	CLEANUPS.with(|seen| assert!(seen.borrow().iter().all(|(len, _)| *len == 0)));
 }
+#[test]
+fn server_certificate_export_preserves_pretty_schema_and_escaped_bytes() {
+	let certificate = "FAKE_CERT\n\"\\λ";
+	let key = loupe_provenance::Secret::new("FAKE_KEY\n\"\\λ".to_owned());
+	let actual = super::server_certificate_json_pretty(certificate, &key).unwrap();
+	let expected = serde_json::to_vec_pretty(&serde_json::json!({
+		"server_cert_pem": certificate,
+		"server_key_pem": key.expose(),
+	}))
+	.unwrap();
+	assert_eq!(actual.expose(), &expected);
+	assert_eq!(format!("{actual:?}"), "[redacted]");
+}

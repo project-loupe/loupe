@@ -227,6 +227,8 @@ fixed public value. Debug checks compare exact field-matched baselines.
 
 `loupe-tls` exercises the production certificate, key and trust-root loaders.
 `sha2` checks that worker fingerprints hash the exact supplied DER bytes.
+`base64` provides a reference decoder/encoder for guarded PEM input and export
+byte transfers; that comparison does not independently verify base64 itself.
 The PEM pair in `fixtures/` is deliberately public test material, never an
 authentication credential. Seeds vary each PEM field independently.
 
@@ -304,7 +306,8 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `storage_identity` | Independent anchor recognition, equivalent spelling, metadata-only diagnostics, explicit identity framing and reference BLAKE3 |
 | `storage_policy_snapshot` | Independent campaign-policy admission, capped retry arithmetic, phase mapping and redacted conflict errors |
 | `tls_fingerprint` | Exact SHA-256 of arbitrary DER bytes and repeatability |
-| `tls_pem` | Certificate/key/root parsing, successful CA reload, valid fixture admission and malformed-label refusal |
+| `tls_input` | Actual guarded file/base64/argument owners, exact bytes, UTF-8 admission, fixed errors and redacted formatting |
+| `tls_pem` | Certificate/key/root parsing, successful CA reload, direct-loader controls and shared reqwest admission against its previous constructor |
 | `worker_broker_policy` | Both provider policies, denied tools and request headers, exact output reservation accounting |
 | `worker_broker_usage` | Independent JSON/SSE accounting, response header filtering and an empty tracing baseline |
 | `worker_config` | Actual file load/merge/validation, absolute resolved paths, model/effort/host policy and nonzero resource limits |
@@ -448,7 +451,8 @@ with the package installation. Flag-shaped values remain operands in the
 oracle; the target does not mistake those values for security options.
 
 All 34 main-surface S1 targets plus smoke are registered. S3 additionally
-registers `core_text_exact` for the marked exact-text policies. Its temporary
+registers `core_text_exact` for the marked exact-text policies and `tls_input`
+for guarded PEM readers and exports. The former's temporary
 `source-migration` dependency is removed at atomic source adoption; the target
 and its independent oracle remain. Each real target has
 a retained corpus, a clean short campaign and a detected guard mutation.
@@ -466,7 +470,7 @@ or resource-limit coverage remains an explicit gap in the broad ingress rule.
 | git2 submodule extraction | [runner.rs](../crates/loupe-worker/src/runner.rs), `checkout_tolerates_submodule_gitlinks`, owns real gitlink-tree tests as assigned by S1 target 24b. Generated malformed-tree cases remain an integration-test backlog. |
 | Clone/fetch/checkout and Git failures | [repo_cache.rs](../crates/loupe-worker/src/repo_cache.rs) and runner tests cover fetch/reclone/checkout behavior. The cursor/origin target does not cover all Git transport failures or filesystem effects; S3 owns Repo provenance and diagnostic sinks. Arbitrary failure-output coverage remains unassigned. |
 | Raw database rows and secret BLOB reads | Storage round-trip/migration tests own database fixtures. The three storage targets cover named value parsers, not every row decoder or corruption error. S2 owns scope decisions; S3 owns secret holders and Db decoding. General corrupt-row parser coverage remains unassigned. |
-| CLI/env/startup loaders | CLI, web-config, server-main and provider-auth tests own PEM/base64 precedence and credential loading. TOML targets and `tls_pem` do not cover their combined argv/env behavior. S3 owns Config minting and Secret migration; arbitrary combined-loader coverage remains unassigned. |
+| CLI/env/startup loaders | CLI, web-config, server-main and provider-auth tests own PEM/base64 precedence and credential loading. `tls_input` covers the shared guarded readers, not combined argv/env behavior. S3 owns Config minting and Secret migration; arbitrary combined-loader coverage remains unassigned. |
 | Sendmail status/stderr and pipe interaction | [email_dispatch.rs](../crates/loupe-server/tests/email_dispatch.rs) covers successful stdin delivery; renderer tests reject header injection. No dedicated failure/backpressure target or process-output budget is specified. S3's renderer/log work alone does not establish those properties. |
 | Reporter HTTP collection | GitHub HTTP integration tests and the response target own response decoding. Reporter `.bytes()`/`.text()` collection is outside L3's three clients and remains uncapped; its transport budget is an unresolved contract. S3 owns Reporter ingress. |
 | CLI collection and Git diagnostics | Both CLI backend tests exercise L5's one-MiB retention, drain, head/tail and deadlines. L2 tests UTF-8-safe Git display truncation after collection, not a Git pipe-allocation limit. S3 owns labels and disclosure; bounded buffers do not imply redacted logs. |
