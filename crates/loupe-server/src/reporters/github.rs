@@ -125,7 +125,7 @@ impl GithubReporter {
 /// App tokens retain the existing installation-token cache ownership.
 enum DispatchBearer<'a> {
 	Pat(&'a str),
-	App(String),
+	App(std::sync::Arc<loupe_provenance::Secret<String>>),
 }
 
 impl DispatchBearer<'_> {
@@ -133,7 +133,7 @@ impl DispatchBearer<'_> {
 	fn expose_for_dispatch(&self) -> &str {
 		match self {
 			Self::Pat(pat) => pat,
-			Self::App(token) => token,
+			Self::App(token) => token.expose(),
 		}
 	}
 }

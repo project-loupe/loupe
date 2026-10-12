@@ -352,6 +352,24 @@ operator's master key — the same key the server gets at startup via
 directory" + "Run the server" sections for the master-key sourcing
 rules.
 
+GitHub App authentication keeps JWTs and installation tokens in guarded
+allocations. Cached tokens share one guarded owner across concurrent dispatches;
+the cache still expires them after 50 minutes and refreshes once after an App
+401. PAT dispatch borrows its stored allocation and never retries a 401.
+The private HTTP bearer adapter reserves the complete `Bearer ` buffer and
+retains its guard through sensitive header clones. Token-mint HTTP responses
+have a separate 256 KiB streaming limit, checked against both Content-Length
+and received chunks; exact-limit bodies remain accepted. The collector reserves
+that capacity once and wipes it on completion, error, or cancellation. This
+does not change the pure GitHub response decoder or the 16 MiB Loupe API limit.
+
+Returned private DER is wiped after RSA parsing through its actual zeroization
+implementation. JWT signature and output scratch are guarded, with base64
+written into the final reserved output. These guarantees cover Loupe's current
+owned buffers. PEM/serde parser scratch, opaque ring signing state, codec or
+compiler temporaries, HTTP/TLS encoding, and kernel/receiver copies remain
+outside that guarantee; a redacted holder does not erase those allocations.
+
 ## Storage layout for the review harness
 
 Schema v3 has a typed storage API ahead of the v2 scheduler and endpoints.

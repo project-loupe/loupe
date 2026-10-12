@@ -154,16 +154,18 @@ pub fn do_test(data: &[u8]) {
 					assert!(status.is_success(), "token error status admitted");
 					assert_eq!(
 						expected.as_ref().and_then(|fields| fields.first()).and_then(Value::as_str),
-						Some(token.as_str())
+						Some(token.expose().as_str())
 					);
 					let credential = ReporterCredential::GithubPat(loupe_provenance::Secret::new(
-						token.as_bytes().to_vec(),
+						token.expose().as_bytes().to_vec(),
 					));
 					assert_redacted(
 						&format!("{credential:?}"),
-						token.as_bytes(),
+						token.expose().as_bytes(),
 						&Redaction::baseline("GithubPat(redacted)"),
 					);
+					assert_eq!(format!("{token:?}"), "[redacted]");
+					assert_eq!(format!("{token}"), "[redacted]");
 				},
 				Err(error) => {
 					let expected = if status.is_success() {

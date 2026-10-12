@@ -44,6 +44,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 bytes = { version = "1", default-features = false, features = ["std"] }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await", "std"] }
 http-body-util = { version = "0.1", default-features = false }

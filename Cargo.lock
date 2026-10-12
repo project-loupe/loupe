@@ -944,6 +944,7 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
+ "bytes",
  "clap",
  "futures-util",
  "git2",
@@ -972,6 +973,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
