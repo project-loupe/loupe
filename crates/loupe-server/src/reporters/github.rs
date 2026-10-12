@@ -64,16 +64,18 @@ impl GithubReporter {
 
 	/// Resolve the bearer token for one dispatch: the stored PAT as-is, or
 	/// a repo-scoped installation token minted from the GitHub App.
-	async fn bearer_for(
-		&self, credential: &ReporterCredential, target_owner: &str, target_repo: &str,
-	) -> Result<String> {
+	async fn bearer_for<'a>(
+		&self, credential: &'a ReporterCredential, target_owner: &str, target_repo: &str,
+	) -> Result<DispatchBearer<'a>> {
 		match credential {
-			ReporterCredential::GithubPat(pat) => Ok(pat.clone()),
-			ReporterCredential::GithubApp(key) => {
-				self.tokens
-					.token_for(&self.http, &self.api_base, key, target_owner, target_repo)
-					.await
-			},
+			ReporterCredential::GithubPat(pat) => std::str::from_utf8(pat.expose())
+				.map(DispatchBearer::Pat)
+				.map_err(|_| anyhow!("stored PAT is not valid UTF-8")),
+			ReporterCredential::GithubApp(key) => self
+				.tokens
+				.token_for(&self.http, &self.api_base, key, target_owner, target_repo)
+				.await
+				.map(DispatchBearer::App),
 			ReporterCredential::None => {
 				anyhow::bail!("GithubReporter dispatched without a PAT or GitHub App credential")
 			},
@@ -90,8 +92,10 @@ impl GithubReporter {
 	async fn post_with_refresh<B: Serialize>(
 		&self, url: Url, body: &B, session: &mut DispatchSession<'_>, what: &str,
 	) -> Result<reqwest::Response> {
-		let resp =
-			self.post_json(url.clone(), body, &session.bearer).await.context(what.to_owned())?;
+		let resp = self
+			.post_json(url.clone(), body, session.bearer.expose_for_dispatch())
+			.await
+			.context(what.to_owned())?;
 		let ReporterCredential::GithubApp(key) = session.credential else {
 			return Ok(resp);
 		};
@@ -105,13 +109,32 @@ impl GithubReporter {
 		);
 		self.tokens.invalidate(key.app_id(), owner, repo).await;
 		session.bearer = self.bearer_for(session.credential, owner, repo).await?;
-		self.post_json(url, body, &session.bearer).await.context(what.to_owned())
+		self.post_json(url, body, session.bearer.expose_for_dispatch())
+			.await
+			.context(what.to_owned())
 	}
 
 	async fn post_json<B: Serialize>(
 		&self, url: Url, body: &B, bearer: &str,
 	) -> reqwest::Result<reqwest::Response> {
 		github_app::github_request(self.http.post(url), bearer).json(body).send().await
+	}
+}
+
+/// A PAT borrows its guarded DAO allocation for the dispatch lifetime.
+/// App tokens retain the existing installation-token cache ownership.
+enum DispatchBearer<'a> {
+	Pat(&'a str),
+	App(String),
+}
+
+impl DispatchBearer<'_> {
+	/// Borrow the bearer only at the authenticated HTTP request sink.
+	fn expose_for_dispatch(&self) -> &str {
+		match self {
+			Self::Pat(pat) => pat,
+			Self::App(token) => token,
+		}
 	}
 }
 
@@ -122,7 +145,7 @@ struct DispatchSession<'a> {
 	credential: &'a ReporterCredential,
 	target_owner: &'a str,
 	target_repo: &'a str,
-	bearer: String,
+	bearer: DispatchBearer<'a>,
 }
 
 #[derive(Serialize)]
@@ -482,13 +505,21 @@ mod tests {
 			"Unicode bytes must not set the limit"
 		);
 		reporter
-			.dispatch(&repo(), &[report.clone()], &ReporterCredential::GithubPat("pat".into()))
+			.dispatch(
+				&repo(),
+				&[report.clone()],
+				&ReporterCredential::GithubPat(loupe_provenance::Secret::new(b"pat".to_vec())),
+			)
 			.await
 			.expect("exact character limit is accepted");
 		assert_eq!(requests.load(Ordering::SeqCst), 2);
 		report.finding.description.push('é');
 		let error = reporter
-			.dispatch(&repo(), &[report.clone()], &ReporterCredential::GithubPat("pat".into()))
+			.dispatch(
+				&repo(),
+				&[report.clone()],
+				&ReporterCredential::GithubPat(loupe_provenance::Secret::new(b"pat".to_vec())),
+			)
 			.await
 			.unwrap_err();
 		assert!(error.to_string().contains("65536"), "local size rejection: {error:#}");
@@ -696,7 +727,13 @@ mod tests {
 		gh.rejected.lock().unwrap().push("ghp_stale".into());
 
 		let err = reporter
-			.dispatch(&repo(), &one_finding(), &ReporterCredential::GithubPat("ghp_stale".into()))
+			.dispatch(
+				&repo(),
+				&one_finding(),
+				&ReporterCredential::GithubPat(loupe_provenance::Secret::new(
+					b"ghp_stale".to_vec(),
+				)),
+			)
 			.await
 			.unwrap_err()
 			.to_string();

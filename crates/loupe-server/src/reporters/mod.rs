@@ -38,7 +38,7 @@ pub struct ReportFinding {
 pub enum ReporterCredential {
 	None,
 	/// A personal access token stored for this repo.
-	GithubPat(String),
+	GithubPat(loupe_provenance::Secret<Vec<u8>>),
 	/// The server-wide GitHub App; the reporter mints a short-lived,
 	/// repo-scoped installation token from it per dispatch.
 	GithubApp(Box<github_app::GithubAppKey>),

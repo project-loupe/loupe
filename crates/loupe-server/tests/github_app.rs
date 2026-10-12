@@ -124,7 +124,7 @@ async fn put_app(admin: &reqwest::Client, app_id: u64, pem: &str) -> reqwest::Re
 		.json(&SetGithubAppRequest {
 			protocol_version: PROTOCOL_VERSION,
 			app_id,
-			private_key_pem: pem.to_owned(),
+			private_key_pem: loupe_provenance::Secret::new(pem.to_owned()),
 		})
 		.send()
 		.await
@@ -241,7 +241,7 @@ async fn worker_certificates_cannot_touch_the_github_app() {
 		.json(&SetGithubAppRequest {
 			protocol_version: PROTOCOL_VERSION,
 			app_id: 42,
-			private_key_pem: APP_PRIVATE_KEY_PEM.into(),
+			private_key_pem: loupe_provenance::Secret::new(APP_PRIVATE_KEY_PEM.into()),
 		})
 		.send()
 		.await

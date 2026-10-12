@@ -48,7 +48,7 @@ pub(super) fn fk_enabled(conn: &Connection) -> bool {
 
 pub(super) fn open(path: &Path) -> Connection {
 	let conn = Connection::open(path).unwrap();
-	conn.pragma_update(None, "key", format!("x'{}'", MasterKey::for_tests().to_hex())).unwrap();
+	conn.pragma_update(None, "key", MasterKey::for_tests().sqlcipher_key().expose()).unwrap();
 	conn.pragma_update(None, "journal_mode", "WAL").unwrap();
 	conn.pragma_update(None, "foreign_keys", true).unwrap();
 	conn

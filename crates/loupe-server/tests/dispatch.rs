@@ -615,7 +615,7 @@ async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
 		.json(&SetGithubAppRequest {
 			protocol_version: PROTOCOL_VERSION,
 			app_id: STUB_APP_ID,
-			private_key_pem: APP_PRIVATE_KEY_PEM.into(),
+			private_key_pem: loupe_provenance::Secret::new(APP_PRIVATE_KEY_PEM.into()),
 		})
 		.send()
 		.await
@@ -777,7 +777,7 @@ async fn dispatch_refuses_app_mode_targets_outside_the_owner_allowlist() {
 		.json(&SetGithubAppRequest {
 			protocol_version: PROTOCOL_VERSION,
 			app_id: STUB_APP_ID,
-			private_key_pem: APP_PRIVATE_KEY_PEM.into(),
+			private_key_pem: loupe_provenance::Secret::new(APP_PRIVATE_KEY_PEM.into()),
 		})
 		.send()
 		.await

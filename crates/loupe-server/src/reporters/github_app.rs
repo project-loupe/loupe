@@ -54,7 +54,7 @@ impl GithubAppKey {
 	pub fn from_pem(app_id: u64, pem: &str) -> Result<Self> {
 		let mut bytes = pem.as_bytes();
 		let key = rustls_pemfile::private_key(&mut bytes)
-			.context("reading GitHub App private key PEM")?
+			.map_err(|_| anyhow!("invalid GitHub App private key PEM"))?
 			.ok_or_else(|| anyhow!("GitHub App private key PEM contains no private key"))?;
 		let key_pair = match key {
 			PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
@@ -397,6 +397,18 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 		assert!(err.contains("must be RSA"), "error: {err}");
 		let err = GithubAppKey::from_pem(1, "not a pem at all").unwrap_err().to_string();
 		assert!(err.contains("contains no private key"), "error: {err}");
+	}
+
+	#[test]
+	fn credential_malformed_private_pem_errors_do_not_reflect_bytes() {
+		let pem = "-----BEGIN FAKE_PRIVATE_PEM_SENTINEL\n";
+		let error = GithubAppKey::from_pem(42, pem).unwrap_err();
+		for formatted in [format!("{error}"), format!("{error:#}"), format!("{error:?}")] {
+			assert!(
+				!formatted.contains("FAKE_PRIVATE_PEM_SENTINEL"),
+				"private-key parser errors must not reflect private PEM bytes"
+			);
+		}
 	}
 
 	#[test]

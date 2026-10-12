@@ -517,7 +517,7 @@ async fn github_app_set(
 	let req = SetGithubAppRequest {
 		protocol_version: PROTOCOL_VERSION,
 		app_id: a.app_id,
-		private_key_pem,
+		private_key_pem: loupe_provenance::Secret::new(private_key_pem),
 	};
 	let resp = client.put(url(base, "/v1/github-app")).json(&req).send().await?;
 	server_response(resp, "configure GitHub App").await?;

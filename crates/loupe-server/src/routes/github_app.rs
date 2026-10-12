@@ -27,7 +27,7 @@ pub async fn set(
 	if req.app_id == 0 {
 		return Err((StatusCode::BAD_REQUEST, "app_id must be positive".into()));
 	}
-	let key = GithubAppKey::from_pem(req.app_id, &req.private_key_pem)
+	let key = GithubAppKey::from_pem(req.app_id, req.private_key_pem.expose())
 		.map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid GitHub App private key: {e:#}")))?;
 	let info = state.github_reporter.verify_app(&key).await.map_err(|e| {
 		(StatusCode::BAD_REQUEST, format!("GitHub rejected the app credential: {e:#}"))
@@ -62,7 +62,7 @@ pub async fn get(
 ) -> Result<Json<GithubAppResponse>, (StatusCode, String)> {
 	let stored = state
 		.db
-		.with_conn(|c| Ok(github_app::get(c)?))
+		.with_conn(|c| Ok(github_app::summary(c)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("reading GitHub App: {e}")))?;
 	Ok(Json(GithubAppResponse {
 		protocol_version: PROTOCOL_VERSION,

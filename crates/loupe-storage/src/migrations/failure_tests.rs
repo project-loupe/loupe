@@ -219,7 +219,7 @@ fn v3_real_commit_failure_rolls_back_and_restores_foreign_keys() {
 	conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
 	conn.busy_timeout(std::time::Duration::ZERO).unwrap();
 	let reader = Connection::open(&path).unwrap();
-	reader.pragma_update(None, "key", format!("x'{}'", MasterKey::for_tests().to_hex())).unwrap();
+	reader.pragma_update(None, "key", MasterKey::for_tests().sqlcipher_key().expose()).unwrap();
 	reader.execute_batch("BEGIN; SELECT * FROM jobs;").unwrap();
 	let before = schema(&conn);
 	let mut reached_commit = false;

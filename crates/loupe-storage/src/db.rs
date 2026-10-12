@@ -72,7 +72,8 @@ impl Db {
 		// PRAGMA key MUST run before any other statement that touches
 		// pages: SQLCipher decrypts pages on read, so an unkeyed read
 		// against an encrypted file returns "file is not a database".
-		conn.pragma_update(None, "key", format!("x'{}'", key.to_hex()))?;
+		let sqlcipher_key = key.sqlcipher_key();
+		conn.pragma_update(None, "key", sqlcipher_key.expose())?;
 		conn.pragma_update(None, "journal_mode", "WAL")?;
 		conn.pragma_update(None, "foreign_keys", "ON")?;
 		conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -168,7 +169,7 @@ mod tests {
 		);
 		// Repair only the invalid rows and prove that every seeded kind opens.
 		let conn = Connection::open(&path).unwrap();
-		conn.pragma_update(None, "key", format!("x'{}'", key.to_hex())).unwrap();
+		conn.pragma_update(None, "key", key.sqlcipher_key().expose()).unwrap();
 		conn.execute("DELETE FROM jobs WHERE kind IN ('bogus-a', 'bogus-b')", []).unwrap();
 		drop(conn);
 		let db = Db::open(&path, &key).unwrap();
@@ -216,9 +217,19 @@ mod tests {
 		let key_a = MasterKey::from_bytes([0xAAu8; 32]);
 		let key_b = MasterKey::from_bytes([0xBBu8; 32]);
 		// Create + close.
-		{
-			let _db = Db::open(&path, &key_a).unwrap();
-		}
+		let id = {
+			let db = Db::open(&path, &key_a).unwrap();
+			db.with_conn(|c| {
+				Ok(crate::secrets::insert(
+					c,
+					crate::secrets::SecretKind::GithubPat,
+					"reopen",
+					b"fake_reopen_pat",
+					1,
+				)?)
+			})
+			.unwrap()
+		};
 		// Reopen with the wrong key — first migration query must fail.
 		let err = match Db::open(&path, &key_b) {
 			Err(e) => e,
@@ -229,6 +240,10 @@ mod tests {
 			msg.contains("not a database") || msg.contains("file is encrypted"),
 			"expected SQLCipher cipher error, got: {msg}"
 		);
+		// A correct-key reopen must still recover real content after the failed open.
+		let reopened = Db::open(&path, &key_a).unwrap();
+		let value = reopened.with_conn(|c| Ok(crate::secrets::read(c, id)?)).unwrap().unwrap();
+		assert_eq!(value.expose(), b"fake_reopen_pat");
 	}
 
 	#[test]

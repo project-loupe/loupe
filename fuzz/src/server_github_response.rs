@@ -156,7 +156,9 @@ pub fn do_test(data: &[u8]) {
 						expected.as_ref().and_then(|fields| fields.first()).and_then(Value::as_str),
 						Some(token.as_str())
 					);
-					let credential = ReporterCredential::GithubPat(token.clone());
+					let credential = ReporterCredential::GithubPat(loupe_provenance::Secret::new(
+						token.as_bytes().to_vec(),
+					));
 					assert_redacted(
 						&format!("{credential:?}"),
 						token.as_bytes(),

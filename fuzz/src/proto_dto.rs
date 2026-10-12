@@ -209,7 +209,22 @@ pub fn do_test(data: &[u8]) {
 				);
 			}
 		},
-		18 => roundtrip::<SetGithubAppRequest>(raw),
+		18 => {
+			if let Some((value, back)) = decode::<SetGithubAppRequest>(raw) {
+				assert_eq!(value.protocol_version, back.protocol_version);
+				assert_eq!(value.app_id, back.app_id);
+				assert!(
+					bool::from(
+						value
+							.private_key_pem
+							.expose()
+							.as_bytes()
+							.ct_eq(back.private_key_pem.expose().as_bytes())
+					),
+					"App private PEM changed during wire round trip"
+				);
+			}
+		},
 		19 => roundtrip::<GithubAppSummary>(raw),
 		20 => roundtrip::<GithubAppResponse>(raw),
 		21 => roundtrip::<UpdateRepoRequest>(raw),

@@ -155,9 +155,8 @@ pub fn run_init_with_options(
 			// Persist as 64-char lowercase hex — same shape `serve` expects
 			// on disk and what an operator would paste into `PRAGMA key`.
 			if options.persist_secrets {
-				let mut bytes = k.to_hex().into_bytes();
-				bytes.push(b'\n');
-				write_secret(&layout.master_key, &bytes)?;
+				let hex = k.to_hex();
+				write_secret_parts(&layout.master_key, &[hex.expose().as_bytes(), b"\n"])?;
 			}
 			(k, true)
 		},
@@ -184,21 +183,26 @@ pub fn run_init_with_options(
 }
 
 fn write_secret(path: &Path, contents: &[u8]) -> Result<()> {
+	write_secret_parts(path, &[contents])
+}
+
+fn write_secret_parts(path: &Path, parts: &[&[u8]]) -> Result<()> {
+	use std::io::Write;
 	#[cfg(unix)]
-	{
-		use std::io::Write;
+	let mut file = {
 		use std::os::unix::fs::OpenOptionsExt;
-		let mut f = std::fs::OpenOptions::new()
+		std::fs::OpenOptions::new()
 			.write(true)
 			.create_new(true)
 			.mode(0o600)
 			.open(path)
-			.with_context(|| format!("creating {}", path.display()))?;
-		f.write_all(contents).with_context(|| format!("writing {}", path.display()))?;
-	}
+			.with_context(|| format!("creating {}", path.display()))?
+	};
 	#[cfg(not(unix))]
-	{
-		std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+	let mut file =
+		std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+	for part in parts {
+		file.write_all(part).with_context(|| format!("writing {}", path.display()))?;
 	}
 	Ok(())
 }
@@ -232,8 +236,17 @@ mod tests {
 		// master.key must be 64 hex chars + newline.
 		let raw = std::fs::read_to_string(&out.layout.master_key).unwrap();
 		let trimmed = raw.trim_end();
+		assert_eq!(raw.len(), 65);
+		assert_eq!(raw.as_bytes().last(), Some(&b'\n'));
 		assert_eq!(trimmed.len(), 64);
 		assert!(trimmed.chars().all(|c| c.is_ascii_hexdigit()));
+		assert_eq!(trimmed, out.master_key.to_hex().expose());
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mode = std::fs::metadata(&out.layout.master_key).unwrap().permissions().mode();
+			assert_eq!(mode & 0o777, 0o600);
+		}
 
 		// Admin bundle must be parseable as a real cert.
 		assert!(out.admin_bundle.cert_pem.contains("BEGIN CERTIFICATE"));
@@ -267,6 +280,7 @@ mod tests {
 		// DB only opens with the same key — proves init actually used it.
 		let same = MasterKey::from_bytes([0x42u8; 32]);
 		assert!(Db::open(&out.layout.db_path, &same).is_ok());
+		assert!(Db::open(&out.layout.db_path, &MasterKey::from_bytes([0x43; 32])).is_err());
 	}
 
 	#[test]

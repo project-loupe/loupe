@@ -181,25 +181,33 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 
 fn print_init_env(out: &loupe_server::init::InitOutput) {
 	for (name, value) in init_env_assignments(out) {
-		println!("{name}={value}");
+		println!("{name}={}", value.expose());
 	}
 }
 
-fn init_env_assignments(out: &loupe_server::init::InitOutput) -> Vec<(&'static str, String)> {
-	vec![
-		("LOUPE_MASTER_KEY", out.master_key.to_hex()),
-		("LOUPE_SERVER_CERT_PEM_B64", b64(&out.server_bundle.cert_pem)),
-		("LOUPE_SERVER_KEY_PEM_B64", b64(&out.server_bundle.key_pem)),
-		("LOUPE_CA_CERT_PEM_B64", b64(&out.ca_cert_pem)),
-		("LOUPE_CA_KEY_PEM_B64", b64(&out.ca_key_pem)),
-		("LOUPE_ADMIN_CERT_PEM_B64", b64(&out.admin_bundle.cert_pem)),
-		("LOUPE_ADMIN_KEY_PEM_B64", b64(&out.admin_bundle.key_pem)),
-	]
+fn init_env_assignments(
+	out: &loupe_server::init::InitOutput,
+) -> impl Iterator<Item = (&'static str, loupe_provenance::Secret<String>)> + '_ {
+	// Guard each encoded allocation and retire it after its one export.
+	std::iter::once_with(|| ("LOUPE_MASTER_KEY", out.master_key.to_hex())).chain(
+		[
+			("LOUPE_SERVER_CERT_PEM_B64", &out.server_bundle.cert_pem),
+			("LOUPE_SERVER_KEY_PEM_B64", &out.server_bundle.key_pem),
+			("LOUPE_CA_CERT_PEM_B64", &out.ca_cert_pem),
+			("LOUPE_CA_KEY_PEM_B64", &out.ca_key_pem),
+			("LOUPE_ADMIN_CERT_PEM_B64", &out.admin_bundle.cert_pem),
+			("LOUPE_ADMIN_KEY_PEM_B64", &out.admin_bundle.key_pem),
+		]
+		.into_iter()
+		.map(|(name, value)| (name, b64(value))),
+	)
 }
 
-fn b64(value: &str) -> String {
+fn b64(value: &str) -> loupe_provenance::Secret<String> {
 	use base64::Engine as _;
-	base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+	loupe_provenance::Secret::new(
+		base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+	)
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -341,13 +349,16 @@ fn init_tracing() {
 /// init` writes to `master.key`). `Ok(None)` if the variable is unset.
 fn read_master_key_from_env() -> Result<Option<MasterKey>> {
 	let Ok(raw) = std::env::var("LOUPE_MASTER_KEY") else { return Ok(None) };
-	Ok(Some(parse_master_key_hex(raw.trim()).context("LOUPE_MASTER_KEY")?))
+	let raw = loupe_provenance::Secret::new(raw);
+	Ok(Some(parse_master_key_hex(raw.expose().trim()).context("LOUPE_MASTER_KEY")?))
 }
 
 fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
-	let raw = std::fs::read_to_string(path)
-		.with_context(|| format!("reading master key file at {}", path.display()))?;
-	parse_master_key_hex(raw.trim())
+	let raw = loupe_provenance::Secret::new(
+		std::fs::read_to_string(path)
+			.with_context(|| format!("reading master key file at {}", path.display()))?,
+	);
+	parse_master_key_hex(raw.expose().trim())
 		.with_context(|| format!("master key file at {}", path.display()))
 }
 
@@ -386,7 +397,9 @@ fn parse_master_key_hex(s: &str) -> Result<MasterKey> {
 		let lo = u8::from_str_radix(&s[i * 2 + 1..i * 2 + 2], 16).expect("ascii hex digit");
 		*byte = (hi << 4) | lo;
 	}
-	Ok(MasterKey::from_bytes(bytes))
+	let key = MasterKey::from_bytes(bytes);
+	loupe_provenance::Zeroise::zeroise(&mut bytes);
+	Ok(key)
 }
 
 #[cfg(test)]
@@ -431,7 +444,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let assignments = init_env_assignments(&out);
+		let assignments: Vec<_> = init_env_assignments(&out).collect();
 		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
 		assert_eq!(
 			names,
@@ -446,14 +459,35 @@ mod tests {
 			]
 		);
 		for (name, value) in &assignments {
-			assert!(!value.is_empty(), "{name} value must be present");
-			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+			assert!(!value.expose().is_empty(), "{name} value must be present");
+			assert!(!value.expose().contains('\n'), "{name} value must fit dotenv/env-file syntax");
 		}
-		assert_eq!(assignments[0].1, out.master_key.to_hex());
+		assert_eq!(assignments[0].1.expose(), out.master_key.to_hex().expose());
+		let exported_key = parse_master_key_hex(assignments[0].1.expose()).unwrap();
+		let reopened = loupe_storage::Db::open(&out.layout.db_path, &exported_key).unwrap();
+		let admin_count = reopened
+			.with_conn(|c| {
+				Ok(c.query_row("SELECT COUNT(*) FROM workers WHERE kind = 'admin'", [], |row| {
+					row.get::<_, i64>(0)
+				})?)
+			})
+			.unwrap();
+		assert_eq!(admin_count, 1, "exported master key must recover the initialized database");
 
 		use base64::Engine as _;
 		let server_cert =
-			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
+			base64::engine::general_purpose::STANDARD.decode(assignments[1].1.expose()).unwrap();
 		assert_eq!(String::from_utf8(server_cert).unwrap(), out.server_bundle.cert_pem);
+		for ((_, encoded), expected) in assignments.iter().skip(2).zip([
+			&out.server_bundle.key_pem,
+			&out.ca_cert_pem,
+			&out.ca_key_pem,
+			&out.admin_bundle.cert_pem,
+			&out.admin_bundle.key_pem,
+		]) {
+			let decoded =
+				base64::engine::general_purpose::STANDARD.decode(encoded.expose()).unwrap();
+			assert_eq!(decoded, expected.as_bytes(), "export bytes must be preserved");
+		}
 	}
 }

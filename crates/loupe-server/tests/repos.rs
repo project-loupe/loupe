@@ -65,7 +65,7 @@ fn store_github_app(db: &Db) {
 			&StoredGithubApp {
 				app_id: 4242,
 				slug: "loupe-reporter".into(),
-				private_key_pem: APP_PRIVATE_KEY_PEM.into(),
+				private_key_pem: loupe_provenance::Secret::new(APP_PRIVATE_KEY_PEM.into()),
 			},
 			0,
 		)?)
@@ -148,7 +148,7 @@ fn repo_reporting(db: &Db, repo_id: i64) -> ReportingDestination {
 	serde_json::from_str(&reporting_json).unwrap()
 }
 
-fn secret_value(db: &Db, id: i64) -> Option<Vec<u8>> {
+fn secret_value(db: &Db, id: i64) -> Option<loupe_provenance::Secret<Vec<u8>>> {
 	db.with_conn(|c| Ok(secrets::read(c, id)?)).unwrap()
 }
 
@@ -379,7 +379,7 @@ async fn admin_can_rotate_a_repo_github_pat() {
 		},
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
-	assert_eq!(secret_value(&f.db, old_secret_id).unwrap(), b"ghp_old");
+	assert_eq!(secret_value(&f.db, old_secret_id).unwrap().expose(), b"ghp_old");
 
 	let req = RotateRepoPatRequest {
 		protocol_version: PROTOCOL_VERSION,
@@ -406,8 +406,8 @@ async fn admin_can_rotate_a_repo_github_pat() {
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
 	assert_ne!(new_secret_id, old_secret_id);
-	assert_eq!(secret_value(&f.db, new_secret_id).unwrap(), b"ghp_new");
-	assert_eq!(secret_value(&f.db, old_secret_id), None);
+	assert_eq!(secret_value(&f.db, new_secret_id).unwrap().expose(), b"ghp_new");
+	assert!(secret_value(&f.db, old_secret_id).is_none());
 
 	f.handle.shutdown().await;
 }
@@ -472,7 +472,7 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		},
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
-	assert_eq!(secret_value(&f.db, first_secret_id).unwrap(), b"ghp_first");
+	assert_eq!(secret_value(&f.db, first_secret_id).unwrap().expose(), b"ghp_first");
 
 	let req = SetRepoGithubReportingRequest {
 		protocol_version: PROTOCOL_VERSION,
@@ -500,8 +500,8 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
 	assert_ne!(second_secret_id, first_secret_id);
-	assert_eq!(secret_value(&f.db, second_secret_id).unwrap(), b"ghp_second");
-	assert_eq!(secret_value(&f.db, first_secret_id), None);
+	assert_eq!(secret_value(&f.db, second_secret_id).unwrap().expose(), b"ghp_second");
+	assert!(secret_value(&f.db, first_secret_id).is_none());
 
 	f.handle.shutdown().await;
 }
@@ -621,7 +621,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		ReportingDestination::GithubIssue { pat_secret_id: Some(id), .. } => id,
 		other => panic!("expected a PAT-backed destination, got {other:?}"),
 	};
-	assert_eq!(secret_value(&f.db, old_secret_id).unwrap(), b"ghp_old");
+	assert_eq!(secret_value(&f.db, old_secret_id).unwrap().expose(), b"ghp_old");
 
 	let req = SetRepoGithubReportingRequest {
 		protocol_version: PROTOCOL_VERSION,
@@ -644,7 +644,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 			pat_secret_id: None,
 		}
 	);
-	assert_eq!(secret_value(&f.db, old_secret_id), None, "orphaned PAT must be dropped");
+	assert!(secret_value(&f.db, old_secret_id).is_none(), "orphaned PAT must be dropped");
 
 	let listing: ListReposResponse =
 		admin.get("https://loupe-server/v1/repos").send().await.unwrap().json().await.unwrap();
@@ -684,7 +684,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 	assert_eq!(resp.status(), 204);
 	match repo_reporting(&f.db, repo_id) {
 		ReportingDestination::GithubIssue { pat_secret_id: Some(id), .. } => {
-			assert_eq!(secret_value(&f.db, id).unwrap(), b"ghp_back");
+			assert_eq!(secret_value(&f.db, id).unwrap().expose(), b"ghp_back");
 		},
 		other => panic!("expected a PAT-backed destination, got {other:?}"),
 	}

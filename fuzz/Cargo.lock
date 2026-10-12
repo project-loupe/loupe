@@ -1087,6 +1087,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "loupe-core",
+ "loupe-provenance",
  "rand_core 0.6.4",
  "rusqlite",
  "serde",

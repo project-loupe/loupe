@@ -116,11 +116,22 @@ pub struct SetRepoGithubReportingRequest {
 /// the same way repo registration carries a PAT; the server verifies it
 /// against GitHub and moves it into the `secrets` table. The key never
 /// travels back out in any response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SetGithubAppRequest {
 	pub protocol_version: u16,
 	pub app_id: u64,
-	pub private_key_pem: String,
+	#[serde(with = "crate::secret_serde::string")]
+	pub private_key_pem: Secret<String>,
+}
+
+impl std::fmt::Debug for SetGithubAppRequest {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SetGithubAppRequest")
+			.field("protocol_version", &self.protocol_version)
+			.field("app_id", &self.app_id)
+			.field("private_key_pem", &self.private_key_pem)
+			.finish()
+	}
 }
 
 /// Non-secret view of the configured GitHub App.
@@ -297,6 +308,30 @@ mod tests {
 
 	use super::*;
 
+	#[test]
+	fn credential_app_request_debug_redacts_private_pem() {
+		let request: super::SetGithubAppRequest = serde_json::from_str(
+			r#"{"protocol_version":1,"app_id":42,"private_key_pem":"FAKE_APP_REQUEST_SENTINEL"}"#,
+		)
+		.unwrap();
+		for formatted in [format!("{request:?}"), format!("{request:#?}")] {
+			assert!(
+				!formatted.contains("FAKE_APP_REQUEST_SENTINEL"),
+				"App request Debug must not expose private PEM"
+			);
+		}
+	}
+
+	#[test]
+	fn app_request_wire_roundtrip_preserves_all_fields() {
+		let wire = serde_json::json!({
+			"protocol_version": super::PROTOCOL_VERSION,
+			"app_id": 42,
+			"private_key_pem": "FAKE_APP_WIRE_SENTINEL\n",
+		});
+		let request: super::SetGithubAppRequest = serde_json::from_value(wire.clone()).unwrap();
+		assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+	}
 	#[test]
 	fn register_repo_request_round_trips() {
 		let req = RegisterRepoRequest {

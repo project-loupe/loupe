@@ -1015,9 +1015,9 @@ fn reporter_credential(
 				.db
 				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
 				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
-			let pat =
-				String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?;
-			Ok(reporters::ReporterCredential::GithubPat(pat))
+			std::str::from_utf8(bytes.expose())
+				.map_err(|_| anyhow::anyhow!("stored PAT is not valid UTF-8"))?;
+			Ok(reporters::ReporterCredential::GithubPat(bytes))
 		},
 		ReportingDestination::GithubIssue { pat_secret_id: None, target_owner, .. } => {
 			// Enforced again here, not only at registration, so tightening
@@ -1037,7 +1037,7 @@ fn reporter_credential(
 				})?;
 			let key = reporters::github_app::GithubAppKey::from_pem(
 				stored.app_id,
-				&stored.private_key_pem,
+				stored.private_key_pem.expose(),
 			)?;
 			Ok(reporters::ReporterCredential::GithubApp(Box::new(key)))
 		},
