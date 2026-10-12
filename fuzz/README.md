@@ -282,6 +282,12 @@ boundaries even when their producer is authenticated or runs locally.
 
 ## Targets and coverage
 
+The fuzz lockfile pins serde, serde_json and Clap (including their companion
+packages) to the product lockfile's versions. Keep these aligned when updating
+dependencies so direct parser campaigns exercise the parser versions we ship.
+Fuzz-only feature unification is still separate from normal per-crate checks;
+both remain required validation inputs.
+
 Implemented targets (each corpus includes valid and malformed inputs):
 
 | Target | Assertions |
