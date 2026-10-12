@@ -26,6 +26,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use loupe_provenance::Secret;
 use tokio::net::UnixListener;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -89,18 +90,55 @@ impl ModelProvider {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CredentialKind {
+pub(super) enum CredentialKind {
 	AnthropicApiKey,
 	AnthropicOAuthToken,
 	OpenAiApiKey,
 }
 
-/// Host-held provider authentication. Deliberately does not implement
-/// `Debug`, so logging a broker configuration cannot print the secret.
-#[derive(Clone)]
+/// Host-held provider authentication with a shared, erased-on-drop owner.
 pub struct ModelCredential {
 	kind: CredentialKind,
-	secret: String,
+	secret: Arc<Secret<String>>,
+}
+
+impl Clone for ModelCredential {
+	fn clone(&self) -> Self {
+		Self { kind: self.kind, secret: Arc::clone(&self.secret) }
+	}
+}
+
+impl std::fmt::Debug for ModelCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+
+impl std::fmt::Display for ModelCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+
+// Only this private HTTP-egress adapter exposes bytes to Bytes/HTTP. API keys
+// borrow the shared raw owner; Bearer headers own one guarded prefixed buffer.
+enum ModelHeaderOwner {
+	ApiKey(Arc<Secret<String>>),
+	Bearer(Secret<Vec<u8>>),
+}
+
+impl AsRef<[u8]> for ModelHeaderOwner {
+	fn as_ref(&self) -> &[u8] {
+		match self {
+			Self::ApiKey(secret) => secret.expose().as_bytes(),
+			Self::Bearer(secret) => secret.expose(),
+		}
+	}
+}
+
+struct ModelAuthHeader {
+	name: HeaderName,
+	value: HeaderValue,
 }
 
 /// Worker-owned ingredients reused to create a fresh broker session for
@@ -146,19 +184,23 @@ pub fn bind_model_into_sandbox(
 
 impl ModelCredential {
 	pub fn anthropic_api_key(secret: impl Into<String>) -> Self {
-		Self { kind: CredentialKind::AnthropicApiKey, secret: secret.into() }
+		Self::from_secret(CredentialKind::AnthropicApiKey, Secret::new(secret.into()))
 	}
 
 	pub fn anthropic_oauth_token(secret: impl Into<String>) -> Self {
-		Self { kind: CredentialKind::AnthropicOAuthToken, secret: secret.into() }
+		Self::from_secret(CredentialKind::AnthropicOAuthToken, Secret::new(secret.into()))
 	}
 
 	pub fn openai_api_key(secret: impl Into<String>) -> Self {
-		Self { kind: CredentialKind::OpenAiApiKey, secret: secret.into() }
+		Self::from_secret(CredentialKind::OpenAiApiKey, Secret::new(secret.into()))
 	}
 
-	fn validate_for(&self, provider: ModelProvider) -> Result<()> {
-		if self.secret.is_empty() {
+	pub(super) fn from_secret(kind: CredentialKind, secret: Secret<String>) -> Self {
+		Self { kind, secret: Arc::new(secret) }
+	}
+
+	fn prepare_for(&self, provider: ModelProvider) -> Result<ModelAuthHeader> {
+		if self.secret.expose().is_empty() {
 			anyhow::bail!("model broker credential must not be empty");
 		}
 		let matches = matches!(
@@ -170,9 +212,24 @@ impl ModelCredential {
 		if !matches {
 			anyhow::bail!("model broker credential does not match the configured provider");
 		}
-		HeaderValue::from_str(&self.secret)
+		let (name, owner) = match self.kind {
+			CredentialKind::AnthropicApiKey => (
+				HeaderName::from_static("x-api-key"),
+				ModelHeaderOwner::ApiKey(Arc::clone(&self.secret)),
+			),
+			CredentialKind::AnthropicOAuthToken | CredentialKind::OpenAiApiKey => {
+				let mut bytes = Vec::with_capacity(b"Bearer ".len() + self.secret.expose().len());
+				bytes.extend_from_slice(b"Bearer ");
+				bytes.extend_from_slice(self.secret.expose().as_bytes());
+				(AUTHORIZATION, ModelHeaderOwner::Bearer(Secret::new(bytes)))
+			},
+		};
+		// Actual Bytes preserves the guarded owner through HTTP header clones.
+		// Sensitivity controls formatting; HTTP/TLS/kernel copies are opaque.
+		let mut value = HeaderValue::from_maybe_shared(Bytes::from_owner(owner))
 			.context("model broker credential is not valid as an HTTP header value")?;
-		Ok(())
+		value.set_sensitive(true);
+		Ok(ModelAuthHeader { name, value })
 	}
 }
 
@@ -306,7 +363,7 @@ impl LimitKind {
 struct BrokerState {
 	backend: ModelBrokerBackend,
 	upstream: reqwest::Url,
-	credential: ModelCredential,
+	auth: ModelAuthHeader,
 	limits: ModelBrokerLimits,
 	usage: Arc<UsageCounters>,
 	http: reqwest::Client,
@@ -327,7 +384,7 @@ impl ModelBrokerSession {
 		limits: ModelBrokerLimits,
 	) -> Result<Self> {
 		limits.validate()?;
-		credential.validate_for(backend.provider())?;
+		let auth = credential.prepare_for(backend.provider())?;
 		if !matches!(upstream.scheme(), "http" | "https") || upstream.host_str().is_none() {
 			anyhow::bail!("model broker upstream must be an HTTP(S) URL with a host");
 		}
@@ -350,14 +407,8 @@ impl ModelBrokerSession {
 			.redirect(reqwest::redirect::Policy::none())
 			.build()
 			.context("building model broker HTTP client")?;
-		let state = Arc::new(BrokerState {
-			backend,
-			upstream,
-			credential,
-			limits,
-			usage: usage.clone(),
-			http,
-		});
+		let state =
+			Arc::new(BrokerState { backend, upstream, auth, limits, usage: usage.clone(), http });
 		let shutdown = CancellationToken::new();
 		let task_shutdown = shutdown.clone();
 		let task = tokio::spawn(serve_session(listener, state, task_shutdown));
@@ -488,7 +539,7 @@ async fn handle_request(
 	}
 	let query = query.map(str::to_owned);
 
-	let headers = sanitize_request_headers(request.headers(), &state.credential)?;
+	let headers = sanitize_request_headers(request.headers(), &state.auth);
 	let body = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES).collect().await {
 		Ok(body) => body.to_bytes(),
 		Err(_) => {
@@ -543,9 +594,7 @@ async fn handle_request(
 	Ok(stream_upstream_response(response, state))
 }
 
-fn sanitize_request_headers(
-	headers: &HeaderMap, credential: &ModelCredential,
-) -> Result<HeaderMap> {
+fn sanitize_request_headers(headers: &HeaderMap, auth: &ModelAuthHeader) -> HeaderMap {
 	let connection_headers = connection_header_names(headers);
 	let mut sanitized = HeaderMap::new();
 	for (name, value) in headers {
@@ -553,19 +602,8 @@ fn sanitize_request_headers(
 			sanitized.append(name.clone(), value.clone());
 		}
 	}
-	let secret = HeaderValue::from_str(&credential.secret)
-		.context("model broker credential is not valid as an HTTP header value")?;
-	match credential.kind {
-		CredentialKind::AnthropicApiKey => {
-			sanitized.insert(HeaderName::from_static("x-api-key"), secret);
-		},
-		CredentialKind::AnthropicOAuthToken | CredentialKind::OpenAiApiKey => {
-			let bearer = HeaderValue::from_str(&format!("Bearer {}", credential.secret))
-				.context("model broker bearer credential is not a valid HTTP header value")?;
-			sanitized.insert(AUTHORIZATION, bearer);
-		},
-	}
-	Ok(sanitized)
+	sanitized.insert(auth.name.clone(), auth.value.clone());
+	sanitized
 }
 
 fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
@@ -855,7 +893,6 @@ fn empty_response(status: StatusCode) -> Response<BrokerBody> {
 #[cfg(fuzzing)]
 pub mod fuzzing {
 	use super::*;
-
 	pub fn request_policy(body: &[u8], backend: &ModelBrokerBackend) -> Option<Vec<u8>> {
 		enforce_request_policy(&Bytes::copy_from_slice(body), backend)
 			.ok()
@@ -904,6 +941,234 @@ mod tests {
 	use tokio::sync::Mutex;
 
 	use super::*;
+
+	fn credential_headers(headers: &HeaderMap, credential: &ModelCredential) -> Result<HeaderMap> {
+		let provider = match credential.kind {
+			CredentialKind::AnthropicApiKey | CredentialKind::AnthropicOAuthToken => {
+				ModelProvider::Claude
+			},
+			CredentialKind::OpenAiApiKey => ModelProvider::Codex,
+		};
+		Ok(sanitize_request_headers(headers, &credential.prepare_for(provider)?))
+	}
+
+	// Runtime ownership/header regressions and environment compatibility.
+	// These formatter/owner APIs are new acceptance checks, not old leak claims.
+	#[test]
+	fn model_credential_formatting_is_exactly_redacted() {
+		let credential = ModelCredential::openai_api_key("format-canary");
+		assert_eq!(format!("{credential:?}"), "[redacted]");
+		assert_eq!(format!("{credential}"), "[redacted]");
+	}
+
+	#[test]
+	fn model_api_header_owns_the_shared_allocation_until_last_clone_drops() {
+		let credential = ModelCredential::anthropic_api_key("synthetic-long-key-".repeat(1024));
+		let weak = Arc::downgrade(&credential.secret);
+		let header = credential.prepare_for(ModelProvider::Claude).unwrap();
+		assert_eq!(header.value.as_bytes().as_ptr(), credential.secret.expose().as_ptr());
+		let clone = header.value.clone();
+		assert_eq!(header.value.as_bytes().as_ptr(), clone.as_bytes().as_ptr());
+		drop(credential);
+		assert!(weak.upgrade().is_some());
+		drop(header);
+		assert!(weak.upgrade().is_some());
+		assert!(clone.is_sensitive());
+		assert_eq!(clone.as_bytes(), "synthetic-long-key-".repeat(1024).as_bytes());
+		drop(clone);
+		assert!(weak.upgrade().is_none(), "last header clone retained its source owner");
+	}
+
+	#[test]
+	fn model_bearer_header_clones_share_the_prepared_prefixed_bytes() {
+		let credential = ModelCredential::openai_api_key("synthetic-bearer");
+		let weak = Arc::downgrade(&credential.secret);
+		let header = credential.prepare_for(ModelProvider::Codex).unwrap();
+		let clone = header.value.clone();
+		assert_eq!(header.value.as_bytes().as_ptr(), clone.as_bytes().as_ptr());
+		drop(credential);
+		assert!(weak.upgrade().is_none(), "prepared bearer needlessly retained raw source");
+		drop(header);
+		assert!(clone.is_sensitive());
+		assert_eq!(clone.as_bytes(), b"Bearer synthetic-bearer");
+	}
+
+	#[tokio::test]
+	async fn model_context_session_retains_api_owner_until_shutdown() {
+		let credential = ModelCredential::anthropic_api_key("session-owner");
+		let weak = Arc::downgrade(&credential.secret);
+		let context = ModelBrokerContext::new(
+			"unused-worker".into(),
+			"http://127.0.0.1:1".parse().unwrap(),
+			credential,
+			limits(),
+		);
+		let cloned = context.clone();
+		assert!(Arc::ptr_eq(&context.credential.secret, &cloned.credential.secret));
+		let session = cloned.start_session(claude_backend()).await.unwrap();
+		drop(context);
+		drop(cloned);
+		assert!(weak.upgrade().is_some());
+		session.finish().await.unwrap();
+		assert!(weak.upgrade().is_none());
+	}
+
+	#[test]
+	fn model_credential_clone_shares_raw_allocation() {
+		let original = ModelCredential::anthropic_api_key("synthetic-model-key-".repeat(1024));
+		let cloned = original.clone();
+		assert_eq!(original.secret.expose(), cloned.secret.expose());
+		assert_eq!(
+			original.secret.expose().as_ptr(),
+			cloned.secret.expose().as_ptr(),
+			"ModelCredential Clone duplicated the raw secret allocation"
+		);
+	}
+
+	#[test]
+	fn model_api_key_header_is_sensitive() {
+		let headers = credential_headers(
+			&HeaderMap::new(),
+			&ModelCredential::anthropic_api_key("synthetic-api-key"),
+		)
+		.unwrap();
+		let header = &headers["x-api-key"];
+		assert_eq!(header.as_bytes(), b"synthetic-api-key");
+		assert!(header.is_sensitive(), "generated API-key header is not sensitive");
+	}
+
+	#[test]
+	fn model_bearer_header_is_sensitive() {
+		for credential in [
+			ModelCredential::anthropic_oauth_token("synthetic-oauth"),
+			ModelCredential::openai_api_key("synthetic-oauth"),
+		] {
+			let headers = credential_headers(&HeaderMap::new(), &credential).unwrap();
+			let header = &headers[AUTHORIZATION];
+			assert_eq!(header.as_bytes(), b"Bearer synthetic-oauth");
+			assert!(header.is_sensitive(), "generated Bearer header is not sensitive");
+		}
+	}
+
+	#[test]
+	fn model_credential_header_admission_preserves_exact_bytes() {
+		for value in ["\tkey\t", " key ", "clé-秘密", " ", &"long-key".repeat(4096)] {
+			for (credential, provider, name, expected) in [
+				(
+					ModelCredential::anthropic_api_key(value),
+					ModelProvider::Claude,
+					"x-api-key",
+					value.to_owned(),
+				),
+				(
+					ModelCredential::anthropic_oauth_token(value),
+					ModelProvider::Claude,
+					"authorization",
+					format!("Bearer {value}"),
+				),
+				(
+					ModelCredential::openai_api_key(value),
+					ModelProvider::Codex,
+					"authorization",
+					format!("Bearer {value}"),
+				),
+			] {
+				credential.prepare_for(provider).unwrap();
+				let headers = credential_headers(&HeaderMap::new(), &credential).unwrap();
+				assert_eq!(headers[name].as_bytes(), expected.as_bytes());
+			}
+		}
+		for value in ["", "key\0", "key\r", "key\n", "key\u{7f}"] {
+			assert!(ModelCredential::anthropic_api_key(value)
+				.prepare_for(ModelProvider::Claude)
+				.is_err());
+			assert!(ModelCredential::openai_api_key(value)
+				.prepare_for(ModelProvider::Codex)
+				.is_err());
+		}
+		assert!(ModelCredential::openai_api_key("valid")
+			.prepare_for(ModelProvider::Claude)
+			.is_err());
+		assert!(ModelCredential::anthropic_api_key("valid")
+			.prepare_for(ModelProvider::Codex)
+			.is_err());
+	}
+
+	#[test]
+	fn model_environment_selection_preserves_precedence_and_invalid_utf8() {
+		use std::ffi::{OsStr, OsString};
+		use std::os::unix::ffi::OsStringExt;
+
+		use crate::test_env::in_env;
+		let invalid = OsString::from_vec(b"synthetic-invalid-\xff".to_vec());
+		for (provider, preferred, fallback) in [
+			("claude", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+			("codex", "CODEX_API_KEY", "OPENAI_API_KEY"),
+		] {
+			for (case, primary, secondary, expected, present) in [
+				(
+					"preferred",
+					Some(OsStr::new("preferred")),
+					Some(OsStr::new("fallback")),
+					Some("preferred"),
+					true,
+				),
+				("fallback", None, Some(OsStr::new("fallback")), Some("fallback"), true),
+				(
+					"empty",
+					Some(OsStr::new("")),
+					Some(OsStr::new("fallback")),
+					Some("fallback"),
+					true,
+				),
+				("missing", None, None, None, false),
+				("invalid", Some(invalid.as_os_str()), Some(OsStr::new("fallback")), None, true),
+			] {
+				if !in_env("llm::model_broker::tests::model_environment_selection_preserves_precedence_and_invalid_utf8", &format!("{provider}-{case}"), &[(preferred, primary), (fallback, secondary)]) {
+					continue;
+				}
+				let runtime = super::super::ModelBrokerRuntimeConfig {
+					worker_binary: "unused-worker".into(),
+					limits: ModelBrokerLimits::default(),
+				};
+				let (available, result) = if provider == "claude" {
+					(
+						super::super::claude_auth_available(),
+						super::super::claude_model_broker_context(runtime),
+					)
+				} else {
+					(
+						super::super::codex_auth_available(),
+						super::super::codex_model_broker_context(runtime),
+					)
+				};
+				assert_eq!(available, present);
+				match expected {
+					Some(expected) => {
+						let context = result.unwrap();
+						assert_eq!(context.credential.secret.expose(), expected);
+						if provider == "claude" {
+							assert!(
+								context.credential.kind
+									== if case == "preferred" {
+										CredentialKind::AnthropicApiKey
+									} else {
+										CredentialKind::AnthropicOAuthToken
+									}
+							);
+						}
+					},
+					None => {
+						let error = result.err().expect("invalid/missing credential was accepted");
+						assert!(!format!("{error:#}").contains("synthetic-invalid"));
+						if case == "invalid" {
+							assert!(error.to_string().contains("valid UTF-8"));
+						}
+					},
+				}
+			}
+		}
+	}
 
 	#[derive(Clone, Debug)]
 	struct CapturedRequest {
@@ -1256,7 +1521,7 @@ mod tests {
 		headers.insert("x-api-key", HeaderValue::from_static("client-secret"));
 		headers.insert("x-retained", HeaderValue::from_static("ordinary"));
 		let sanitized =
-			sanitize_request_headers(&headers, &ModelCredential::anthropic_api_key("host-secret"))
+			credential_headers(&headers, &ModelCredential::anthropic_api_key("host-secret"))
 				.unwrap();
 		for name in denied {
 			assert!(!sanitized.contains_key(name), "forwarded denied header {name}");

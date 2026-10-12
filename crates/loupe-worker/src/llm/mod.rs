@@ -25,6 +25,7 @@ pub mod model_proxy;
 pub mod prompts;
 
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -35,8 +36,9 @@ use clap::ValueEnum;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
 use loupe_proto::JobCapability;
+use loupe_provenance::{Secret, Zeroise};
 pub use mcp::McpContext;
-use model_broker::{ModelBrokerContext, ModelBrokerLimits, ModelCredential};
+use model_broker::{CredentialKind, ModelBrokerContext, ModelBrokerLimits, ModelCredential};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
@@ -255,9 +257,9 @@ pub fn claude_auth_available() -> bool {
 
 fn claude_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<ModelBrokerContext> {
 	let credential = if let Some(secret) = utf8_env_value("ANTHROPIC_API_KEY")? {
-		ModelCredential::anthropic_api_key(secret)
+		ModelCredential::from_secret(CredentialKind::AnthropicApiKey, secret)
 	} else if let Some(secret) = utf8_env_value("CLAUDE_CODE_OAUTH_TOKEN")? {
-		ModelCredential::anthropic_oauth_token(secret)
+		ModelCredential::from_secret(CredentialKind::AnthropicOAuthToken, secret)
 	} else {
 		anyhow::bail!("Claude model broker requires ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN");
 	};
@@ -322,11 +324,7 @@ pub fn codex_available() -> bool {
 /// Return true when the worker has auth material the codex CLI can use
 /// without running an interactive login during a scan.
 pub fn codex_auth_available() -> bool {
-	codex_api_key_env().is_some()
-}
-
-pub(crate) fn codex_api_key_env() -> Option<OsString> {
-	env_value("CODEX_API_KEY").or_else(|| env_value("OPENAI_API_KEY"))
+	env_present("CODEX_API_KEY") || env_present("OPENAI_API_KEY")
 }
 
 fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<ModelBrokerContext> {
@@ -340,7 +338,7 @@ fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<Model
 	Ok(ModelBrokerContext::new(
 		runtime.worker_binary,
 		OPENAI_UPSTREAM_URL.parse().expect("static OpenAI upstream URL is valid"),
-		ModelCredential::openai_api_key(secret),
+		ModelCredential::from_secret(CredentialKind::OpenAiApiKey, secret),
 		runtime.limits,
 	))
 }
@@ -368,18 +366,38 @@ fn env_present(name: &str) -> bool {
 	env_value(name).is_some()
 }
 
-fn env_value(name: &str) -> Option<OsString> {
-	std::env::var_os(name).filter(|v| !v.is_empty())
+// Own every controllable getenv copy, including probes, empty values and
+// invalid UTF-8. The original process environment remains outside this owner.
+struct EnvironmentCredential(Vec<u8>);
+
+impl EnvironmentCredential {
+	fn new(value: OsString) -> Self {
+		Self(value.into_vec())
+	}
+
+	fn into_utf8(mut self, name: &str) -> Result<Secret<String>> {
+		match String::from_utf8(std::mem::take(&mut self.0)) {
+			Ok(value) => Ok(Secret::new(value)),
+			Err(error) => {
+				let _rejected = Secret::new(error.into_bytes());
+				anyhow::bail!("{name} must contain valid UTF-8 for HTTP authentication");
+			},
+		}
+	}
 }
 
-fn utf8_env_value(name: &str) -> Result<Option<String>> {
-	env_value(name)
-		.map(|value| {
-			value.into_string().map_err(|_| {
-				anyhow::anyhow!("{name} must contain valid UTF-8 for HTTP authentication")
-			})
-		})
-		.transpose()
+impl Drop for EnvironmentCredential {
+	fn drop(&mut self) {
+		self.0.zeroise();
+	}
+}
+
+fn env_value(name: &str) -> Option<EnvironmentCredential> {
+	std::env::var_os(name).map(EnvironmentCredential::new).filter(|value| !value.0.is_empty())
+}
+
+fn utf8_env_value(name: &str) -> Result<Option<Secret<String>>> {
+	env_value(name).map(|value| value.into_utf8(name)).transpose()
 }
 
 /// Build the scan [`LlmBackend`] according to the configured agent
@@ -551,6 +569,18 @@ fn build_codex_backend(
 mod tests {
 	use super::*;
 	use crate::test_env::in_env;
+
+	#[test]
+	fn environment_credential_moves_the_same_allocation_into_its_secret_owner() {
+		use std::os::unix::ffi::OsStringExt;
+		let raw = OsString::from_vec(b"synthetic-environment-key".to_vec());
+		let pointer = raw.as_encoded_bytes().as_ptr();
+		let guarded = EnvironmentCredential::new(raw);
+		assert_eq!(guarded.0.as_ptr(), pointer);
+		let secret = guarded.into_utf8("SYNTHETIC_KEY").unwrap();
+		assert_eq!(secret.expose().as_ptr(), pointer);
+		assert_eq!(secret.expose(), "synthetic-environment-key");
+	}
 
 	#[test]
 	fn provider_auth_checks_accept_api_keys() {
