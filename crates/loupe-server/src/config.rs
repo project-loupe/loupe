@@ -2,6 +2,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use loupe_core::source_migration::text::BoundedText;
+use loupe_core::text::policy::RepoOwner;
+use loupe_provenance::{Config as ConfigSource, Ingress, Mark, Untrusted, Unvalidated, Validate};
 use serde::Deserialize;
 
 /// Server configuration. Populated by `loupe-server`'s clap parser; lives
@@ -154,19 +157,103 @@ impl FileConfig {
 	pub fn load(path: &Path) -> Result<Self> {
 		let raw = std::fs::read_to_string(path)
 			.with_context(|| format!("reading config file {}", path.display()))?;
-		let mut cfg: FileConfig = toml::from_str(&raw)
-			.with_context(|| format!("parsing config file {}", path.display()))?;
 		let base = path.parent().unwrap_or_else(|| Path::new("."));
-		cfg.paths.db = cfg.paths.db.map(|p| resolve(base, p));
-		cfg.paths.server_cert = cfg.paths.server_cert.map(|p| resolve(base, p));
-		cfg.paths.server_key = cfg.paths.server_key.map(|p| resolve(base, p));
-		cfg.paths.ca_cert = cfg.paths.ca_cert.map(|p| resolve(base, p));
-		cfg.paths.ca_key = cfg.paths.ca_key.map(|p| resolve(base, p));
-		cfg.paths.master_key = cfg.paths.master_key.map(|p| resolve(base, p));
+		// SAFETY: raw is this actual configuration-file read, before TOML parsing.
+		#[allow(unsafe_code)]
+		let ingress = unsafe { Ingress::<ConfigSource>::new() };
+		let cfg = ServerFileConfigDecoder { base }.decode_legacy(Untrusted::new(raw, ingress))?;
 		cfg.github_app
 			.validate()
 			.with_context(|| format!("validating config file {}", path.display()))?;
 		cfg.worker_budgets.validate()?;
+		Ok(cfg)
+	}
+}
+
+// Host paths retain their native representation and relative resolution. They
+// are not RepoPath and have no lossy UTF-8 conversion or repository-path cap.
+struct ConfiguredPath(PathBuf);
+impl ConfiguredPath {
+	fn new(_: &Mark<'_, ConfigSource>, base: &Path, path: PathBuf) -> Self {
+		Self(resolve(base, path))
+	}
+}
+struct ConfiguredPaths {
+	db: Option<ConfiguredPath>,
+	server_cert: Option<ConfiguredPath>,
+	server_key: Option<ConfiguredPath>,
+	ca_cert: Option<ConfiguredPath>,
+	ca_key: Option<ConfiguredPath>,
+	master_key: Option<ConfiguredPath>,
+}
+struct ServerFileInput {
+	// Text/path fields are removed before this closed-scalar remainder is stored.
+	scalars: FileConfig,
+	paths: ConfiguredPaths,
+	owners: Option<Vec<BoundedText<RepoOwner, ConfigSource>>>,
+}
+#[derive(Debug, thiserror::Error)]
+enum ConfigDecodeError {
+	#[error("parsing config file: {0}")]
+	Toml(&'static str),
+	#[error(transparent)]
+	Text(#[from] loupe_core::text::Error),
+}
+struct ServerFileConfigDecoder<'a> {
+	base: &'a Path,
+}
+impl Validate<&[u8], ConfigSource> for ServerFileConfigDecoder<'_> {
+	type Output = ServerFileInput;
+	type Error = ConfigDecodeError;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, &[u8]>, mark: Mark<'view, ConfigSource>,
+	) -> Result<Self::Output, Self::Error> {
+		let raw = std::str::from_utf8(input.get())
+			.map_err(|_| ConfigDecodeError::Toml("invalid UTF-8"))?;
+		// TOML parser scratch belongs to the pinned dependency. No whole-file
+		// ceiling is invented; admitted free text receives its exact field cap.
+		let mut cfg: FileConfig = toml::from_str(raw).map_err(|error: toml::de::Error| {
+			ConfigDecodeError::Toml(crate::ingress::error::category(&error.message()))
+		})?;
+		let paths = std::mem::take(&mut cfg.paths);
+		let paths = ConfiguredPaths {
+			db: paths.db.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+			server_cert: paths.server_cert.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+			server_key: paths.server_key.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+			ca_cert: paths.ca_cert.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+			ca_key: paths.ca_key.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+			master_key: paths.master_key.map(|path| ConfiguredPath::new(&mark, self.base, path)),
+		};
+		let owners = cfg
+			.github_app
+			.allowed_target_owners
+			.take()
+			.map(|owners| {
+				owners
+					.iter()
+					.map(|owner| BoundedText::new(&mark, owner))
+					.collect::<Result<Vec<_>, _>>()
+			})
+			.transpose()?;
+		Ok(ServerFileInput { scalars: cfg, paths, owners })
+	}
+}
+impl ServerFileConfigDecoder<'_> {
+	/// Temporary I exit for the existing defaults→file→env→flags process owner.
+	fn decode_legacy(self, input: Untrusted<String, ConfigSource>) -> Result<FileConfig> {
+		let input = input.as_bytes().validate(self)?;
+		let mut cfg = input.scalars;
+		cfg.paths = PathsSection {
+			db: input.paths.db.map(|path| path.0),
+			server_cert: input.paths.server_cert.map(|path| path.0),
+			server_key: input.paths.server_key.map(|path| path.0),
+			ca_cert: input.paths.ca_cert.map(|path| path.0),
+			ca_key: input.paths.ca_key.map(|path| path.0),
+			master_key: input.paths.master_key.map(|path| path.0),
+		};
+		cfg.github_app.allowed_target_owners = input
+			.owners
+			.map(|owners| owners.iter().map(|owner| owner.expose().to_owned()).collect());
 		Ok(cfg)
 	}
 }

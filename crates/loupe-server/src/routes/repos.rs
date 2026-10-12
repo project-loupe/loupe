@@ -7,8 +7,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use loupe_core::ReportingDestination;
 use loupe_proto::{
-	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RepoSummary, ReportingSetup,
-	RotateRepoPatRequest, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
+	ListReposResponse, RegisterRepoResponse, RepoSummary, ReportingSetup, PROTOCOL_VERSION,
 };
 use loupe_storage::github_app;
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
@@ -86,15 +85,18 @@ enum ReportingWrite<T> {
 /// the generated `pat_secret_id`; without a PAT the destination reports
 /// through the server-wide GitHub App. Returns the new repo id.
 pub async fn create(
-	State(state): State<AppState>, Json(req): Json<RegisterRepoRequest>,
+	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<(StatusCode, Json<RegisterRepoResponse>), (StatusCode, String)> {
+	let input = crate::ingress::registry::RegisterRepoDecoder::decode_legacy(body)?;
+	let req = input.request;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
 			format!("unsupported protocol_version {}", req.protocol_version),
 		));
 	}
-	let parsed = parse_github_clone_url(&req.clone_url)
+	let parsed = input
+		.derived
 		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https or file URL".into()))?;
 	if let ReportingSetup::GithubIssue { target_owner, github_pat, .. } = &req.reporting {
 		check_github_credential(
@@ -203,8 +205,9 @@ pub async fn list(
 /// would silently change where new findings get filed, so re-register
 /// the repo instead.
 pub async fn update(
-	State(state): State<AppState>, Path(id): Path<i64>, Json(req): Json<UpdateRepoRequest>,
+	State(state): State<AppState>, Path(id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let req = crate::ingress::registry::UpdateRepoDecoder::decode_legacy(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -243,8 +246,9 @@ pub async fn update(
 /// GitHub issue reporting repo to a freshly-stored PAT, then drops the
 /// old secret if no other repo still references it.
 pub async fn rotate_github_pat(
-	State(state): State<AppState>, Path(id): Path<i64>, Json(req): Json<RotateRepoPatRequest>,
+	State(state): State<AppState>, Path(id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let req = crate::ingress::registry::RotateRepoPatDecoder::decode_legacy(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -326,9 +330,9 @@ pub async fn rotate_github_pat(
 /// server-wide GitHub App. Either way a PAT the repo no longer uses is
 /// dropped unless another repo still references it.
 pub async fn set_github_reporting(
-	State(state): State<AppState>, Path(id): Path<i64>,
-	Json(req): Json<SetRepoGithubReportingRequest>,
+	State(state): State<AppState>, Path(id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let req = crate::ingress::registry::SetRepoGithubReportingDecoder::decode_legacy(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,

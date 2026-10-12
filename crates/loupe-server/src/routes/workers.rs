@@ -9,8 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
-use loupe_proto::{RegisterWorkerRequest, RegisterWorkerResponse, PROTOCOL_VERSION};
+use loupe_proto::{RegisterWorkerResponse, PROTOCOL_VERSION};
 use loupe_storage::workers::{self, WorkerKind};
 use loupe_tls::cert_fingerprint;
 use rustls_pemfile::certs;
@@ -20,8 +19,9 @@ use crate::state::AppState;
 /// `POST /v1/workers` — admin-only. Mints a worker client cert and
 /// records its fingerprint as a `kind = 'worker'` row.
 pub async fn create(
-	State(state): State<AppState>, Json(req): Json<RegisterWorkerRequest>,
+	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
+	let req = crate::ingress::registry::RegisterWorkerDecoder::decode_legacy(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,

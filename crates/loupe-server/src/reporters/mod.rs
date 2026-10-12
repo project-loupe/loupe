@@ -13,6 +13,7 @@ use loupe_storage::repos::RepoRow;
 pub mod email;
 pub mod github;
 pub mod github_app;
+mod ingress;
 
 pub use email::EmailReporter;
 pub use github::GithubReporter;

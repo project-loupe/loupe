@@ -13,7 +13,10 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use futures_util::StreamExt;
+use loupe_provenance::{Ingress, Worker};
 use serde::Deserialize;
+
+use crate::ingress::{CapturedWorkerBody, RequestBuffer};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,7 +192,7 @@ impl WorkerBudgets {
 	}
 
 	pub(crate) async fn enforce(
-		&self, worker: i64, request: &mut Request,
+		&self, worker: i64, token: Ingress<Worker>, request: &mut Request,
 	) -> Result<(), StatusCode> {
 		self.charge(worker, Charge::Request)?;
 		if request.method() == Method::POST && request.uri().path() == "/v1/jobs/lease" {
@@ -197,19 +200,15 @@ impl WorkerBudgets {
 		}
 		// Axum's existing JSON/Bytes extractor cap is 2 MiB. Keep that cap
 		// while charging actual chunks even for handlers that ignore the body.
-		const BODY_CAP: usize = 2 * 1024 * 1024;
 		let body = std::mem::replace(request.body_mut(), Body::empty());
 		let mut stream = body.into_data_stream();
-		let mut buffered = Vec::new();
+		let mut buffered = RequestBuffer::default();
 		while let Some(chunk) = stream.next().await {
 			let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
 			self.charge(worker, Charge::Bytes(chunk.len() as u64))?;
-			if chunk.len() > BODY_CAP - buffered.len() {
-				return Err(StatusCode::PAYLOAD_TOO_LARGE);
-			}
-			buffered.extend_from_slice(&chunk);
+			buffered.append(&chunk)?;
 		}
-		*request.body_mut() = Body::from(buffered);
+		request.extensions_mut().insert(CapturedWorkerBody::new(buffered, token));
 		Ok(())
 	}
 }

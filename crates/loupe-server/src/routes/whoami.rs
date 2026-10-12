@@ -19,6 +19,6 @@ pub async fn get(Extension(authed): Extension<AuthedWorker>) -> (StatusCode, Jso
 		WorkerKind::Admin => "admin",
 		WorkerKind::Worker => "worker",
 	};
-	let resp = WhoamiResponse { worker_id: authed.id(), name: authed.worker.name.clone(), kind };
+	let resp = WhoamiResponse { worker_id: authed.id(), name: authed.name().to_owned(), kind };
 	(StatusCode::OK, Json(resp))
 }

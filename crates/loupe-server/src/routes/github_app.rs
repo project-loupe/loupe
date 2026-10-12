@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use loupe_proto::{GithubAppResponse, GithubAppSummary, SetGithubAppRequest, PROTOCOL_VERSION};
+use loupe_proto::{GithubAppResponse, GithubAppSummary, PROTOCOL_VERSION};
 use loupe_storage::github_app::{self, StoredGithubApp};
 use loupe_storage::repos;
 
@@ -16,8 +16,9 @@ use crate::state::AppState;
 /// against GitHub's `GET /app`, checks the app id matches, and stores
 /// the credential. Replaces any previously stored app.
 pub async fn set(
-	State(state): State<AppState>, Json(req): Json<SetGithubAppRequest>,
+	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let req = crate::ingress::registry::SetGithubAppDecoder::decode_legacy(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,

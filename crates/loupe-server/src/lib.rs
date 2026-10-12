@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! `loupe-server` library surface.
 //!
 //! Exposed for integration tests; the binary in `main.rs` is a thin
@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod background;
 pub mod config;
+mod ingress;
 pub mod init;
 pub mod job_capability;
 pub mod reporters;

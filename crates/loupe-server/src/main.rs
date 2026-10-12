@@ -1,10 +1,13 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use loupe_provenance::{
+	Config as ConfigSource, Ingress, Mark, Secret, Untrusted, Unvalidated, Validate,
+};
 use loupe_server::init::{run_init_with_options, DataDirLayout, InitOptions};
 use loupe_server::{serve, AppState, Config, FileConfig};
 use loupe_storage::secrets::MasterKey;
@@ -203,7 +206,24 @@ fn init_env_assignments(
 	Ok(assignments)
 }
 
-async fn run_serve(args: ServeArgs) -> Result<()> {
+async fn run_serve(mut args: ServeArgs) -> Result<()> {
+	// SAFETY: these are the actual process CLI/environment path arguments,
+	// before selecting file defaults. Keep native OS strings and precedence.
+	#[allow(unsafe_code)]
+	let input = unsafe { Ingress::<ConfigSource>::new() };
+	for path in [
+		&mut args.config,
+		&mut args.db,
+		&mut args.master_key_file,
+		&mut args.server_cert,
+		&mut args.server_key,
+		&mut args.ca_cert,
+		&mut args.ca_key,
+	] {
+		if let Some(raw) = path.take() {
+			*path = Some(ServerHostPathDecoder::decode_legacy(Untrusted::new(raw, input)));
+		}
+	}
 	let file_cfg = match &args.config {
 		Some(path) => FileConfig::load(path)?,
 		None => FileConfig::default(),
@@ -344,7 +364,14 @@ fn init_tracing() {
 fn read_master_key_from_env() -> Result<Option<MasterKey>> {
 	let Ok(raw) = std::env::var("LOUPE_MASTER_KEY") else { return Ok(None) };
 	let raw = loupe_provenance::Secret::new(raw);
-	Ok(Some(parse_master_key_hex(raw.expose().trim()).context("LOUPE_MASTER_KEY")?))
+	// SAFETY: raw is the actual environment read, already guarded, before hex decoding.
+	#[allow(unsafe_code)]
+	let input = unsafe { Ingress::<ConfigSource>::new() };
+	Ok(Some(
+		Untrusted::new(raw.expose().as_str(), input)
+			.validate(ServerMasterKeyDecoder)
+			.context("LOUPE_MASTER_KEY")?,
+	))
 }
 
 fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
@@ -352,7 +379,11 @@ fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
 		std::fs::read_to_string(path)
 			.with_context(|| format!("reading master key file at {}", path.display()))?,
 	);
-	parse_master_key_hex(raw.expose().trim())
+	// SAFETY: raw is this actual configuration-file read before hex decoding.
+	#[allow(unsafe_code)]
+	let input = unsafe { Ingress::<ConfigSource>::new() };
+	Untrusted::new(raw.expose().as_str(), input)
+		.validate(ServerMasterKeyDecoder)
 		.with_context(|| format!("master key file at {}", path.display()))
 }
 
@@ -362,20 +393,101 @@ fn pem_from_env_or_file(
 ) -> Result<loupe_provenance::Secret<String>> {
 	if let Some(pem) = pem.filter(|s| !s.expose().is_empty()) {
 		tracing::info!(%label, "loupe-server: TLS PEM loaded from environment");
-		return Ok(pem.into_pem());
+		// SAFETY: this is the selected original CLI/environment PEM argument.
+		#[allow(unsafe_code)]
+		let input = unsafe { Ingress::<ConfigSource>::new() };
+		return Ok(ServerTlsPemEgress::move_legacy(pem.into_pem(), input));
 	}
 	if let Some(pem_b64) = pem_b64.filter(|s| !s.expose().is_empty()) {
 		tracing::info!(%label, "loupe-server: TLS PEM loaded from base64 environment");
 		return decode_pem_b64(label, pem_b64.expose());
 	}
 	let path = path.context(missing)?;
-	loupe_tls::read_pem_file(&path)
-		.with_context(|| format!("reading {label} at {}", path.display()))
+	let pem = loupe_tls::read_pem_file(&path)
+		.with_context(|| format!("reading {label} at {}", path.display()))?;
+	// SAFETY: pem is the exact guarded UTF-8 payload of this actual file read.
+	#[allow(unsafe_code)]
+	let input = unsafe { Ingress::<ConfigSource>::new() };
+	Ok(ServerTlsPemEgress::move_legacy(pem, input))
 }
 
 fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<loupe_provenance::Secret<String>> {
-	loupe_tls::decode_pem_base64(pem_b64.trim())
+	// SAFETY: this is the selected actual base64 CLI/environment argument;
+	// capture precedes decoding and never relabels the derived PEM output.
+	#[allow(unsafe_code)]
+	let input = unsafe { Ingress::<ConfigSource>::new() };
+	Untrusted::new(pem_b64, input)
+		.validate(ServerBase64PemDecoder)
 		.with_context(|| format!("decoding base64 {label} PEM"))
+}
+
+struct ConfiguredHostPath(PathBuf);
+struct ServerHostPathDecoder;
+impl Validate<PathBuf, ConfigSource> for ServerHostPathDecoder {
+	type Output = ConfiguredHostPath;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, PathBuf>, _: Mark<'view, ConfigSource>,
+	) -> Result<Self::Output, Self::Error> {
+		Ok(ConfiguredHostPath(input.get().clone()))
+	}
+}
+impl ServerHostPathDecoder {
+	fn decode_legacy(input: Untrusted<PathBuf, ConfigSource>) -> PathBuf {
+		let Ok(path) = input.validate(Self);
+		path.0
+	}
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CredentialInputError {
+	#[error("expected 64 hex characters, got {0} chars")]
+	MasterKey(usize),
+	#[error("invalid base64 or UTF-8 PEM input")]
+	Pem,
+}
+struct ServerMasterKeyDecoder;
+impl Validate<&str, ConfigSource> for ServerMasterKeyDecoder {
+	type Output = MasterKey;
+	type Error = CredentialInputError;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, &str>, _: Mark<'view, ConfigSource>,
+	) -> Result<Self::Output, Self::Error> {
+		let raw = input.get().trim();
+		parse_master_key_hex(raw).map_err(|_| CredentialInputError::MasterKey(raw.len()))
+	}
+}
+struct ServerBase64PemDecoder;
+impl Validate<&str, ConfigSource> for ServerBase64PemDecoder {
+	type Output = Secret<String>;
+	type Error = CredentialInputError;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, &str>, _: Mark<'view, ConfigSource>,
+	) -> Result<Self::Output, Self::Error> {
+		loupe_tls::decode_pem_base64(input.get().trim()).map_err(|_| CredentialInputError::Pem)
+	}
+}
+
+// A named TLS forward-payload egress, not PEM syntax or trust admission. The
+// existing TLS constructors own those checks. UTF-8 is already established by
+// PemInput/read_pem_file; impose no new cap or normalization on mixed bundles.
+// Validation borrows the original guarded owner; this temporary I exit moves
+// that exact allocation. M replaces the unlabelled consumer signature.
+struct ServerTlsPemEgress;
+impl Validate<&str, ConfigSource> for ServerTlsPemEgress {
+	type Output = ();
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, _: Unvalidated<'view, &str>, _: Mark<'view, ConfigSource>,
+	) -> Result<Self::Output, Self::Error> {
+		Ok(())
+	}
+}
+impl ServerTlsPemEgress {
+	fn move_legacy(pem: Secret<String>, input: Ingress<ConfigSource>) -> Secret<String> {
+		let Ok(()) = Untrusted::new(pem.expose().as_str(), input).validate(Self);
+		pem
+	}
 }
 
 fn parse_master_key_hex(s: &str) -> Result<MasterKey> {
@@ -489,6 +601,30 @@ mod tls_consumer_tests {
 	use base64::Engine as _;
 
 	use super::*;
+
+	#[test]
+	fn config_raw_pem_egress_moves_original_guarded_allocation() {
+		let pem: loupe_tls::PemInput = "FAKE_CONFIG_RAW_PEM".into();
+		let address = pem.expose().as_ptr();
+		let output = pem_from_env_or_file("key", Some(pem), None, None, "missing").unwrap();
+		assert_eq!(output.expose().as_ptr(), address);
+		assert_eq!(output.expose(), "FAKE_CONFIG_RAW_PEM");
+		assert_eq!(format!("{output:?}"), "[redacted]");
+	}
+
+	#[test]
+	fn config_master_key_file_preserves_trim_view_and_fixed_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("master.key");
+		let hex = "aB".repeat(32);
+		std::fs::write(&path, format!(" \n{hex}\r\n")).unwrap();
+		let key = read_master_key_from_file(&path).unwrap();
+		assert_eq!(key.to_hex().expose(), &"ab".repeat(32));
+		std::fs::write(&path, "FAKE_BAD_CONFIG_MASTER_KEY").unwrap();
+		let error = read_master_key_from_file(&path).unwrap_err();
+		assert!(format!("{error:#}").contains("expected 64 hex characters"));
+		assert!(!format!("{error:#?}").contains("FAKE_BAD_CONFIG_MASTER_KEY"));
+	}
 
 	#[test]
 	fn tls_consumer_server_options_debug_redacts_raw_and_encoded_tls_inputs() {

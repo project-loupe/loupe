@@ -20,7 +20,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use loupe_provenance::Secret;
+use loupe_provenance::{
+	Ingress, Mark, Reporter as ReporterSource, Secret, Untrusted, Unvalidated, Validate,
+};
 use reqwest::header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION};
 use reqwest::{StatusCode, Url};
 use ring::rand::SystemRandom;
@@ -170,8 +172,11 @@ pub async fn fetch_app(
 		.await
 		.context("fetching GitHub App metadata")?;
 	let status = resp.status();
-	let body = resp.bytes().await.context("reading GitHub App metadata response")?;
-	parse_app_response(status, &body, key.app_id())
+	let body = super::ingress::read(resp).await?;
+	if !status.is_success() {
+		bail!("github returned {status} when fetching app {}", key.app_id());
+	}
+	super::ingress::AppMetadataDecoder::decode_legacy(body)
 }
 
 /// Decode app metadata without reflecting response content into diagnostics.
@@ -317,14 +322,21 @@ async fn lookup_installation(
 		.await
 		.with_context(|| format!("looking up the GitHub App installation for {owner}/{repo}"))?;
 	let status = resp.status();
-	let body = resp.bytes().await.context("reading installation response")?;
-	parse_installation_response(status, &body, owner, repo)
+	let body = super::ingress::read(resp).await?;
+	check_installation_status(status, owner, repo)?;
+	Ok(body.as_bytes().validate(super::ingress::InstallationDecoder)?)
 }
 
 /// Decode an installation lookup; owner/repo are configured request metadata.
 pub fn parse_installation_response(
 	status: StatusCode, body: &[u8], owner: &str, repo: &str,
 ) -> Result<u64> {
+	check_installation_status(status, owner, repo)?;
+	let body: InstallationBody = decode_body(body, "parsing installation response")?;
+	Ok(body.id)
+}
+
+fn check_installation_status(status: StatusCode, owner: &str, repo: &str) -> Result<()> {
 	if status == StatusCode::NOT_FOUND {
 		bail!(
 			"the GitHub App is not installed on {owner}/{repo}; add the repository to the \
@@ -334,8 +346,7 @@ pub fn parse_installation_response(
 	if !status.is_success() {
 		bail!("github returned {status} when looking up the installation for {owner}/{repo}");
 	}
-	let body: InstallationBody = decode_body(body, "parsing installation response")?;
-	Ok(body.id)
+	Ok(())
 }
 
 async fn mint_token(
@@ -354,13 +365,16 @@ async fn mint_token(
 		.context("minting GitHub App installation token")?;
 	let status = resp.status();
 	let body = read_token_response(resp).await?;
-	parse_access_token_response(status, &body, installation_id)
+	check_access_token_status(status, installation_id)?;
+	Ok(body.as_bytes().validate(AccessTokenDecoder)?)
 }
 
 /// Collect only the confidential token response. Reserve the approved limit
 /// once, then wipe the entire capacity on return, error, or cancellation.
 /// Upstream network chunks and serde scratch are owned by their libraries.
-async fn read_token_response(resp: reqwest::Response) -> Result<Zeroizing<Vec<u8>>> {
+async fn read_token_response(
+	resp: reqwest::Response,
+) -> Result<Untrusted<Zeroizing<Vec<u8>>, ReporterSource>> {
 	if resp.content_length().is_some_and(|len| len > MAX_TOKEN_RESPONSE_BYTES as u64) {
 		bail!("GitHub installation token response exceeds {MAX_TOKEN_RESPONSE_BYTES} bytes");
 	}
@@ -373,21 +387,43 @@ async fn read_token_response(resp: reqwest::Response) -> Result<Zeroizing<Vec<u8
 		}
 		body.extend_from_slice(&chunk);
 	}
-	Ok(body)
+	// SAFETY: body is the actual token endpoint's guarded bounded HTTP read,
+	// captured here before any JSON parsing or token extraction.
+	#[allow(unsafe_code)]
+	let token = unsafe { Ingress::<ReporterSource>::new() };
+	Ok(Untrusted::new(body, token))
+}
+
+struct AccessTokenDecoder;
+impl Validate<&[u8], ReporterSource> for AccessTokenDecoder {
+	type Output = Secret<String>;
+	type Error = super::ingress::ReporterDecodeError;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, &[u8]>, _: Mark<'view, ReporterSource>,
+	) -> std::result::Result<Self::Output, Self::Error> {
+		serde_json::from_slice::<AccessTokenBody>(input.get())
+			.map(|body| body.token)
+			.map_err(|_| super::ingress::ReporterDecodeError("parsing installation token"))
+	}
 }
 
 /// Decode an installation token; response bodies never become error text.
 pub fn parse_access_token_response(
 	status: StatusCode, body: &[u8], installation_id: u64,
 ) -> Result<Secret<String>> {
+	check_access_token_status(status, installation_id)?;
+	let body: AccessTokenBody = decode_body(body, "parsing installation token")?;
+	Ok(body.token)
+}
+
+fn check_access_token_status(status: StatusCode, installation_id: u64) -> Result<()> {
 	if !status.is_success() {
 		bail!(
 			"github returned {status} when minting an installation token for installation \
 			 {installation_id}"
 		);
 	}
-	let body: AccessTokenBody = decode_body(body, "parsing installation token")?;
-	Ok(body.token)
+	Ok(())
 }
 
 /// Throwaway RSA key for tests. Lives outside `#[cfg(test)]`, like

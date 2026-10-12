@@ -61,7 +61,12 @@ async fn request(
 	}
 	let mut req = req.body(body).unwrap();
 	req.extensions_mut().insert(cert.clone());
-	app.clone().oneshot(req).await.unwrap().status()
+	let response = app.clone().oneshot(req).await.unwrap();
+	assert_eq!(
+		response.headers()[loupe_proto::PROTOCOL_VERSION_HEADER],
+		loupe_proto::PROTOCOL_VERSION.to_string()
+	);
+	response.status()
 }
 
 #[tokio::test]
@@ -124,5 +129,54 @@ async fn chunks_override_content_length_and_existing_body_cap_still_applies() {
 	assert_eq!(
 		request(&app, &worker, "/v1/whoami", Body::from("ab"), false).await,
 		StatusCode::TOO_MANY_REQUESTS
+	);
+}
+
+#[tokio::test]
+async fn worker_byte_charge_precedes_body_cap_and_protocol_rejection() {
+	let config = loupe_server::request_budget::WorkerBudgetConfig {
+		bytes: loupe_server::request_budget::BucketConfig {
+			capacity: 2 * 1024 * 1024,
+			refill_per_second: 1,
+		},
+		..Default::default()
+	};
+	let (app, worker, _, _) = configured_fixture(config);
+	// One chunk exceeds both limits. Charge-before-cap gives 429, not 413 or the
+	// unsupported-header 400. The existing cap test covers sufficient byte credit.
+	assert_eq!(
+		request(&app, &worker, "/v1/whoami", Body::from(vec![0; 2 * 1024 * 1024 + 1]), true).await,
+		StatusCode::TOO_MANY_REQUESTS
+	);
+}
+
+#[tokio::test]
+async fn json_extraction_does_not_charge_the_worker_body_twice() {
+	let body = serde_json::json!({
+		"protocol_version": loupe_proto::PROTOCOL_VERSION,
+		"capabilities": [],
+		"wait_seconds": 0,
+		"future_padding": "x".repeat(128 * 1024),
+	})
+	.to_string();
+	let config = loupe_server::request_budget::WorkerBudgetConfig {
+		bytes: loupe_server::request_budget::BucketConfig {
+			capacity: (2 * body.len() + 64 * 1024) as u64,
+			refill_per_second: 1,
+		},
+		..Default::default()
+	};
+	let (app, worker, _, _) = configured_fixture(config);
+	for _ in 0..2 {
+		assert_eq!(
+			request(&app, &worker, "/v1/jobs/lease", Body::from(body.clone()), false).await,
+			StatusCode::OK,
+			"each admitted JSON body consumes its bytes only once"
+		);
+	}
+	assert_eq!(
+		request(&app, &worker, "/v1/jobs/lease", Body::from(body), false).await,
+		StatusCode::TOO_MANY_REQUESTS,
+		"successful JSON extraction must not bypass byte charging"
 	);
 }

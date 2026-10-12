@@ -228,6 +228,269 @@ async fn lease_verify_job(worker: &reqwest::Client) -> LeaseEnvelope {
 }
 
 #[tokio::test]
+async fn heartbeat_body_admission_preserves_empty_and_nonempty_semantics() {
+	let f = bring_up_with_repo_and_worker().await;
+	let queued = enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	assert_eq!(lease.job_id, queued.job_id);
+	let url = format!("https://loupe-server/v1/jobs/{}/heartbeat", lease.job_id);
+	let valid = format!(r#"{{"protocol_version":{PROTOCOL_VERSION}}}"#);
+	let unknown = format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"future":true}}"#);
+	let duplicate = format!(
+		r#"{{"protocol_version":{PROTOCOL_VERSION},"protocol_version":{PROTOCOL_VERSION}}}"#
+	);
+	for (label, content_type, body, expected, diagnostic) in [
+		("empty without media type", None, "", 200, ""),
+		("valid without media type", None, valid.as_str(), 200, ""),
+		("valid non-json media type", Some("text/plain"), valid.as_str(), 200, ""),
+		("unknown member", Some("application/json"), unknown.as_str(), 200, ""),
+		("malformed", None, "{", 400, "invalid heartbeat body:"),
+		("whitespace is not empty", None, " ", 400, "invalid heartbeat body:"),
+		("missing version", Some("application/json"), "{}", 400, "invalid heartbeat body:"),
+		("wrong type", None, r#"{"protocol_version":"wrong"}"#, 400, "invalid heartbeat body:"),
+		("duplicate version", None, duplicate.as_str(), 400, "invalid heartbeat body:"),
+		(
+			"wrong version",
+			None,
+			r#"{"protocol_version":65535}"#,
+			400,
+			"unsupported protocol_version 65535",
+		),
+	] {
+		let mut request =
+			f.worker.post(&url).header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret());
+		if let Some(content_type) = content_type {
+			request = request.header("content-type", content_type);
+		}
+		let response = request.body(body.to_owned()).send().await.unwrap();
+		assert_eq!(response.status().as_u16(), expected, "{label}");
+		assert_eq!(
+			response.headers()[loupe_proto::PROTOCOL_VERSION_HEADER],
+			PROTOCOL_VERSION.to_string()
+		);
+		let text = response.text().await.unwrap();
+		if expected == 200 {
+			let heartbeat: loupe_proto::HeartbeatResponse = serde_json::from_str(&text).unwrap();
+			assert_eq!(heartbeat.protocol_version, PROTOCOL_VERSION);
+			assert!(heartbeat.lease_expires_at >= lease.lease_expires_at, "{label}");
+		} else {
+			assert!(text.starts_with(diagnostic), "{label}: {text}");
+		}
+	}
+	// Rejections leave the actual lease usable, not just a fabricated request fixture.
+	let response = f
+		.worker
+		.post(&url)
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.json(&HeartbeatRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 200);
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn heartbeat_body_and_protocol_checks_precede_capability_validation() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	let url = format!("https://loupe-server/v1/jobs/{}/heartbeat", lease.job_id);
+	for (body, expected, diagnostic) in [
+		("{", 400, "invalid heartbeat body:"),
+		(r#"{"protocol_version":65535}"#, 400, "unsupported protocol_version 65535"),
+		("", 403, ""),
+	] {
+		let response = f.worker.post(&url).body(body).send().await.unwrap();
+		assert_eq!(response.status().as_u16(), expected);
+		assert_eq!(
+			response.headers()[loupe_proto::PROTOCOL_VERSION_HEADER],
+			PROTOCOL_VERSION.to_string()
+		);
+		let text = response.text().await.unwrap();
+		if !diagnostic.is_empty() {
+			assert!(text.starts_with(diagnostic), "{text}");
+		}
+	}
+	let response = f
+		.worker
+		.post(&url)
+		.header(loupe_proto::PROTOCOL_VERSION_HEADER, "65535")
+		.body("{")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 400);
+	let text = response.text().await.unwrap();
+	assert!(
+		text.starts_with(&format!("unsupported {}", loupe_proto::PROTOCOL_VERSION_HEADER)),
+		"{text}"
+	);
+	let response = f
+		.worker
+		.post(&url)
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 200);
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn ingress_heartbeat_error_does_not_reflect_supplied_values() {
+	const SENTINEL: &str = "FAKE_HEARTBEAT_ERROR_SENTINEL";
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	let url = format!("https://loupe-server/v1/jobs/{}/heartbeat", lease.job_id);
+	let positive = f
+		.worker
+		.post(&url)
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.json(&HeartbeatRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(positive.status(), 200);
+	let response = f
+		.worker
+		.post(&url)
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.body(format!(r#"{{"protocol_version":"{SENTINEL}"}}"#))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 400);
+	assert_eq!(
+		response.headers()[loupe_proto::PROTOCOL_VERSION_HEADER],
+		PROTOCOL_VERSION.to_string()
+	);
+	let error = response.text().await.unwrap();
+	f.handle.shutdown().await;
+	assert!(error.starts_with("invalid heartbeat body:"), "{error}");
+	assert!(!error.contains(SENTINEL), "heartbeat rejection reflected a supplied value: {error}");
+}
+
+#[tokio::test]
+async fn ingress_worker_enum_error_does_not_reflect_supplied_values() {
+	const SENTINEL: &str = "FAKE_WORKER_OUTCOME_ERROR_SENTINEL";
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	let url = format!("https://loupe-server/v1/jobs/{}/complete", lease.job_id);
+	let response = f
+		.worker
+		.post(&url)
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.json(&serde_json::json!({"protocol_version": PROTOCOL_VERSION, "outcome": SENTINEL}))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 422);
+	let error = response.text().await.unwrap();
+	let positive = f
+		.worker
+		.post(&url)
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some("controlled failure".into()),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(positive.status(), 204, "valid outcome still completes the unchanged lease");
+	f.handle.shutdown().await;
+	assert!(error.starts_with("Failed to deserialize"), "{error}");
+	assert!(!error.contains(SENTINEL), "worker rejection reflected an unknown enum value: {error}");
+}
+
+fn ingress_llm_submission(title: &str, description: &str) -> serde_json::Value {
+	serde_json::json!({
+		"protocol_version": PROTOCOL_VERSION,
+		"severity": "high", "title": title, "description": description,
+		"file_path": "src/lib.rs", "line_start": 1, "line_end": 1,
+		"poc_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n old\n+#[test] fn triggers_bug() {}\n",
+		"fingerprint": "d".repeat(64)
+	})
+}
+
+#[tokio::test]
+async fn ingress_llm_length_checks_use_trimmed_views() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	let url = format!("https://loupe-server/v1/jobs/{}/llm-findings", lease.job_id);
+	for (title, description, expected) in [
+		(format!("  {}  ", "t".repeat(7)), "d".repeat(80), 400),
+		("t".repeat(8), format!("\r\n\t{}  ", "d".repeat(79)), 400),
+		("t".repeat(8), "d".repeat(80), 204),
+	] {
+		let response = f
+			.worker
+			.post(&url)
+			.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+			.json(&ingress_llm_submission(&title, &description))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), expected);
+	}
+	let (count, title, description): (i64, String, String) =
+		f.db.with_conn(|conn| {
+			Ok(conn.query_row("SELECT COUNT(*), title, description FROM findings", [], |row| {
+				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+			})?)
+		})
+		.unwrap();
+	assert_eq!((count, title.len(), description.len()), (1, 8, 80));
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn ingress_llm_route_retains_original_title_and_description() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+	let lease = lease_job(&f.worker).await;
+	let title = "  Cafe\u{301} index permits denial of service  ";
+	let description = "\r\n\tAn attacker-controlled Cafe\u{301} index reaches the slice operation without a bounds check and can reliably terminate the service process.\r\n  ";
+	let response = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/llm-findings", lease.job_id))
+		.header(JOB_CAPABILITY_HEADER, lease.job_capability.expose_secret())
+		.json(&ingress_llm_submission(title, description))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), 204, "exact-content fixture must first be admitted");
+	let (id, stored_title, stored_description): (i64, String, String) =
+		f.db.with_conn(|conn| {
+			Ok(conn.query_row("SELECT id, title, description FROM findings", [], |row| {
+				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+			})?)
+		})
+		.unwrap();
+	let response =
+		f.admin.get(format!("https://loupe-server/v1/findings/{id}")).send().await.unwrap();
+	assert_eq!(response.status(), 200);
+	let detail: FindingDetail = response.json().await.unwrap();
+	f.handle.shutdown().await;
+	assert_eq!(
+		(
+			stored_title.as_str(),
+			stored_description.as_str(),
+			detail.title.as_str(),
+			detail.description.as_str()
+		),
+		(title, description, title, description),
+		"LLM admission must retain original title/description in storage and HTTP readback"
+	);
+}
+
+#[tokio::test]
 async fn cloned_capability_authenticates_after_lease_owner_drops() {
 	let f = bring_up_with_repo_and_worker().await;
 	let queued = enqueue_scan(&f, f.repo_id).await;

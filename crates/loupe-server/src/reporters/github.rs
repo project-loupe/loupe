@@ -226,9 +226,12 @@ impl Reporter for GithubReporter {
 				)
 				.await?;
 			let status = resp.status();
-			let body = resp.bytes().await.context("reading issue response")?;
-			if let Some(external_id) = parse_issue_response(status, &body)? {
-				external_ids.push(external_id);
+			let body = super::ingress::read(resp).await?;
+			if !status.is_success() {
+				anyhow::bail!("github returned {status} when opening issue");
+			}
+			if let Some(number) = body.as_bytes().validate(super::ingress::IssueReceiptDecoder)? {
+				external_ids.push(number.to_string());
 			}
 		}
 		let external_id = (!external_ids.is_empty()).then(|| external_ids.join(","));
@@ -260,8 +263,13 @@ impl GithubReporter {
 		if status.is_success() {
 			return Ok(());
 		}
-		let body = resp.text().await.unwrap_or_default();
-		check_label_response(status, &body, label.name)
+		let body = super::ingress::read(resp).await?;
+		if status == StatusCode::UNPROCESSABLE_ENTITY
+			&& body.as_bytes().validate(super::ingress::LabelResponseDecoder)?
+		{
+			return Ok(());
+		}
+		anyhow::bail!("github returned {status} when creating label {}", label.name)
 	}
 }
 

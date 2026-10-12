@@ -17,16 +17,14 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
-	validate_llm_finding_submission, CompleteOutcome, CompleteRequest, FindingsBatch,
-	HeartbeatRequest, HeartbeatResponse, JobCapability, JobInfo, LeaseEnvelope, LeasePayload,
-	LeaseRequest, LeaseResponse, LlmFindingSubmission, ScanRequest, ScanResponse,
-	VerdictSubmission, LLM_CODE_REVIEW_SCANNER_ID, PROTOCOL_VERSION,
+	validate_llm_finding_submission, CompleteOutcome, HeartbeatResponse, JobCapability, JobInfo,
+	LeaseEnvelope, LeasePayload, LeaseResponse, ScanResponse, LLM_CODE_REVIEW_SCANNER_ID,
+	PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, secrets};
@@ -95,13 +93,6 @@ pub struct ListQuery {
 	pub kind: Option<String>,
 }
 
-fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String)> {
-	if matches!(limit, Some(n) if n <= 0) {
-		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
-	}
-	Ok(limit)
-}
-
 /// Parse the `state=` filter. Rejects unknown values loudly rather than
 /// silently returning everything — a typo'd filter that looks like it
 /// worked is worse than an error.
@@ -147,8 +138,9 @@ pub fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind>, (StatusCode, Str
 
 /// `POST /v1/repos/:id/scan` — admin enqueues a scan job for `id`.
 pub async fn enqueue_scan(
-	State(state): State<AppState>, Path(repo_id): Path<i64>, Json(req): Json<ScanRequest>,
+	State(state): State<AppState>, Path(repo_id): Path<i64>, body: crate::ingress::OperatorJson,
 ) -> Result<(StatusCode, Json<ScanResponse>), (StatusCode, String)> {
+	let req = crate::ingress::registry::EnqueueScanDecoder::decode_legacy(body)?;
 	check_version(req.protocol_version)?;
 	let now = now_secs();
 
@@ -185,13 +177,9 @@ pub async fn enqueue_scan(
 /// `kind` narrow the result server-side so a caller watching one part of
 /// the queue doesn't have to pull the whole table and filter locally.
 pub async fn list(
-	State(state): State<AppState>, Query(qp): Query<ListQuery>,
+	State(state): State<AppState>,
+	crate::ingress::query::OperatorJobQuery(filter): crate::ingress::query::OperatorJobQuery,
 ) -> Result<Json<Vec<JobInfo>>, (StatusCode, String)> {
-	let filter = jobs::JobFilter {
-		states: parse_states(qp.state.as_deref())?,
-		kind: parse_kind(qp.kind.as_deref())?,
-		limit: positive_limit(qp.limit)?,
-	};
 	let rows = state
 		.db
 		.with_conn(|c| Ok(jobs::list(c, &filter)?))
@@ -287,8 +275,9 @@ pub(crate) const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
 /// historical poll-and-return-empty behaviour.
 pub async fn lease(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Json(req): Json<LeaseRequest>,
+	body: crate::ingress::WorkerJson,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
+	let req = crate::ingress::jobs::LeaseRequestDecoder::decode_legacy(body)?;
 	check_version(req.protocol_version)?;
 	// A worker is eligible for verify jobs iff it advertised at least
 	// one `verify:*` capability. Fine-grained tag matching (e.g.
@@ -423,11 +412,9 @@ fn build_lease_envelope(
 /// `POST /v1/jobs/:id/heartbeat` — worker extends its lease.
 pub async fn heartbeat(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, headers: HeaderMap, body: Bytes,
+	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerBody,
 ) -> Result<Json<HeartbeatResponse>, (StatusCode, String)> {
-	if !body.is_empty() {
-		let req: HeartbeatRequest = serde_json::from_slice(&body)
-			.map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid heartbeat body: {e}")))?;
+	if let Some(req) = crate::ingress::jobs::HeartbeatDecoder::decode_legacy(body)? {
 		check_version(req.protocol_version)?;
 	}
 	let now = now_secs();
@@ -455,8 +442,9 @@ pub async fn heartbeat(
 /// `POST /v1/jobs/:id/findings` — worker submits a batch (scan jobs only).
 pub async fn submit_findings(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, headers: HeaderMap, Json(batch): Json<FindingsBatch>,
+	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let batch = crate::ingress::jobs::FindingsBatchDecoder::decode_legacy(body)?;
 	check_version(batch.protocol_version)?;
 	let now = now_secs();
 
@@ -550,8 +538,9 @@ fn validate_report_size(
 /// `POST /v1/jobs/:id/llm-findings` — strict host-side MCP broker path.
 pub async fn submit_llm_finding(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, headers: HeaderMap, Json(submission): Json<LlmFindingSubmission>,
+	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let submission = crate::ingress::jobs::LlmFindingDecoder::decode_legacy(body)?;
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
 	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
@@ -569,8 +558,8 @@ pub async fn submit_llm_finding(
 	let finding = loupe_core::Finding {
 		scanner_id: LLM_CODE_REVIEW_SCANNER_ID.into(),
 		severity: submission.severity,
-		title: submission.title.trim().into(),
-		description: submission.description.trim().into(),
+		title: submission.title,
+		description: submission.description,
 		file_path: Some(submission.file_path),
 		line_start: Some(submission.line_start),
 		line_end: Some(submission.line_end),
@@ -606,8 +595,9 @@ pub async fn submit_llm_finding(
 /// `POST /v1/jobs/:id/verdict` — worker submits a verdict (verify jobs only).
 pub async fn submit_verdict(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, headers: HeaderMap, Json(submission): Json<VerdictSubmission>,
+	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let submission = crate::ingress::jobs::VerdictSubmissionDecoder::decode_legacy(body)?;
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
 
@@ -636,7 +626,7 @@ pub async fn submit_verdict(
 		},
 		_ => None,
 	};
-	let by_cn = worker.worker.name.clone();
+	let by_cn = worker.name().to_owned();
 	// Resolve effective approval mode for this finding's repo before
 	// the tx so the rollup can route a `confirmed` verdict either to
 	// `confirmed` (immediate dispatch) or `awaiting_approval` (parked
@@ -723,8 +713,9 @@ pub async fn submit_verdict(
 /// incremental run knows where to pick up.
 pub async fn complete(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
-	Path(job_id): Path<i64>, headers: HeaderMap, Json(req): Json<CompleteRequest>,
+	Path(job_id): Path<i64>, headers: HeaderMap, body: crate::ingress::WorkerJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let req = crate::ingress::jobs::CompleteDecoder::decode_legacy(body)?;
 	check_version(req.protocol_version)?;
 	let new_state = match req.outcome {
 		CompleteOutcome::Succeeded => JobState::Succeeded,

@@ -22,8 +22,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use loupe_core::{FindingState, JobKind, ReportingDestination};
 use loupe_proto::{
-	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyRequest, RetryVerifyResponse,
-	PROTOCOL_VERSION,
+	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyResponse, PROTOCOL_VERSION,
 };
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
 use loupe_storage::jobs::NewJob;
@@ -100,12 +99,7 @@ fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String
 }
 
 /// Query string for `GET /v1/repos/:id/findings/search`.
-#[derive(Debug, Deserialize)]
-pub struct SearchQuery {
-	pub q: String,
-	#[serde(default)]
-	pub limit: Option<i64>,
-}
+pub use crate::ingress::query::SearchQuery;
 
 /// `GET /v1/repos/:id/findings/search?q=<keywords>&limit=<n>`. FTS5
 /// keyword search over title, description, file_path. Open to admins
@@ -115,7 +109,7 @@ pub struct SearchQuery {
 /// server-side, so the caller doesn't need to know FTS5 syntax.
 pub async fn search(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>,
-	Path(repo_id): Path<i64>, Query(qp): Query<SearchQuery>, headers: HeaderMap,
+	Path(repo_id): Path<i64>, qp: SearchQuery, headers: HeaderMap,
 ) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
 	authorize_prior_finding_repo(&state, &authed, &headers, repo_id)?;
 	let limit = qp.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
@@ -180,8 +174,9 @@ pub async fn get(
 /// the reaper's system inconclusive marker (`job_id = NULL`) remains
 /// recoverable without that flag.
 pub async fn retry_verify(
-	State(state): State<AppState>, Json(req): Json<RetryVerifyRequest>,
+	State(state): State<AppState>, body: crate::ingress::OperatorJson,
 ) -> Result<Json<RetryVerifyResponse>, (StatusCode, String)> {
+	let req = crate::ingress::registry::RetryVerifyDecoder::decode_legacy(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -369,7 +364,7 @@ pub async fn approve(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	let cn = authed.worker.name.clone();
+	let cn = authed.name().to_owned();
 	let outcome = state
 		.db
 		.with_conn(|c| Ok(findings::approve(c, id, &cn, now)?))
@@ -444,7 +439,7 @@ pub async fn reject(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	let cn = authed.worker.name.clone();
+	let cn = authed.name().to_owned();
 	let outcome = state
 		.db
 		.with_conn(|c| Ok(findings::reject(c, id, &cn, now)?))

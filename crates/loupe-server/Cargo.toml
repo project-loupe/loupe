@@ -26,16 +26,18 @@ clap = { workspace = true }
 futures-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+mime = "0.3"
 tower = { workspace = true }
-loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-core = { version = "0.1.0", path = "../loupe-core", features = ["source-migration"] }
+loupe-http = { version = "0.1.0", path = "../loupe-http" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
-loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
 loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
