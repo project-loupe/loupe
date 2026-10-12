@@ -30,6 +30,7 @@ GEN_TEST server_capability_header
 GEN_TEST server_config
 GEN_TEST server_github_response
 GEN_TEST server_ingress_requests
+GEN_TEST server_ingress_transport
 GEN_TEST server_report_email
 GEN_TEST server_report_github
 GEN_TEST server_request_parsers

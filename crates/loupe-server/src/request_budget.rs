@@ -135,12 +135,30 @@ pub struct WorkerBudgets {
 	config: WorkerBudgetConfig,
 	started: Instant,
 	entries: Mutex<HashMap<i64, Entry>>,
+	#[cfg(fuzzing)]
+	byte_charges: Mutex<Vec<(u64, u64, bool)>>,
 }
 
 impl WorkerBudgets {
+	#[cfg(fuzzing)]
+	pub(crate) fn observed_bytes(&self, worker: i64) -> Option<(u64, u64)> {
+		let entries = self.entries.lock().expect("fixture budget lock");
+		entries.get(&worker).map(|entry| (entry.bytes.remaining, entry.bytes.last))
+	}
+	#[cfg(fuzzing)]
+	pub(crate) fn observed_charges(&self) -> Vec<(u64, u64, bool)> {
+		self.byte_charges.lock().expect("fixture charge lock").clone()
+	}
+
 	pub fn new(config: WorkerBudgetConfig) -> anyhow::Result<Self> {
 		config.validate()?;
-		Ok(Self { config, started: Instant::now(), entries: Mutex::new(HashMap::new()) })
+		Ok(Self {
+			config,
+			started: Instant::now(),
+			entries: Mutex::new(HashMap::new()),
+			#[cfg(fuzzing)]
+			byte_charges: Mutex::new(Vec::new()),
+		})
 	}
 
 	fn charge_at(&self, worker: i64, now: u64, charge: Charge) -> Result<(), &'static str> {
@@ -180,7 +198,17 @@ impl WorkerBudgets {
 	}
 
 	fn charge(&self, worker: i64, charge: Charge) -> Result<(), StatusCode> {
-		self.charge_at(worker, self.started.elapsed().as_secs(), charge).map_err(|category| {
+		let now = self.started.elapsed().as_secs();
+		let result = self.charge_at(worker, now, charge);
+		#[cfg(fuzzing)]
+		if let Charge::Bytes(cost) = charge {
+			self.byte_charges.lock().expect("fixture charge lock").push((
+				now,
+				cost,
+				result.is_ok(),
+			));
+		}
+		result.map_err(|category| {
 			tracing::warn!(
 				event = "worker_budget_exhausted",
 				category,

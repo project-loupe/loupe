@@ -306,9 +306,10 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `proto_dto` | All 36 public DTO types and enum variants, field-preserving round trips, capability redaction and independent LLM submission admission |
 | `proto_version` | Inclusive protocol windows, inverted-window rejection and exact mismatch fields and diagnostics |
 | `server_capability_header` | Exact header-text/length admission, unchanged hash bytes and closed denial diagnostics |
-| `server_config` | Actual file loader, owner-list rejection, root keys, and exact relative path resolution |
+| `server_config` | Actual file loader; independent owner policy and budget admission, exact owner/path spelling, closed error chains and compact owner-cap controls |
 | `server_github_response` | All five production Reporter validators via fixed cfg-only fixtures; independent exact slug policy and raw schema oracles, compact escaped/unescaped 2 MiB boundary recipes, fixed errors and token redaction. Legacy status helpers remain separate compatibility controls; actual HTTP collection belongs to transport tests. |
 | `server_ingress_requests` | All six Worker/eight Operator body decoders and three queries; independent exact fields, Unicode/path/secret policies, original Agent spans and closed diagnostics |
+| `server_ingress_transport` | Actual request collection, live wipe and final-owner lifetime; authenticated router ordering and byte debt; all five Reporter HTTP consumers with caps, status precedence and retry counts |
 | `server_report_email` | Exact header boundary, CR/LF admission and finding-content isolation from headers |
 | `server_report_github` | Title normalization, title/body character caps and observed S3 fence-containment cases |
 | `server_request_parsers` | Protocol headers, state/kind filters, legacy clone URLs and exact FTS stripping/token admission |
@@ -406,6 +407,23 @@ literal or escaped cap-minus-one/exact/plus-one fields (2 MiB text/credential or
 collector's 2 MiB cap. The target does not exercise authentication, budget
 charging, stream cancellation or cleanup; those require actual transport checks.
 
+`server_ingress_transport` selects collector, router, real leased heartbeat or
+Reporter HTTP recipes. Raw collector prefixes are limited to 64 KiB; compact
+recipes reach actual 2 MiB request, 16 MiB Reporter and 256 KiB token boundaries.
+Small empty/one-byte/changing schedules remain; large schedules use bounded
+chunks. Cleanup observes zeroed allocations while still live, including growth,
+stream failure and cancellation. Router fixtures authenticate real test peers
+against fresh database rows. Reporter cases share a persistent loopback listener
+but reset caches/counters and join every task per iteration. Expected early
+socket closure is distinct from a task panic. These fixtures cover actual
+consumer calls, not TLS handshakes or every allocator/dependency copy.
+
+`server_config` ordinarily consumes TOML bytes unchanged. Two-byte inputs
+`[255, edge]` generate one owner at cap-1/cap/cap+1; this fixture bound adds no
+whole-file product limit. The wire schema is a compatibility oracle, with
+independent post-parse owner/budget rules and exact fixed error-chain checks.
+Binary argv/environment/PEM precedence remains covered by process-owner tests.
+
 The report targets pass JSON findings to the actual renderers. Email input
 also supplies `from`, `to` and `subject`, whose newline checks must match
 admission and whose header block must stay independent of finding content.
@@ -495,7 +513,7 @@ or resource-limit coverage remains an explicit gap in the broad ingress rule.
 | Raw database rows and secret BLOB reads | Storage round-trip/migration tests own database fixtures. The three storage targets cover named value parsers, not every row decoder or corruption error. S2 owns scope decisions; S3 owns secret holders and Db decoding. General corrupt-row parser coverage remains unassigned. |
 | CLI/env/startup loaders | CLI, web-config, server-main and provider-auth tests own PEM/base64 precedence and credential loading. `tls_input` covers the shared guarded readers, not combined argv/env behavior. S3 owns Config minting and Secret migration; arbitrary combined-loader coverage remains unassigned. |
 | Sendmail status/stderr and pipe interaction | [email_dispatch.rs](../crates/loupe-server/tests/email_dispatch.rs) covers successful stdin delivery; renderer tests reject header injection. No dedicated failure/backpressure target or process-output budget is specified. S3's renderer/log work alone does not establish those properties. |
-| Reporter HTTP collection | GitHub HTTP integration tests and the response target own response decoding. Reporter `.bytes()`/`.text()` collection is outside L3's three clients and remains uncapped; its transport budget is an unresolved contract. S3 owns Reporter ingress. |
+| Reporter HTTP collection | `server_ingress_transport` reaches all five actual HTTP consumers, including ordinary 16 MiB and token 256 KiB collection, status precedence, ignored bodies and authentication retry counts. TLS handshakes and dependency-owned copies remain outside this target. |
 | CLI collection and Git diagnostics | Both CLI backend tests exercise L5's one-MiB retention, drain, head/tail and deadlines. L2 tests UTF-8-safe Git display truncation after collection, not a Git pipe-allocation limit. S3 owns labels and disclosure; bounded buffers do not imply redacted logs. |
 | MCP framing and session resources | The RPC target reaches the real loop with at most 64 KiB and 32 fixture lines. Production line collection and session resources have no corresponding transport budget; this remains an unassigned resource-limit gap. S3 labels alone do not impose those limits. |
 | Supervisor process output | PID, uid-map, route and address targets bound fixture bytes and cover actual parsers. PID accumulation, command stdout and file reads retain their existing I/O behavior; no production allocation ceiling follows from the harness caps. |

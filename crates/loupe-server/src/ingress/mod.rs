@@ -19,17 +19,19 @@ pub(crate) mod registry;
 #[cfg(test)]
 mod tests;
 pub(crate) mod text;
+#[cfg(fuzzing)]
+pub(crate) mod transport_fuzz;
 pub(crate) use error::DecodeError;
 
 pub(crate) const BODY_CAP: usize = 2 * 1024 * 1024;
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 type CleanupAudit = std::sync::Arc<std::sync::Mutex<Vec<(usize, bool)>>>;
 
 #[derive(Default)]
 pub(crate) struct RequestBuffer {
 	allocation: Box<[u8]>,
 	used: usize,
-	#[cfg(test)]
+	#[cfg(any(test, fuzzing))]
 	audit: Option<CleanupAudit>,
 }
 
@@ -47,7 +49,7 @@ impl RequestBuffer {
 			let mut replacement = Self {
 				allocation: vec![0; required.next_power_of_two().min(BODY_CAP)].into_boxed_slice(),
 				used: self.used,
-				#[cfg(test)]
+				#[cfg(any(test, fuzzing))]
 				audit: self.audit.clone(),
 			};
 			replacement.allocation[..self.used].copy_from_slice(self.as_ref());
@@ -66,7 +68,7 @@ impl AsRef<[u8]> for RequestBuffer {
 impl Drop for RequestBuffer {
 	fn drop(&mut self) {
 		self.allocation.zeroise();
-		#[cfg(test)]
+		#[cfg(any(test, fuzzing))]
 		if let Some(audit) = &self.audit
 			&& !self.allocation.is_empty()
 		{

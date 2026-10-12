@@ -1,6 +1,11 @@
 //! Fixed-source fixtures for actual private server validators.
 //! These entries exist only in fuzz builds and grant no runtime authority.
 
+pub use crate::ingress::transport_fuzz::{collect_operator, Collection};
+#[path = "ingress/router_fuzz.rs"]
+mod router_fixture;
+pub use router_fixture::{leased_heartbeat, request_route, RequestCase, RequestObservation};
+
 pub use crate::ingress::jobs::fuzz::{worker_request, WorkerRequest};
 pub use crate::ingress::query::fuzz::{job_query, operator_search, worker_search};
 pub use crate::ingress::registry::fuzz::{operator_request, OperatorRequest};

@@ -1,0 +1,2 @@
+[server]
+private_config_sentinel = 3
