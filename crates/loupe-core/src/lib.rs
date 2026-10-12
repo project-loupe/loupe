@@ -14,6 +14,7 @@ mod finding_state;
 mod job;
 mod repo;
 pub mod report_limits;
+pub mod security_event;
 mod severity;
 #[cfg(feature = "source-migration")]
 pub mod source_migration;

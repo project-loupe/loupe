@@ -8,6 +8,22 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// Cloning shares one secret owner across the lease's host tasks. Formatting
 /// is redacted; serialization deliberately delivers the bearer over mTLS.
+///
+/// Security events accept closed decisions and scalar context, not this bearer:
+/// ```
+/// use loupe_core::security_event::*;
+/// let capability = loupe_proto::JobCapability::from_secret("fixture");
+/// let context = EventContext::default();
+/// let operation = Operation::Heartbeat;
+/// let requested = RequestedTarget::Job(1);
+/// let reason = CapabilityDenial::InactiveLease;
+/// emit(SecurityEvent::CapabilityDenied { context, operation, requested, reason });
+/// drop(capability);
+/// ```
+/// ```compile_fail,E0308
+/// use loupe_core::security_event::emit;
+/// emit(loupe_proto::JobCapability::from_secret("fixture"));
+/// ```
 pub struct JobCapability(Arc<Secret<String>>);
 
 impl JobCapability {
