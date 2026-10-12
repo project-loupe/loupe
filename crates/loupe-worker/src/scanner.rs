@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 ///   rows for one verify job.
 pub enum VerifyOutcome {
 	Verdict(Verdict),
+	Host(crate::host_outcome::HostVerifyReason),
 	Submitted,
 }
 
@@ -36,10 +37,7 @@ pub trait Scanner: Send + Sync {
 	/// Default impl: not a verifier. Override in scanners that
 	/// advertise a `verify:*` capability.
 	async fn verify(&self, _ctx: &VerifyContext) -> anyhow::Result<VerifyOutcome> {
-		Ok(VerifyOutcome::Verdict(Verdict::Inconclusive {
-			reason: "scanner does not verify".into(),
-			terminal: false,
-		}))
+		Ok(VerifyOutcome::Host(crate::host_outcome::HostVerifyReason::ScannerDoesNotVerify))
 	}
 }
 

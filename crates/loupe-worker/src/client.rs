@@ -10,8 +10,11 @@ use loupe_proto::{
 	JobCapability, LeaseRequest, LeaseResponse, ListFindingsResponse, LlmFindingSubmission,
 	VerdictSubmission, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
+use loupe_provenance::{Ingress, Server, Untrusted};
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use reqwest::Url;
+
+mod ingress;
 
 /// Named authentication handoff: Bytes keeps this shared secret owner alive
 /// through header clones. HTTP/TLS encoding and kernel copies are not covered
@@ -39,6 +42,11 @@ pub struct ServerClient {
 	base: Url,
 }
 
+pub(crate) struct LeaseReceipt {
+	pub(crate) response: LeaseResponse,
+	pub(crate) reviewed_revision: crate::host_outcome::ReviewedRevisionFact,
+}
+
 impl ServerClient {
 	pub fn new(
 		server_cert_pem: &str, client_cert_pem: &str, client_key_pem: &str, base: Url,
@@ -62,6 +70,11 @@ impl ServerClient {
 	pub async fn lease(
 		&self, capabilities: Vec<String>, wait_seconds: u32,
 	) -> Result<LeaseResponse> {
+		Ok(self.lease_for_runner(capabilities, wait_seconds).await?.response)
+	}
+	pub(crate) async fn lease_for_runner(
+		&self, capabilities: Vec<String>, wait_seconds: u32,
+	) -> Result<LeaseReceipt> {
 		let url = self.url("/v1/jobs/lease");
 		let req = LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
 		let resp = self
@@ -71,7 +84,7 @@ impl ServerClient {
 			.await
 			.context("lease request")?;
 		let resp = ensure_ok(resp).await?;
-		serde_json::from_slice(&resp).context("decoding lease response")
+		ingress::lease(&resp).context("decoding lease response")
 	}
 
 	pub async fn heartbeat(
@@ -86,7 +99,7 @@ impl ServerClient {
 			.await
 			.context("heartbeat request")?;
 		let resp = ensure_ok(resp).await?;
-		serde_json::from_slice(&resp).context("decoding heartbeat")
+		ingress::heartbeat(&resp).context("decoding heartbeat")
 	}
 
 	pub async fn submit_findings(
@@ -99,7 +112,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("findings request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
 	pub async fn submit_llm_finding(
@@ -112,7 +125,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("LLM finding request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
 	pub async fn complete(
@@ -125,7 +138,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("complete request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
 	pub async fn submit_verdict(
@@ -138,7 +151,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("verdict request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
 	/// FTS keyword search over a repo's accumulated findings. The
@@ -157,7 +170,7 @@ impl ServerClient {
 			.await
 			.context("search request")?;
 		let resp = ensure_ok(resp).await?;
-		serde_json::from_slice(&resp).context("decoding search response")
+		ingress::search(&resp).context("decoding search response")
 	}
 
 	/// Fetch the full detail view for one finding by id. Used by the
@@ -174,7 +187,7 @@ impl ServerClient {
 			.await
 			.context("get_finding request")?;
 		let resp = ensure_ok(resp).await?;
-		serde_json::from_slice(&resp).context("decoding finding detail")
+		ingress::detail(&resp).context("decoding finding detail")
 	}
 
 	fn url(&self, path: &str) -> Url {
@@ -193,14 +206,23 @@ impl ServerClient {
 	}
 }
 
-async fn ensure_ok(resp: reqwest::Response) -> Result<Bytes> {
+#[allow(unsafe_code)]
+async fn read_server_response(
+	resp: reqwest::Response,
+) -> Result<Untrusted<Bytes, Server>, loupe_http::ResponseBodyError> {
+	let bytes = read_response_bytes(resp).await?;
+	// SAFETY: these owner-backed bytes came directly from this configured
+	// Server client's HTTP response, under the existing bounded body reader.
+	Ok(Untrusted::new(bytes, unsafe { Ingress::<Server>::new() }))
+}
+
+async fn ensure_ok(resp: reqwest::Response) -> Result<Untrusted<Bytes, Server>> {
 	if !resp.status().is_success() {
 		let status = resp.status();
-		let bytes = read_response_bytes(resp)
+		let bytes = read_server_response(resp)
 			.await
 			.map_err(|error| anyhow!("server returned {status}: {error}"))?;
-		let body = String::from_utf8_lossy(&bytes);
-		let body = body.trim();
+		let body = ingress::error(&bytes);
 		if body.is_empty() {
 			return Err(anyhow!("server returned {status}"));
 		}
@@ -220,7 +242,7 @@ async fn ensure_ok(resp: reqwest::Response) -> Result<Bytes> {
 			"server protocol mismatch: worker speaks {PROTOCOL_VERSION}, server sent {server_version}"
 		));
 	}
-	read_response_bytes(resp).await.map_err(|error| anyhow!("reading server response: {error}"))
+	read_server_response(resp).await.map_err(|error| anyhow!("reading server response: {error}"))
 }
 
 #[cfg(test)]

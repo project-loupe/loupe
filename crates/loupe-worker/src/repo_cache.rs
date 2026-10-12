@@ -8,11 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use loupe_provenance::Secret;
+use loupe_core::source_migration::text::BoundedText;
+use loupe_provenance::{Ingress, Mark, Repo, Secret, Untrusted, Unvalidated, Validate};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::git_credentials::GitCredentialOperation;
+use crate::ingress_text::RevisionText;
 
 const CURSOR_FILENAME: &str = ".loupe_cursor";
 const CURSOR_MAGIC: &[u8] = b"LOUPE";
@@ -226,7 +228,10 @@ impl RepoCache {
 	pub fn read_cursor(&self, key: &RepoKey) -> Option<String> {
 		let path = self.repo_path(key).join(CURSOR_FILENAME);
 		let bytes = std::fs::read(&path).ok()?;
-		decode_cursor(&bytes)
+		// SAFETY: actual cached repository cursor bytes, before decoding.
+		#[allow(unsafe_code)]
+		let bytes = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
+		bytes.as_bytes().validate(RepoCursorDecoder).ok()?.map(RepoCursor::legacy_revision)
 	}
 
 	/// Write the cursor for `key`. Always writes the current cursor
@@ -364,7 +369,7 @@ fn encode_cursor(sha: &str) -> Vec<u8> {
 
 /// Decode a cursor file. Returns `None` on missing magic, unknown
 /// version, malformed body, or empty SHA.
-fn decode_cursor(bytes: &[u8]) -> Option<String> {
+fn cursor_text(bytes: &[u8]) -> Option<&str> {
 	let header_len = CURSOR_MAGIC.len() + 2;
 	if bytes.len() < header_len {
 		return None;
@@ -383,8 +388,31 @@ fn decode_cursor(bytes: &[u8]) -> Option<String> {
 	if s.is_empty() {
 		None
 	} else {
-		Some(s.to_owned())
+		Some(s)
 	}
+}
+
+struct RepoCursor(BoundedText<RevisionText, Repo>);
+struct RepoCursorDecoder;
+impl Validate<&[u8], Repo> for RepoCursorDecoder {
+	type Output = Option<RepoCursor>;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, u: Unvalidated<'view, &[u8]>, mark: Mark<'view, Repo>,
+	) -> Result<Self::Output, Self::Error> {
+		Ok(cursor_text(u.get()).and_then(|text| BoundedText::new(&mark, text).ok()).map(RepoCursor))
+	}
+}
+impl RepoCursor {
+	/// Temporary concrete cursor exit; M retains the Repo revision.
+	fn legacy_revision(self) -> String {
+		self.0.expose().to_owned()
+	}
+}
+
+#[cfg(fuzzing)]
+fn decode_cursor(bytes: &[u8]) -> Option<String> {
+	cursor_text(bytes).map(str::to_owned)
 }
 
 /// Exercise the persisted cursor and credential context boundary.
@@ -558,6 +586,18 @@ mod tests {
 		assert!(cache.read_cursor(&key).is_none());
 		cache.write_cursor(&key, "abc123def456").unwrap();
 		assert_eq!(cache.read_cursor(&key).as_deref(), Some("abc123def456"));
+	}
+
+	#[test]
+	fn cursor_repo_text_rejects_new_control_policy() {
+		let tmp = tempfile::tempdir().unwrap();
+		let cache = RepoCache::new(tmp.path().to_path_buf(), u64::MAX, None).unwrap();
+		let key = RepoKey::new("local", "owner", "repo");
+		std::fs::create_dir_all(cache.repo_path(&key)).unwrap();
+		cache.write_cursor(&key, "bad\u{1}revision").unwrap();
+		assert!(cache.read_cursor(&key).is_none(), "Repo cursor control bytes were admitted");
+		cache.write_cursor(&key, " base ").unwrap();
+		assert_eq!(cache.read_cursor(&key).as_deref(), Some("base"));
 	}
 
 	#[test]

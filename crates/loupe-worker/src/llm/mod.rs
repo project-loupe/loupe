@@ -99,7 +99,7 @@ pub async fn fuzz_collect_cli_output(
 	reader: impl tokio::io::AsyncRead + Unpin,
 ) -> std::io::Result<(Vec<u8>, bool)> {
 	let output = cli_output::collect_cli_output(reader).await?;
-	Ok((output.bytes, output.truncated))
+	Ok((output.fixture_bytes(), output.truncated))
 }
 
 const CLI_STREAM_OMISSION: &str = " ... ";

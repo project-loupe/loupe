@@ -65,3 +65,14 @@ fuzz/src/worker_mcp_rpc.rs fuzz entry point: the C entry point takes a raw point
 crates/loupe-web/src/guard.rs actual HTTP request capture mints Browser before guard/token/route validation
 crates/loupe-web/src/ingress/server.rs actual upstream HTTP response capture mints Server before header/body validation
 crates/loupe-web/src/config/input.rs actual native argument/environment and selected PEM/file reads mint Config before named validation
+crates/loupe-worker/src/client.rs actual bounded HTTP response capture mints Server before decoding
+crates/loupe-worker/src/config.rs actual configuration file bytes mint Config before TOML decoding
+crates/loupe-worker/src/config_arguments.rs actual native argument and environment values mint Config before interpretation
+crates/loupe-worker/src/llm/cli_output.rs actual bounded subprocess pipe bytes mint Sandbox before decoding
+crates/loupe-worker/src/llm/model_broker.rs actual limited request body and upstream chunks mint Sandbox and Provider before interpretation
+crates/loupe-worker/src/mcp.rs actual framed MCP records mint Sandbox; filesystem and Git observations mint Repo before interpretation
+crates/loupe-worker/src/repo_cache.rs actual cursor file bytes mint Repo before revision decoding
+crates/loupe-worker/src/runner.rs actual libgit2 path and OID observations mint Repo before interpretation
+crates/loupe-worker/src/scanners/regex_secrets.rs actual file bytes and native walk path mint Repo before scanning
+crates/loupe-worker/src/source_discovery.rs actual Cargo manifest and native discovery observations mint Repo before interpretation
+crates/loupe-worker/src/mcp/legacy_test_api.rs test-only fixed Sandbox fixture enters the actual MCP decoder

@@ -26,17 +26,18 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use loupe_provenance::Secret;
+use loupe_provenance::{Ingress, Provider, Sandbox, Secret, Untrusted};
 use tokio::net::UnixListener;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::SandboxBuilder;
 
+mod ingress;
+
 pub const SANDBOX_MODEL_DIR: &str = "/loupe/model";
 pub const SANDBOX_MODEL_SOCKET: &str = "/loupe/model/session.sock";
 
-const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ADAPTER_CONNECTIONS: usize = 16;
 const BROKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const BROKER_ERROR_TRAILER: &str = "loupe-broker-error";
@@ -365,6 +366,7 @@ struct BrokerState {
 	upstream: reqwest::Url,
 	auth: ModelAuthHeader,
 	limits: ModelBrokerLimits,
+	ingress_limits: crate::limits::Limits,
 	usage: Arc<UsageCounters>,
 	http: reqwest::Client,
 }
@@ -407,8 +409,15 @@ impl ModelBrokerSession {
 			.redirect(reqwest::redirect::Policy::none())
 			.build()
 			.context("building model broker HTTP client")?;
-		let state =
-			Arc::new(BrokerState { backend, upstream, auth, limits, usage: usage.clone(), http });
+		let state = Arc::new(BrokerState {
+			backend,
+			upstream,
+			auth,
+			limits,
+			ingress_limits: crate::limits::Limits::default(),
+			usage: usage.clone(),
+			http,
+		});
 		let shutdown = CancellationToken::new();
 		let task_shutdown = shutdown.clone();
 		let task = tokio::spawn(serve_session(listener, state, task_shutdown));
@@ -540,7 +549,10 @@ async fn handle_request(
 	let query = query.map(str::to_owned);
 
 	let headers = sanitize_request_headers(request.headers(), &state.auth);
-	let body = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES).collect().await {
+	let body = match Limited::new(request.into_body(), state.ingress_limits.model_request_bytes)
+		.collect()
+		.await
+	{
 		Ok(body) => body.to_bytes(),
 		Err(_) => {
 			return Ok(local_error(
@@ -550,7 +562,11 @@ async fn handle_request(
 			));
 		},
 	};
-	let body = match enforce_request_policy(&body, &state.backend) {
+	// SAFETY: this body was just read from the session's sandbox Unix socket
+	// through the existing finite HTTP body collector.
+	#[allow(unsafe_code)]
+	let body = Untrusted::new(body, unsafe { Ingress::<Sandbox>::new() });
+	let body = match ingress::UpstreamRequest::admit(body, &state.backend) {
 		Ok(body) => body,
 		Err(RequestPolicyError::InvalidJson) => {
 			return Ok(local_error(
@@ -559,8 +575,11 @@ async fn handle_request(
 				"model request must be a JSON object",
 			));
 		},
-		Err(RequestPolicyError::DeniedTool(tool_type)) => {
-			tracing::warn!(tool_type, "model broker denied a provider-side fetch tool");
+		Err(RequestPolicyError::DeniedTool(reason)) => {
+			tracing::warn!(
+				reason = reason.as_str(),
+				"model broker denied a provider-side fetch tool"
+			);
 			return Ok(local_error(
 				StatusCode::UNPROCESSABLE_ENTITY,
 				"tool_policy_denied",
@@ -576,12 +595,8 @@ async fn handle_request(
 	upstream.set_path(endpoint);
 	upstream.set_query(query.as_deref());
 	upstream.set_fragment(None);
-	let response = state
-		.http
-		.post(upstream)
-		.headers(headers)
-		.body(body)
-		.send()
+	let response = body
+		.send(state.http.post(upstream).headers(headers))
 		.await
 		.context("sending model request to configured upstream")?;
 	if response.status().is_redirection() {
@@ -649,7 +664,24 @@ fn is_hop_by_hop_name(name: &[u8]) -> bool {
 
 pub(crate) enum RequestPolicyError {
 	InvalidJson,
-	DeniedTool(String),
+	DeniedTool(DeniedToolReason),
+}
+
+/// Closed policy facts; rejected tool spelling is never diagnostic context.
+pub(crate) enum DeniedToolReason {
+	ProviderFetch,
+	RemoteMcp,
+	McpServers,
+}
+
+impl DeniedToolReason {
+	fn as_str(&self) -> &'static str {
+		match self {
+			Self::ProviderFetch => "provider_fetch",
+			Self::RemoteMcp => "remote_mcp",
+			Self::McpServers => "mcp_servers",
+		}
+	}
 }
 
 fn enforce_request_policy(
@@ -675,14 +707,19 @@ pub(crate) fn apply_request_policy(
 	if object.get("mcp_servers").is_some_and(
 		|servers| !matches!(servers, serde_json::Value::Array(items) if items.is_empty()),
 	) {
-		return Err(RequestPolicyError::DeniedTool("mcp_servers".to_owned()));
+		return Err(RequestPolicyError::DeniedTool(DeniedToolReason::McpServers));
 	}
 	if let Some(tools) = object.get("tools").and_then(serde_json::Value::as_array) {
 		for tool in tools {
 			if let Some(tool_type) = tool.get("type").and_then(serde_json::Value::as_str)
 				&& denied_tool_type(backend.provider(), tool_type)
 			{
-				return Err(RequestPolicyError::DeniedTool(tool_type.to_owned()));
+				let reason = if matches!(tool_type, "mcp" | "remote_mcp") {
+					DeniedToolReason::RemoteMcp
+				} else {
+					DeniedToolReason::ProviderFetch
+				};
+				return Err(RequestPolicyError::DeniedTool(reason));
 			}
 		}
 	}
@@ -734,7 +771,7 @@ fn stream_upstream_response(
 		upstream: Box::pin(upstream.bytes_stream()),
 		usage: state.usage.clone(),
 		output_ceiling: state.limits.output_ceiling_bytes,
-		capture: Vec::new(),
+		capture: ingress::ProviderCapture::default(),
 		overflowed: false,
 		terminal: false,
 	};
@@ -753,8 +790,20 @@ fn stream_upstream_response(
 		}
 		match state.upstream.next().await {
 			Some(Ok(chunk)) => {
-				let allowed = state.usage.reserve_output(chunk.len(), state.output_ceiling);
-				if allowed == 0 {
+				// SAFETY: this chunk came directly from the configured provider's
+				// response stream, before interpretation or sandbox forwarding.
+				#[allow(unsafe_code)]
+				let chunk = Untrusted::new(chunk, unsafe { Ingress::<Provider>::new() });
+				let forwarded = match chunk.validate(ingress::ToSandbox {
+					capture: &mut state.capture,
+					usage: &state.usage,
+					output_ceiling: state.output_ceiling,
+				}) {
+					Ok(value) => value,
+					Err(never) => match never {},
+				};
+				state.overflowed = forwarded.overflowed;
+				let Some(chunk) = forwarded.bytes else {
 					state.overflowed = true;
 					let mut trailers = HeaderMap::new();
 					trailers.insert(
@@ -763,14 +812,7 @@ fn stream_upstream_response(
 					);
 					state.terminal = true;
 					return Some((Ok(Frame::trailers(trailers)), state));
-				}
-				let chunk = if allowed < chunk.len() {
-					state.overflowed = true;
-					chunk.slice(..allowed)
-				} else {
-					chunk
 				};
-				state.capture.extend_from_slice(&chunk);
 				Some((Ok(Frame::data(chunk)), state))
 			},
 			Some(Err(error)) => {
@@ -778,7 +820,7 @@ fn stream_upstream_response(
 				Some((Err(Box::new(error) as BoxError), state))
 			},
 			None => {
-				let tokens = token_usage_from_response(&state.capture);
+				let tokens = state.capture.token_usage();
 				state.usage.tokens.fetch_add(tokens, Ordering::Relaxed);
 				None
 			},
@@ -796,7 +838,7 @@ struct OutputStreamState {
 	upstream: UpstreamByteStream,
 	usage: Arc<UsageCounters>,
 	output_ceiling: u64,
-	capture: Vec<u8>,
+	capture: ingress::ProviderCapture,
 	overflowed: bool,
 	terminal: bool,
 }
@@ -941,6 +983,9 @@ mod tests {
 	use tokio::sync::Mutex;
 
 	use super::*;
+
+	#[path = "security_log_tests.rs"]
+	mod security_log_tests;
 
 	fn credential_headers(headers: &HeaderMap, credential: &ModelCredential) -> Result<HeaderMap> {
 		let provider = match credential.kind {

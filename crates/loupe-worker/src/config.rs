@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use loupe_provenance::{Config, Ingress, Untrusted};
 use serde::Deserialize;
 
 use crate::llm::claude_cli::{DEFAULT_CLAUDE_EFFORT, DEFAULT_CLAUDE_MODEL};
@@ -12,6 +13,8 @@ use crate::llm::{CliModelConfig, JobAgent, DEFAULT_REQUEST_TIMEOUT};
 use crate::runner::DEFAULT_MAX_WORKDIR_BYTES;
 use crate::sandbox::{validate_network_host, SandboxNetworkConfig, SandboxNetworkMode};
 use crate::scanners::LlmScannerConfig;
+
+mod ingress;
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/loupe-worker";
 const DEFAULT_MAX_CACHE_GB: u64 = 40;
@@ -523,10 +526,19 @@ impl Default for WorkerConfig {
 
 impl FileConfig {
 	pub fn load(path: &Path) -> Result<Self> {
-		let raw = std::fs::read_to_string(path)
+		let raw = std::fs::read(path)
 			.with_context(|| format!("reading worker config file {}", path.display()))?;
-		let mut cfg: FileConfig = toml::from_str(&raw)
-			.with_context(|| format!("parsing worker config file {}", path.display()))?;
+		// SAFETY: these are the original bytes just read from the configured
+		// worker TOML file, before UTF-8 or TOML interpretation.
+		#[allow(unsafe_code)]
+		let raw = Untrusted::new(raw, unsafe { Ingress::<Config>::new() });
+		let decoded =
+			raw.as_bytes().validate(ingress::WorkerFileConfigDecoder).map_err(|error| {
+				let operation =
+					if error.is::<std::str::Utf8Error>() { "reading" } else { "parsing" };
+				error.context(format!("{operation} worker config file {}", path.display()))
+			})?;
+		let mut cfg = decoded.into_legacy();
 		let base = path.parent().unwrap_or_else(|| Path::new("."));
 		cfg.tls.ca_cert = cfg.tls.ca_cert.map(|p| resolve(base, p));
 		cfg.tls.cert = cfg.tls.cert.map(|p| resolve(base, p));
@@ -813,6 +825,111 @@ allowlist = ["from-file.example"]
 
 		let err = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
 		let msg = format!("{err:#}");
-		assert!(msg.contains("llama") || msg.contains("scan"), "got: {msg}");
+		// The closed admission error keeps the rejected-choice category and
+		// original offset, rather than echoing the rejected config value.
+		assert!(msg.contains("unknown variant") && msg.contains("bytes "), "got: {msg}");
+	}
+
+	#[test]
+	fn model_names_and_file_paths_keep_exact_spelling() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(
+			&path,
+			"[agents.claude]\nmodel = ' Cafe\u{301}-Model '\n\
+			 [agents.codex]\nmodel = 'MiXeD%2fModel'\n\
+			 [tls]\nkey = 'keys/../Cafe\u{301}%2f.KEY'\n\
+			 [cache]\ndir = './cache:Case%2f'\n",
+		)
+		.unwrap();
+		let cfg = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap();
+		assert_eq!(cfg.agents.claude.model, " Cafe\u{301}-Model ");
+		assert_eq!(cfg.agents.codex.model, "MiXeD%2fModel");
+		assert_eq!(cfg.tls.key.unwrap(), dir.path().join("keys/../Cafe\u{301}%2f.KEY"));
+		assert_eq!(cfg.cache.dir, dir.path().join("./cache:Case%2f"));
+	}
+
+	#[test]
+	fn file_scanner_zeros_are_rejected_unless_the_override_replaces_them() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		for field in ["max_concurrent_files", "max_file_bytes", "per_request_timeout_seconds"] {
+			std::fs::write(&path, format!("[scanner_defaults]\n{field} = 0\n")).unwrap();
+			let error =
+				WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+			assert_eq!(
+				error.to_string(),
+				format!("scanner_defaults.{field} must be greater than zero")
+			);
+			let cfg = WorkerConfig::load(
+				Some(&path),
+				WorkerConfigOverrides {
+					max_concurrent_files: Some(3),
+					max_file_bytes: Some(7),
+					per_request_timeout_seconds: Some(11),
+					..Default::default()
+				},
+			)
+			.unwrap();
+			assert_eq!(cfg.scanner_defaults.max_concurrent_files, 3);
+			assert_eq!(cfg.scanner_defaults.max_file_bytes, 7);
+			assert_eq!(cfg.scanner_defaults.per_request_timeout, Duration::from_secs(11));
+		}
+	}
+
+	#[test]
+	fn file_model_nonempty_checks_and_closed_values_do_not_trim() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		for (section, field, value) in [
+			("agents.claude", "model", " "),
+			("agents.codex", "model", ""),
+			("agents.claude", "effort", "MAX"),
+			("agents.codex", "effort", " high "),
+			("logging", "level", "Info"),
+		] {
+			std::fs::write(&path, format!("[{section}]\n{field} = '{value}'\n")).unwrap();
+			let error =
+				WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+			assert!(
+				error.to_string().starts_with(&format!("{section}.{field} must ")),
+				"{error:#}"
+			);
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn path_overrides_are_host_paths_and_keep_non_utf8_bytes() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[tls]\nkey = 'file.key'\n[cache]\ndir = 'file-cache'\n").unwrap();
+		let key = PathBuf::from(std::ffi::OsString::from_vec(b"../operator-\xff.key".to_vec()));
+		let cache = dir.path().join("absolute-cache");
+		let cfg = WorkerConfig::load(
+			Some(&path),
+			WorkerConfigOverrides {
+				key: Some(key.clone()),
+				cache_dir: Some(cache.clone()),
+				..Default::default()
+			},
+		)
+		.unwrap();
+		assert_eq!(cfg.tls.key.unwrap().as_os_str().as_bytes(), key.as_os_str().as_bytes());
+		assert_eq!(cfg.cache.dir, cache);
+	}
+
+	#[test]
+	fn config_read_rejects_non_utf8_and_malformed_toml() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, b"[agents.codex]\nmodel = '\xff'\n").unwrap();
+		let error = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+		assert!(error.to_string().starts_with("reading worker config file "));
+		std::fs::write(&path, "[agents.codex\nmodel = 'valid'\n").unwrap();
+		let error = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+		assert!(error.to_string().starts_with("parsing worker config file "));
 	}
 }

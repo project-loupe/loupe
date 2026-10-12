@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! Entry point for the loupe scan/verify worker.
 //!
 //! Worker and internal helper modes are selected via subcommands:
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
+use loupe_worker::config::{LoggingConfig, WorkerConfig};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
 	claude_available, codex_auth_available, codex_available, BackendRuntimeConfig, JobAgent,
@@ -29,6 +29,9 @@ use loupe_worker::sandbox::SandboxNetworkMode;
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
+
+mod config_arguments;
+use config_arguments::{ConfiguredPath, ConfiguredText, ConfiguredUrl, WorkerOverridesDecoder};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe scan/verify worker")]
@@ -70,19 +73,19 @@ struct GitCredentialArgs {
 struct RunArgs {
 	/// Path to worker config TOML. CLI/env values override file settings.
 	#[arg(long, env = "LOUPE_WORKER_CONFIG")]
-	config: Option<PathBuf>,
+	config: Option<ConfiguredPath>,
 	/// Base URL of the loupe-server (e.g. https://loupe-server:8443).
 	#[arg(long, env = "LOUPE_SERVER_URL")]
-	server_url: Option<reqwest::Url>,
+	server_url: Option<ConfiguredUrl>,
 	/// Path to the CA cert (server-auth root).
 	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: Option<PathBuf>,
+	ca_cert: Option<ConfiguredPath>,
 	/// Path to this worker's client cert PEM.
 	#[arg(long, env = "LOUPE_WORKER_CERT")]
-	cert: Option<PathBuf>,
+	cert: Option<ConfiguredPath>,
 	/// Path to this worker's client private-key PEM.
 	#[arg(long, env = "LOUPE_WORKER_KEY")]
-	key: Option<PathBuf>,
+	key: Option<ConfiguredPath>,
 	/// CA cert PEM content. When set, this takes precedence over
 	/// --ca-cert / LOUPE_CA_CERT.
 	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM", hide_env_values = true)]
@@ -103,7 +106,7 @@ struct RunArgs {
 	key_pem_b64: Option<loupe_tls::PemInput>,
 	/// Where to keep cached bare clones.
 	#[arg(long, env = "LOUPE_CACHE_DIR")]
-	cache_dir: Option<PathBuf>,
+	cache_dir: Option<ConfiguredPath>,
 	/// Maximum cache size in GB before LRU eviction kicks in.
 	#[arg(long, env = "LOUPE_MAX_CACHE_GB")]
 	max_cache_gb: Option<u64>,
@@ -118,10 +121,10 @@ struct RunArgs {
 	sandbox_network: Option<SandboxNetworkMode>,
 	/// Comma-separated hostnames or IPv4 addresses added in allowlist mode.
 	#[arg(long, env = "LOUPE_SANDBOX_ALLOWLIST", value_delimiter = ',')]
-	sandbox_allowlist: Option<Vec<String>>,
+	sandbox_allowlist: Option<Vec<ConfiguredText>>,
 	/// Logging level: trace, debug, info, warn, or error.
 	#[arg(long, env = "LOUPE_LOG_LEVEL")]
-	log_level: Option<String>,
+	log_level: Option<ConfiguredText>,
 	/// Emit structured JSON logs.
 	#[arg(long, env = "LOUPE_LOG_JSON", value_parser = clap::builder::BoolishValueParser::new())]
 	log_json: Option<bool>,
@@ -136,16 +139,16 @@ struct RunArgs {
 	verify_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
 	#[arg(long, env = "LOUPE_CLAUDE_MODEL")]
-	claude_model: Option<String>,
+	claude_model: Option<ConfiguredText>,
 	/// Claude effort level: low, medium, high, xhigh, or max.
 	#[arg(long, env = "LOUPE_CLAUDE_EFFORT")]
-	claude_effort: Option<String>,
+	claude_effort: Option<ConfiguredText>,
 	/// Codex model for every Codex-backed invocation.
 	#[arg(long, env = "LOUPE_CODEX_MODEL")]
-	codex_model: Option<String>,
+	codex_model: Option<ConfiguredText>,
 	/// Codex reasoning effort: none, low, medium, high, or xhigh.
 	#[arg(long, env = "LOUPE_CODEX_EFFORT")]
-	codex_effort: Option<String>,
+	codex_effort: Option<ConfiguredText>,
 	/// Fleet-wide default for concurrent per-file LLM sessions.
 	#[arg(long, env = "LOUPE_MAX_CONCURRENT_FILES")]
 	max_concurrent_files: Option<usize>,
@@ -157,7 +160,7 @@ struct RunArgs {
 	per_request_timeout_seconds: Option<u64>,
 	/// BKB HTTP API URL for the optional bkb-mcp child.
 	#[arg(long, env = "LOUPE_BKB_API_URL")]
-	bkb_api_url: Option<String>,
+	bkb_api_url: Option<ConfiguredText>,
 	/// Maximum model API requests allowed in one broker session.
 	#[arg(long, env = "LOUPE_BROKER_REQUEST_CEILING")]
 	broker_request_ceiling: Option<u64>,
@@ -516,35 +519,8 @@ fn replace_model_base_url(argument: OsString, base_url: &str) -> OsString {
 
 fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 	WorkerConfig::load(
-		args.config.as_deref(),
-		WorkerConfigOverrides {
-			server_url: args.server_url.clone(),
-			ca_cert: args.ca_cert.clone(),
-			cert: args.cert.clone(),
-			key: args.key.clone(),
-			cache_dir: args.cache_dir.clone(),
-			max_cache_gb: args.max_cache_gb,
-			max_workdir_gb: args.max_workdir_gb,
-			disable_sandbox: args.disable_sandbox,
-			sandbox_network: args.sandbox_network,
-			sandbox_allowlist: args.sandbox_allowlist.clone(),
-			log_level: args.log_level.clone(),
-			log_json: args.log_json,
-			log_agent_output: args.log_agent_output,
-			scan_agent: args.scan_agent,
-			verify_agent: args.verify_agent,
-			claude_model: args.claude_model.clone(),
-			claude_effort: args.claude_effort.clone(),
-			codex_model: args.codex_model.clone(),
-			codex_effort: args.codex_effort.clone(),
-			max_concurrent_files: args.max_concurrent_files,
-			max_file_bytes: args.max_file_bytes,
-			per_request_timeout_seconds: args.per_request_timeout_seconds,
-			bkb_api_url: args.bkb_api_url.clone(),
-			broker_request_ceiling: args.broker_request_ceiling,
-			broker_output_ceiling_bytes: args.broker_output_ceiling_bytes,
-			broker_token_ceiling: args.broker_token_ceiling,
-		},
+		args.config.as_ref().map(ConfiguredPath::as_path),
+		WorkerOverridesDecoder::into_legacy(args),
 	)
 }
 
@@ -672,6 +648,9 @@ fn bool_env(name: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+mod test_env;
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 
@@ -738,7 +717,62 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(cli.run.sandbox_network, Some(SandboxNetworkMode::Allowlist));
-		assert_eq!(cli.run.sandbox_allowlist.unwrap(), ["example.com", "203.0.113.9"]);
+		assert_eq!(
+			cli.run
+				.sandbox_allowlist
+				.unwrap()
+				.iter()
+				.map(ConfiguredText::legacy_override)
+				.collect::<Vec<_>>(),
+			["example.com", "203.0.113.9"]
+		);
+	}
+
+	#[test]
+	fn config_cli_flags_override_environment_then_file_values() {
+		use std::ffi::OsStr;
+
+		if !test_env::in_env(
+			"tests::config_cli_flags_override_environment_then_file_values",
+			"config-precedence",
+			&[
+				("LOUPE_CODEX_MODEL", Some(OsStr::new(" Env-Cafe\u{301} "))),
+				("LOUPE_MAX_FILE_BYTES", Some(OsStr::new("23"))),
+				("LOUPE_WORKER_CONFIG", None),
+			],
+		) {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(
+			&path,
+			"[agents.codex]\nmodel = 'File-Model'\n\
+			 [scanner_defaults]\nmax_file_bytes = 17\n",
+		)
+		.unwrap();
+		let cli = Cli::try_parse_from([
+			OsStr::new("loupe-worker"),
+			OsStr::new("--config"),
+			path.as_os_str(),
+		])
+		.unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.agents.codex.model, " Env-Cafe\u{301} ");
+		assert_eq!(cfg.scanner_defaults.max_file_bytes, 23);
+		let cli = Cli::try_parse_from([
+			OsStr::new("loupe-worker"),
+			OsStr::new("--config"),
+			path.as_os_str(),
+			OsStr::new("--codex-model"),
+			OsStr::new(" Flag-Cafe\u{301} "),
+			OsStr::new("--max-file-bytes"),
+			OsStr::new("31"),
+		])
+		.unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.agents.codex.model, " Flag-Cafe\u{301} ");
+		assert_eq!(cfg.scanner_defaults.max_file_bytes, 31);
 	}
 
 	#[test]
@@ -914,5 +948,46 @@ mod tls_consumer_tests {
 			Some(key)
 		)
 		.is_err());
+	}
+}
+
+#[cfg(test)]
+mod config_admission_tests {
+	use super::*;
+	#[test]
+	fn worker_cli_model_rejects_control_before_config_override() {
+		let result = Cli::try_parse_from(["loupe-worker", "--codex-model", "model\u{1}"]);
+		assert!(result.is_err(), "worker CLI model control bytes were accepted");
+	}
+	#[test]
+	fn worker_cli_model_rejects_text_over_two_mib() {
+		let model = "a".repeat(2 * 1024 * 1024 + 1);
+		let result = Cli::try_parse_from(["loupe-worker", "--codex-model", &model]);
+		assert!(result.is_err(), "worker CLI model above 2 MiB was accepted");
+	}
+	#[cfg(unix)]
+	#[test]
+	fn worker_cli_and_environment_keep_native_config_paths() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+		let native = OsString::from_vec(b"../operator-\xff-cache".to_vec());
+		if !test_env::in_env(
+			"config_admission_tests::worker_cli_and_environment_keep_native_config_paths",
+			"native-config-path",
+			&[("LOUPE_CACHE_DIR", Some(native.as_os_str()))],
+		) {
+			return;
+		}
+		let cli = Cli::try_parse_from(["loupe-worker"]).unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.cache.dir.as_os_str().as_bytes(), native.as_bytes());
+		let flag = OsString::from_vec(b"../flag-\xfe-cache".to_vec());
+		let cli = Cli::try_parse_from([
+			OsString::from("loupe-worker"),
+			OsString::from("--cache-dir"),
+			flag.clone(),
+		])
+		.unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.cache.dir.as_os_str().as_bytes(), flag.as_bytes());
 	}
 }

@@ -10,7 +10,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::{Finding, Severity};
+use loupe_core::Finding;
+use loupe_provenance::{Ingress, Repo, Untrusted};
 use regex::Regex;
 use walkdir::WalkDir;
 
@@ -19,6 +20,7 @@ use crate::scanner::{ScanContext, Scanner};
 const SCANNER_ID: &str = "regex-secrets";
 const CAPABILITIES: &[&str] = &["scan:secrets"];
 const MAX_FILE_BYTES: u64 = 1_048_576; // 1 MB; bigger files are skipped.
+mod ingress;
 
 pub struct RegexSecretsScanner {
 	re: Regex,
@@ -103,39 +105,20 @@ fn walk(
 			Ok(b) => b,
 			Err(_) => continue,
 		};
-		// Skip binary-looking files.
-		if bytes.iter().take(8192).any(|b| *b == 0) {
-			continue;
-		}
-		let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-		for m in re.find_iter(text) {
-			let line_start = 1 + text[..m.start()].matches('\n').count() as u32;
-			let rel = entry.path().strip_prefix(workdir).unwrap_or(entry.path()).to_string_lossy();
-			// Fingerprint shape: `(scanner_id, file, matched_secret)`.
-			// Deliberately excludes line_start (line shifts when an
-			// unrelated line is added above the match) and head_sha
-			// (every scan would otherwise produce a fresh fingerprint
-			// for the same secret, defeating the dedup index). The
-			// matched bytes themselves are stable across cosmetic
-			// edits and uniquely identify the secret.
-			let _ = head_sha;
-			let fingerprint = crate::fingerprint::compute(SCANNER_ID, &rel, m.as_str());
-			out.push(Finding {
-				scanner_id: SCANNER_ID.into(),
-				severity: Severity::High,
-				title: "Possible AWS access key id".into(),
-				description: format!(
-					"Found a string matching the AWS access key id pattern (`AKIA…`) at {rel}:{line_start}. \
-					 Treat as a potential secret leak — confirm against the AWS account before reporting."
-				),
-				file_path: Some(rel.into_owned()),
-				line_start: Some(line_start),
-				line_end: Some(line_start),
-				cwe: Some("CWE-798".into()),
-				patch_unified: None,
-				poc_unified: None,
-				fingerprint,
-			});
+		let input = ingress::RepoFileInput {
+			bytes,
+			relative_path: entry.path().strip_prefix(workdir).unwrap_or(entry.path()).to_owned(),
+		};
+		// SAFETY: actual file bytes and native repository-relative path from
+		// this walk entry, before text decoding or matching.
+		#[allow(unsafe_code)]
+		let input = Untrusted::new(input, unsafe { Ingress::<Repo>::new() });
+		let _ = head_sha;
+		match input.validate(ingress::RegexSecretFindings { regex: re })? {
+			ingress::FileFindings::UnrepresentablePath => continue,
+			ingress::FileFindings::Findings(findings) => {
+				out.extend(findings.into_iter().map(ingress::RepoFinding::into_legacy))
+			},
 		}
 	}
 	Ok(out)
@@ -149,10 +132,27 @@ fn is_git_metadata(path: &Path) -> bool {
 mod tests {
 	use std::fs;
 
-	use loupe_core::RepoSpec;
+	use loupe_core::{RepoSpec, Severity};
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn regex_repo_paths_never_alias_non_utf8_names() {
+		use std::os::unix::ffi::OsStringExt;
+		let dir = tempfile::tempdir().unwrap();
+		let invalid = std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec());
+		fs::write(dir.path().join(invalid), "AKIAIOSFODNN7EXAMPLE").unwrap();
+		fs::write(dir.path().join("visible.rs"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+		let findings = RegexSecretsScanner::new().scan(&make_ctx(dir.path())).await.unwrap();
+		assert_eq!(
+			findings.len(),
+			1,
+			"unrepresentable native Repo path produced a lossy finding alias"
+		);
+		assert_eq!(findings[0].file_path.as_deref(), Some("visible.rs"));
+	}
 
 	fn make_ctx(workdir: &Path) -> ScanContext {
 		ScanContext {

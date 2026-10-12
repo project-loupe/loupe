@@ -29,7 +29,10 @@ impl FuzzSession {
 
 	pub async fn run(&self, input: &[u8]) -> SessionOutcome {
 		let mut reply = Vec::new();
-		let completed = run_session(self.0.clone(), input, &mut reply).await.is_ok();
+		let completed =
+			run_session(self.0.clone(), input, &mut reply, crate::limits::Limits::default())
+				.await
+				.is_ok();
 		let (verdict, patch) = if let Some(verify) = &self.0.verify {
 			let inner = verify.inner.lock().await;
 			let verdict = inner.verdict.as_ref().map(|verdict| match verdict {

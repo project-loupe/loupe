@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! `loupe-worker` library surface.
 
 #[cfg(test)]
@@ -8,6 +8,9 @@ pub mod client;
 pub mod config;
 pub mod fingerprint;
 mod git_credentials;
+pub mod host_outcome;
+mod ingress_text;
+mod limits;
 pub mod llm;
 pub mod mcp;
 pub mod repo_cache;

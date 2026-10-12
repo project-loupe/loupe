@@ -347,4 +347,79 @@ mod tests {
 			"ctx.config override should have caught widget.c"
 		);
 	}
+
+	#[tokio::test]
+	async fn malformed_known_patch_discards_all_overrides_but_unknown_members_do_not() {
+		let tmp = tempfile::tempdir().unwrap();
+		for name in ["one.rs", "two.rs", "only.c", "blocked.rs"] {
+			std::fs::write(tmp.path().join(name), "// source\n").unwrap();
+		}
+		let baseline = ScannerConfig {
+			include_extensions: vec!["rs".to_owned()],
+			exclude_path_substrings: vec!["blocked".to_owned()],
+			..Default::default()
+		};
+		for (patch, expected_calls) in [
+			(serde_json::Value::Null, 2),
+			(serde_json::json!({}), 2),
+			(serde_json::json!({"include_extensions": null}), 2),
+			(serde_json::json!({"include_extensions": []}), 0),
+			(serde_json::json!({"exclude_path_substrings": []}), 3),
+			(serde_json::json!({"include_extensions": ["c"], "future": {"nested": [1]}}), 1),
+			(serde_json::json!({"include_extensions": ["c"], "max_file_bytes": "bad"}), 2),
+			(serde_json::json!({"include_extensions": ["c"], "max_concurrent_files": -1}), 2),
+			(
+				serde_json::json!({"include_extensions": ["c"], "per_request_timeout_seconds": false}),
+				2,
+			),
+			(serde_json::json!({"include_extensions": ["c"], "exclude_path_substrings": [1]}), 2),
+			(
+				serde_json::json!({"include_extensions": ["c", null], "exclude_path_substrings": []}),
+				2,
+			),
+			(serde_json::json!("not a patch"), 2),
+			// The derived patch struct also accepts positional sequences.
+			(serde_json::json!([1, 4096, 1, ["c"], []]), 1),
+			(serde_json::json!([1, 4096, 1, ["c"]]), 1),
+			(serde_json::json!([1, "bad", 1, ["c"], []]), 2),
+			(serde_json::json!([1, 4096, 1, ["c"], [], "extra"]), 2),
+			// Lease JSON has already become Value: its last duplicate wins
+			// before the patch decoder can see an earlier malformed member.
+			(
+				serde_json::from_str(r#"{"include_extensions":["rs"],"include_extensions":["c"]}"#)
+					.unwrap(),
+				1,
+			),
+			(
+				serde_json::from_str(r#"{"include_extensions":7,"include_extensions":["c"]}"#)
+					.unwrap(),
+				1,
+			),
+			(
+				serde_json::from_str(r#"{"include_extensions":["c"],"include_extensions":7}"#)
+					.unwrap(),
+				2,
+			),
+			(
+				serde_json::from_str(
+					r#"{"include_extensions":["c"],"max_file_bytes":false,"max_file_bytes":4096}"#,
+				)
+				.unwrap(),
+				1,
+			),
+		] {
+			let calls = Arc::new(AtomicUsize::new(0));
+			let observed = calls.clone();
+			let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+				observed.fetch_add(1, Ordering::SeqCst);
+				Ok(String::new())
+			}));
+			let scanner = LlmCodeReviewScanner::new(backend).with_config(baseline.clone());
+			let mut ctx = make_ctx(tmp.path());
+			ctx.config = patch;
+			let findings = scanner.scan(&ctx).await.unwrap();
+			assert!(findings.is_empty());
+			assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "patch: {}", ctx.config);
+		}
+	}
 }

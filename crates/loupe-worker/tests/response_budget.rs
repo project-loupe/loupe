@@ -97,9 +97,9 @@ async fn worker_no_content_is_empty_success() {
 
 #[tokio::test]
 async fn conservative_escaped_finding_fixture_fits_budget() {
-	let description = "\u{0001}".repeat(16_384);
-	let diff = "\u{0001}".repeat(262_144);
-	let body = serde_json::to_vec(&serde_json::json!({
+	let description = "a".repeat(16_384);
+	let diff = "a".repeat(262_144);
+	let mut body = serde_json::to_string(&serde_json::json!({
 		"protocol_version": PROTOCOL_VERSION,
 		"id": 1, "repo_id": 1, "job_id": 1,
 		"scanner_id": "scanner", "severity": "high", "title": "example",
@@ -108,9 +108,16 @@ async fn conservative_escaped_finding_fixture_fits_budget() {
 		"verification_required": true, "created_at": 42,
 	}))
 	.unwrap();
+	// Preserve the original six-byte escaping stress while using admitted text.
+	// serde_json would otherwise serialize these letters as one byte each.
+	body = body.replace(&format!("\"{diff}\""), &format!("\"{}\"", "\\u0061".repeat(diff.len())));
+	body = body.replace(
+		&format!("\"{description}\""),
+		&format!("\"{}\"", "\\u0061".repeat(description.len())),
+	);
 	assert!(body.len() > 3_244_032, "fixture includes escaped fields and metadata");
 	assert!(body.len() < BUDGET);
-	let base = chunked_response("200 OK", &body, body.len()).await;
+	let base = chunked_response("200 OK", body.as_bytes(), body.len()).await;
 	let client = ServerClient::from_parts(reqwest::Client::new(), base);
 	let finding = client.get_finding(1, &JobCapability::from_secret("test")).await.unwrap();
 	assert_eq!(finding.description, description);

@@ -395,11 +395,9 @@ impl LlmBackend for ClaudeCliBackend {
 		};
 
 		let output_truncated = stdout.truncated || stderr.truncated;
-		let stdout = stdout.bytes;
-		let stderr = stderr.bytes;
 		if !status.success() {
-			let stderr_text = String::from_utf8_lossy(&stderr);
-			let stdout_text = String::from_utf8_lossy(&stdout);
+			let stderr_text = stderr.diagnostic().into_legacy();
+			let stdout_text = stdout.diagnostic().into_legacy();
 			tracing::debug!(
 				backend = BACKEND_ID,
 				exit = ?status.code(),
@@ -432,8 +430,10 @@ impl LlmBackend for ClaudeCliBackend {
 				"claude CLI output exceeds {MAX_CLI_OUTPUT_BYTES} bytes per stream"
 			));
 		}
-		let text = String::from_utf8(stdout)
-			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
+		let text = stdout
+			.text()
+			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?
+			.into_legacy();
 		// Debug instrumentation hooks (no-ops when env vars unset):
 		//
 		// - worker config `[logging].agent_output = true` dumps the full
@@ -450,7 +450,7 @@ impl LlmBackend for ClaudeCliBackend {
 				"claude-cli: agent stdout (full)"
 			);
 			if !stderr.is_empty() {
-				let stderr_text = String::from_utf8_lossy(&stderr);
+				let stderr_text = stderr.diagnostic().into_legacy();
 				tracing::info!(
 					backend = BACKEND_ID,
 					agent_stderr = %stderr_text,

@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glob::Pattern;
+use loupe_core::source_migration::text::{BoundedText, RepoPath};
+use loupe_provenance::{Ingress, Mark, Repo, Untrusted, Unvalidated, Validate};
 use serde::Deserialize;
 
+use crate::ingress_text::ScannerExcludePattern;
 use crate::llm::DEFAULT_REQUEST_TIMEOUT;
 
 /// Config knobs operators can set via the repo's `scanner_config`
@@ -169,16 +172,16 @@ pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<Path
 	let mut out = Vec::new();
 
 	if roots.roots.is_empty() && roots.files.is_empty() {
-		collect_from_root(workdir, cfg, &mut out);
+		collect_from_root(workdir, workdir, cfg, &mut out);
 	} else {
 		for file in roots.files {
 			if is_within_workdir(&file, &canonical_workdir) {
-				collect_file(&file, cfg, &mut out);
+				collect_file(workdir, &file, cfg, &mut out);
 			}
 		}
 		for root in roots.roots {
 			if is_within_workdir(&root, &canonical_workdir) {
-				collect_from_root(&root, cfg, &mut out);
+				collect_from_root(workdir, &root, cfg, &mut out);
 			}
 		}
 	}
@@ -243,9 +246,7 @@ struct WorkspaceManifest {
 
 fn parse_workspace(cargo_toml: &Path) -> Option<WorkspaceManifest> {
 	let manifest = parse_manifest(cargo_toml)?;
-	let workspace = manifest.get("workspace")?;
-	let exclude = read_string_array(workspace, "exclude");
-	Some(WorkspaceManifest { exclude })
+	manifest.legacy_discovery()
 }
 
 fn cargo_package_manifests(
@@ -271,12 +272,68 @@ fn manifest_has_package(cargo_toml: &Path) -> bool {
 	let Some(manifest) = parse_manifest(cargo_toml) else {
 		return false;
 	};
-	manifest.get("package").is_some()
+	manifest.has_package
 }
 
-fn parse_manifest(cargo_toml: &Path) -> Option<toml::Value> {
-	let text = std::fs::read_to_string(cargo_toml).ok()?;
-	toml::from_str(&text).ok()
+fn parse_manifest(cargo_toml: &Path) -> Option<CargoDiscoveryManifest> {
+	let bytes = std::fs::read(cargo_toml).ok()?;
+	// SAFETY: original repository Cargo.toml bytes, before UTF-8/TOML parsing.
+	#[allow(unsafe_code)]
+	let bytes = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
+	bytes.as_bytes().validate(CargoDiscoveryManifestDecoder).ok().flatten()
+}
+
+struct CargoDiscoveryManifest {
+	has_package: bool,
+	exclude: Option<Vec<BoundedText<ScannerExcludePattern, Repo>>>,
+	#[cfg(fuzzing)]
+	original: toml::Value,
+}
+struct CargoDiscoveryManifestDecoder;
+impl Validate<&[u8], Repo> for CargoDiscoveryManifestDecoder {
+	type Output = Option<CargoDiscoveryManifest>;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, u: Unvalidated<'view, &[u8]>, mark: Mark<'view, Repo>,
+	) -> Result<Self::Output, Self::Error> {
+		let Some(manifest) = std::str::from_utf8(u.get())
+			.ok()
+			.and_then(|text| toml::from_str::<toml::Value>(text).ok())
+		else {
+			return Ok(None);
+		};
+		let exclude = match manifest.get("workspace") {
+			None => None,
+			Some(workspace) => {
+				let values = workspace
+					.get("exclude")
+					.and_then(toml::Value::as_array)
+					.into_iter()
+					.flatten()
+					.filter_map(toml::Value::as_str);
+				let mut exclude = Vec::new();
+				for value in values {
+					let Ok(value) = BoundedText::new(&mark, value) else { return Ok(None) };
+					exclude.push(value);
+				}
+				Some(exclude)
+			},
+		};
+		Ok(Some(CargoDiscoveryManifest {
+			has_package: manifest.get("package").is_some(),
+			exclude,
+			#[cfg(fuzzing)]
+			original: manifest,
+		}))
+	}
+}
+impl CargoDiscoveryManifest {
+	/// Temporary marked Repo exclusion projection into the legacy selector.
+	fn legacy_discovery(self) -> Option<WorkspaceManifest> {
+		self.exclude.map(|values| WorkspaceManifest {
+			exclude: values.into_iter().map(|v| v.expose().to_owned()).collect(),
+		})
+	}
 }
 
 /// Fuzz-only access to production manifest parsing and source selection.
@@ -285,7 +342,8 @@ pub mod fuzz_support {
 	use std::path::{Path, PathBuf};
 
 	pub fn parse_manifest(path: &Path) -> Option<toml::Value> {
-		super::parse_manifest(path)
+		// Fuzz-only original syntax oracle; no production generic Value exit.
+		super::parse_manifest(path).map(|manifest| manifest.original)
 	}
 
 	pub fn workspace_excludes(path: &Path) -> Option<Vec<String>> {
@@ -297,17 +355,6 @@ pub mod fuzz_support {
 		cfg.exclude_path_substrings.extend_from_slice(excludes);
 		super::walk_source_files(workdir, &cfg)
 	}
-}
-
-fn read_string_array(table: &toml::Value, key: &str) -> Vec<String> {
-	table
-		.get(key)
-		.and_then(|value| value.as_array())
-		.into_iter()
-		.flatten()
-		.filter_map(|value| value.as_str())
-		.map(str::to_owned)
-		.collect()
 }
 
 fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
@@ -396,26 +443,75 @@ fn add_existing_dirs(base: &Path, names: &[&str], out: &mut Vec<PathBuf>) {
 	}
 }
 
-fn collect_from_root(root: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
+fn collect_from_root(workdir: &Path, root: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
 	walkdir::WalkDir::new(root)
 		.into_iter()
 		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file())
-		.for_each(|entry| collect_file(entry.path(), cfg, out));
+		.for_each(|entry| collect_file(workdir, entry.path(), cfg, out));
 }
 
-fn collect_file(path: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
-	if !has_allowed_extension(path, &cfg.include_extensions) {
-		return;
+fn collect_file(workdir: &Path, path: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
+	// SAFETY: native file path from an actual walk entry or the observed
+	// package build.rs file, before file-name interpretation here.
+	#[allow(unsafe_code)]
+	let path = Untrusted::new(path.to_owned(), unsafe { Ingress::<Repo>::new() });
+	if let Some(path) = path
+		.validate(DiscoveredSourcePathDecoder { workdir, cfg })
+		.expect("infallible path selection")
+	{
+		out.push(path.legacy_discovery_path());
 	}
-	if is_excluded_path(path, &cfg.exclude_path_substrings) {
-		return;
+}
+
+enum SourcePathRepresentation {
+	Relative(RepoPath<Repo>),
+	UnrepresentableNative,
+}
+struct DiscoveredSourcePath {
+	native: PathBuf,
+	representation: SourcePathRepresentation,
+}
+struct DiscoveredSourcePathDecoder<'a> {
+	workdir: &'a Path,
+	cfg: &'a ScannerConfig,
+}
+impl Validate<PathBuf, Repo> for DiscoveredSourcePathDecoder<'_> {
+	type Output = Option<DiscoveredSourcePath>;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, u: Unvalidated<'view, PathBuf>, mark: Mark<'view, Repo>,
+	) -> Result<Self::Output, Self::Error> {
+		let path = u.get();
+		if !has_allowed_extension(path, &self.cfg.include_extensions)
+			|| is_excluded_path(path, &self.cfg.exclude_path_substrings)
+			|| !path.metadata().map(|m| m.len() <= self.cfg.max_file_bytes).unwrap_or(false)
+		{
+			return Ok(None);
+		}
+		let representation = path
+			.strip_prefix(self.workdir)
+			.ok()
+			.and_then(Path::to_str)
+			.and_then(|v| RepoPath::new(&mark, v).ok())
+			.map(SourcePathRepresentation::Relative)
+			.unwrap_or(SourcePathRepresentation::UnrepresentableNative);
+		Ok(Some(DiscoveredSourcePath { native: path.clone(), representation }))
 	}
-	if !path.metadata().map(|m| m.len() <= cfg.max_file_bytes).unwrap_or(false) {
-		return;
+}
+impl DiscoveredSourcePath {
+	/// Temporary native operational exit for the existing prompt consumer.
+	/// Unrepresentable names stay native; they are never lossy RepoPath text.
+	fn legacy_discovery_path(self) -> PathBuf {
+		match self.representation {
+			SourcePathRepresentation::Relative(path) => {
+				let _ = path;
+			},
+			SourcePathRepresentation::UnrepresentableNative => {},
+		}
+		self.native
 	}
-	out.push(path.to_path_buf());
 }
 
 fn is_excluded_dir(path: &Path, cfg: &ScannerConfig) -> bool {
@@ -501,6 +597,16 @@ mod tests {
 	use std::path::Path;
 
 	use super::*;
+
+	#[test]
+	fn cargo_repo_excludes_reject_new_text_policy_before_discovery() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("Cargo.toml");
+		std::fs::write(&path, "[workspace]\nexclude = [\"bad\\u0001\"]\n").unwrap();
+		assert!(parse_workspace(&path).is_none(), "Repo Cargo exclude control bytes were admitted");
+		std::fs::write(&path, "[workspace]\nexclude = [\" exact \" , 7, \"exact\"]\n").unwrap();
+		assert_eq!(parse_workspace(&path).unwrap().exclude, vec![" exact ", "exact"]);
+	}
 
 	fn write_crate(root: &Path, files: &[(&str, &str)]) {
 		std::fs::create_dir_all(root).unwrap();
@@ -603,6 +709,93 @@ mod tests {
 		cfg.apply_patch(patch);
 		assert_eq!(cfg.include_extensions, vec!["c".to_owned(), "h".to_owned()]);
 		assert_eq!(cfg.exclude_path_substrings, original_excludes);
+	}
+
+	#[test]
+	fn patch_preserves_exact_lists_and_accepts_zero_scalars() {
+		let extensions = vec!["RS", "cafe\u{301}", "RS", "", " rs "];
+		let excludes = vec!["dir:Tests", "cafe\u{301}", "file:[", "", "dir:Tests"];
+		let patch: ScannerConfigPatch = serde_json::from_value(serde_json::json!({
+			"max_concurrent_files": 0,
+			"max_file_bytes": 0,
+			"per_request_timeout_seconds": 0,
+			"include_extensions": extensions,
+			"exclude_path_substrings": excludes,
+			"future_option": {"arbitrary": [false, null, {"x": 1}]}
+		}))
+		.unwrap();
+		let mut cfg = ScannerConfig::default();
+		cfg.apply_patch(patch);
+		assert_eq!(cfg.max_concurrent_files, 0);
+		assert_eq!(cfg.max_file_bytes, 0);
+		assert_eq!(cfg.per_request_timeout, Duration::ZERO);
+		assert_eq!(cfg.include_extensions, extensions);
+		assert_eq!(cfg.exclude_path_substrings, excludes);
+	}
+
+	#[test]
+	fn patch_null_fields_preserve_baseline_but_empty_lists_replace_it() {
+		let mut cfg = ScannerConfig::default();
+		let baseline = cfg.clone();
+		cfg.apply_patch(
+			serde_json::from_str(
+				r#"{"max_concurrent_files":null,"max_file_bytes":null,"per_request_timeout_seconds":null,"include_extensions":null,"exclude_path_substrings":null}"#,
+			)
+			.unwrap(),
+		);
+		assert_eq!(cfg.max_concurrent_files, baseline.max_concurrent_files);
+		assert_eq!(cfg.max_file_bytes, baseline.max_file_bytes);
+		assert_eq!(cfg.per_request_timeout, baseline.per_request_timeout);
+		assert_eq!(cfg.include_extensions, baseline.include_extensions);
+		assert_eq!(cfg.exclude_path_substrings, baseline.exclude_path_substrings);
+		cfg.apply_patch(
+			serde_json::from_str(r#"{"include_extensions":[],"exclude_path_substrings":[]}"#)
+				.unwrap(),
+		);
+		assert!(cfg.include_extensions.is_empty());
+		assert!(cfg.exclude_path_substrings.is_empty());
+	}
+
+	#[test]
+	fn legacy_patch_decoder_accepts_embedded_controls_without_rewriting() {
+		// Baseline evidence for the deliberate new single-line admission rule;
+		// this acceptance is not a requirement of the future marked decoder.
+		let raw = "case\r\ncafe\u{301}\t\0";
+		let patch: ScannerConfigPatch = serde_json::from_value(serde_json::json!({
+			"include_extensions": [raw], "exclude_path_substrings": [raw]
+		}))
+		.unwrap();
+		assert_eq!(patch.include_extensions.unwrap()[0].as_bytes(), raw.as_bytes());
+		assert_eq!(patch.exclude_path_substrings.unwrap()[0].as_bytes(), raw.as_bytes());
+	}
+
+	#[test]
+	fn exclusion_patterns_and_extension_comparison_keep_distinct_semantics() {
+		for (path, pattern, expected) in [
+			("src/tests/helper.rs", "dir:tests", true),
+			("src/tests_extra/helper.rs", "dir:tests", false),
+			("src/Tests/helper.rs", "dir:tests", false),
+			("src/tests/helper.rs", "/tests", true),
+			("src/tests_extra/helper.rs", "/tests", false),
+			("src/tests_extra/helper.rs", "tests", true),
+			("src/tests/helper.rs", "src/tests", true),
+			("src/test_one.rs", "file:test_*.rs", true),
+			("src/test_one.rs", "test_*.rs", false),
+			("src/test_one.rs", "file:src/*", false),
+			("src/[.rs", "file:[", false),
+			("src/anything.rs", "", true),
+			("src/cafe\u{301}.rs", "caf\u{e9}", false),
+			("src/cafe\u{301}.rs", "cafe\u{301}", true),
+		] {
+			assert_eq!(matches_exclude(Path::new(path), pattern), expected, "{path}: {pattern}");
+		}
+		let extensions = vec!["RS".to_owned(), "Rs.In".to_owned(), "E\u{301}".to_owned()];
+		assert!(has_allowed_extension(Path::new("src/main.rS"), &extensions));
+		assert!(has_allowed_extension(Path::new("src/generated.RS.IN"), &extensions));
+		assert!(has_allowed_extension(Path::new("src/main.E\u{301}"), &extensions));
+		assert!(!has_allowed_extension(Path::new("src/main.\u{c9}"), &extensions));
+		assert!(!has_allowed_extension(Path::new("src/main.rs.bak"), &extensions));
+		assert_eq!(extensions, ["RS", "Rs.In", "E\u{301}"]);
 	}
 
 	#[test]
