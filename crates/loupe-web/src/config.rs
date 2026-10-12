@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser};
+mod input;
 
 /// Default listen port. Deliberately not adjacent to the server's 8443:
 /// this is a different kind of endpoint and should not look like one.
@@ -45,28 +46,28 @@ fn default_bind() -> SocketAddr {
 /// path, in that precedence order — identical to `loupectl`.
 #[derive(Debug, Args)]
 pub struct ConnArgs {
-	#[arg(long, env = "LOUPE_SERVER_URL")]
+	#[arg(long, env = "LOUPE_SERVER_URL", value_parser = input::UrlParser)]
 	pub server_url: Option<reqwest::Url>,
 
-	#[arg(long, env = "LOUPE_CA_CERT")]
+	#[arg(long, env = "LOUPE_CA_CERT", value_parser = input::PathParser)]
 	pub ca_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true, value_parser = input::PemParser)]
 	pub ca_cert_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true, value_parser = input::PemParser)]
 	pub ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 
-	#[arg(long, env = "LOUPE_ADMIN_CERT")]
+	#[arg(long, env = "LOUPE_ADMIN_CERT", value_parser = input::PathParser)]
 	pub admin_cert: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM", hide_env_values = true, value_parser = input::PemParser)]
 	pub admin_cert_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_CERT_PEM_B64", hide_env_values = true, value_parser = input::PemParser)]
 	pub admin_cert_pem_b64: Option<loupe_tls::PemInput>,
 
-	#[arg(long, env = "LOUPE_ADMIN_KEY")]
+	#[arg(long, env = "LOUPE_ADMIN_KEY", value_parser = input::PathParser)]
 	pub admin_key: Option<PathBuf>,
-	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM", hide_env_values = true, value_parser = input::PemParser)]
 	pub admin_key_pem: Option<loupe_tls::PemInput>,
-	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true)]
+	#[arg(long, env = "LOUPE_ADMIN_KEY_PEM_B64", hide_env_values = true, value_parser = input::PemParser)]
 	pub admin_key_pem_b64: Option<loupe_tls::PemInput>,
 }
 
@@ -135,18 +136,10 @@ impl ConnArgs {
 }
 
 fn pem_from_env_or_file(
-	label: &str, pem: &Option<loupe_tls::PemInput>, pem_b64: &Option<loupe_tls::PemInput>,
+	_label: &str, pem: &Option<loupe_tls::PemInput>, pem_b64: &Option<loupe_tls::PemInput>,
 	path: Option<&PathBuf>, missing: &'static str,
 ) -> Result<loupe_provenance::Secret<String>> {
-	if let Some(pem) = pem.as_ref().filter(|s| !s.expose().is_empty()) {
-		return Ok(pem.clone().into_pem());
-	}
-	if let Some(pem_b64) = pem_b64.as_ref().filter(|s| !s.expose().is_empty()) {
-		return loupe_tls::decode_pem_base64(pem_b64.expose().trim())
-			.with_context(|| format!("decoding base64 {label} PEM"));
-	}
-	let path = path.context(missing)?;
-	loupe_tls::read_pem_file(path).with_context(|| format!("reading {label} at {}", path.display()))
+	input::selected(pem, pem_b64, path, missing)
 }
 
 #[cfg(test)]

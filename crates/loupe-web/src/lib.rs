@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! `loupe-web` — a local operator dashboard for `loupe-server`.
 //!
 //! # Shape
@@ -27,10 +27,17 @@
 //!   in [`guard`] close that one.
 //!
 //! Exposed as a library so integration tests can drive the router.
+//!
+//! The actual Browser request context has no public construction path:
+//!
+//! ```compile_fail,E0603
+//! use loupe_web::ingress::BrowserRequest;
+//! ```
 
 pub mod client;
 pub mod config;
 pub mod guard;
+mod ingress;
 pub mod routes;
 pub mod state;
 pub mod token;

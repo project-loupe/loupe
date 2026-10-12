@@ -3,7 +3,7 @@
 use loupe_web::{AdminClient, Token, WebState};
 
 #[tokio::test]
-async fn invalid_path_values_are_only_reflected_inside_json_strings() {
+async fn invalid_path_values_have_fixed_json_diagnostics() {
 	let client =
 		AdminClient::from_parts(reqwest::Client::new(), "http://127.0.0.1:9/".parse().unwrap());
 	let token = Token::generate();
@@ -24,7 +24,7 @@ async fn invalid_path_values_are_only_reflected_inside_json_strings() {
 		let body = response.text().await.unwrap();
 		let decoded: serde_json::Value =
 			serde_json::from_str(&body).expect("API reflected path input outside a JSON string");
-		assert!(decoded["error"].as_str().unwrap().contains("hostile-\"-value"));
+		assert_eq!(decoded["error"], "invalid request path identifier");
 	}
 	let response = http
 		.get(format!("http://{address}/api/config"))

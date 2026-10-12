@@ -25,9 +25,10 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use loupe_provenance::{Browser, Ingress, Mark, Unvalidated, Validate};
 
+use crate::ingress::BrowserRequest;
 use crate::state::WebState;
-use crate::token;
 
 /// Header a mutating request must carry. The value is irrelevant; its
 /// presence is what forces a preflight for cross-origin callers.
@@ -64,47 +65,75 @@ fn same_origin(headers: &HeaderMap, state: &WebState) -> bool {
 	}
 }
 
-fn forbidden(reason: &str) -> Response {
+fn forbidden(reason: &'static str) -> Response {
 	(StatusCode::FORBIDDEN, format!("{reason}\n")).into_response()
 }
 
 /// Applies the Host allowlist and, for mutating requests, the CSRF pair.
 /// Mounted on every route including the document, so DNS rebinding cannot
 /// even fetch the page.
-pub async fn browser_guard(State(state): State<WebState>, req: Request, next: Next) -> Response {
-	if !host_is_allowed(req.headers(), &state) {
-		return forbidden(
-			"unexpected Host header; loupe-web only answers on its own loopback address",
-		);
+#[allow(unsafe_code)]
+pub async fn browser_guard(
+	State(state): State<WebState>, mut req: Request, next: Next,
+) -> Response {
+	// SAFETY: this is the actual incoming Browser request, before application
+	// interpretation. Every private decoder reuses this one request token.
+	let context = BrowserRequest::captured(unsafe { Ingress::new() });
+	if let Err(error) = context.guard(&req, &state) {
+		return error.into_response();
 	}
-	if is_mutating(req.method()) {
-		if !same_origin(req.headers(), &state) {
-			return forbidden("cross-origin request refused");
-		}
-		if req.headers().get(REQUEST_HEADER).is_none() {
-			return forbidden(concat!(
-				"missing ",
-				"X-Loupe-Dashboard",
-				" header; mutating requests must come from the dashboard itself"
-			));
-		}
-	}
+	req.extensions_mut().insert(context);
 	next.run(req).await
+}
+
+pub(crate) struct BrowserGuard<'a>(pub(crate) &'a WebState);
+pub(crate) enum GuardFailure {
+	Host,
+	Origin,
+	Header,
+}
+impl IntoResponse for GuardFailure {
+	fn into_response(self) -> Response {
+		forbidden(match self {
+		Self::Host=>"unexpected Host header; loupe-web only answers on its own loopback address",
+		Self::Origin=>"cross-origin request refused",
+		Self::Header=>"missing X-Loupe-Dashboard header; mutating requests must come from the dashboard itself",
+	})
+	}
+}
+impl Validate<(&HeaderMap, &Method), Browser> for BrowserGuard<'_> {
+	type Output = ();
+	type Error = GuardFailure;
+	fn validate<'v>(
+		self, u: Unvalidated<'v, (&HeaderMap, &Method)>, _: Mark<'v, Browser>,
+	) -> Result<(), GuardFailure> {
+		let (headers, method) = *u.get();
+		if !host_is_allowed(headers, self.0) {
+			return Err(GuardFailure::Host);
+		}
+		if is_mutating(method) {
+			if !same_origin(headers, self.0) {
+				return Err(GuardFailure::Origin);
+			}
+			if headers.get(REQUEST_HEADER).is_none() {
+				return Err(GuardFailure::Header);
+			}
+		}
+		Ok(())
+	}
 }
 
 /// Requires a valid origin-scoped capability header. Mounted on `/api`
 /// only so the document and assets can load before the page recovers the
 /// token from its URL fragment.
 pub async fn require_token(State(state): State<WebState>, req: Request, next: Next) -> Response {
-	let presented = req.headers().get(token::HEADER_NAME).and_then(|h| h.to_str().ok());
-	match presented {
-		Some(candidate) if state.token.matches(candidate) => next.run(req).await,
-		_ => (
-			StatusCode::UNAUTHORIZED,
-			"missing or invalid dashboard capability; reopen the URL printed at startup\n",
-		)
-			.into_response(),
+	let Some(context) = req.extensions().get::<BrowserRequest>() else {
+		return crate::ingress::Failure::Context.into_response();
+	};
+	if let Err(error) = context.check_token(req.headers(), &state.token) {
+		return error.into_response();
 	}
+	next.run(req).await
 }
 
 #[cfg(test)]

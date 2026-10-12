@@ -62,3 +62,6 @@ fuzz/src/server_request_parsers.rs fuzz entry point: the C entry point takes a r
 fuzz/src/server_github_response.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_network_parsers.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_rpc.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+crates/loupe-web/src/guard.rs actual HTTP request capture mints Browser before guard/token/route validation
+crates/loupe-web/src/ingress/server.rs actual upstream HTTP response capture mints Server before header/body validation
+crates/loupe-web/src/config/input.rs actual native argument/environment and selected PEM/file reads mint Config before named validation

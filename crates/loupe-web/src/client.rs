@@ -8,7 +8,6 @@
 //! banner instead of a wall of opaque 400s.
 
 use anyhow::{Context, Result};
-use loupe_http::read_response_bytes;
 use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use reqwest::{Method, StatusCode, Url};
 
@@ -39,6 +38,29 @@ impl UpstreamError {
 }
 
 pub type UpstreamResult<T> = std::result::Result<T, UpstreamError>;
+
+/// Opaque startup response. Server text stays in its guarded source owner.
+///
+/// The production health owner cannot become an arbitrary JSON value:
+///
+/// ```compile_fail,E0308
+/// async fn raw_response(client: &loupe_web::AdminClient) {
+///     let _: serde_json::Value = client.health().await.unwrap();
+/// }
+/// ```
+///
+/// Its diagnostic form is available without exposing Server content:
+///
+/// ```
+/// fn requires_debug<T: std::fmt::Debug>() {}
+/// requires_debug::<loupe_web::client::HealthResponse>();
+/// ```
+pub struct HealthResponse(pub(crate) crate::ingress::server::ServerJson);
+impl std::fmt::Debug for HealthResponse {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
 
 /// Admin-authenticated client. Holds the mTLS identity; every method is a
 /// thin pass-through so the dashboard never invents its own semantics.
@@ -78,9 +100,22 @@ impl AdminClient {
 		&self, method: Method, path: &str, query: &[(&str, String)],
 		body: Option<serde_json::Value>,
 	) -> UpstreamResult<(StatusCode, Option<serde_json::Value>)> {
-		let mut url = self.base.join(path).map_err(|e| {
-			UpstreamError::transport(format!("building upstream URL for {path}: {e}"))
-		})?;
+		let body = body
+			.as_ref()
+			.map(crate::ingress::json::legacy_value_bytes)
+			.transpose()
+			.map_err(|_| UpstreamError::transport("encoding upstream request failed".into()))?;
+		self.call_forward(method, path, query, body)
+			.await
+			.map_err(crate::ingress::server::Failure::into_error_legacy)?
+			.into_call_legacy()
+	}
+
+	pub(crate) async fn call_forward(
+		&self, method: Method, path: &str, query: &[(&str, String)], body: Option<bytes::Bytes>,
+	) -> Result<crate::ingress::server::Outcome, crate::ingress::server::Failure> {
+		use crate::ingress::server::{self, Failure};
+		let mut url = self.base.join(path).map_err(|_| Failure::Url)?;
 		if !query.is_empty() {
 			// Built through `query_pairs_mut` so values are percent-encoded:
 			// the search term is free-form operator input.
@@ -94,41 +129,10 @@ impl AdminClient {
 			.request(method, url)
 			.header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string());
 		if let Some(body) = body {
-			req = req.json(&body);
+			req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
 		}
-		let resp = req
-			.send()
-			.await
-			.map_err(|e| UpstreamError::transport(format!("upstream request failed: {e}")))?;
-
-		let status = resp.status();
-		if !status.is_success() {
-			let bytes = read_response_bytes(resp).await.map_err(|error| UpstreamError {
-				status: Some(status),
-				message: format!("reading upstream body: {error}"),
-			})?;
-			let body = String::from_utf8_lossy(&bytes);
-			let message = body.trim();
-			let message = if message.is_empty() {
-				format!("server returned {status}")
-			} else {
-				message.into()
-			};
-			return Err(UpstreamError { status: Some(status), message });
-		}
-		check_protocol_header(&resp)?;
-
-		// 204 and empty bodies are normal on the mutating routes.
-		let bytes = read_response_bytes(resp)
-			.await
-			.map_err(|e| UpstreamError::transport(format!("reading upstream body: {e}")))?;
-		let text = String::from_utf8_lossy(&bytes);
-		if text.trim().is_empty() {
-			return Ok((status, None));
-		}
-		serde_json::from_str(&text)
-			.map(|value| (status, Some(value)))
-			.map_err(|e| UpstreamError::transport(format!("upstream sent invalid JSON: {e}")))
+		let resp = req.send().await.map_err(|_| Failure::Transport)?;
+		server::receive(resp).await
 	}
 
 	/// GET a path and deserialize into `T`. Used for the few places the
@@ -136,9 +140,9 @@ impl AdminClient {
 	pub async fn get_typed<T: serde::de::DeserializeOwned>(&self, path: &str) -> UpstreamResult<T> {
 		let (_, value) = self.call(Method::GET, path, &[], None).await?;
 		let value = value
-			.ok_or_else(|| UpstreamError::transport(format!("{path} returned an empty body")))?;
+			.ok_or_else(|| UpstreamError::transport("upstream returned an empty body".into()))?;
 		serde_json::from_value(value)
-			.map_err(|e| UpstreamError::transport(format!("decoding {path}: {e}")))
+			.map_err(|_| UpstreamError::transport("decoding upstream response failed".into()))
 	}
 
 	/// Stamp `protocol_version` into an outgoing body.
@@ -155,31 +159,12 @@ impl AdminClient {
 
 	/// Unauthenticated liveness probe. Returns the server's protocol
 	/// version so the UI can diagnose a mismatch explicitly.
-	pub async fn health(&self) -> UpstreamResult<serde_json::Value> {
-		self.get_typed("/v1/health").await
+	pub async fn health(&self) -> UpstreamResult<HealthResponse> {
+		self.call_forward(Method::GET, "/v1/health", &[], None)
+			.await
+			.map_err(crate::ingress::server::Failure::into_error_legacy)?
+			.into_health_legacy()
 	}
-}
-
-/// Reject a response whose protocol header is missing or disagrees with
-/// this build. `loupectl` skips this check; the worker does it, and for a
-/// long-running dashboard it is the difference between one actionable
-/// banner and every action failing for no visible reason.
-fn check_protocol_header(resp: &reqwest::Response) -> UpstreamResult<()> {
-	let header = resp.headers().get(PROTOCOL_VERSION_HEADER).ok_or_else(|| {
-		UpstreamError::transport(format!("server response missing {PROTOCOL_VERSION_HEADER}"))
-	})?;
-	let server_version = header
-		.to_str()
-		.map_err(|_| UpstreamError::transport("server protocol header is not ASCII".into()))?
-		.parse::<u16>()
-		.map_err(|_| UpstreamError::transport("server protocol header is not a u16".into()))?;
-	if server_version != PROTOCOL_VERSION {
-		return Err(UpstreamError::transport(format!(
-			"server speaks protocol {server_version}, this loupe-web build speaks \
-			 {PROTOCOL_VERSION} — rebuild loupe-web against the running server"
-		)));
-	}
-	Ok(())
 }
 
 #[cfg(test)]
