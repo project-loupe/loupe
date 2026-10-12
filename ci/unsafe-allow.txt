@@ -12,6 +12,7 @@ crates/loupe-provenance/kani/mod.rs Kani harness: mints labels for symbolic inpu
 crates/loupe-provenance/src/tests.rs test fixture: mints labels for input the test made up
 crates/loupe-provenance/src/untrusted.rs declares `unsafe fn Ingress::new`, the minting contract (P3)
 crates/loupe-provenance/src/volatile.rs volatile writes that zeroise secrets (P9)
+crates/loupe-core/tests/source_migration.rs test fixture: mints labels for input the test made up
 fuzz/src/smoke.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_bounded.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_ident.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

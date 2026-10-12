@@ -1,5 +1,49 @@
 //! Field policies shared by domain validation and DAO parameter types.
-use super::{AnchorPolicy, IdentPolicy, JsonPolicy, TextPolicy};
+use super::{AnchorPolicy, IdentPolicy, JsonPolicy, Normalization, TextPolicy, Whitespace};
+
+/// New compatibility ceiling for previously unbounded legacy strings.
+/// Route/destination limits still apply, including the smaller LLM PoC cap.
+pub const LEGACY_TEXT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+macro_rules! exact_texts {
+	($( $name:ident, $field:literal, $multi:literal; )*) => { $(
+		/// Preserves admitted decoded UTF-8, including significant whitespace.
+		#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+		pub struct $name;
+		impl TextPolicy for $name {
+			const FIELD: &'static str = $field;
+			const MAX_CHARS: usize = LEGACY_TEXT_MAX_BYTES;
+			const MAX_BYTES: usize = LEGACY_TEXT_MAX_BYTES;
+			const MULTILINE: bool = $multi;
+			const ALLOW_EMPTY: bool = true;
+			const NORMALIZATION: Normalization = Normalization::Exact;
+			const WHITESPACE: Whitespace = Whitespace::Significant;
+			const ALLOW_CR: bool = $multi;
+		}
+	)* };
+}
+
+// These policies do not establish diff applicability, URL authorization,
+// email-header validity, or the stricter LLM field grammar.
+exact_texts! {
+	FindingTitle, "finding_title", false;
+	FindingDescription, "finding_description", true;
+	PocUnified, "poc_unified", true;
+	PatchUnified, "patch_unified", true;
+	VerdictNotes, "verdict_notes", true;
+	VerdictReason, "verdict_reason", true;
+	PatchNotes, "patch_notes", true;
+	ScannerIdText, "scanner_id", false;
+	CweText, "cwe", false;
+	FindingFingerprintText, "finding_fingerprint", false;
+	RepoHost, "repo_host", false;
+	RepoOwner, "repo_owner", false;
+	RepoName, "repo_name", false;
+	CloneUrl, "clone_url", false;
+	GitBranch, "git_branch", false;
+	MailAddress, "mail_address", false;
+	MailSubjectPrefix, "mail_subject_prefix", false;
+}
 
 macro_rules! texts {
 	($( $name:ident, $field:literal, $chars:literal, $multi:literal; )*) => { $(

@@ -969,6 +969,7 @@ name = "loupe-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "loupe-provenance",
  "regex",
  "serde",
  "serde_json",

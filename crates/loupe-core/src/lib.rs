@@ -15,6 +15,8 @@ mod job;
 mod repo;
 pub mod report_limits;
 mod severity;
+#[cfg(feature = "source-migration")]
+pub mod source_migration;
 mod state_machine;
 pub mod text;
 mod verdict;

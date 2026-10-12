@@ -11,14 +11,23 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+[features]
+# Removed with the legacy API at the atomic source-adoption commit.
+source-migration = []
+
 [dependencies]
 blake3 = { workspace = true }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 unicode-general-category = { workspace = true }
 unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

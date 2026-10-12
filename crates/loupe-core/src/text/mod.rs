@@ -7,18 +7,31 @@
 //! title(BoundedText::<Objective>::new("not a title").unwrap());
 //! ```
 
-mod json;
+pub(crate) mod checked;
+pub(crate) mod json;
 pub mod policy;
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
-use std::sync::LazyLock;
 
 pub use json::BoundedJson;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use unicode_general_category::{get_general_category, GeneralCategory as G};
 use unicode_normalization::UnicodeNormalization;
+
+/// Whether field validation normalizes prose or retains admitted UTF-8 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Normalization {
+	Semantic,
+	Exact,
+}
+
+/// Whether boundary whitespace and repeated blank lines are meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Whitespace {
+	Prose,
+	Significant,
+}
 
 pub trait TextPolicy {
 	const FIELD: &'static str;
@@ -26,6 +39,9 @@ pub trait TextPolicy {
 	const MAX_BYTES: usize;
 	const MULTILINE: bool;
 	const ALLOW_EMPTY: bool = false;
+	const NORMALIZATION: Normalization = Normalization::Semantic;
+	const WHITESPACE: Whitespace = Whitespace::Prose;
+	const ALLOW_CR: bool = false;
 }
 pub trait IdentPolicy {
 	const FIELD: &'static str;
@@ -85,9 +101,11 @@ impl fmt::Debug for Error {
 	}
 }
 
-fn characters(field: &'static str, text: &str, multiline: bool) -> Result<(), Error> {
+fn characters(
+	field: &'static str, text: &str, multiline: bool, allow_cr: bool,
+) -> Result<(), Error> {
 	for c in text.chars() {
-		if multiline && matches!(c, '\n' | '\t') {
+		if multiline && (matches!(c, '\n' | '\t') || (allow_cr && c == '\r')) {
 			continue;
 		}
 		let cp = c as u32;
@@ -156,81 +174,22 @@ fn oversized(field: &'static str, raw: &str, max_bytes: usize) -> Result<(), Err
 
 impl<P: TextPolicy> BoundedText<P> {
 	pub fn new(raw: &str) -> Result<Self, Error> {
-		oversized(P::FIELD, raw, P::MAX_BYTES)?;
-		let text = normalized(raw);
-		if text.is_empty() && !P::ALLOW_EMPTY {
-			return Err(Error::new(P::FIELD, Rule::Empty));
-		}
-		characters(P::FIELD, &text, P::MULTILINE)?;
-		limits::<P>(&text)?;
-		if text.trim() != text || text.contains("\n\n\n") {
-			return Err(Error::new(P::FIELD, Rule::Whitespace));
-		}
-		Ok(Self(text, PhantomData))
+		checked::text::<P>(raw).map(|text| Self(text, PhantomData))
 	}
 }
 impl<P: IdentPolicy> Identifier<P> {
 	pub fn new(raw: &str) -> Result<Self, Error> {
-		// Identifiers are never normalized, so the exact cap can go first.
-		if raw.len() > P::MAX_LEN {
-			return Err(Error::new(P::FIELD, Rule::Bytes));
-		}
-		characters(P::FIELD, raw, false)?;
-		if !P::accepts(raw) {
-			return Err(Error::new(P::FIELD, Rule::Identifier));
-		}
-		if raw.trim() != raw || raw.contains("  ") {
-			return Err(Error::new(P::FIELD, Rule::Whitespace));
-		}
-		Ok(Self(raw.to_owned(), PhantomData))
+		checked::identifier::<P>(raw).map(|text| Self(text, PhantomData))
 	}
 }
 impl<P: AnchorPolicy> Anchor<P> {
 	pub fn new(raw: &str) -> Result<Self, Error> {
-		let text = normalized(raw);
-		characters(P::FIELD, &text, false)?;
-		let text = text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-		// Case mapping can introduce combining sequences; retain NFC at rest.
-		let text: String = text.nfc().collect();
-		if text.is_empty() {
-			return Err(Error::new(P::FIELD, Rule::Empty));
-		}
-		limits::<P>(&text)?;
-		static TRANSIENT_ID: LazyLock<Regex> = LazyLock::new(|| {
-			Regex::new(r"(?-u:\b(job|campaign|generation|unit|lead|finding|line)[ #_-]?[0-9]+\b)")
-				.unwrap()
-		});
-		for word in text.split_whitespace() {
-			let location = word.rsplit_once(':').is_some_and(|(name, number)| {
-				!name.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
-			});
-			if location {
-				return Err(Error::new(P::FIELD, Rule::IdentityLocation));
-			}
-		}
-		if TRANSIENT_ID.is_match(&text) {
-			return Err(Error::new(P::FIELD, Rule::IdentityTransientId));
-		}
-		if text.split_whitespace().any(|word| {
-			(7..=64).contains(&word.len())
-				&& word.bytes().all(|b| b.is_ascii_hexdigit())
-				&& word.bytes().any(|b| b.is_ascii_digit())
-		}) {
-			return Err(Error::new(P::FIELD, Rule::IdentityHash));
-		}
-		Ok(Self(text, PhantomData))
+		checked::anchor::<P>(raw).map(|text| Self(text, PhantomData))
 	}
 }
 impl RepoPath {
 	pub fn new(raw: &str) -> Result<Self, Error> {
-		characters("path", raw, false)?;
-		if raw.len() > 512 {
-			return Err(Error::new("path", Rule::Bytes));
-		}
-		if !is_repo_path(raw.as_bytes()) {
-			return Err(Error::new("path", Rule::Path));
-		}
-		Ok(Self(raw.to_owned()))
+		checked::path(raw).map(Self)
 	}
 	pub fn expose(&self) -> &str {
 		&self.0
