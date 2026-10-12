@@ -3,7 +3,7 @@ use loupe_core::text::policy::{Argument, Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use rusqlite::{params, Connection, Transaction};
 
-use crate::review::{changed, optional, parsed, standalone, string_enum};
+use crate::review::{changed, parsed, standalone, string_enum};
 use crate::source_refs::InspectedRefs;
 use crate::{inventory, ownership, Conflict, Error, Ownership, Result};
 string_enum!(Disposition { LeadCreated=>"lead_created", NoLeadFound=>"no_lead_found", NotApplicable=>"not_applicable", NeedsFollowUp=>"needs_follow_up" });
@@ -63,7 +63,7 @@ pub fn insert(tx: &Transaction<'_>, new: &NewResult<'_>, now: i64) -> Result<i64
 	Ok(tx.last_insert_rowid())
 }
 pub fn list(conn: &Connection, unit: i64) -> Result<Vec<UnitResult>> {
-	Ok(conn.prepare("SELECT review_unit_result_id,review_unit_id,produced_by_job_id,commit_sha,profile_version,disposition,inspected_refs,counterevidence,proof_gaps,result_payload,invalidated,invalidated_reason,corroborates_review_unit_result_id,corroborates_inventory_exclusion_id,created_at FROM review_unit_results WHERE review_unit_id=?1 ORDER BY review_unit_result_id")?.query_map([unit],|r|Ok(UnitResult{result_id:r.get(0)?,unit_id:r.get(1)?,produced_by_job:r.get(2)?,commit_sha:r.get(3)?,profile_version:r.get(4)?,disposition:parsed(r,5)?,inspected_refs:parsed(r,6)?,counterevidence:optional(r,7)?,proof_gaps:optional(r,8)?,payload:parsed(r,9)?,invalidated:r.get(10)?,invalidated_reason:optional(r,11)?,corroborates_result:r.get(12)?,corroborates_exclusion:r.get(13)?,created_at:r.get(14)?}))?.collect::<rusqlite::Result<_>>()?)
+	Ok(conn.prepare("SELECT review_unit_result_id,review_unit_id,produced_by_job_id,commit_sha,profile_version,disposition,inspected_refs,counterevidence,proof_gaps,result_payload,invalidated,invalidated_reason,corroborates_review_unit_result_id,corroborates_inventory_exclusion_id,created_at FROM review_unit_results WHERE review_unit_id=?1 ORDER BY review_unit_result_id")?.query_map([unit],|r|Ok(UnitResult{result_id:r.get(0)?,unit_id:r.get(1)?,produced_by_job:r.get(2)?,commit_sha:crate::ingress::revision_legacy(r,3)?,profile_version:r.get(4)?,disposition:parsed(r,5)?,inspected_refs:crate::ingress::inspected_refs_legacy(r,6)?,counterevidence:crate::ingress::optional_argument_legacy(r,7)?,proof_gaps:crate::ingress::optional_argument_legacy(r,8)?,payload:crate::ingress::agent_payload_legacy(r,9)?,invalidated:r.get(10)?,invalidated_reason:crate::ingress::optional_reason_legacy(r,11)?,corroborates_result:r.get(12)?,corroborates_exclusion:r.get(13)?,created_at:r.get(14)?}))?.collect::<rusqlite::Result<_>>()?)
 }
 pub fn invalidate(tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason>) -> Result<()> {
 	changed(tx.execute("UPDATE review_unit_results SET invalidated=1,invalidated_reason=?2 WHERE review_unit_result_id=?1 AND invalidated=0",params![id,reason.expose()])?,Conflict::Corroboration)

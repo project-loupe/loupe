@@ -71,21 +71,20 @@ pub fn touch_last_seen(conn: &Connection, id: i64, now: i64) -> rusqlite::Result
 }
 
 fn row_to_worker(row: &rusqlite::Row) -> rusqlite::Result<WorkerRow> {
-	let kind_str: String = row.get(2)?;
-	let kind = match kind_str.as_str() {
+	let kind = match row.get_ref(2)?.as_str().map_err(|_| crate::review::invalid_scalar(2))? {
 		"worker" => WorkerKind::Worker,
 		"admin" => WorkerKind::Admin,
-		other => {
+		_ => {
 			return Err(rusqlite::Error::FromSqlConversionFailure(
 				2,
 				rusqlite::types::Type::Text,
-				format!("unknown worker kind: {other}").into(),
+				"invalid stored worker kind".into(),
 			))
 		},
 	};
 	Ok(WorkerRow {
 		id: row.get(0)?,
-		name: row.get(1)?,
+		name: crate::ingress::worker_name_legacy(row, 1)?,
 		kind,
 		cert_fingerprint: row.get(3)?,
 		created_at: row.get(4)?,

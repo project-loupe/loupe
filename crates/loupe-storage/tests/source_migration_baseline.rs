@@ -1,5 +1,6 @@
-//! Passing compatibility evidence on the unchanged DAO implementation.
-//! These are not runtime regressions or claims that staged reads are active.
+//! Historical storage representation and retained compatibility controls.
+//! The D baseline accepted oversized columns; I now rejects their read without
+//! changing the original stored bytes (see the saved pre-I runtime evidence).
 #[path = "support/db.rs"]
 mod fixture;
 
@@ -8,7 +9,7 @@ use loupe_storage::source_refs::UnitRefs;
 use loupe_storage::{findings, review_units, Db};
 
 #[test]
-fn legacy_finding_columns_preserve_unbounded_text_controls_and_empty_options() {
+fn invalid_legacy_columns_remain_unchanged_when_actual_read_rejects_them() {
 	let db = Db::open_in_memory(&MasterKey::for_tests()).unwrap();
 	let mut finding = fixture::finding();
 	finding.title = format!("{}\0\r\n", "x".repeat(2 * 1024 * 1024 + 1));
@@ -17,12 +18,15 @@ fn legacy_finding_columns_preserve_unbounded_text_controls_and_empty_options() {
 	let id = fixture::seed(&db, &finding, "[]");
 	db.with_conn(|conn| {
 		conn.execute("UPDATE findings SET approved_by_cn=?1 WHERE id=?2", ("same", id))?;
-		let row = findings::get(conn, id)?.unwrap();
-		assert_eq!(row.approved_by_cn.as_deref(), Some("same"));
-		assert_eq!(row.clone().into_finding(), finding);
+		assert!(findings::get(conn, id).is_err());
 		let raw: String =
 			conn.query_row("SELECT title FROM findings WHERE id=?1", [id], |r| r.get(0))?;
 		assert_eq!(raw, finding.title);
+		conn.execute("UPDATE findings SET title='admitted' WHERE id=?1", [id])?;
+		finding.title = "admitted".into();
+		let row = findings::get(conn, id)?.unwrap();
+		assert_eq!(row.approved_by_cn.as_deref(), Some("same"));
+		assert_eq!(row.into_finding(), finding);
 		Ok(())
 	})
 	.unwrap();

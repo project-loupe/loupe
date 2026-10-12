@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
 //! SQLite storage layer for loupe.
 //!
 //! The schema is defined as an ordered list of migrations in `migrations`.
@@ -15,6 +16,7 @@ pub mod findings;
 pub mod generations;
 pub mod github_app;
 pub mod identity;
+mod ingress;
 pub mod inventory;
 pub mod jobs;
 pub mod lead_observations;

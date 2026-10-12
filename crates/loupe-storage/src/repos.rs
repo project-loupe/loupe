@@ -120,14 +120,10 @@ fn count_github_destinations(
 	conn: &Connection, matches: impl Fn(Option<i64>) -> bool,
 ) -> rusqlite::Result<usize> {
 	let mut stmt = conn.prepare("SELECT reporting FROM registered_repos")?;
-	let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+	let rows = stmt.query_map([], |row| crate::ingress::reporting_legacy(row, 0))?;
 	let mut count = 0usize;
 	for row in rows {
-		let reporting_text = row?;
-		let reporting: ReportingDestination =
-			serde_json::from_str(&reporting_text).map_err(|e| {
-				rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
-			})?;
+		let reporting = row?;
 		if let ReportingDestination::GithubIssue { pat_secret_id, .. } = reporting
 			&& matches(pat_secret_id)
 		{
@@ -217,26 +213,21 @@ FROM registered_repos
 "#;
 
 fn row_to_repo(row: &rusqlite::Row) -> rusqlite::Result<RepoRow> {
-	let scanner_config_text: String = row.get(7)?;
-	let reporting_text: String = row.get(8)?;
-	let scanner_config: serde_json::Value =
-		serde_json::from_str(&scanner_config_text).unwrap_or(serde_json::Value::Null);
-	let reporting: ReportingDestination = serde_json::from_str(&reporting_text).map_err(|e| {
-		rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, e.into())
-	})?;
+	let scanner_config = crate::ingress::scanner_document_legacy(row, 7)?;
+	let reporting = crate::ingress::reporting_legacy(row, 8)?;
 	Ok(RepoRow {
 		id: row.get(0)?,
-		clone_url: row.get(1)?,
-		host: row.get(2)?,
-		owner: row.get(3)?,
-		repo: row.get(4)?,
-		default_branch: row.get(5)?,
+		clone_url: crate::ingress::clone_url_legacy(row, 1)?,
+		host: crate::ingress::repo_host_legacy(row, 2)?,
+		owner: crate::ingress::repo_owner_legacy(row, 3)?,
+		repo: crate::ingress::repo_name_legacy(row, 4)?,
+		default_branch: crate::ingress::optional_branch_legacy(row, 5)?,
 		scan_interval_seconds: row.get(6)?,
 		scanner_config,
 		reporting,
 		verification_enabled: row.get::<_, i64>(9)? != 0,
 		require_approval: row.get::<_, Option<i64>>(10)?.map(|v| v != 0),
-		last_scanned_sha: row.get(11)?,
+		last_scanned_sha: crate::ingress::optional_revision_legacy(row, 11)?,
 		last_scanned_at: row.get(12)?,
 		created_at: row.get(13)?,
 		disabled_at: row.get(14)?,

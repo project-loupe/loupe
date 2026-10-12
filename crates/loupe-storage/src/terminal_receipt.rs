@@ -63,7 +63,9 @@ pub enum Replayed {
 /// Lease validation and the job's terminal transition belong to the caller.
 pub fn insert(tx: &Transaction<'_>, new: &NewReceipt<'_>, now: i64) -> Result<i64> {
 	let phase: String = tx
-		.query_row("SELECT kind FROM jobs WHERE id=?1", [new.job_id], |r| r.get(0))
+		.query_row("SELECT kind FROM jobs WHERE id=?1", [new.job_id], |r| {
+			crate::ingress::job_kind_text_legacy(r, 0)
+		})
 		.optional()?
 		.ok_or(Error::NotFound(Entity::Job, new.job_id))?;
 	if !new.phase.is_known() || phase != new.phase.as_str() {
@@ -75,7 +77,7 @@ pub fn insert(tx: &Transaction<'_>, new: &NewReceipt<'_>, now: i64) -> Result<i6
 	Ok(tx.last_insert_rowid())
 }
 pub fn get(conn: &Connection, job: i64) -> Result<Option<Receipt>> {
-	Ok(conn.query_row("SELECT job_terminal_receipt_id,job_id,phase,terminal_reason,subject_title,subject_digest,pinned_commit_sha,effective_recipe,result_digest,evidence_rung,result_counts,finishing_capability_hash,created_at FROM job_terminal_receipts WHERE job_id=?1",[job],|r|Ok(Receipt{receipt_id:r.get(0)?,job_id:r.get(1)?,phase:parsed(r,2)?,terminal_reason:parsed(r,3)?,subject_title:optional(r,4)?,subject_digest:r.get(5)?,pinned_commit_sha:r.get(6)?,effective_recipe:parsed(r,7)?,result_digest:r.get(8)?,evidence_rung:optional(r,9)?,result_counts:optional(r,10)?,finishing_capability_hash:r.get(11)?,created_at:r.get(12)?})).optional()?)
+	Ok(conn.query_row("SELECT job_terminal_receipt_id,job_id,phase,terminal_reason,subject_title,subject_digest,pinned_commit_sha,effective_recipe,result_digest,evidence_rung,result_counts,finishing_capability_hash,created_at FROM job_terminal_receipts WHERE job_id=?1",[job],|r|Ok(Receipt{receipt_id:r.get(0)?,job_id:r.get(1)?,phase:crate::ingress::job_kind_legacy(r,2)?,terminal_reason:crate::ingress::reason_legacy(r,3)?,subject_title:crate::ingress::optional_receipt_title_legacy(r,4)?,subject_digest:r.get(5)?,pinned_commit_sha:crate::ingress::revision_legacy(r,6)?,effective_recipe:crate::ingress::db_payload_legacy(r,7)?,result_digest:r.get(8)?,evidence_rung:optional(r,9)?,result_counts:crate::ingress::optional_db_payload_legacy(r,10)?,finishing_capability_hash:r.get(11)?,created_at:r.get(12)?})).optional()?)
 }
 pub fn replay_terminal(
 	tx: &Transaction<'_>, job: i64, capability: &[u8; 32], digest: &[u8; 32],

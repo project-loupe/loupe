@@ -3,7 +3,7 @@ use loupe_core::text::policy::Payload;
 use loupe_core::text::BoundedJson;
 use rusqlite::{params, Connection, Transaction};
 
-use crate::review::{parsed, standalone};
+use crate::review::standalone;
 use crate::{leads, ownership, Entity, Error, Ownership, Result};
 pub struct NewObservation<'a> {
 	pub lead_id: i64,
@@ -29,6 +29,6 @@ pub fn insert(tx: &Transaction<'_>, new: &NewObservation<'_>, now: i64) -> Resul
 	Ok(tx.last_insert_rowid())
 }
 pub fn list(conn: &Connection, lead: i64) -> Result<Vec<Observation>> {
-	Ok(conn.prepare("SELECT lead_observation_id,lead_id,submitted_by_job_id,observation_payload,commit_sha,created_at FROM lead_observations WHERE lead_id=?1 ORDER BY lead_observation_id")?.query_map([lead],|r|Ok(Observation{observation_id:r.get(0)?,lead_id:r.get(1)?,submitted_by_job:r.get(2)?,payload:parsed(r,3)?,commit_sha:r.get(4)?,created_at:r.get(5)?}))?.collect::<rusqlite::Result<_>>()?)
+	Ok(conn.prepare("SELECT lead_observation_id,lead_id,submitted_by_job_id,observation_payload,commit_sha,created_at FROM lead_observations WHERE lead_id=?1 ORDER BY lead_observation_id")?.query_map([lead],|r|Ok(Observation{observation_id:r.get(0)?,lead_id:r.get(1)?,submitted_by_job:r.get(2)?,payload:crate::ingress::agent_payload_legacy(r,3)?,commit_sha:crate::ingress::revision_legacy(r,4)?,created_at:r.get(5)?}))?.collect::<rusqlite::Result<_>>()?)
 }
 standalone! {insert(new:&NewObservation<'_>,now:i64)->i64;}

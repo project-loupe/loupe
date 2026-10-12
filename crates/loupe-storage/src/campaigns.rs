@@ -56,17 +56,17 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Campaign> {
 		repo_id: r.get(1)?,
 		recipe: parsed(r, 2)?,
 		trigger: parsed(r, 3)?,
-		requested_base_sha: r.get(4)?,
-		target_commit_sha: r.get(5)?,
+		requested_base_sha: crate::ingress::optional_revision_legacy(r, 4)?,
+		target_commit_sha: crate::ingress::revision_legacy(r, 5)?,
 		generation_id: r.get(6)?,
 		state: parsed(r, 7)?,
-		terminal_reason: optional(r, 8)?,
-		effective_policy: parsed(r, 9)?,
+		terminal_reason: crate::ingress::optional_reason_legacy(r, 8)?,
+		effective_policy: crate::ingress::db_payload_legacy(r, 9)?,
 		deadline_at: r.get(10)?,
 		root_campaign_id: r.get(11)?,
 		continuation_of_campaign_id: r.get(12)?,
 		coverage_at_finish: optional(r, 13)?,
-		terminal_counts: optional(r, 14)?,
+		terminal_counts: crate::ingress::optional_db_payload_legacy(r, 14)?,
 		created_at: r.get(15)?,
 		finished_at: r.get(16)?,
 	})
@@ -101,7 +101,9 @@ pub fn list_for_repo(conn: &Connection, repo: i64) -> Result<Vec<Campaign>> {
 fn counts(tx: &Transaction<'_>, sql: &str, id: Option<i64>) -> Result<serde_json::Value> {
 	let mut object = serde_json::Map::new();
 	let mut statement = tx.prepare(sql)?;
-	for pair in statement.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+	for pair in statement
+		.query_map([id], |r| Ok((crate::ingress::count_key_legacy(r, 0)?, r.get::<_, i64>(1)?)))?
+	{
 		let (key, count) = pair?;
 		object.insert(key, count.into());
 	}
@@ -127,7 +129,11 @@ pub fn summarize(tx: &Transaction<'_>, id: i64) -> Result<TerminalSummary> {
 		 GROUP BY kind,state ORDER BY kind,state",
 	)?;
 	for record in statement.query_map([id], |r| {
-		Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+		Ok((
+			crate::ingress::job_kind_text_legacy(r, 0)?,
+			crate::ingress::count_key_legacy(r, 1)?,
+			r.get::<_, i64>(2)?,
+		))
 	})? {
 		let (kind, state, count) = record?;
 		jobs.push(serde_json::json!({ "kind": kind, "state": state, "count": count }));

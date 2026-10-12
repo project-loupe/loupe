@@ -495,40 +495,32 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 }
 
 fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
-	let sev_str: String = row.get(4)?;
-	let severity = sev_str.parse::<Severity>().map_err(|e| {
-		rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
-	})?;
+	let severity = crate::review::parsed(row, 4)?;
 	Ok(FindingRow {
 		id: row.get(0)?,
 		repo_id: row.get(1)?,
 		job_id: row.get(2)?,
-		scanner_id: row.get(3)?,
+		scanner_id: crate::ingress::scanner_legacy(row, 3)?,
 		severity,
-		title: row.get(5)?,
-		description: row.get(6)?,
-		file_path: row.get(7)?,
+		title: crate::ingress::finding_title_legacy(row, 5)?,
+		description: crate::ingress::description_legacy(row, 6)?,
+		file_path: crate::ingress::optional_finding_path_legacy(row, 7)?,
 		line_start: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
 		line_end: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
-		cwe: row.get(10)?,
-		patch_unified: row.get(11)?,
-		poc_unified: row.get(12)?,
-		fingerprint: row.get(13)?,
-		state: {
-			let state_str: String = row.get(14)?;
-			state_str.parse::<FindingState>().map_err(|e| {
-				rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Text, e.into())
-			})?
-		},
+		cwe: crate::ingress::optional_cwe_legacy(row, 10)?,
+		patch_unified: crate::ingress::optional_patch_legacy(row, 11)?,
+		poc_unified: crate::ingress::optional_poc_legacy(row, 12)?,
+		fingerprint: crate::ingress::fingerprint_legacy(row, 13)?,
+		state: crate::review::parsed(row, 14)?,
 		verification_required: row.get::<_, i64>(15)? != 0,
 		created_at: row.get(16)?,
 		approved_at: row.get(17)?,
-		approved_by_cn: row.get(18)?,
+		approved_by_cn: crate::ingress::optional_audit_legacy(row, 18)?,
 		rejected_at: row.get(19)?,
-		rejected_by_cn: row.get(20)?,
+		rejected_by_cn: crate::ingress::optional_audit_legacy(row, 20)?,
 		patch_proposed_at: row.get(21)?,
-		patch_proposed_by_cn: row.get(22)?,
-		patch_notes: row.get(23)?,
+		patch_proposed_by_cn: crate::ingress::optional_audit_legacy(row, 22)?,
+		patch_notes: crate::ingress::optional_patch_notes_legacy(row, 23)?,
 	})
 }
 

@@ -90,25 +90,36 @@ pub enum Ownership {
 	ProofExecution,
 }
 
-pub(crate) fn parsed<T: FromStr>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
-where
-	T::Err: std::error::Error + Send + Sync + 'static,
-{
-	row.get::<_, String>(index)?
-		.parse()
-		.map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
+// Only closed scalar vocabularies implement this trait. Text-bearing types,
+// including JobKind::Unknown, go through named marked SQL validators.
+pub(crate) trait ClosedSqlEnum: FromStr {}
+impl ClosedSqlEnum for loupe_core::JobState {}
+impl ClosedSqlEnum for loupe_core::FindingState {}
+impl ClosedSqlEnum for loupe_core::Severity {}
+
+pub(crate) fn invalid_scalar(index: usize) -> rusqlite::Error {
+	rusqlite::Error::FromSqlConversionFailure(index, Type::Text, "invalid stored scalar".into())
 }
-pub(crate) fn optional<T: FromStr>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>>
+
+pub(crate) fn parsed<T: ClosedSqlEnum>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
 where
 	T::Err: std::error::Error + Send + Sync + 'static,
 {
-	row.get::<_, Option<String>>(index)?
-		.map(|s| {
-			s.parse().map_err(|e| {
-				rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e))
-			})
-		})
-		.transpose()
+	row.get_ref(index)?
+		.as_str()
+		.map_err(|_| invalid_scalar(index))?
+		.parse()
+		.map_err(|_| invalid_scalar(index))
+}
+pub(crate) fn optional<T: ClosedSqlEnum>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>>
+where
+	T::Err: std::error::Error + Send + Sync + 'static,
+{
+	if matches!(row.get_ref(index)?, rusqlite::types::ValueRef::Null) {
+		Ok(None)
+	} else {
+		parsed(row, index).map(Some)
+	}
 }
 
 /// A duplicate on a UNIQUE index or on a rowid-alias primary key; SQLite
@@ -136,6 +147,7 @@ pub(crate) fn changed(count: usize, conflict: Conflict) -> crate::Result<()> {
 macro_rules! string_enum {
 	($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
 		#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum $name { $($variant),+ }
+        impl crate::review::ClosedSqlEnum for $name {}
 		impl $name { pub fn as_str(self) -> &'static str { match self { $(Self::$variant => $value),+ } } }
 		impl std::str::FromStr for $name {
 			type Err = loupe_core::text::Error;

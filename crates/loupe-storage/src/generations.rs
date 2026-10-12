@@ -3,7 +3,7 @@ use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
-use crate::review::{changed, classify, optional, parsed, standalone, string_enum};
+use crate::review::{changed, classify, parsed, standalone, string_enum};
 use crate::{ownership, Conflict, Entity, Error, Ownership, Result};
 
 string_enum!(State { Building => "building", Active => "active", Retired => "retired" });
@@ -52,19 +52,19 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Generation> {
 		generation_id: r.get(0)?,
 		repo_id: r.get(1)?,
 		predecessor_generation_id: r.get(2)?,
-		commit_sha: r.get(3)?,
+		commit_sha: crate::ingress::revision_legacy(r, 3)?,
 		state: parsed(r, 4)?,
 		workflow_contract_version: r.get(5)?,
 		profile_version: r.get(6)?,
-		generated_profile: optional(r, 7)?,
+		generated_profile: crate::ingress::optional_db_payload_legacy(r, 7)?,
 		inventory_digest: r.get(8)?,
 		coverage: parsed(r, 9)?,
 		corroboration: parsed(r, 10)?,
-		pending_follow_up: optional(r, 11)?,
+		pending_follow_up: crate::ingress::optional_db_payload_legacy(r, 11)?,
 		created_at: r.get(12)?,
 		activated_at: r.get(13)?,
 		retired_at: r.get(14)?,
-		retired_reason: optional(r, 15)?,
+		retired_reason: crate::ingress::optional_reason_legacy(r, 15)?,
 	})
 }
 pub fn create(tx: &Transaction<'_>, new: &NewGeneration<'_>, now: i64) -> Result<i64> {

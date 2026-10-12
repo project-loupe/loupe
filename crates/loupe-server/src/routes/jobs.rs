@@ -1083,7 +1083,7 @@ mod storage_error_tests {
 				)),
 				StatusCode::BAD_REQUEST,
 			),
-			(Error::UnknownJobKinds(vec![]), StatusCode::INTERNAL_SERVER_ERROR),
+			(Error::UnknownJobKinds(0), StatusCode::INTERNAL_SERVER_ERROR),
 		] {
 			assert_eq!(
 				storage_write_error("submit", error).0,

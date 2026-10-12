@@ -45,20 +45,6 @@ struct StoredAppWrite<'a> {
 	private_key_pem: &'a str,
 }
 
-#[derive(Deserialize)]
-struct StoredAppRead {
-	app_id: u64,
-	slug: String,
-	#[serde(deserialize_with = "deserialize_private_pem")]
-	private_key_pem: Secret<String>,
-}
-
-fn deserialize_private_pem<'de, D: serde::Deserializer<'de>>(
-	deserializer: D,
-) -> Result<Secret<String>, D::Error> {
-	String::deserialize(deserializer).map(Secret::new)
-}
-
 /// Store (or replace) the credential.
 pub fn set(conn: &Connection, app: &StoredGithubApp, now: i64) -> rusqlite::Result<()> {
 	let record = StoredAppWrite {
@@ -83,44 +69,23 @@ pub fn set(conn: &Connection, app: &StoredGithubApp, now: i64) -> rusqlite::Resu
 
 /// Read the credential. `Ok(None)` when no app has been configured.
 pub fn get(conn: &Connection) -> rusqlite::Result<Option<StoredGithubApp>> {
-	read_record::<StoredAppRead>(conn).map(|record| {
-		record.map(|record| StoredGithubApp {
-			app_id: record.app_id,
-			slug: record.slug,
-			private_key_pem: record.private_key_pem,
-		})
-	})
+	conn.query_row(
+		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
+		params![SecretKind::GithubApp.as_str(), LABEL],
+		crate::ingress::app_legacy,
+	)
+	.optional()
 }
 
-/// Read display metadata. Serde skips the unknown PEM field without
-/// allocating a decoded PEM string. Existence checks that need to reject
-/// malformed credential records must continue to use [`get`].
+/// Read display metadata without allocating a decoded PEM string. Full
+/// credential existence/validity checks must continue to use get.
 pub fn summary(conn: &Connection) -> rusqlite::Result<Option<StoredGithubAppSummary>> {
-	read_record(conn)
-}
-
-fn read_record<T: serde::de::DeserializeOwned>(conn: &Connection) -> rusqlite::Result<Option<T>> {
-	let bytes = conn
-		.query_row(
-			"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
-			params![SecretKind::GithubApp.as_str(), LABEL],
-			|r| r.get::<_, Vec<u8>>(0).map(Secret::new),
-		)
-		.optional()?;
-	bytes
-		.map(|b| {
-			serde_json::from_slice(b.expose()).map_err(|_| {
-				rusqlite::Error::FromSqlConversionFailure(
-					0,
-					rusqlite::types::Type::Blob,
-					Box::new(std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"invalid stored GitHub App credential",
-					)),
-				)
-			})
-		})
-		.transpose()
+	conn.query_row(
+		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
+		params![SecretKind::GithubApp.as_str(), LABEL],
+		crate::ingress::app_summary_legacy,
+	)
+	.optional()
 }
 
 /// Remove the credential. Returns whether one was stored.

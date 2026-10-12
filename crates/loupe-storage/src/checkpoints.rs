@@ -3,7 +3,7 @@ use loupe_core::text::policy::{ClientKey, Payload};
 use loupe_core::text::{BoundedJson, Identifier};
 use rusqlite::{params, OptionalExtension, Transaction};
 
-use crate::review::{is_unique, parsed, standalone, string_enum};
+use crate::review::{is_unique, standalone, string_enum};
 use crate::{Conflict, Error, Result};
 string_enum!(Operation { SubmitReviewUnit=>"submit_review_unit", SubmitLead=>"submit_lead", SubmitUnitResult=>"submit_unit_result", SubmitObservation=>"submit_observation", StageArtifact=>"stage_proof_artifact", RecordExecution=>"record_execution", ValidateFixPatch=>"validate_fix_patch", SubmitSiblingLead=>"submit_sibling_lead", InitializeSurveyBatch=>"initialize_survey_batch" });
 /// Stored bytes stay borrowed so a malformed digest cannot be truncated or
@@ -79,9 +79,9 @@ pub fn lookup(
 			params![job, qualified],
 			|r| {
 				Ok((
-					r.get::<_, String>(0)?,
+					crate::ingress::operation_legacy(r, 0)?,
 					r.get::<_, Vec<u8>>(1)?,
-					parsed::<BoundedJson<Payload>>(r, 2)?,
+					crate::ingress::db_payload_legacy(r, 2)?,
 				))
 			},
 		)

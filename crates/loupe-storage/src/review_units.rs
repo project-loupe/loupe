@@ -5,7 +5,7 @@ use loupe_core::text::policy::{Argument, ClientKey, Objective, Payload, Reason, 
 use loupe_core::text::{BoundedJson, BoundedText, Identifier};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
-use crate::review::{changed, classify, optional, parsed, standalone, string_enum};
+use crate::review::{changed, classify, parsed, standalone, string_enum};
 use crate::source_refs::UnitRefs;
 use crate::{inventory, ownership, Conflict, Entity, Error, Ownership, Result};
 
@@ -85,21 +85,21 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Unit> {
 	Ok(Unit {
 		unit_id: r.get(0)?,
 		generation_id: r.get(1)?,
-		client_key: parsed(r, 2)?,
-		title: parsed(r, 3)?,
-		objective: parsed(r, 4)?,
+		client_key: crate::ingress::client_key_legacy(r, 2)?,
+		title: crate::ingress::title_legacy(r, 3)?,
+		objective: crate::ingress::objective_legacy(r, 4)?,
 		status: parsed(r, 5)?,
-		defer_reason: optional(r, 6)?,
+		defer_reason: crate::ingress::optional_reason_legacy(r, 6)?,
 		priority: parsed(r, 7)?,
-		priority_proposal: optional(r, 8)?,
-		source_refs: parsed(r, 9)?,
-		depends_on: optional(r, 10)?,
-		closure_criteria: optional(r, 11)?,
-		semantic_context: optional(r, 12)?,
+		priority_proposal: crate::ingress::optional_agent_payload_legacy(r, 8)?,
+		source_refs: crate::ingress::unit_refs_legacy(r, 9)?,
+		depends_on: crate::ingress::optional_agent_payload_legacy(r, 10)?,
+		closure_criteria: crate::ingress::optional_argument_legacy(r, 11)?,
+		semantic_context: crate::ingress::optional_agent_payload_legacy(r, 12)?,
 		carry_depth: r.get(13)?,
 		carried_from: r.get(14)?,
 		stale: r.get(15)?,
-		stale_reason: optional(r, 16)?,
+		stale_reason: crate::ingress::optional_reason_legacy(r, 16)?,
 		assignment_epoch: r.get(17)?,
 		created_by_job: r.get(18)?,
 		created_at: r.get(19)?,

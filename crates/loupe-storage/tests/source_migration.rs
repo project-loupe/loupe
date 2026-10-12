@@ -1,4 +1,4 @@
-//! New marked-read acceptance fixtures. Production DAOs remain unchanged.
+//! Marked-read fixtures and compatibility with the adopted actual SQL owners.
 #[path = "support/db.rs"]
 mod fixture;
 #[path = "support/stored.rs"]
@@ -88,7 +88,10 @@ fn marked_read_rejects_new_caps_and_controls_without_changing_legacy_rows() {
 	for title in ["x".repeat(LEGACY_TEXT_MAX_BYTES + 1), "bad\0title".into(), "bad\rtitle".into()] {
 		db.with_conn(|conn| {
 			conn.execute("UPDATE findings SET title=?1 WHERE id=?2", (&title, id))?;
-			assert_eq!(findings::get(conn, id)?.unwrap().title, title);
+			assert!(findings::get(conn, id).is_err());
+			let stored: String =
+				conn.query_row("SELECT title FROM findings WHERE id=?1", [id], |r| r.get(0))?;
+			assert_eq!(stored, title);
 			Ok(())
 		})
 		.unwrap();
@@ -106,7 +109,12 @@ fn marked_read_rejects_new_caps_and_controls_without_changing_legacy_rows() {
 	}
 	db.with_conn(|conn| {
 		conn.execute("UPDATE findings SET file_path=?1 WHERE id=?2", ("x".repeat(513), id))?;
-		assert_eq!(findings::get(conn, id)?.unwrap().file_path.unwrap().len(), 513);
+		assert!(findings::get(conn, id).is_err());
+		let len: i64 =
+			conn.query_row("SELECT length(file_path) FROM findings WHERE id=?1", [id], |r| {
+				r.get(0)
+			})?;
+		assert_eq!(len, 513);
 		Ok(())
 	})
 	.unwrap();

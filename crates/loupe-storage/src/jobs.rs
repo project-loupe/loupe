@@ -643,20 +643,16 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 }
 
 pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
-	let kind_str: String = row.get(2)?;
-	let state_str: String = row.get(3)?;
-	let kind = kind_str.parse::<JobKind>().expect("infallible kind parser");
-	let state = state_str.parse::<JobState>().map_err(|e| {
-		rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into())
-	})?;
+	let kind = crate::ingress::job_kind_legacy(row, 2)?;
+	let state = crate::review::parsed(row, 3)?;
 	Ok(JobRow {
 		id: row.get(0)?,
 		repo_id: row.get(1)?,
 		kind,
 		state,
 		incremental: row.get::<_, i64>(4)? != 0,
-		since_sha: row.get(5)?,
-		head_sha: row.get(6)?,
+		since_sha: crate::ingress::optional_revision_legacy(row, 5)?,
+		head_sha: crate::ingress::optional_revision_legacy(row, 6)?,
 		parent_job_id: row.get(7)?,
 		target_finding_id: row.get(8)?,
 		worker_id: row.get(9)?,
@@ -665,7 +661,7 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		enqueued_at: row.get(12)?,
 		started_at: row.get(13)?,
 		finished_at: row.get(14)?,
-		error: row.get(15)?,
+		error: crate::ingress::optional_diagnostic_legacy(row, 15)?,
 		campaign_id: row.get(16)?,
 		generation_id: row.get(17)?,
 		assigned_lead_id: row.get(18)?,
@@ -677,7 +673,7 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		hard_deadline_at: row.get(24)?,
 		submit_by: row.get(25)?,
 		token_budget: row.get(26)?,
-		recipe: crate::review::optional(row, 27)?,
+		recipe: crate::ingress::optional_db_payload_legacy(row, 27)?,
 		workflow_contract_version: row.get(28)?,
 	})
 }

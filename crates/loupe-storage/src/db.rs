@@ -11,8 +11,8 @@ use crate::secrets::MasterKey;
 pub enum Error {
 	#[error(transparent)]
 	Sqlite(#[from] rusqlite::Error),
-	#[error("database contains unknown job kinds {0:?}; refusing startup")]
-	UnknownJobKinds(Vec<String>),
+	#[error("database contains {0} unknown job kinds; refusing startup")]
+	UnknownJobKinds(usize),
 	#[error(transparent)]
 	Validation(#[from] loupe_core::text::Error),
 	#[error("conflict: {0:?}")]
@@ -82,15 +82,14 @@ impl Db {
 		// enforcement disabled. Check on every boot, not just during v3.
 		// NOT EXISTS rather than NOT IN: a NULL in the lookup would make
 		// `NOT IN` evaluate to NULL for every row and pass everything.
-		let unknown = conn
-			.prepare(
-				"SELECT DISTINCT kind FROM jobs j
+		let unknown: usize = conn.query_row(
+			"SELECT COUNT(*) FROM (SELECT DISTINCT kind FROM jobs j
 				  WHERE NOT EXISTS (SELECT 1 FROM job_kinds k WHERE k.kind = j.kind)
-				  ORDER BY kind",
-			)?
-			.query_map([], |row| row.get::<_, String>(0))?
-			.collect::<rusqlite::Result<Vec<_>>>()?;
-		if !unknown.is_empty() {
+                )",
+			[],
+			|row| row.get(0),
+		)?;
+		if unknown != 0 {
 			return Err(Error::UnknownJobKinds(unknown));
 		}
 		crate::scheduler::ensure_state(&conn)?;
@@ -162,7 +161,8 @@ mod tests {
 			},
 		};
 		let message = error.to_string();
-		assert!(message.contains("bogus-a") && message.contains("bogus-b"), "{message}");
+		assert_eq!(message, "database contains 2 unknown job kinds; refusing startup");
+		assert!(!format!("{error:?}").contains("bogus"));
 		assert!(
 			!message.contains("survey") && !message.contains("drilldown"),
 			"known kinds must not be diagnosed as unknown: {message}"
@@ -200,7 +200,7 @@ mod tests {
 			);
 			if unknown {
 				match result {
-					Err(Error::UnknownJobKinds(kinds)) => assert_eq!(kinds, ["bogus"]),
+					Err(Error::UnknownJobKinds(count)) => assert_eq!(count, 1),
 					Err(other) => panic!("expected unknown-kind rejection, got {other}"),
 					Ok(_) => panic!("a NULL lookup row must not disable unknown-kind rejection"),
 				}

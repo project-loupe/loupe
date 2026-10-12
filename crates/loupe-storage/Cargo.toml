@@ -13,12 +13,12 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-loupe-core = { version = "0.1.0", path = "../loupe-core" }
-loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
+loupe-core = { version = "0.1.0", path = "../loupe-core", features = ["source-migration"] }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
 rand_core = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 

@@ -3,7 +3,7 @@ use loupe_core::text::policy::Reason;
 use loupe_core::text::{BoundedText, RepoPath, SourceRef};
 use rusqlite::{params, Connection, Transaction};
 
-use crate::review::{is_unique, optional, parsed, standalone, string_enum};
+use crate::review::{is_unique, parsed, standalone, string_enum};
 use crate::{ownership, Conflict, Error, Ownership, Result};
 string_enum!(EntryKind { Tracked => "tracked", Submodule => "submodule" });
 string_enum!(Disposition { Mapped => "mapped", Context => "context", Excluded => "excluded", Unresolved => "unresolved" });
@@ -191,9 +191,10 @@ pub fn insert(
 }
 pub fn list(conn: &Connection, generation: i64) -> Result<Vec<Entry>> {
 	Ok(conn.prepare("SELECT inventory_entry_id,generation_id,path,blob_sha,entry_kind,disposition,disposition_reason,highlighted FROM generation_inventory WHERE generation_id=?1 ORDER BY path")?.query_map([generation],|r| {
-		let reason: Option<BoundedText<Reason>> = optional(r,6)?;
-		let path = InventoryPath { rendering:r.get(2)?,representable:reason.as_ref().is_none_or(|reason|reason.expose()!="unrepresentable-path") };
-		Ok(Entry { inventory_entry_id:r.get(0)?,generation_id:r.get(1)?,path,blob_sha:r.get(3)?,kind:parsed(r,4)?,disposition:parsed(r,5)?,reason,highlighted:r.get(7)? })
+		let reason: Option<BoundedText<Reason>> = crate::ingress::optional_reason_legacy(r,6)?;
+		let representable = reason.as_ref().is_none_or(|reason|reason.expose()!="unrepresentable-path");
+ let path = InventoryPath { rendering:crate::ingress::inventory_path_legacy(r,2,representable)?,representable };
+		Ok(Entry { inventory_entry_id:r.get(0)?,generation_id:r.get(1)?,path,blob_sha:crate::ingress::optional_revision_legacy(r,3)?,kind:parsed(r,4)?,disposition:parsed(r,5)?,reason,highlighted:r.get(7)? })
 	})?.collect::<rusqlite::Result<_>>()?)
 }
 pub fn verify_refs(tx: &Transaction<'_>, generation: i64, refs: &[SourceRef]) -> Result<()> {
