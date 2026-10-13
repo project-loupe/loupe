@@ -18,9 +18,12 @@ The existing `test (stable)` CI job invokes the same normal gate, including
 production lint and boundary self-tests, per-crate checks and nightly negative
 API doctests. Its stable toolchain remains the default; nightly is selected
 explicitly for formatting and doctests. The separate fuzz-replay job checks
-saved inputs and generated runners. Scheduled Kani runs retain their bounded
-wrapper and selected fast harnesses. Full local verification additionally
-requires the worker image's toolchains for the five ignored build checks.
+saved inputs and generated runners. The fuzz job selects one registered target
+at random, excluding smoke, and runs it for five minutes on every push and PR.
+Build time is additional; crashes fail the job and are uploaded as artifacts.
+Scheduled Kani runs retain their bounded wrapper and selected fast harnesses.
+Full local verification additionally requires the worker image's toolchains
+for the five ignored build checks.
 
 Campaign scripts require Bash, GNU coreutils (`timeout`, `nice`, `date`),
 and util-linux (`flock`, `setsid`, `taskset`). Fuzzing needs `cargo-fuzz`

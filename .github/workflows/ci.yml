@@ -100,3 +100,27 @@ jobs:
           sh fuzz/src/bin/gen_target.sh
           git diff --exit-code -- fuzz/runners/src/bin fuzz/targets.h
           test -z "$(git ls-files --others --exclude-standard fuzz/runners/src/bin fuzz/targets.h)"
+
+  fuzz:
+    name: Fuzz (5 minutes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: /tmp/cargo-target-loupe-ci-fuzz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Fuzz a random target for five minutes
+        run: |
+          target=$(awk '$1 == "GEN_TEST" && $2 != "smoke" { print $2 "_target" }' fuzz/src/bin/gen_target.sh | shuf -n 1)
+          echo "Fuzzing $target for 300 seconds"
+          ci/fuzz.sh "$target" 300
+      - name: Preserve crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/runners/artifacts/
+          if-no-files-found: ignore
