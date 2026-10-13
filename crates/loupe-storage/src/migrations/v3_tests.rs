@@ -95,8 +95,8 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 fn v3_refuses_busy_unknown_and_duplicate_verify_without_changes() {
 	for (mutate, expected) in [
 		(busy as fn(&Connection), "leased"),
-		(unknown_kind, "bogus"),
-		(duplicate_verify, "idx_jobs_active_verify"),
+		(unknown_kind, "UnknownJobKind"),
+		(duplicate_verify, "DuplicateVerify"),
 	] {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("loupe.sqlite");
@@ -107,10 +107,12 @@ fn v3_refuses_busy_unknown_and_duplicate_verify_without_changes() {
 		let jobs = rows(&conn, "SELECT * FROM jobs ORDER BY id");
 		let err = apply_pending(&mut conn).expect_err("unsafe v3 upgrade must be refused");
 		assert!(err.to_string().contains(expected), "{err}");
-		if expected == "idx_jobs_active_verify" {
-			assert!(err.to_string().contains("finding 2"), "{err}");
+		if expected == "DuplicateVerify" {
+			assert!(err.to_string().contains("column=target_finding_id"), "{err}");
+			assert!(err.to_string().contains("rowid="), "{err}");
 			assert!(err.to_string().contains("cancel"), "{err}");
 		}
+		assert!(!format!("{err:?}").contains("bogus"));
 		assert!(fk_enabled(&conn));
 		drop(conn);
 		let conn = open(&path);

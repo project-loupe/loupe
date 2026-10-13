@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use thiserror::Error;
 
-use crate::migrations::{apply_pending, current_schema_version};
+use crate::migrations::{apply_pending_with_finalizer, current_schema_version};
 use crate::secrets::MasterKey;
 
 #[derive(Debug, Error)]
 pub enum Error {
+	#[error(transparent)]
+	Migration(#[from] crate::migrations::MigrationFailure),
 	#[error(transparent)]
 	Sqlite(#[from] rusqlite::Error),
 	#[error("database contains {0} unknown job kinds; refusing startup")]
@@ -60,14 +62,15 @@ impl Db {
 	}
 
 	fn bootstrap(conn: Connection, key: &MasterKey) -> Result<Self> {
-		Self::bootstrap_with_migration(conn, key, apply_pending)
+		Self::bootstrap_with_migration(conn, key, |conn| {
+			apply_pending_with_finalizer(conn, Self::finalize)
+		})
 	}
 
 	// Keep configuration and connection disposal on the real startup path
 	// when migration tests inject failures at transactional boundaries.
 	pub(crate) fn bootstrap_with_migration(
-		mut conn: Connection, key: &MasterKey,
-		migrate: impl FnOnce(&mut Connection) -> rusqlite::Result<()>,
+		mut conn: Connection, key: &MasterKey, migrate: impl FnOnce(&mut Connection) -> Result<()>,
 	) -> Result<Self> {
 		// PRAGMA key MUST run before any other statement that touches
 		// pages: SQLCipher decrypts pages on read, so an unkeyed read
@@ -78,22 +81,30 @@ impl Db {
 		conn.pragma_update(None, "foreign_keys", "ON")?;
 		conn.pragma_update(None, "synchronous", "NORMAL")?;
 		migrate(&mut conn)?;
+		Ok(Self { conn: Mutex::new(conn) })
+	}
+
+	fn finalize(conn: &Connection, _upgrading: bool) -> Result<()> {
 		// Foreign keys do not retroactively validate rows inserted with
 		// enforcement disabled. Check on every boot, not just during v3.
 		// NOT EXISTS rather than NOT IN: a NULL in the lookup would make
 		// `NOT IN` evaluate to NULL for every row and pass everything.
-		let unknown: usize = conn.query_row(
-			"SELECT COUNT(*) FROM (SELECT DISTINCT kind FROM jobs j
-				  WHERE NOT EXISTS (SELECT 1 FROM job_kinds k WHERE k.kind = j.kind)
-                )",
+		let unknown: Option<i64> = conn.query_row(
+			"SELECT MIN(rowid) FROM jobs j
+				  WHERE NOT EXISTS (SELECT 1 FROM job_kinds k WHERE k.kind = j.kind)",
 			[],
 			|row| row.get(0),
 		)?;
-		if unknown != 0 {
-			return Err(Error::UnknownJobKinds(unknown));
+		if let Some(rowid) = unknown {
+			return Err(crate::migrations::MigrationFailure::new(
+				crate::migrations::MigrationStage::Finalize,
+				crate::migrations::MigrationReason::UnknownJobKind,
+			)
+			.at("jobs", "kind", Some(rowid))
+			.into());
 		}
-		crate::scheduler::ensure_state(&conn)?;
-		Ok(Self { conn: Mutex::new(conn) })
+		crate::scheduler::ensure_state(conn)?;
+		Ok(())
 	}
 
 	/// Run a closure with exclusive access to the underlying connection.
@@ -161,7 +172,19 @@ mod tests {
 			},
 		};
 		let message = error.to_string();
-		assert_eq!(message, "database contains 2 unknown job kinds; refusing startup");
+		assert!(
+			matches!(
+				error,
+				Error::Migration(crate::migrations::MigrationFailure {
+					reason: crate::migrations::MigrationReason::UnknownJobKind,
+					table: Some("jobs"),
+					column: Some("kind"),
+					rowid: Some(1),
+					..
+				})
+			),
+			"{error}"
+		);
 		assert!(!format!("{error:?}").contains("bogus"));
 		assert!(
 			!message.contains("survey") && !message.contains("drilldown"),
@@ -195,12 +218,18 @@ mod tests {
 					if unknown {
 						conn.execute("INSERT INTO jobs VALUES ('bogus')", [])?;
 					}
-					Ok(())
+					Db::finalize(conn, false)
 				},
 			);
 			if unknown {
 				match result {
-					Err(Error::UnknownJobKinds(count)) => assert_eq!(count, 1),
+					Err(Error::Migration(failure)) => {
+						assert_eq!(
+							failure.reason,
+							crate::migrations::MigrationReason::UnknownJobKind
+						);
+						assert_eq!(failure.rowid, Some(2));
+					},
 					Err(other) => panic!("expected unknown-kind rejection, got {other}"),
 					Ok(_) => panic!("a NULL lookup row must not disable unknown-kind rejection"),
 				}

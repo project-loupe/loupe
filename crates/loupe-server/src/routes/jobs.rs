@@ -505,7 +505,9 @@ fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCod
 		Error::Conflict(_) => StatusCode::CONFLICT,
 		Error::Ownership(_) => StatusCode::FORBIDDEN,
 		Error::NotFound(_, _) => StatusCode::NOT_FOUND,
-		Error::Sqlite(_) | Error::UnknownJobKinds(_) => StatusCode::INTERNAL_SERVER_ERROR,
+		Error::Sqlite(_) | Error::Migration(_) | Error::UnknownJobKinds(_) => {
+			StatusCode::INTERNAL_SERVER_ERROR
+		},
 	};
 	(status, format!("{context}: {error}"))
 }

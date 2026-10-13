@@ -1,13 +1,21 @@
 //! Embedded SQL migrations.
 //!
-//! Consecutive SQL migrations share a transaction. Structural migrations
-//! run on the bare connection and own their transaction and version writes.
+//! All pending SQL and structural migrations share one IMMEDIATE transaction.
+//! The framework owns validation, version writes, FK restoration, and commit.
 //! `schema_meta.version` is authoritative; `PRAGMA user_version` mirrors it.
 //! Migrations must be append-only — never edit a published version.
 
 use rusqlite::{params, Connection};
 
+mod error;
+mod framework;
 mod v3;
+
+pub use error::{MigrationFailure, MigrationReason, MigrationStage};
+use framework::apply_with_finalizer;
+
+type MigrationResult<T = ()> = std::result::Result<T, MigrationFailure>;
+type Probe<'a> = dyn FnMut(v3::Step, &Connection) -> rusqlite::Result<()> + 'a;
 
 #[cfg(test)]
 mod framework_tests;
@@ -25,7 +33,7 @@ mod v3_tests;
 /// ascending order.
 enum Migration {
 	Sql { version: u32, sql: &'static str },
-	Structural { version: u32, run: fn(&mut Connection) -> rusqlite::Result<()> },
+	Structural { version: u32, run: fn(&Connection, &mut Probe<'_>) -> MigrationResult },
 }
 
 impl Migration {
@@ -60,53 +68,21 @@ pub const LATEST_SCHEMA_VERSION: u32 = {
 
 /// Apply any migrations whose version is higher than `schema_meta.version`.
 /// The bootstrap migration (`v0 → v1`) creates `schema_meta` itself.
-pub fn apply_pending(conn: &mut Connection) -> rusqlite::Result<()> {
-	apply_migrations(conn, MIGRATIONS)
+pub fn apply_pending(conn: &mut Connection) -> crate::Result<()> {
+	apply_pending_with_finalizer(conn, |_, _| Ok(()))
 }
 
-fn apply_migrations(conn: &mut Connection, migrations: &[Migration]) -> rusqlite::Result<()> {
-	let current = read_current_version(conn)?;
-	let latest = migrations.last().map_or(0, Migration::version);
-	if current > latest {
-		return Err(migration_error(format!(
-			"database has schema {current}, but this binary supports schema {latest}; use a newer binary"
-		)));
-	}
-	let mut applied = current;
-	let mut pending = migrations.iter().filter(|m| m.version() > current).peekable();
-	while let Some(migration) = pending.peek() {
-		match migration {
-			Migration::Sql { .. } => {
-				let tx = conn.transaction()?;
-				while let Some(Migration::Sql { version, sql }) = pending.peek() {
-					tx.execute_batch(sql)?;
-					set_version(&tx, *version)?;
-					applied = *version;
-					pending.next();
-				}
-				tx.commit()?;
-				// Mirror each committed batch before dispatching a structural
-				// migration, even if that next migration refuses to proceed.
-				conn.pragma_update(None, "user_version", applied)?;
-			},
-			Migration::Structural { version, run } => {
-				run(conn)?;
-				// The body owns its version write; never mirror a version it
-				// did not record, or the next boot re-dispatches it.
-				let recorded = read_current_version(conn)?;
-				if recorded != *version {
-					return Err(migration_error(format!(
-						"structural migration {version} returned without recording itself in schema_meta (found {recorded})"
-					)));
-				}
-				applied = *version;
-				pending.next();
-			},
-		}
-	}
-	// Also repair a stale mirror when there is nothing to migrate.
-	conn.pragma_update(None, "user_version", applied)?;
-	Ok(())
+/// Run startup checks and initialization before the upgrade commits. The
+/// boolean identifies an actual upgrade, as opposed to reopening current data.
+pub fn apply_pending_with_finalizer(
+	conn: &mut Connection, finalize: impl FnOnce(&Connection, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
+	apply_with_finalizer(conn, MIGRATIONS, finalize, &mut |_, _| Ok(()))
+}
+
+#[cfg(test)]
+fn apply_migrations(conn: &mut Connection, migrations: &[Migration]) -> crate::Result<()> {
+	apply_with_finalizer(conn, migrations, |_, _| Ok(()), &mut |_, _| Ok(()))
 }
 
 fn set_version(conn: &Connection, version: u32) -> rusqlite::Result<()> {
@@ -118,13 +94,6 @@ fn set_version(conn: &Connection, version: u32) -> rusqlite::Result<()> {
 	Ok(())
 }
 
-fn migration_error(message: impl Into<String>) -> rusqlite::Error {
-	rusqlite::Error::SqliteFailure(
-		rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-		Some(message.into()),
-	)
-}
-
 /// Highest applied migration version — `0` if `schema_meta` doesn't yet exist.
 pub fn current_schema_version(conn: &Connection) -> rusqlite::Result<u32> {
 	read_current_version(conn)
@@ -132,16 +101,24 @@ pub fn current_schema_version(conn: &Connection) -> rusqlite::Result<u32> {
 
 fn read_current_version(conn: &Connection) -> rusqlite::Result<u32> {
 	let exists: bool = conn.query_row(
-		"SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta')",
+		"SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='schema_meta')",
 		[],
 		|r| r.get(0),
 	)?;
 	if !exists {
 		return Ok(0);
 	}
-	let v: Option<u32> =
-		conn.query_row("SELECT version FROM schema_meta WHERE id = 1", [], |r| r.get(0)).ok();
-	Ok(v.unwrap_or(0))
+	let valid: bool = conn.query_row(
+		"SELECT COUNT(*) = 1 AND COALESCE(MIN(typeof(id) = 'integer' AND id = 1
+		 AND typeof(version) = 'integer' AND version BETWEEN 1 AND 4294967295), 0)
+		 FROM schema_meta",
+		[],
+		|row| row.get(0),
+	)?;
+	if !valid {
+		return Err(rusqlite::Error::InvalidQuery);
+	}
+	conn.query_row("SELECT version FROM schema_meta WHERE id = 1", [], |r| r.get(0))
 }
 
 /// v1 — initial schema.

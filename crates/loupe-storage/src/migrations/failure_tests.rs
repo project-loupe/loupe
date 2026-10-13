@@ -6,6 +6,13 @@ use super::*;
 use crate::secrets::MasterKey;
 use crate::Db;
 
+fn migration_error(_message: impl Into<String>) -> rusqlite::Error {
+	rusqlite::Error::SqliteFailure(
+		rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+		Some("private injected payload".into()),
+	)
+}
+
 #[test]
 fn v3_precommit_failures_reopen_as_complete_v2_and_retry() {
 	for step in [
@@ -19,6 +26,7 @@ fn v3_precommit_failures_reopen_as_complete_v2_and_retry() {
 		Step::ForeignKeyCheck,
 		Step::IntegrityCheck,
 		Step::Commit,
+		Step::Restore,
 	] {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("loupe.sqlite");
@@ -38,7 +46,8 @@ fn v3_precommit_failures_reopen_as_complete_v2_and_retry() {
 			}
 		})
 		.expect_err("precommit failure must abort the migration");
-		assert!(error.to_string().contains("injected"), "{step:?}: {error}");
+		assert!(!error.to_string().contains("private injected payload"), "{step:?}: {error}");
+		assert!(!format!("{error:?}").contains("private injected payload"));
 		assert!(fk_enabled(&conn));
 		drop(conn);
 		let mut conn = open(&path);
@@ -81,7 +90,16 @@ fn v3_exact_copy_check_detects_equal_length_corruption() {
 			}
 			Ok(())
 		}).expect_err("same-length corruption must fail exact copy verification");
-		assert!(error.to_string().contains("legacy jobs copy differs"), "{error}");
+		assert!(
+			matches!(
+				error,
+				crate::Error::Migration(MigrationFailure {
+					reason: MigrationReason::CopyMismatch,
+					..
+				})
+			),
+			"{error}"
+		);
 		assert!(fk_enabled(&conn));
 		drop(conn);
 		let mut conn = open(&path);
@@ -95,8 +113,8 @@ fn v3_exact_copy_check_detects_equal_length_corruption() {
 #[test]
 fn v3_validators_reject_injected_fk_and_check_violations() {
 	for (at, sql, diagnostic) in [
-		(Step::ForeignKeyCheck, "UPDATE jobs SET repo_id = 999 WHERE id = 1", "foreign_key_check"),
-		(Step::IntegrityCheck, "PRAGMA ignore_check_constraints = ON; UPDATE jobs SET token_budget = 0 WHERE id = 1; PRAGMA ignore_check_constraints = OFF;", "integrity_check"),
+		(Step::ForeignKeyCheck, "UPDATE jobs SET repo_id = 999 WHERE id = 1", "ForeignKeyCheck"),
+		(Step::IntegrityCheck, "PRAGMA ignore_check_constraints = ON; UPDATE jobs SET token_budget = 0 WHERE id = 1; PRAGMA ignore_check_constraints = OFF;", "IntegrityCheck"),
 	] {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("loupe.sqlite");
@@ -117,11 +135,12 @@ fn v3_validators_reject_injected_fk_and_check_violations() {
 }
 
 #[test]
-fn v3_restoration_failure_rejects_bootstrap_but_keeps_complete_v3() {
+fn v3_restoration_failure_rejects_bootstrap_and_keeps_complete_v2() {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dir.path().join("loupe.sqlite");
 	let mut conn = open(&path);
 	settled(&mut conn);
+	let before = schema(&conn);
 	drop(conn);
 	let result = Db::bootstrap_with_migration(
 		Connection::open(&path).unwrap(),
@@ -139,14 +158,14 @@ fn v3_restoration_failure_rejects_bootstrap_but_keeps_complete_v3() {
 	let Err(error) = result else {
 		panic!("restoration failure must not construct a Db");
 	};
-	assert!(error.to_string().contains("FK restoration failure"), "{error}");
+	assert!(error.to_string().contains("RestoreForeignKeys"), "{error}");
 	let conn = open(&path);
-	assert_eq!(markers(&conn), (3, 3));
+	assert_eq!(markers(&conn), (2, 2));
 	assert!(fk_enabled(&conn));
-	let expected = schema(&conn);
+	assert_eq!(schema(&conn), before);
 	let mut fresh = Connection::open_in_memory().unwrap();
 	apply_pending(&mut fresh).unwrap();
-	assert_eq!(expected, schema(&fresh), "restoration failure must leave the entire v3 schema");
+	let expected = schema(&fresh);
 	assert!(rows(&conn, "PRAGMA foreign_key_check").is_empty());
 	drop(conn);
 	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
@@ -176,12 +195,8 @@ fn v3_panic_restores_the_prior_fk_setting() {
 			assert!(result.is_err(), "probe must panic");
 			assert!(conn.is_autocommit());
 			assert_eq!(fk_enabled(&conn), prior);
-			if step == Step::Copy {
-				assert_eq!(markers(&conn), (2, 2));
-				assert_eq!(schema(&conn), before);
-			} else {
-				assert_eq!(markers(&conn), (3, 3));
-			}
+			assert_eq!(markers(&conn), (2, 2));
+			assert_eq!(schema(&conn), before);
 		}
 	}
 }
@@ -231,7 +246,17 @@ fn v3_real_commit_failure_rolls_back_and_restores_foreign_keys() {
 	})
 	.expect_err("SQLite must refuse COMMIT while a reader holds the file");
 	assert!(reached_commit, "failure must occur at COMMIT, not during DDL: {error}");
-	assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+	assert!(
+		matches!(
+			error,
+			crate::Error::Migration(MigrationFailure {
+				stage: MigrationStage::Commit,
+				sqlite_code: Some(rusqlite::ffi::SQLITE_BUSY),
+				..
+			})
+		),
+		"{error}"
+	);
 	assert!(fk_enabled(&conn));
 	assert!(conn.is_autocommit());
 	drop(reader);
@@ -244,22 +269,18 @@ fn v3_real_commit_failure_rolls_back_and_restores_foreign_keys() {
 }
 
 #[test]
-fn v1_upgrade_and_v3_refusal_leave_committed_capability_migration() {
+fn v1_upgrade_requeues_leases_only_when_every_migration_succeeds() {
 	for refuse in [false, true] {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("loupe.sqlite");
 		let mut conn = open(&path);
 		v1(&mut conn);
 		conn.execute_batch("UPDATE jobs SET state = 'leased', worker_id = 1, lease_expires_at = 100 WHERE id IN (2, 3);").unwrap();
-		fn fail_precheck(conn: &mut Connection) -> rusqlite::Result<()> {
-			assert_eq!(markers(conn), (2, 2));
-			run_with_probe(conn, &mut |step, _conn| {
-				if step == Step::PreCheck {
-					Err(migration_error("injected pre-check failure"))
-				} else {
-					Ok(())
-				}
-			})
+		let before = schema(&conn);
+		let jobs = rows(&conn, "SELECT * FROM jobs ORDER BY id");
+		fn fail_precheck(conn: &Connection, _: &mut Probe<'_>) -> MigrationResult {
+			assert_eq!(markers(conn), (1, 1));
+			Err(MigrationFailure::new(MigrationStage::PreCheck, MigrationReason::Database))
 		}
 		if refuse {
 			apply_migrations(
@@ -276,19 +297,18 @@ fn v1_upgrade_and_v3_refusal_leave_committed_capability_migration() {
 		}
 		drop(conn);
 		let mut conn = open(&path);
-		let version = if refuse { 2 } else { LATEST_SCHEMA_VERSION };
+		let version = if refuse { 1 } else { LATEST_SCHEMA_VERSION };
 		assert_eq!(markers(&conn), (version, version));
+		if refuse {
+			assert_eq!(schema(&conn), before);
+			assert_eq!(rows(&conn, "SELECT * FROM jobs ORDER BY id"), jobs);
+			apply_pending(&mut conn).unwrap();
+			assert_eq!(markers(&conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
+		}
 		assert_eq!(rows(&conn, "SELECT state, worker_id, lease_expires_at, job_capability_hash, finished_at FROM jobs WHERE id = 2"),
 			vec![vec!["succeeded".to_owned().into(), rusqlite::types::Value::Null, rusqlite::types::Value::Null, rusqlite::types::Value::Null, 6.into()]]);
 		assert_eq!(rows(&conn, "SELECT state, worker_id, lease_expires_at, attempts, started_at, finished_at, error, head_sha FROM jobs WHERE id = 3"),
 			vec![vec!["queued".to_owned().into(), rusqlite::types::Value::Null, rusqlite::types::Value::Null, 0.into(), rusqlite::types::Value::Null, rusqlite::types::Value::Null, rusqlite::types::Value::Null, rusqlite::types::Value::Null]]);
-		if refuse {
-			let mut expected = Connection::open_in_memory().unwrap();
-			settled(&mut expected);
-			assert_eq!(schema(&conn), schema(&expected));
-			apply_pending(&mut conn).unwrap();
-			assert_eq!(markers(&conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
-		}
 	}
 }
 
