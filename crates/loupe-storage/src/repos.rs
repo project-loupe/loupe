@@ -6,6 +6,104 @@ use loupe_core::{ReportingDestination, ScannerDocument};
 use loupe_provenance::{Db, Source};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::scope::RepoScope;
+
+/// Read only the repository selected by the issuer.
+pub fn get(scope: &RepoScope<'_>) -> crate::Result<Option<RepoRow>> {
+	Ok(get_raw(scope.conn, scope.repo_id)?)
+}
+
+/// Delete only the selected repository; callers cannot supply a replacement ID.
+/// ```compile_fail,E0061
+/// # fn foreign(scope: &loupe_storage::scope::RepoScope<'_>) {
+/// loupe_storage::repos::delete(scope, 2);
+/// # }
+/// ```
+pub fn delete(scope: &RepoScope<'_>) -> crate::Result<bool> {
+	scope.require_operator()?;
+	Ok(delete_raw(scope.conn, scope.repo_id)?)
+}
+
+pub fn update(scope: &RepoScope<'_>, patch: &RepoUpdate, now: i64) -> crate::Result<bool> {
+	scope.require_operator()?;
+	Ok(update_raw(scope.conn, scope.repo_id, patch, now)?)
+}
+
+/// Replace this repository's GitHub destination without accepting a secret ID.
+pub fn set_github_reporting<S: Source>(
+	scope: &RepoScope<'_>, target_owner: &BoundedText<RepoOwner, S>,
+	target_repo: &BoundedText<RepoName, S>, pat: Option<&loupe_provenance::Secret<String>>,
+	now: i64,
+) -> crate::Result<crate::registry::ReportingWrite<bool>> {
+	scope.require_operator()?;
+	let Some(old) = get(scope)? else {
+		return Ok(crate::registry::ReportingWrite::Done(false));
+	};
+	let previous = match old.reporting {
+		ReportingDestination::GithubIssue { pat_secret_id, .. } => pat_secret_id,
+		_ => None,
+	};
+	let secret_id = match pat {
+		Some(pat) => Some(crate::secrets::insert(
+			scope.conn,
+			crate::secrets::SecretKind::GithubPat,
+			&format!(
+				"pat:{}:{}/{}:repo:{}:replaces:{}:at:{now}",
+				old.host.expose(),
+				target_owner.expose(),
+				target_repo.expose(),
+				scope.repo_id,
+				previous.unwrap_or(0)
+			),
+			pat.expose().as_bytes(),
+			now,
+		)?),
+		None if crate::github_app::get(scope.conn)?.is_none() => {
+			return Ok(crate::registry::ReportingWrite::NoApp)
+		},
+		None => None,
+	};
+	let reporting = ReportingDestination::GithubIssue {
+		target_owner: target_owner.clone(),
+		target_repo: target_repo.clone(),
+		pat_secret_id: secret_id,
+	};
+	let changed = update_reporting(scope.conn, scope.repo_id, &reporting)?;
+	if let Some(previous) = previous
+		&& count_github_pat_references(scope.conn, previous)? == 0
+	{
+		crate::secrets::delete(scope.conn, previous)?;
+	}
+	Ok(crate::registry::ReportingWrite::Done(changed))
+}
+
+// debug-ok: PAT rotation outcomes are closed variants without credential bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatRotation {
+	Rotated,
+	Missing,
+	AppMode,
+	OtherDestination,
+}
+
+pub fn rotate_github_pat(
+	scope: &RepoScope<'_>, pat: &loupe_provenance::Secret<String>, now: i64,
+) -> crate::Result<PatRotation> {
+	scope.require_operator()?;
+	let Some(old) = get(scope)? else {
+		return Ok(PatRotation::Missing);
+	};
+	match old.reporting {
+		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id: Some(_) } => {
+			set_github_reporting(scope, &target_owner, &target_repo, Some(pat), now)?;
+			Ok(PatRotation::Rotated)
+		},
+		ReportingDestination::GithubIssue { .. } => Ok(PatRotation::AppMode),
+		_ => Ok(PatRotation::OtherDestination),
+	}
+}
+
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRow {
 	pub id: i64,
@@ -37,6 +135,7 @@ impl RepoRow {
 	}
 }
 
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug)]
 pub struct NewRepo<S: Source> {
 	pub clone_url: BoundedText<CloneUrl, S>,
@@ -70,7 +169,15 @@ impl<S: Source> Clone for NewRepo<S> {
 	}
 }
 
-pub fn insert<S: Source>(conn: &Connection, new: &NewRepo<S>, now: i64) -> rusqlite::Result<i64> {
+pub(crate) fn insert<S: Source>(
+	conn: &Connection, new: &NewRepo<S>, now: i64,
+) -> rusqlite::Result<i64> {
+	#[expect(
+		clippy::expect_used,
+		reason = "ReportingDestination serializes only its closed enum, typed strings and integers into String"
+	)]
+	let reporting =
+		serde_json::to_string(&new.reporting).expect("reporting is always serialisable");
 	conn.execute(
 		"INSERT INTO registered_repos
 		   (clone_url, host, owner, repo, default_branch, scan_interval_seconds,
@@ -84,7 +191,7 @@ pub fn insert<S: Source>(conn: &Connection, new: &NewRepo<S>, now: i64) -> rusql
 			new.default_branch.as_ref().map(BoundedText::expose),
 			new.scan_interval_seconds,
 			serde_json::to_string(&new.scanner_config).unwrap_or_else(|_| "{}".into()),
-			serde_json::to_string(&new.reporting).expect("reporting is always serialisable"),
+			reporting,
 			new.verification_enabled as i64,
 			new.require_approval.map(|b| b as i64),
 			now,
@@ -93,7 +200,7 @@ pub fn insert<S: Source>(conn: &Connection, new: &NewRepo<S>, now: i64) -> rusql
 	Ok(conn.last_insert_rowid())
 }
 
-pub fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<RepoRow>> {
+pub(crate) fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<RepoRow>> {
 	let Some(limit) = limit else {
 		let mut stmt = conn.prepare(&format!("SELECT {REPO_COLUMNS} FROM registered_repos"))?;
 		let rows = stmt.query_map([], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -106,35 +213,42 @@ pub fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<RepoR
 	Ok(rows)
 }
 
-pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<RepoRow>> {
+pub(crate) fn get_raw(conn: &Connection, id: i64) -> rusqlite::Result<Option<RepoRow>> {
 	let mut stmt =
 		conn.prepare(&format!("SELECT {REPO_COLUMNS} FROM registered_repos WHERE id = ?1"))?;
 	stmt.query_row(params![id], row_to_repo).optional()
 }
 
-pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+pub(crate) fn delete_raw(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	let n = conn.execute("DELETE FROM registered_repos WHERE id = ?1", params![id])?;
 	Ok(n > 0)
 }
 
-pub fn update_reporting<S: Source>(
+pub(crate) fn update_reporting<S: Source>(
 	conn: &Connection, id: i64, reporting: &ReportingDestination<S>,
 ) -> rusqlite::Result<bool> {
+	#[expect(
+		clippy::expect_used,
+		reason = "ReportingDestination serializes only its closed enum, typed strings and integers into String"
+	)]
+	let reporting = serde_json::to_string(reporting).expect("reporting is always serialisable");
 	let n = conn.execute(
 		"UPDATE registered_repos SET reporting = ?1 WHERE id = ?2",
-		params![serde_json::to_string(reporting).expect("reporting is always serialisable"), id,],
+		params![reporting, id],
 	)?;
 	Ok(n > 0)
 }
 
 /// How many repos file issues with the PAT stored under `secret_id`.
-pub fn count_github_pat_references(conn: &Connection, secret_id: i64) -> rusqlite::Result<usize> {
+pub(crate) fn count_github_pat_references(
+	conn: &Connection, secret_id: i64,
+) -> rusqlite::Result<usize> {
 	count_github_destinations(conn, |pat_secret_id| pat_secret_id == Some(secret_id))
 }
 
 /// How many repos file issues through the server-wide GitHub App, i.e.
 /// GitHub destinations without a PAT of their own.
-pub fn count_github_app_references(conn: &Connection) -> rusqlite::Result<usize> {
+pub(crate) fn count_github_app_references(conn: &Connection) -> rusqlite::Result<usize> {
 	count_github_destinations(conn, |pat_secret_id| pat_secret_id.is_none())
 }
 
@@ -162,6 +276,7 @@ fn count_github_destinations(
 /// `None` = clear back to "inherit server default", `Some(Some(b))` =
 /// pin per-repo. Returns `Ok(true)` if a row matched, `Ok(false)` if
 /// `id` is unknown.
+// debug-ok: repository updates contain only booleans and an optional numeric scan interval.
 #[derive(Debug, Default, Clone)]
 pub struct RepoUpdate {
 	pub disabled: Option<bool>,
@@ -170,13 +285,15 @@ pub struct RepoUpdate {
 	pub require_approval: Option<Option<bool>>,
 }
 
-pub fn update(conn: &Connection, id: i64, patch: &RepoUpdate, now: i64) -> rusqlite::Result<bool> {
+pub(crate) fn update_raw(
+	conn: &Connection, id: i64, patch: &RepoUpdate, now: i64,
+) -> rusqlite::Result<bool> {
 	if patch.disabled.is_none()
 		&& patch.scan_interval_seconds.is_none()
 		&& patch.verification_enabled.is_none()
 		&& patch.require_approval.is_none()
 	{
-		return Ok(get(conn, id)?.is_some());
+		return Ok(get_raw(conn, id)?.is_some());
 	}
 	let mut sets: Vec<&str> = Vec::new();
 	let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -216,7 +333,7 @@ pub fn update(conn: &Connection, id: i64, patch: &RepoUpdate, now: i64) -> rusql
 /// `last_scanned_at` is NULL meaning "never scanned"). Disabled repos
 /// are skipped. Returns full rows so the caller can decide whether to
 /// pass `since_sha` for incremental.
-pub fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<RepoRow>> {
+pub(crate) fn list_due_for_scan(conn: &Connection, now: i64) -> rusqlite::Result<Vec<RepoRow>> {
 	let mut stmt = conn.prepare(&format!(
 		"SELECT {REPO_COLUMNS} FROM registered_repos
 		 WHERE scan_interval_seconds IS NOT NULL
@@ -323,7 +440,7 @@ mod tests {
 		assert_eq!(listed[0].id, id);
 		assert_eq!(listed[0].clone_url.expose(), "https://github.com/acme/widget.git");
 
-		let one = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let one = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		assert_eq!(one.scan_interval_seconds, Some(3600));
 		match one.reporting {
 			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
@@ -334,7 +451,7 @@ mod tests {
 			},
 		}
 
-		assert!(db.with_conn(|c| Ok(delete(c, id)?)).unwrap());
+		assert!(db.with_conn(|c| Ok(delete_raw(c, id)?)).unwrap());
 		assert!(db.with_conn(|c| Ok(list(c, None)?)).unwrap().is_empty());
 	}
 
@@ -352,7 +469,7 @@ mod tests {
 	#[test]
 	fn delete_missing_returns_false() {
 		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
-		assert!(!db.with_conn(|c| Ok(delete(c, 9_999)?)).unwrap());
+		assert!(!db.with_conn(|c| Ok(delete_raw(c, 9_999)?)).unwrap());
 	}
 
 	#[test]
@@ -425,17 +542,22 @@ mod tests {
 		// Disable.
 		let updated = db
 			.with_conn(|c| {
-				Ok(update(c, id, &RepoUpdate { disabled: Some(true), ..Default::default() }, 123)?)
+				Ok(update_raw(
+					c,
+					id,
+					&RepoUpdate { disabled: Some(true), ..Default::default() },
+					123,
+				)?)
 			})
 			.unwrap();
 		assert!(updated);
-		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		assert_eq!(row.disabled_at, Some(123));
 
 		// Re-enable + change interval + flip verification.
 		let updated = db
 			.with_conn(|c| {
-				Ok(update(
+				Ok(update_raw(
 					c,
 					id,
 					&RepoUpdate {
@@ -449,7 +571,7 @@ mod tests {
 			})
 			.unwrap();
 		assert!(updated);
-		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		assert_eq!(row.disabled_at, None);
 		assert_eq!(row.scan_interval_seconds, Some(7200));
 		assert!(row.verification_enabled);
@@ -457,7 +579,7 @@ mod tests {
 
 		// Clearing require_approval drops back to "inherit".
 		db.with_conn(|c| {
-			Ok(update(
+			Ok(update_raw(
 				c,
 				id,
 				&RepoUpdate { require_approval: Some(None), ..Default::default() },
@@ -465,11 +587,12 @@ mod tests {
 			)?)
 		})
 		.unwrap();
-		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		assert_eq!(row.require_approval, None);
 
 		// Empty patch on missing id returns false.
-		let touched = db.with_conn(|c| Ok(update(c, 9_999, &RepoUpdate::default(), 0)?)).unwrap();
+		let touched =
+			db.with_conn(|c| Ok(update_raw(c, 9_999, &RepoUpdate::default(), 0)?)).unwrap();
 		assert!(!touched);
 	}
 
@@ -497,7 +620,7 @@ mod tests {
 		})
 		.unwrap();
 
-		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		match row.reporting {
 			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 				assert_eq!(pat_secret_id, Some(new_sid))

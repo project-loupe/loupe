@@ -12,6 +12,7 @@ use loupe_provenance::{Ingress, Mark, Server, Untrusted, Unvalidated, Validate};
 use super::json::{self, Buffer};
 use crate::client::{UpstreamError, UpstreamResult};
 
+// debug-ok: rejection categories hold only numeric protocol/status metadata.
 #[derive(Debug)]
 pub(crate) enum Failure {
 	Url,
@@ -93,7 +94,7 @@ struct ServerText {
 }
 impl ServerText {
 	// Called only inside the two fixed Server validators. Keep original bytes
-	// even when legacy lossy UTF-8 needs a distinct view (up to three times size).
+	// even when lossy UTF-8 needs a distinct view (up to three times size).
 	fn decode(original: &Bytes, _: &Mark<'_, Server>) -> Result<Self, Failure> {
 		let replacement = if std::str::from_utf8(original).is_ok() {
 			None
@@ -127,8 +128,13 @@ impl ServerText {
 	}
 	fn text(&self) -> &str {
 		// Both branches were admitted above; this conversion cannot allocate.
-		std::str::from_utf8(self.replacement.as_ref().unwrap_or(&self.original))
-			.expect("validated Server UTF-8")
+		#[expect(
+			clippy::expect_used,
+			reason = "private ServerText is constructed only from validated original UTF-8 or complete UTF-8 chunks plus replacement characters"
+		)]
+		let text = std::str::from_utf8(self.replacement.as_ref().unwrap_or(&self.original))
+			.expect("validated Server UTF-8");
+		text
 	}
 }
 pub(crate) struct ServerJson(ServerText);

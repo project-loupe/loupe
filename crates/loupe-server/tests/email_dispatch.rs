@@ -102,9 +102,10 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 		.unwrap();
 
 	// Register a repo with Email reporting.
-	let resp = admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
+	let repo_id = common::register_local_repo(
+		&db,
+		&clone_url,
+		RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
 			branch: None,
@@ -117,21 +118,8 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval: None,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-	db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(&clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
+		},
+	);
 
 	// Mint a worker, run a scan.
 	let resp = admin
@@ -173,15 +161,10 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	assert!(captured.contains("To: security@example.com"));
 	assert!(captured.contains("Subject: [scan]"));
 	assert!(captured.contains("AWS access key"), "captured: {captured}");
-	let reviewed_sha: String = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT head_sha FROM jobs WHERE repo_id = ?1", [repo_id], |r| {
-				r.get(0)
-			})?)
-		})
-		.unwrap();
+	let jobs = common::jobs(&db, repo_id);
+	let reviewed_sha = jobs[0].head_sha.as_ref().unwrap().expose();
 	assert!(
-		captured.contains(&format!("reviewed revision: {reviewed_sha}")),
+		captured.contains(&format!("- reviewed revision:\n```\n{reviewed_sha}\n```")),
 		"captured: {captured}"
 	);
 

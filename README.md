@@ -141,9 +141,10 @@ The binaries land in `target/release/`:
 - `target/release/loupectl` (admin CLI)
 
 `cargo test --workspace --all-targets` runs the unit and integration
-test suites; the LLM-backend live test skips automatically when
-`claude` is not on PATH, and the bubblewrap integration tests skip
-when `bwrap` is missing.
+test suites. Sandbox integration tests require Bubblewrap (`bwrap`),
+`curl`, `mawk`, and permission to create unprivileged user namespaces.
+On Ubuntu, install the tools with `sudo apt-get install bubblewrap curl mawk`.
+The LLM-backend live test skips automatically when `claude` is not on PATH.
 
 Before every commit, run `ci/check.sh` with stable Rust, nightly Rust
 (including rustfmt), and `jq` installed. It checks formatting, lints,
@@ -832,6 +833,13 @@ reporting with `repo set-github-reporting`, then run
 verifier-issued `dismiss` and a human `reject` both land on
 `state = 'dismissed'`, but only the human path stamps `rejected_*`.
 
+Reports render finding text and paths as literal content. An oversized report
+fails delivery and remains `confirmed` for retry: GitHub bodies allow 65,536
+characters and 262,144 bytes, including formatting; email allows 8,192 bytes
+per header line, 65,536 bytes for all headers and 16 MiB for the full message.
+Successfully delivered GitHub issues stay marked `reported` if a later issue
+in the batch fails. Email marks the whole batch only after sendmail succeeds.
+
 ## Verification flow (LLM second opinion)
 
 Setting `verification_enabled = true` on a repo causes scan-time
@@ -874,7 +882,8 @@ push and pull request:
 - **fmt** — `cargo fmt --all -- --check` on a nightly toolchain.
 - **clippy** — `cargo clippy --workspace --all-targets --all-features
   -- -D warnings` on stable.
-- **test** — `cargo test --workspace --all-targets` on stable.
+- **test** — `ci/check.sh`: tests, boundary gates, production lints,
+  per-crate checks and nightly compile-fail doctests.
 - **fuzz-replay** — replay committed seeds and verify generated runners.
 
 ## Layout

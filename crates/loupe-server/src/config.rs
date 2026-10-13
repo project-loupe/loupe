@@ -35,7 +35,7 @@ pub struct Config {
 }
 impl std::fmt::Debug for Config {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		// Preserve the existing public-path diagnostic; PEM owners redact.
+		// Public paths remain diagnostic metadata; PEM owners redact.
 		f.debug_struct("Config")
 			.field("bind_addr", &self.bind_addr)
 			.field("db_path", &self.db_path.as_path())
@@ -67,6 +67,7 @@ impl Config {
 /// cert/key) are interpreted relative to the directory containing the
 /// config file, so a single `config.toml` can ship next to the data
 /// directory without forcing absolute paths on operators.
+// debug-ok: configuration paths, PEM and target-owner wrappers redact; nested sections contain only numeric policy or socket metadata.
 #[derive(Debug, Clone, Default)]
 pub struct FileConfig {
 	pub server: ServerSection,
@@ -81,6 +82,7 @@ pub struct FileConfig {
 /// installation on GitHub already decides which trackers it can write
 /// to; this section lets the server refuse destinations outside an
 /// expected owner set before an issue is ever filed.
+// debug-ok: Config paths and target-owner content use redacted wrappers.
 #[derive(Debug, Clone, Default)]
 pub struct GithubAppSection {
 	/// Tracker owners (users or organizations) that app-mode GitHub
@@ -89,7 +91,8 @@ pub struct GithubAppSection {
 	pub allowed_target_owners: Option<Vec<BoundedText<RepoOwner, ConfigSource>>>,
 }
 
-/// Review-harness overrides. Environment and CLI overrides arrive at cutover.
+/// Review-harness overrides from the TOML configuration file.
+// debug-ok: review overrides contain only optional numeric limits and durations.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewSection {
@@ -122,6 +125,7 @@ pub struct ReviewSection {
 	pub verify_token_budget: Option<u64>,
 }
 
+// debug-ok: the optional socket address is deployment endpoint metadata.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
@@ -129,6 +133,7 @@ pub struct ServerSection {
 	pub bind: Option<SocketAddr>,
 }
 
+// debug-ok: Config paths and target-owner content use redacted wrappers.
 #[derive(Debug, Clone, Default)]
 pub struct PathsSection {
 	pub db: Option<ConfiguredPath>,
@@ -143,6 +148,7 @@ pub struct PathsSection {
 	pub master_key: Option<ConfiguredPath>,
 }
 
+// debug-ok: approval and verification defaults are optional booleans.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySection {
@@ -166,6 +172,10 @@ impl FileConfig {
 	/// resolved relative to the file's parent directory, then returned
 	/// in absolute form so callers don't need to remember the base.
 	pub fn load(path: &Path) -> Result<Self> {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "configuration ingress reads the operator-selected TOML file before its Config decoder"
+		)]
 		let raw = std::fs::read_to_string(path)
 			.with_context(|| format!("reading config file {}", path.display()))?;
 		let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -214,6 +224,7 @@ struct RawPaths {
 struct RawGithubApp {
 	allowed_target_owners: Option<Vec<String>>,
 }
+// debug-ok: TOML categories are fixed host literals; text errors retain only closed policy metadata.
 #[derive(Debug, thiserror::Error)]
 enum ConfigDecodeError {
 	#[error("parsing config file: {0}")]
@@ -232,8 +243,8 @@ impl Validate<&[u8], ConfigSource> for ServerFileConfigDecoder<'_> {
 	) -> Result<Self::Output, Self::Error> {
 		let raw = std::str::from_utf8(input.get())
 			.map_err(|_| ConfigDecodeError::Toml("invalid UTF-8"))?;
-		// TOML parser scratch belongs to the pinned dependency. No whole-file
-		// ceiling is invented; admitted free text receives its exact field cap.
+		// TOML parser scratch belongs to the dependency. The file has no aggregate
+		// size cap; admitted free text receives its exact field cap.
 		let mut cfg: RawFileConfig = toml::from_str(raw).map_err(|error: toml::de::Error| {
 			ConfigDecodeError::Toml(crate::ingress::error::category(&error.message()))
 		})?;

@@ -11,13 +11,21 @@ fn checkpoint_replay_does_not_hide_other_insert_failures() {
 		transaction::immediate(conn, |tx| {
 			let key = crate::test_support::identifier("insert-failure").unwrap();
 			let digest = [7; 32];
-			c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &digest, &payload(), 0)?;
+			c::record_or_replay(
+				&crate::test_support::scope(tx, 1),
+				101,
+				c::Operation::SubmitLead,
+				&key,
+				&digest,
+				&payload(),
+				0,
+			)?;
 			tx.execute_batch(
 				"CREATE TEMP TRIGGER refuse_checkpoint BEFORE INSERT ON job_checkpoints
 				 BEGIN SELECT RAISE(ABORT, 'checkpoint insert refused'); END;",
 			)?;
 			let result = c::record_or_replay(
-				tx,
+				&crate::test_support::scope(tx, 1),
 				101,
 				c::Operation::SubmitLead,
 				&key,
@@ -33,7 +41,7 @@ fn checkpoint_replay_does_not_hide_other_insert_failures() {
 			tx.execute_batch("DROP TRIGGER refuse_checkpoint")?;
 			assert_eq!(
 				c::record_or_replay(
-					tx,
+					&crate::test_support::scope(tx, 1),
 					101,
 					c::Operation::SubmitLead,
 					&key,
@@ -57,12 +65,33 @@ fn checkpoint_lookup_rejects_malformed_stored_digests() {
 		transaction::immediate(conn, |tx| {
 			let key = crate::test_support::identifier("stored-digest").unwrap();
 			let digest = [7; 32];
-			assert!(c::lookup(tx, 101, c::Operation::SubmitLead, &key, &digest)?.is_none());
-			c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &digest, &payload(), 0)?;
+			assert!(c::lookup(
+				&crate::test_support::scope(tx, 1),
+				101,
+				c::Operation::SubmitLead,
+				&key,
+				&digest
+			)?
+			.is_none());
+			c::record_or_replay(
+				&crate::test_support::scope(tx, 1),
+				101,
+				c::Operation::SubmitLead,
+				&key,
+				&digest,
+				&payload(),
+				0,
+			)?;
 			for length in [0, 1, 31, 32, 33, 64] {
 				let stored = vec![7u8; length];
 				tx.execute("UPDATE job_checkpoints SET payload_digest=?1", [&stored])?;
-				let result = c::lookup(tx, 101, c::Operation::SubmitLead, &key, &digest);
+				let result = c::lookup(
+					&crate::test_support::scope(tx, 1),
+					101,
+					c::Operation::SubmitLead,
+					&key,
+					&digest,
+				);
 				if length == 32 {
 					assert_eq!(
 						result?,
@@ -89,22 +118,47 @@ fn checkpoint_run_owns_the_replay_sequence() {
 	let db = fixture();
 	let key = crate::test_support::identifier("owned-sequence").unwrap();
 	let calls = std::cell::Cell::new(0);
-	let body = |_: &rusqlite::Transaction<'_>| -> crate::Result<BoundedJson<Payload, loupe_provenance::Agent>> {
-		calls.set(calls.get() + 1);
-		Ok(crate::test_support::json("{\"lead_id\":7}")?)
-	};
+	let body =
+		|_: &crate::scope::RepoScope<'_>| -> crate::Result<BoundedJson<Payload, loupe_provenance::Agent>> {
+			calls.set(calls.get() + 1);
+			Ok(crate::test_support::json("{\"lead_id\":7}")?)
+		};
 	db.with_conn(|conn| {
 		let first = transaction::immediate(conn, |tx| {
-			c::run(tx, 101, c::Operation::SubmitLead, &key, &[1; 32], 0, body)
+			c::run(
+				&crate::test_support::scope(tx, 1),
+				101,
+				c::Operation::SubmitLead,
+				&key,
+				&[1; 32],
+				0,
+				body,
+			)
 		})?;
 		assert!(matches!(first, c::Outcome::Fresh(ref r) if r.expose() == "{\"lead_id\":7}"));
 		let second = transaction::immediate(conn, |tx| {
-			c::run(tx, 101, c::Operation::SubmitLead, &key, &[1; 32], 1, body)
+			c::run(
+				&crate::test_support::scope(tx, 1),
+				101,
+				c::Operation::SubmitLead,
+				&key,
+				&[1; 32],
+				1,
+				body,
+			)
 		})?;
 		assert!(matches!(second, c::Outcome::Replayed(ref r) if r.expose() == "{\"lead_id\":7}"));
 		assert_eq!(calls.get(), 1, "a replay must not re-run the domain body");
 		let conflict = transaction::immediate(conn, |tx| {
-			c::run(tx, 101, c::Operation::SubmitLead, &key, &[2; 32], 2, body)
+			c::run(
+				&crate::test_support::scope(tx, 1),
+				101,
+				c::Operation::SubmitLead,
+				&key,
+				&[2; 32],
+				2,
+				body,
+			)
 		});
 		assert!(matches!(conflict, Err(Error::Conflict(Conflict::Checkpoint))));
 		assert_eq!(calls.get(), 1, "a conflicting reuse must not run the body either");
@@ -125,12 +179,18 @@ fn replay_lookup_prevents_repeating_domain_side_effects() {
 		anchor: crate::test_support::anchor("token refresh").unwrap(),
 		instance: None,
 	};
-	let submit = |tx: &rusqlite::Transaction<'_>| -> crate::Result<_> {
-		if let Some(response) = c::lookup(tx, 101, c::Operation::SubmitLead, &key, &[1; 32])? {
+	let submit = |tx: &rusqlite::Connection| -> crate::Result<_> {
+		if let Some(response) = c::lookup(
+			&crate::test_support::scope(tx, 1),
+			101,
+			c::Operation::SubmitLead,
+			&key,
+			&[1; 32],
+		)? {
 			return Ok(response.expose().to_owned());
 		}
 		let outcome = l::submit(
-			tx,
+			&crate::test_support::scope(tx, 1),
 			&l::NewLead {
 				generation_id: 11,
 				unit_id: None,
@@ -149,24 +209,45 @@ fn replay_lookup_prevents_repeating_domain_side_effects() {
 			_ => panic!("open lead"),
 		};
 		let response = crate::test_support::json(&format!("{{\"lead_id\":{id}}}"))?;
-		c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &[1; 32], &response, 0)?;
+		c::record_or_replay(
+			&crate::test_support::scope(tx, 1),
+			101,
+			c::Operation::SubmitLead,
+			&key,
+			&[1; 32],
+			&response,
+			0,
+		)?;
 		Ok(response.expose().to_owned())
 	};
 	db.with_conn(|conn| {
-		let first = transaction::immediate(conn, submit)?;
-		let replayed = transaction::immediate(conn, submit)?;
+		let first = transaction::immediate(conn, |tx| submit(tx))?;
+		let replayed = transaction::immediate(conn, |tx| submit(tx))?;
 		assert_eq!(replayed, first);
-		let id = l::list(conn, 11)?[0].lead_id;
+		let id = l::list(&crate::test_support::scope(conn, 1), 11)?[0].lead_id;
 		assert!(
-			crate::lead_observations::list(conn, id)?.is_empty(),
+			crate::lead_observations::list(&crate::test_support::scope(conn, 1), id)?.is_empty(),
 			"checkpoint replay must not repeat domain side effects"
 		);
 		transaction::immediate(conn, |tx| {
 			assert!(matches!(
-				c::lookup(tx, 101, c::Operation::SubmitLead, &key, &[2; 32]),
+				c::lookup(
+					&crate::test_support::scope(tx, 1),
+					101,
+					c::Operation::SubmitLead,
+					&key,
+					&[2; 32]
+				),
 				Err(Error::Conflict(Conflict::Checkpoint))
 			));
-			assert!(c::lookup(tx, 102, c::Operation::SubmitLead, &key, &[1; 32])?.is_none());
+			assert!(c::lookup(
+				&crate::test_support::scope(tx, 1),
+				102,
+				c::Operation::SubmitLead,
+				&key,
+				&[1; 32]
+			)?
+			.is_none());
 			Ok(())
 		})
 	})
@@ -181,12 +262,12 @@ fn lease_transaction_composes_checkpoints_and_typed_failures() {
   let lease=ActiveLease{identity:LeaseIdentity{job_id:101,worker_id:1,capability_hash:&[0;32]},now:5};
   let key=crate::test_support::identifier("typed-transaction").unwrap();
   let result:crate::Result<Option<()>>=jobs::with_active_lease_transaction(conn,lease,|tx,_|{
-   c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),0)?;
+   c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitLead,&key,&[1;32],&payload(),0)?;
    Err(Error::Conflict(Conflict::LeadState))
   });
   assert!(matches!(result,Err(Error::Conflict(Conflict::LeadState))));
   assert_eq!(conn.query_row("SELECT COUNT(*) FROM job_checkpoints",[],|r|r.get::<_,i64>(0))?,0);
-  let recorded=jobs::with_active_lease_transaction(conn,lease,|tx,_|c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),0))?;
+  let recorded=jobs::with_active_lease_transaction(conn,lease,|tx,_|c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitLead,&key,&[1;32],&payload(),0))?;
   assert_eq!(recorded,Some(c::Recorded::Recorded));
   assert!(jobs::with_active_lease_transaction(conn,ActiveLease{now:11,..lease},|_,_|->crate::Result<()>{panic!("an expired capability cannot enter the mutation")})?.is_none());
   Ok(())
@@ -197,13 +278,13 @@ fn checkpoint_replay_is_scoped_by_operation_job_and_digest() {
 	let db = fixture();
 	db.with_conn(|conn|transaction::immediate(conn,|tx|{
   let key=crate::test_support::identifier("client-key").unwrap();let original=crate::test_support::json("{\"id\":42}").unwrap();
-  assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&original,0).expect("record first submission"),c::Recorded::Recorded);
-  assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),1)?,c::Recorded::Replayed(crate::test_support::db_json(original.expose()).unwrap()));
-  assert!(matches!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[2;32],&payload(),1),Err(Error::Conflict(Conflict::Checkpoint))));
-  assert_eq!(c::record_or_replay(tx,101,c::Operation::SubmitReviewUnit,&key,&[2;32],&payload(),1)?,c::Recorded::Recorded);
-  assert_eq!(c::record_or_replay(tx,102,c::Operation::SubmitLead,&key,&[2;32],&payload(),1)?,c::Recorded::Recorded);
+  assert_eq!(c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitLead,&key,&[1;32],&original,0).expect("record first submission"),c::Recorded::Recorded);
+  assert_eq!(c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitLead,&key,&[1;32],&payload(),1)?,c::Recorded::Replayed(crate::test_support::db_json(original.expose()).unwrap()));
+  assert!(matches!(c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitLead,&key,&[2;32],&payload(),1),Err(Error::Conflict(Conflict::Checkpoint))));
+  assert_eq!(c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitReviewUnit,&key,&[2;32],&payload(),1)?,c::Recorded::Recorded);
+  assert_eq!(c::record_or_replay(&crate::test_support::scope(tx, 1),102,c::Operation::SubmitLead,&key,&[2;32],&payload(),1)?,c::Recorded::Recorded);
   tx.execute("UPDATE job_checkpoints SET operation='submit_observation' WHERE job_id=101 AND operation='submit_lead'",[])?;
-  assert!(matches!(c::record_or_replay(tx,101,c::Operation::SubmitLead,&key,&[1;32],&payload(),1),Err(Error::Conflict(Conflict::Checkpoint))));
+  assert!(matches!(c::record_or_replay(&crate::test_support::scope(tx, 1),101,c::Operation::SubmitLead,&key,&[1;32],&payload(),1),Err(Error::Conflict(Conflict::Checkpoint))));
   Ok(())
  })).unwrap();
 }
@@ -218,7 +299,15 @@ fn checkpoint_and_domain_rows_roll_back_together() {
 		let data = payload();
 		let result: crate::Result<()> = transaction::immediate(conn, |tx| {
 			assert_eq!(
-				c::record_or_replay(tx, 101, c::Operation::SubmitLead, &key, &[1; 32], &data, 0)?,
+				c::record_or_replay(
+					&crate::test_support::scope(tx, 1),
+					101,
+					c::Operation::SubmitLead,
+					&key,
+					&[1; 32],
+					&data,
+					0
+				)?,
 				c::Recorded::Recorded
 			);
 			let identity = Identity {
@@ -228,7 +317,7 @@ fn checkpoint_and_domain_rows_roll_back_together() {
 			};
 			assert!(matches!(
 				l::submit(
-					tx,
+					&crate::test_support::scope(tx, 1),
 					&l::NewLead {
 						generation_id: 11,
 						unit_id: None,
@@ -250,21 +339,21 @@ fn checkpoint_and_domain_rows_roll_back_together() {
 			matches!(result, Err(Error::Conflict(Conflict::CampaignState))),
 			"failure must occur after both writes"
 		);
-		assert!(l::list(conn, 11)?.is_empty());
+		assert!(l::list(&crate::test_support::scope(conn, 1), 11)?.is_empty());
 		assert_eq!(
 			conn.query_row("SELECT COUNT(*) FROM job_checkpoints", [], |r| r.get::<_, i64>(0))?,
 			0
 		);
 		assert_eq!(
-			c::standalone::record_or_replay(
-				conn,
+			crate::test_support::scoped(conn, 1, |scope| c::record_or_replay(
+				scope,
 				101,
 				c::Operation::SubmitLead,
 				&key,
 				&[1; 32],
 				&data,
 				1
-			)?,
+			))?,
 			c::Recorded::Recorded
 		);
 		Ok(())
@@ -282,10 +371,10 @@ fn terminal_replay_rejects_each_incomplete_or_wrong_binding() {
 					"expected {expected:?}"
 				);
 			}
-			rejected(t::replay_terminal(tx, 999, &[1; 32], &[2; 32])?, t::Reject::MissingJob);
-			rejected(t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?, t::Reject::NonterminalJob);
+			rejected(t::replay_terminal(&crate::test_support::scope(tx, 1), 999, &[1; 32], &[2; 32])?, t::Reject::MissingJob);
+			rejected(t::replay_terminal(&crate::test_support::scope(tx, 1), 101, &[1; 32], &[2; 32])?, t::Reject::NonterminalJob);
 			tx.execute("UPDATE jobs SET state='succeeded' WHERE id=101", [])?;
-			rejected(t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?, t::Reject::MissingReceipt);
+			rejected(t::replay_terminal(&crate::test_support::scope(tx, 1), 101, &[1; 32], &[2; 32])?, t::Reject::MissingReceipt);
 			let data = payload();
 			let why = reason();
 			let new = t::NewReceipt::<
@@ -307,25 +396,25 @@ fn terminal_replay_rejects_each_incomplete_or_wrong_binding() {
 				result_counts: Some(&data),
 				finishing_capability_hash: Some(&[1; 32]),
 			};
-			t::insert(tx, &new, 1)?;
+			t::insert(&crate::test_support::scope(tx, 1), &new, 1)?;
 			assert!(
-				matches!(t::replay_terminal(tx,101,&[1;32],&[2;32])?,t::Replayed::Receipt(r) if r.job_id==101)
+				matches!(t::replay_terminal(&crate::test_support::scope(tx, 1),101,&[1;32],&[2;32])?,t::Replayed::Receipt(r) if r.job_id==101)
 			);
-			rejected(t::replay_terminal(tx, 101, &[9; 32], &[2; 32])?, t::Reject::WrongCapability);
-			rejected(t::replay_terminal(tx, 101, &[1; 32], &[9; 32])?, t::Reject::WrongDigest);
+			rejected(t::replay_terminal(&crate::test_support::scope(tx, 1), 101, &[9; 32], &[2; 32])?, t::Reject::WrongCapability);
+			rejected(t::replay_terminal(&crate::test_support::scope(tx, 1), 101, &[1; 32], &[9; 32])?, t::Reject::WrongDigest);
 			tx.execute(
 				"UPDATE job_terminal_receipts SET finishing_capability_hash=NULL WHERE job_id=101",
 				[],
 			)?;
 			rejected(
-				t::replay_terminal(tx, 101, &[1; 32], &[2; 32])?,
+				t::replay_terminal(&crate::test_support::scope(tx, 1), 101, &[1; 32], &[2; 32])?,
 				t::Reject::MissingCapability,
 			);
 			assert!(matches!(
-				t::insert(tx, &new, 2),
+				t::insert(&crate::test_support::scope(tx, 1), &new, 2),
 				Err(Error::Conflict(Conflict::TerminalReceipt))
 			));
-			assert_eq!(t::get(tx, 101)?.unwrap().terminal_reason.expose(), why.expose());
+			assert_eq!(t::get(&crate::test_support::scope(tx, 1), 101)?.unwrap().terminal_reason.expose(), why.expose());
 			Ok(())
 		})
 	})

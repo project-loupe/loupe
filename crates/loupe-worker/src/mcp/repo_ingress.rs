@@ -33,11 +33,14 @@ impl Validate<PathBuf, Repo> for SubmittedPathMembership<'_> {
 		})
 	}
 }
+// debug-ok: Fieldless fixed error with no rejected input retained.
 #[derive(Debug, thiserror::Error)]
 #[error("`file` resolves outside the workdir")]
 pub(super) struct OutsideWorkdir;
 
+#[cfg(fuzzing)]
 pub(super) struct LocalFindingSource;
+#[cfg(fuzzing)]
 impl Validate<&[u8], Repo> for LocalFindingSource {
 	type Output = u64;
 	type Error = std::str::Utf8Error;
@@ -47,6 +50,7 @@ impl Validate<&[u8], Repo> for LocalFindingSource {
 		Ok(std::str::from_utf8(u.get())?.lines().count().max(1) as u64)
 	}
 }
+#[cfg(fuzzing)]
 pub(super) struct FingerprintWindow<'a> {
 	pub(super) file: &'a str,
 	pub(super) line_start: u32,
@@ -54,7 +58,15 @@ pub(super) struct FingerprintWindow<'a> {
 }
 /// Host-computed digest; its narrow output is not invented Agent text.
 pub(super) struct ComputedFingerprint(String);
+impl std::fmt::Debug for ComputedFingerprint {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ComputedFingerprint([redacted])")
+	}
+}
 impl ComputedFingerprint {
+	pub(super) fn from_stream(hash: blake3::Hash) -> Self {
+		Self(hash.to_hex().to_string())
+	}
 	pub(super) fn for_submission(&self) -> &str {
 		&self.0
 	}
@@ -71,6 +83,7 @@ impl serde::Serialize for ComputedFingerprint {
 		serializer.serialize_str(&self.0)
 	}
 }
+#[cfg(fuzzing)]
 impl Validate<&[u8], Repo> for FingerprintWindow<'_> {
 	type Output = ComputedFingerprint;
 	type Error = std::str::Utf8Error;

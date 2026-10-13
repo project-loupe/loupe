@@ -57,8 +57,7 @@ verification_default = true
 [review]
 # Limits for the review harness (campaign scheduling). Every key is
 # optional; the built-in defaults below apply when a key is omitted.
-# Environment and CLI overrides for this section arrive with the
-# harness cutover, so until then this file is the only override point.
+# This section is configured through TOML; it has no environment or CLI overrides.
 # The server validates the section at startup and refuses to start on
 # an inconsistent combination (for example a submit margin at or above
 # its phase deadline, or a lease longer than any phase deadline).

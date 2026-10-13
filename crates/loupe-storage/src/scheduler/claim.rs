@@ -16,6 +16,7 @@ pub struct ClaimRequest<'a, S: Source> {
 	pub policy: &'a ClaimPolicy,
 }
 
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug)]
 pub struct Claimed {
 	pub job: JobRow,
@@ -32,9 +33,8 @@ const ANTI_AFFINITY: &str = "CASE WHEN j.kind='verify' AND j.campaign_id IS NOT 
 /// Runtime gating is mandatory, even when callers request unsupported kinds.
 /// Legacy rows follow `RUNTIME_KINDS`; campaign rows additionally need a
 /// phase handler for their kind (`PHASE_RUNTIME_KINDS`), because `verify`
-/// is a runtime kind for the legacy pipeline long before the phase
-/// endpoints exist.
-pub fn claim<S: Source>(
+/// has a legacy runtime handler but no campaign phase endpoint.
+pub(crate) fn claim_raw<S: Source>(
 	tx: &Transaction<'_>, req: &ClaimRequest<'_, S>,
 ) -> Result<Option<Claimed>> {
 	let kinds: Vec<_> = req
@@ -57,7 +57,7 @@ pub fn claim<S: Source>(
 	claim_filtered(tx, req, &kinds, &campaign_kinds)
 }
 
-/// Kept inside this module's parent so phase logic can be tested before B4.
+/// Private fixture entry point bypassing the absent runtime phase handlers.
 /// Campaign rows are offered for every requested kind.
 #[cfg(test)]
 pub(super) fn claim_kinds<S: Source>(
@@ -157,7 +157,7 @@ fn claim_filtered<S: Source>(
 		tx.execute("INSERT INTO scheduler_repo_state(repo_id,last_claim_seq,burst) VALUES(?1,?2,CASE WHEN ?3='survey' THEN 0 ELSE 1 END)
 		 ON CONFLICT(repo_id) DO UPDATE SET last_claim_seq=excluded.last_claim_seq,
 		 burst=CASE WHEN ?3='survey' OR scheduler_repo_state.burst>=?4 THEN 0 ELSE scheduler_repo_state.burst+1 END",params![job.repo_id,seq,job.kind.as_str(),req.policy.urgency_burst_length])?;
-		let campaign = campaigns::get(tx, campaign_id)?
+		let campaign = campaigns::get_raw(tx, campaign_id)?
 			.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
 		let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
 		let phase = policy.phase(&job.kind)?;
@@ -192,12 +192,13 @@ fn claim_filtered<S: Source>(
 				// retry cannot confuse it with a skipped (e.g. unpinned) batch.
 				let initialized = checkpoints::initialize_survey_batch(
 					tx,
+					job.repo_id,
 					job.id,
 					req.now,
 					|tx| {
 						let units = tx.prepare(&format!("SELECT u.review_unit_id,u.assignment_epoch FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.generation_id=?1 AND {} ORDER BY CASE u.priority_band WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,u.created_at,u.review_unit_id LIMIT ?2",*review_units::UNIT_NEEDS_WORK))?
 							.query_map(params![generation,policy.survey_units_per_job],|r|Ok(review_units::Assignment{unit_id:r.get(0)?,expected_epoch:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-						review_units::assign(tx, job.id, &units)?;
+						review_units::assign_selected(tx, job.repo_id, job.id, &units)?;
 						Ok(())
 					},
 				)?;
@@ -205,7 +206,7 @@ fn claim_filtered<S: Source>(
 			}
 			assigned_units = tx.prepare("SELECT review_unit_id FROM job_assigned_review_units WHERE job_id=?1 AND completed=0 ORDER BY position")?.query_map([job.id],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
 		}
-		job = jobs::get(tx, job.id)?.ok_or(Error::NotFound(Entity::Job, job.id))?;
+		job = jobs::get_raw(tx, job.id)?.ok_or(Error::NotFound(Entity::Job, job.id))?;
 	}
 	Ok(Some(Claimed { job, assigned_units, resumed }))
 }

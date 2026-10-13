@@ -90,6 +90,7 @@ record_impls!(LeaseRequest<S> { protocol_version, capabilities, wait_seconds });
 /// the queue is empty / no job matches the worker's capabilities (`Empty`).
 /// We carry the variant inside the body rather than relying on HTTP status
 /// codes because intermediaries strip / mangle them often enough.
+// debug-ok: lease fields delegate to redacted owners; empty has only protocol.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
 pub enum LeaseResponse<ContentS: Source, MetaS: Source> {
@@ -102,6 +103,7 @@ pub enum LeaseResponse<ContentS: Source, MetaS: Source> {
 /// `payload` discriminates between scan and verify so that, for verify
 /// jobs, the target finding travels alongside the repo spec without
 /// inflating every scan-job response with optional finding fields.
+// debug-ok: capability, credentials and all text delegate to redacted owners.
 #[derive(Debug, Serialize)]
 #[serde(bound(serialize = ""))]
 pub struct LeaseEnvelope<ContentS: Source, MetaS: Source> {
@@ -129,6 +131,7 @@ pub struct LeaseEnvelope<ContentS: Source, MetaS: Source> {
 	pub payload: LeasePayload<ContentS, MetaS>,
 }
 
+// debug-ok: finding and revision owners redact content; remaining field is ID.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
 pub enum LeasePayload<ContentS: Source, MetaS: Source> {
@@ -290,7 +293,7 @@ mod tests {
 	#[test]
 	fn verify_lease_omits_unset_reviewed_sha() {
 		// Missing-field input admission is checked by the worker's named lease
-		// decoder; this retains the exact old wire fixture as an output oracle.
+		// decoder; this fixture checks output serialization.
 		let raw = r#"{
 			"protocol_version":2,
 			"job_id":7,

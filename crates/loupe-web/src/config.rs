@@ -17,6 +17,7 @@ pub use input::{ConfigPath, ConfigPem, ConfigTlsPem, ConfigUrl};
 /// this is a different kind of endpoint and should not look like one.
 pub const DEFAULT_PORT: u16 = 8455;
 
+// debug-ok: listen address/count are public; connection owners redact inputs.
 #[derive(Debug, Parser)]
 #[command(
 	name = "loupe-web",
@@ -46,6 +47,7 @@ fn default_bind() -> SocketAddr {
 /// Upstream connection arguments. Each of CA cert / admin cert / admin key
 /// is resolvable from a raw PEM env var, a base64 PEM env var, or a file
 /// path, in that precedence order — identical to `loupectl`.
+// debug-ok: every URL, path and PEM field delegates to a redacted Config owner.
 #[derive(Debug, Args)]
 pub struct ConnArgs {
 	#[arg(long, env = "LOUPE_SERVER_URL", value_parser = input::UrlParser)]

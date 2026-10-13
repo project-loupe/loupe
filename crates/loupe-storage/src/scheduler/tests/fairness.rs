@@ -40,7 +40,7 @@ fn enqueue(
 			finding=Some(id);
 		}
 		let recipe = recipe();
-		enqueue_phase(tx,&NewPhaseJob{repo_id:repo,kind,campaign_id:repo,generation_id:Some(generation),assigned_lead_id:lead,target_finding_id:finding,continuation_of_job_id:None,band,effective_priority:priority,eligible_at:at,token_budget:None,recipe:PhaseRecipeInput::Submitted(&recipe),handoff:true},at)
+		enqueue_phase(&crate::test_support::scope(tx, repo),&NewPhaseJob{kind,campaign_id:repo,generation_id:Some(generation),assigned_lead_id:lead,target_finding_id:finding,continuation_of_job_id:None,band,effective_priority:priority,eligible_at:at,token_budget:None,recipe:PhaseRecipeInput::Submitted(&recipe),handoff:true},at)
 	})).unwrap()
 }
 
@@ -109,7 +109,7 @@ fn verification_anti_affinity_is_a_preference_not_a_filter() {
 	let same = enqueue(&db, 1, JobKind::<loupe_provenance::Agent>::Verify, Band::Normal, 100, 0);
 	let other = enqueue(&db, 1, JobKind::<loupe_provenance::Agent>::Verify, Band::Normal, 0, 1);
 	db.with_conn(|c| {
-		let finding=jobs::get(c,same)?.unwrap().target_finding_id.unwrap();
+		let finding=jobs::get_raw(c,same)?.unwrap().target_finding_id.unwrap();
 		c.execute("INSERT INTO finding_review_details(finding_id,repo_id,workflow_contract_version,profile_version,reviewed_commit_sha,identity_family,identity_anchor,identity_fingerprint,l2_argument,counterevidence,assumptions_gaps,confidence,submitted_rung,origin_lead_id,created_at) VALUES(?1,1,1,1,'base','family','anchor',zeroblob(32),'{}','counter','gaps','high','L2',?2,0)",params![finding,drilldown.job.assigned_lead_id])?;
 		Ok(())
 	}).unwrap();
@@ -180,7 +180,7 @@ fn an_expired_survey_keeps_its_age_for_burst_promotion() {
 	.unwrap();
 	assert_eq!(take(&db, ALL, 900, &policy).unwrap().job.id, old);
 	db.with_conn(|c| {
-		assert_eq!(jobs::get(c, new)?.unwrap().state, JobState::Queued);
+		assert_eq!(jobs::get_raw(c, new)?.unwrap().state, JobState::Queued);
 		Ok(())
 	})
 	.unwrap();
@@ -230,7 +230,7 @@ fn scheduler_state_rolls_back_with_a_failed_claim() {
 		c.execute_batch("CREATE TEMP TRIGGER fail_deadline BEFORE UPDATE OF hard_deadline_at ON jobs BEGIN SELECT RAISE(ABORT,'injected deadline failure'); END;")?;
 		let error=transaction::immediate(c,|tx|claim_kinds(tx,&ClaimRequest{worker_id:1,kinds:ALL,now:100,capability_hash:&[55;32],legacy_lease_seconds:600,policy:&ClaimPolicy::default()},ALL));
 		assert!(error.is_err());
-		assert_eq!(jobs::get(c,survey)?.unwrap().state,JobState::Queued);
+		assert_eq!(jobs::get_raw(c,survey)?.unwrap().state,JobState::Queued);
 		assert_eq!(c.query_row("SELECT seq FROM scheduler_clock",[],|r|r.get::<_,i64>(0))?,0);
 		assert_eq!(c.query_row("SELECT COUNT(*) FROM scheduler_repo_state",[],|r|r.get::<_,i64>(0))?,0);
 		Ok(())

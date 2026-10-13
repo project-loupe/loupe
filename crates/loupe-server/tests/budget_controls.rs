@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use loupe_server::{router, AppState, PeerCert};
 use loupe_storage::secrets::MasterKey;
-use loupe_storage::{workers, Db};
+use loupe_storage::{registry, Db};
 use loupe_tls::{cert_fingerprint, Ca};
 use tower::ServiceExt;
 
@@ -18,33 +18,17 @@ fn configured_fixture(
 	let db = Arc::new(Db::open_in_memory(&MasterKey::for_tests()).unwrap());
 	let admin = PeerCert(rustls::pki_types::CertificateDer::from(vec![4, 5, 6]));
 	let other = PeerCert(rustls::pki_types::CertificateDer::from(vec![7, 8, 9]));
-	db.with_conn(|conn| {
-		workers::insert(
-			conn,
-			&common::marked::operator::text("admin"),
-			workers::WorkerKind::Admin,
-			&cert_fingerprint(admin.0.as_ref()),
+	registry::bootstrap_admin(&db, &cert_fingerprint(admin.0.as_ref()), 0).unwrap();
+	for (name, peer) in [("other", &other), ("worker", &cert)] {
+		registry::register_worker(
+			&db,
+			&common::marked::operator_ingress(),
+			&common::marked::operator::text(name),
+			&cert_fingerprint(peer.0.as_ref()),
 			0,
-		)?;
-		Ok(workers::insert(
-			conn,
-			&common::marked::operator::text("other"),
-			workers::WorkerKind::Worker,
-			&cert_fingerprint(other.0.as_ref()),
-			0,
-		)?)
-	})
-	.unwrap();
-	db.with_conn(|conn| {
-		Ok(workers::insert(
-			conn,
-			&common::marked::operator::text("worker"),
-			workers::WorkerKind::Worker,
-			&cert_fingerprint(cert.0.as_ref()),
-			0,
-		)?)
-	})
-	.unwrap();
+		)
+		.unwrap();
+	}
 	let state =
 		AppState::new(db, ca, Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()));
 	(router(state.with_worker_budgets(config).unwrap()), cert, admin, other)

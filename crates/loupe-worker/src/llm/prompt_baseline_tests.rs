@@ -1,4 +1,4 @@
-//! Behavioral baselines run against the frozen post-M prompt consumers.
+//! Prompt framing checks through the scanner and renderer consumers.
 
 use super::*;
 
@@ -180,8 +180,10 @@ fn s3_compatibility_verification_projection_retains_only_its_eight_fields() {
 #[test]
 fn s3_compatibility_request_debug_already_redacts_the_prompt() {
 	let request = crate::llm::LlmRequest {
+		security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		prompt: Prompt::instruction("S3_DEBUG_CONTENT_SENTINEL").unwrap(),
+		sandbox_workdir: crate::sandbox::SandboxPath::fixture("/tmp".into()),
 		workdir: "/tmp".into(),
 		timeout: std::time::Duration::from_secs(1),
 		cancel: tokio_util::sync::CancellationToken::new(),

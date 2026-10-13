@@ -15,6 +15,11 @@ use crate::sandbox::{validate_network_host, SandboxNetworkConfig, SandboxNetwork
 use crate::scanners::LlmScannerConfig;
 
 mod ingress;
+mod sandbox;
+pub use sandbox::{
+	ConfigNonSecret, SandboxAgentConfig, SandboxLaunchConfig, SandboxNetworkPolicy,
+	SandboxRequiredHosts,
+};
 pub mod value;
 pub use value::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
 
@@ -24,8 +29,10 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_MAX_CONCURRENT_FILES: usize = 8;
 const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+// debug-ok: Effective configuration contains redacted text/path owners, numeric limits and closed modes.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
+	launch_path: ConfigNonSecret,
 	pub server_url: Option<ConfiguredUrl>,
 	pub tls: TlsConfig,
 	pub cache: CacheConfig,
@@ -38,6 +45,7 @@ pub struct WorkerConfig {
 	pub broker: ModelBrokerLimits,
 }
 
+// debug-ok: All selected certificate paths use the redacted ConfiguredPath formatter.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
 	pub ca_cert: Option<ConfiguredPath>,
@@ -45,18 +53,21 @@ pub struct TlsConfig {
 	pub key: Option<ConfiguredPath>,
 }
 
+// debug-ok: The configured cache path is redacted; capacity is numeric.
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
 	pub dir: ConfiguredPath,
 	pub max_gb: u64,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
 	pub max_workdir_bytes: u64,
 	pub disable_sandbox: bool,
 }
 
+// debug-ok: Configured level is redacted; remaining fields are boolean settings.
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
 	pub level: ConfiguredText,
@@ -64,6 +75,7 @@ pub struct LoggingConfig {
 	pub agent_output: bool,
 }
 
+// debug-ok: Closed agent variants and redacted model/effort configurations.
 #[derive(Debug, Clone)]
 pub struct AgentsConfig {
 	pub scan: JobAgent,
@@ -72,11 +84,13 @@ pub struct AgentsConfig {
 	pub codex: CliModelConfig,
 }
 
+// debug-ok: Every content field uses the redacted ConfiguredText formatter.
 #[derive(Debug, Clone)]
 pub struct BkbConfig {
 	pub api_url: ConfiguredText,
 }
 
+// debug-ok: Effective configuration contains redacted text/path owners, numeric limits and closed modes.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerConfigOverrides {
 	pub server_url: Option<ConfiguredUrl>,
@@ -107,6 +121,7 @@ pub struct WorkerConfigOverrides {
 	pub broker_token_ceiling: Option<u64>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -132,6 +147,7 @@ struct FileConfig {
 	pub broker: BrokerSection,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerSection {
@@ -139,6 +155,7 @@ struct ServerSection {
 	pub url: Option<String>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TlsSection {
@@ -150,6 +167,7 @@ struct TlsSection {
 	pub key: Option<PathBuf>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CacheSection {
@@ -159,6 +177,7 @@ struct CacheSection {
 	pub max_gb: Option<u64>,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeSection {
@@ -168,6 +187,7 @@ struct RuntimeSection {
 	pub disable_sandbox: Option<bool>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SandboxSection {
@@ -177,6 +197,7 @@ struct SandboxSection {
 	pub allowlist: Option<Vec<String>>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoggingSection {
@@ -188,6 +209,7 @@ struct LoggingSection {
 	pub agent_output: Option<bool>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentsSection {
@@ -201,6 +223,7 @@ struct AgentsSection {
 	pub codex: AgentSection,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentSection {
@@ -210,6 +233,7 @@ struct AgentSection {
 	pub effort: Option<String>,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScannerDefaultsSection {
@@ -221,6 +245,7 @@ struct ScannerDefaultsSection {
 	pub per_request_timeout_seconds: Option<u64>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BkbSection {
@@ -228,6 +253,7 @@ struct BkbSection {
 	pub api_url: Option<String>,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrokerSection {
@@ -240,6 +266,13 @@ struct BrokerSection {
 }
 
 impl WorkerConfig {
+	/// Declare only the exact supported public sandbox fields after validating
+	/// the merged configuration. Other fields have no non-secret projection.
+	pub fn sandbox_launch_config(&self) -> Result<SandboxLaunchConfig> {
+		self.validate()?;
+		Ok(sandbox::finalize(self, self.launch_path.clone()))
+	}
+
 	pub fn load(path: Option<&Path>, overrides: WorkerConfigOverrides) -> Result<Self> {
 		let mut cfg = WorkerConfig::default();
 		if let Some(path) = path {
@@ -461,6 +494,11 @@ impl WorkerConfig {
 		if !matches!(bkb_url.scheme(), "http" | "https") {
 			anyhow::bail!("bkb.api_url must be an HTTP(S) URL with a host");
 		}
+		// The complete BKB endpoint is deliberately published inside the
+		// sandbox. Authentication belongs in a host broker, never this field.
+		if !bkb_url.username().is_empty() || bkb_url.password().is_some() {
+			anyhow::bail!("bkb.api_url must not contain userinfo");
+		}
 		// Each sandbox launch turns this host into a network policy entry, so
 		// reject anything the policy cannot express while the worker is still
 		// starting instead of failing every leased job.
@@ -474,12 +512,14 @@ impl WorkerConfig {
 #[cfg(fuzzing)]
 pub mod fuzzing {
 	use super::*;
+	// debug-ok: Closed fieldless variants; no dynamic content.
 	#[derive(Clone, Copy, Debug)]
 	pub enum ArgumentCase {
 		Text,
 		Url,
 		Path,
 	}
+	// debug-ok: Cfg(fuzzing) synthetic observation only; raw values support independent oracle comparisons.
 	#[derive(Debug, PartialEq, Eq)]
 	pub enum ArgumentValue {
 		Text(String),
@@ -546,10 +586,22 @@ pub mod fuzzing {
 	}
 }
 
+fn capture_launch_path() -> ConfigNonSecret {
+	let path = std::env::var("PATH").unwrap_or_else(|_| {
+		"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+	});
+	// SAFETY: exact launch environment acquisition, before its closed public
+	// sandbox-path projection. Invalid UTF-8/missing PATH retains the fallback.
+	#[allow(unsafe_code)]
+	let original = Untrusted::new(path, unsafe { Ingress::<Config>::new() });
+	sandbox::launch_path(original)
+}
+
 impl Default for WorkerConfig {
 	fn default() -> Self {
 		let scanner_defaults = LlmScannerConfig::default();
 		Self {
+			launch_path: capture_launch_path(),
 			server_url: None,
 			tls: TlsConfig::default(),
 			cache: CacheConfig {
@@ -593,6 +645,10 @@ impl Default for WorkerConfig {
 
 impl FileConfig {
 	fn load(path: &Path) -> Result<ingress::DecodedWorkerFileConfig> {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Worker config ingress reads the selected Config path before named TOML admission."
+		)]
 		let raw = std::fs::read(path)
 			.with_context(|| format!("reading worker config file {}", path.display()))?;
 		// SAFETY: these are the original bytes just read from the configured
@@ -643,7 +699,74 @@ fn validate_nonzero(name: &str, value: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	#[allow(unsafe_code)]
+	fn launch_path_is_captured_once_when_config_is_loaded() {
+		let name = "config::tests::launch_path_is_captured_once_when_config_is_loaded";
+		if !crate::test_env::in_env(
+			name,
+			"captured-path",
+			&[("PATH", Some(std::ffi::OsStr::new("/initial/bin")))],
+		) {
+			return;
+		}
+		let config = super::WorkerConfig::load(None, Default::default()).unwrap();
+		// SAFETY: in_env runs only this synchronous test in a fresh child.
+		unsafe {
+			std::env::set_var("PATH", "/later/bin");
+		}
+		assert_eq!(
+			config.sandbox_launch_config().unwrap().path().for_sandbox(),
+			"/initial/bin",
+			"sandbox PATH must use the original config-load capture"
+		);
+	}
+
+	#[test]
+	fn declared_sandbox_config_is_exact_and_redacted() {
+		let config = super::WorkerConfig::load(None, Default::default()).unwrap();
+		let launch = config.sandbox_launch_config().unwrap();
+		assert_eq!(
+			launch.claude().model().for_sandbox(),
+			config.agents.claude.model.for_operation()
+		);
+		assert_eq!(
+			launch.claude().effort().for_sandbox(),
+			config.agents.claude.effort.for_operation()
+		);
+		assert_eq!(launch.codex().model().for_sandbox(), config.agents.codex.model.for_operation());
+		assert_eq!(
+			launch.codex().effort().for_sandbox(),
+			config.agents.codex.effort.for_operation()
+		);
+		assert_eq!(launch.bkb_api_url().for_sandbox(), config.bkb.api_url.for_operation());
+		assert_eq!(launch.network().mode(), config.sandbox.mode);
+		assert!(launch.network().allowlist().is_empty());
+		assert!(!format!("{launch:?}").contains(config.bkb.api_url.for_operation()));
+	}
+
 	use super::*;
+
+	#[test]
+	fn s3_sandbox_bkb_userinfo_is_rejected_without_echoing_it() {
+		for url in
+			["https://user:private-bkb-password@example.com/api", "https://user@example.com/api"]
+		{
+			let mut cfg = WorkerConfig::default();
+			cfg.bkb.api_url = ConfiguredText::Builtin(url);
+			let result = cfg.validate();
+			assert!(result.is_err(), "sandbox-public BKB URL must reject userinfo");
+			assert_eq!(result.unwrap_err().to_string(), "bkb.api_url must not contain userinfo");
+		}
+	}
+
+	#[test]
+	fn s3_sandbox_bkb_keeps_ordinary_public_path_and_query() {
+		let mut cfg = WorkerConfig::default();
+		cfg.bkb.api_url = ConfiguredText::Builtin("https://example.com/api/v2?format=json");
+		cfg.validate().unwrap();
+		assert_eq!(cfg.bkb.api_url.for_operation(), "https://example.com/api/v2?format=json");
+	}
 
 	#[test]
 	fn defaults_match_expected_agent_and_cache_settings() {

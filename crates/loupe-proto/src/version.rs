@@ -9,6 +9,7 @@ pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Returned by the server (in a 400 body) when a client speaks a version
 /// outside the server's supported window.
+// debug-ok: mismatch contains only three numeric protocol versions.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[error(
 	"loupe protocol version mismatch: client sent {client}, server supports [{server_min}, {server_max}]"
@@ -21,8 +22,7 @@ pub struct ProtocolMismatch {
 
 /// Helper for the server side: confirm a request's `protocol_version`
 /// falls within `[min, max]` (inclusive). The current build accepts
-/// `PROTOCOL_VERSION..=PROTOCOL_VERSION`, but the function takes a range
-/// so we can widen later without touching every call site.
+/// `PROTOCOL_VERSION..=PROTOCOL_VERSION`.
 pub fn check_protocol_version(
 	client: u16, server_min: u16, server_max: u16,
 ) -> Result<(), ProtocolMismatch> {

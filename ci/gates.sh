@@ -2,22 +2,37 @@
 # Gate checks shared by ci/check.sh and ci/gate-selftest.sh. Sourced;
 # each function prints what it rejects and returns non-zero.
 #
-# Threat model (loupe-provenance P3): these checks make it impossible
-# for the project's own developers and agents to mint a trust-asserting
-# label by mistake, and make every deliberate route visible in a diff a
-# reviewer reads (an allow-list entry, an `unsafe` keyword, a manifest
-# change). They do not try to stop deliberately obfuscated code; that
-# is code review's job.
+# Unchecked provenance construction requires unsafe code. These lexical
+# checks keep unsafe code and lint exceptions in explicitly listed files.
+# Deliberately obscured macro or name resolution still requires code review.
 
 GATES_DIR=$(cd "$(dirname "${GATES_SH:-ci/gates.sh}")" 2>/dev/null && pwd)
+
+# Every production crate is covered by default; an environment variable cannot
+# narrow the set. Derives in literal examples and comments are not Rust items.
+gate_derived_debug() {
+	root=$1
+	debug_rc=0
+	debug_tmp=$(mktemp -d)
+	for debug_file in $(rust_files "$root/crates"); do
+		case "$debug_file" in */src/*.rs) ;; *) continue ;; esac
+		: > "$debug_tmp/comments"
+		awk -v line_comments="$debug_tmp/comments" -f "$GATES_DIR/strip-rust.awk" "$root/crates/$debug_file" > "$debug_tmp/code"
+		if ! awk -v line_comments="$debug_tmp/comments" -f "$GATES_DIR/derived-debug.awk" "$debug_tmp/code" "$root/crates/$debug_file"; then
+			debug_rc=1
+		fi
+	done
+	rm -r "$debug_tmp"
+	return "$debug_rc"
+}
 
 # Rust source files under $1, relative paths, sorted.
 rust_files() {
 	(cd "$1" && find . \( -name target -o -name .local -o -name .git \) -prune -o -name '*.rs' -type f -print | sed 's|^\./||' | sort)
 }
 
-# Until sandbox values carry provenance, host environment forwarding has no
-# production caller. This lexical gate catches ordinary calls and references;
+# Host environment forwarding is forbidden in production. This lexical gate
+# catches ordinary calls and references;
 # deliberately obscured macro/name resolution remains a code-review concern.
 gate_no_forward_env() {
 	root=$1

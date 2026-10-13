@@ -182,13 +182,12 @@ async fn register_with(
 	h: &Harness, clone_url: &str, require_approval: Option<bool>, target_repo: &str,
 	reporting: ReportingSetup,
 ) -> i64 {
-	let resp = h
-		.admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
+	common::register_local_repo(
+		&h.db,
+		clone_url,
+		RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
-			// We patch this to the local file:// path after registration so
-			// the URL parser still sees a github.com host on the way in.
+			// Keep the authored repository identity while using the local clone.
 			clone_url: format!("https://github.com/loupe/{target_repo}.git"),
 			branch: None,
 			scan_interval_seconds: None,
@@ -196,22 +195,8 @@ async fn register_with(
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-	h.db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
-	repo_id
+		},
+	)
 }
 
 async fn make_worker_runner(h: &Harness) -> (Runner, tempfile::TempDir) {
@@ -265,15 +250,9 @@ async fn require_approval_default_holds_findings_until_approved() {
 		h.stub.captured.lock().unwrap().is_empty(),
 		"approval-required finding must not auto-dispatch"
 	);
-	let (id, state, approved_at): (i64, String, Option<i64>) =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT id, state, approved_at FROM findings WHERE repo_id = ?1",
-				[repo_id],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-			)?)
-		})
-		.unwrap();
+	let findings = common::findings(&h.db, repo_id);
+	let (id, state, approved_at) =
+		(findings[0].id, findings[0].state.as_str(), findings[0].approved_at);
 	assert_eq!(state, "awaiting_approval");
 	assert!(approved_at.is_none());
 
@@ -291,19 +270,16 @@ async fn require_approval_default_holds_findings_until_approved() {
 	assert_eq!(issues[0].owner, "acme");
 	assert_eq!(issues[0].repo, "approve-target");
 
-	let (state, approved_at, approved_by): (String, Option<i64>, Option<String>) =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT state, approved_at, approved_by_cn FROM findings WHERE id = ?1",
-				[id],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-			)?)
-		})
-		.unwrap();
+	let finding = common::finding(&h.db, repo_id, id);
+	let (state, approved_at, approved_by) = (
+		finding.state.as_str(),
+		finding.approved_at,
+		finding.approved_by_cn.as_ref().map(|name| name.expose()),
+	);
 	assert_eq!(state, "reported");
 	assert!(approved_at.is_some(), "approved_at must be stamped");
 	assert_eq!(
-		approved_by.as_deref(),
+		approved_by,
 		Some("admin"),
 		"approved_by_cn must record the admin's worker name (the init-time admin's name)"
 	);
@@ -320,15 +296,11 @@ async fn rejecting_a_held_finding_dismisses_without_dispatch() {
 
 	trigger_scan_and_run(&h, repo_id).await;
 
-	let id: i64 =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT id FROM findings WHERE repo_id = ?1 AND state = 'awaiting_approval'",
-				[repo_id],
-				|r| r.get(0),
-			)?)
-		})
-		.unwrap();
+	let id = common::findings(&h.db, repo_id)
+		.into_iter()
+		.find(|finding| finding.state.as_str() == "awaiting_approval")
+		.unwrap()
+		.id;
 
 	let resp =
 		h.admin.post(format!("https://loupe-server/v1/findings/{id}/reject")).send().await.unwrap();
@@ -338,18 +310,15 @@ async fn rejecting_a_held_finding_dismisses_without_dispatch() {
 		h.stub.captured.lock().unwrap().is_empty(),
 		"reject must not dispatch — issue should never reach the reporter"
 	);
-	let (state, rejected_at, rejected_by): (String, Option<i64>, Option<String>) =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT state, rejected_at, rejected_by_cn FROM findings WHERE id = ?1",
-				[id],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-			)?)
-		})
-		.unwrap();
+	let finding = common::finding(&h.db, repo_id, id);
+	let (state, rejected_at, rejected_by) = (
+		finding.state.as_str(),
+		finding.rejected_at,
+		finding.rejected_by_cn.as_ref().map(|name| name.expose()),
+	);
 	assert_eq!(state, "dismissed");
 	assert!(rejected_at.is_some(), "rejected_at must be stamped");
-	assert_eq!(rejected_by.as_deref(), Some("admin"));
+	assert_eq!(rejected_by, Some("admin"));
 
 	// Re-rejecting must report 409 — the finding is no longer pending.
 	let resp =
@@ -376,13 +345,8 @@ async fn per_repo_opt_out_beats_global_default() {
 		"per-repo require_approval=false must dispatch immediately even when the server default is on"
 	);
 
-	let state: String =
-		h.db.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM findings WHERE repo_id = ?1", [repo_id], |r| {
-				r.get(0)
-			})?)
-		})
-		.unwrap();
+	let findings = common::findings(&h.db, repo_id);
+	let state = findings[0].state.as_str();
 	assert_eq!(state, "reported");
 
 	h.server.shutdown().await;
@@ -406,15 +370,11 @@ async fn manual_mode_leaves_approved_findings_confirmed_without_calling_the_repo
 		h.stub.captured.lock().unwrap().is_empty(),
 		"manual mode + require_approval must hold the finding before approve"
 	);
-	let id: i64 =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT id FROM findings WHERE repo_id = ?1 AND state = 'awaiting_approval'",
-				[repo_id],
-				|r| r.get(0),
-			)?)
-		})
-		.unwrap();
+	let id = common::findings(&h.db, repo_id)
+		.into_iter()
+		.find(|finding| finding.state.as_str() == "awaiting_approval")
+		.unwrap()
+		.id;
 
 	// Approve. The dispatcher should short-circuit on Manual and leave
 	// the finding confirmed without ever touching the GitHub stub.
@@ -430,18 +390,13 @@ async fn manual_mode_leaves_approved_findings_confirmed_without_calling_the_repo
 		h.stub.captured.lock().unwrap().is_empty(),
 		"manual mode must not call the reporter even after approve"
 	);
-	let (state, reported_at, approved_by): (String, Option<i64>, Option<String>) =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT state, reported_at, approved_by_cn FROM findings WHERE id = ?1",
-				[id],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-			)?)
-		})
-		.unwrap();
+	let finding = common::finding(&h.db, repo_id, id);
+	let state = finding.state.as_str();
+	let approved_by = finding.approved_by_cn.as_ref().map(|name| name.expose());
 	assert_eq!(state, "confirmed");
-	assert!(reported_at.is_none(), "reported_at must wait for an actual reporter");
-	assert_eq!(approved_by.as_deref(), Some("admin"));
+	// The private reported_at NULL oracle is in storage's
+	// manual_approval_preserves_unreported_sql_audit test.
+	assert_eq!(approved_by, Some("admin"));
 
 	h.server.shutdown().await;
 	drop(h.server_dir);
@@ -459,15 +414,11 @@ async fn manual_repo_can_add_reporting_and_retry_confirmed_findings() {
 		h.stub.captured.lock().unwrap().is_empty(),
 		"manual repo must not dispatch before reporting is configured"
 	);
-	let id: i64 =
-		h.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT id FROM findings WHERE repo_id = ?1 AND state = 'confirmed'",
-				[repo_id],
-				|r| r.get(0),
-			)?)
-		})
-		.unwrap();
+	let id = common::findings(&h.db, repo_id)
+		.into_iter()
+		.find(|finding| finding.state.as_str() == "confirmed")
+		.unwrap()
+		.id;
 
 	let resp = h
 		.admin
@@ -504,11 +455,8 @@ async fn manual_repo_can_add_reporting_and_retry_confirmed_findings() {
 	assert_eq!(issues[0].owner, "acme");
 	assert_eq!(issues[0].repo, "late-target");
 
-	let state: String =
-		h.db.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM findings WHERE id = ?1", [id], |r| r.get(0))?)
-		})
-		.unwrap();
+	let finding = common::finding(&h.db, repo_id, id);
+	let state = finding.state.as_str();
 	assert_eq!(state, "reported");
 
 	let resp = h

@@ -288,6 +288,7 @@ pub(crate) fn get_finding(
 }
 
 #[cfg(fuzzing)]
+// debug-ok: cfg(fuzzing) field names are closed unit variants.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Field {
 	Scanner,
@@ -302,12 +303,14 @@ pub enum Field {
 	RejectedBy,
 }
 #[cfg(fuzzing)]
+// debug-ok: cfg(fuzzing) source names are closed unit variants.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FieldSource {
 	Agent,
 	Server,
 }
 #[cfg(fuzzing)]
+// debug-ok: cfg(fuzzing)-only field observations contain synthetic fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FieldObservation {
 	pub field: Field,

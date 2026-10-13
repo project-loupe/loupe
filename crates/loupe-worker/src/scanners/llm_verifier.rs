@@ -71,6 +71,8 @@ impl Scanner for LlmVerifierScanner {
 		// startup if it sees only `--finding-id`, so passing both
 		// here is load-bearing.
 		let req = LlmRequest {
+			sandbox_workdir: ctx.sandbox_workdir.clone(),
+			security: ctx.security.clone(),
 			tool_boundary: ctx.tool_boundary,
 			prompt,
 			workdir: ctx.workdir.clone(),
@@ -110,7 +112,9 @@ mod tests {
 			panic!("verify")
 		};
 		VerifyContext {
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			sandbox_workdir: crate::sandbox::SandboxPath::fixture(PathBuf::from("/tmp")),
 			workdir: PathBuf::from("/tmp"),
 			repo_id: 1,
 			job_id: 42,
@@ -137,12 +141,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn returns_submitted_outcome_so_runner_skips_its_post() {
-		// MCP-driven verifier: the backend stub doesn't have to emit
-		// any verdict JSON — that path is gone. The contract this
-		// test pins is just "scanner returns Submitted, runner won't
-		// post again." If a future refactor accidentally returns
-		// `Verdict(...)` instead, the runner would POST a duplicate
-		// verification row.
+		// MCP submits the verdict during the session. Returning Submitted keeps
+		// the runner from posting a duplicate; stdout need not contain verdict JSON.
 		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| Ok(String::new())));
 		let outcome = LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
 		assert!(matches!(outcome, VerifyOutcome::Submitted));
@@ -150,12 +150,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn forwards_finding_id_and_job_id_to_backend_so_mcp_enters_verify_mode() {
-		// Pin the load-bearing wiring: the MCP server only flips into
-		// verify mode when BOTH `--finding-id` and `--job-id` reach
-		// it (via the LlmRequest fields). Capture what the backend
-		// sees and assert both are populated. If a future refactor
-		// drops one, the agent silently falls into discovery mode and
-		// the verifier surface disappears.
+		// Verify mode requires both finding_id and job_id on the LlmRequest;
+		// otherwise the backend cannot expose the verifier's MCP tools.
 		#[allow(clippy::type_complexity)]
 		let captured: Arc<Mutex<Option<(Option<i64>, Option<i64>, Option<i64>)>>> =
 			Arc::new(Mutex::new(None));

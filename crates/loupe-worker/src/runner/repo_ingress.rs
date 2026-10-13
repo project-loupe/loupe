@@ -56,9 +56,14 @@ impl Validate<GitlinkName<'_>, Repo> for RepositoryGitlinkPathDecoder {
 	}
 }
 impl RepositoryGitlinkPath {
-	/// Existing repository-path diagnostic projection. Full path-log framing
-	/// remains a separate sink node; lossy display is never marked RepoPath.
-	pub(super) fn for_log(&self) -> std::borrow::Cow<'_, str> {
+	pub(super) fn byte_count(&self) -> usize {
+		match self {
+			Self::Relative(path) => path.expose().len(),
+			Self::UnrepresentableNative { bytes, .. } => bytes.len(),
+		}
+	}
+	#[cfg(test)]
+	pub(super) fn fixture_text(&self) -> std::borrow::Cow<'_, str> {
 		match self {
 			Self::Relative(path) => std::borrow::Cow::Borrowed(path.expose()),
 			Self::UnrepresentableNative { bytes, .. } => String::from_utf8_lossy(bytes),

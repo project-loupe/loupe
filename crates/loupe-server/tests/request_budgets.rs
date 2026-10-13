@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use loupe_server::{router, AppState, PeerCert};
 use loupe_storage::secrets::MasterKey;
-use loupe_storage::{workers, Db};
+use loupe_storage::{registry, Db};
 use loupe_tls::{cert_fingerprint, Ca};
 use tower::ServiceExt;
 
@@ -14,15 +14,13 @@ fn fixture() -> (axum::Router, PeerCert) {
 	let ca = Arc::new(Ca::new("budget test").unwrap());
 	let cert = PeerCert(rustls::pki_types::CertificateDer::from(vec![1, 2, 3]));
 	let db = Arc::new(Db::open_in_memory(&MasterKey::for_tests()).unwrap());
-	db.with_conn(|conn| {
-		Ok(workers::insert(
-			conn,
-			&common::marked::operator::text("worker"),
-			workers::WorkerKind::Worker,
-			&cert_fingerprint(cert.0.as_ref()),
-			0,
-		)?)
-	})
+	registry::register_worker(
+		&db,
+		&common::marked::operator_ingress(),
+		&common::marked::operator::text("worker"),
+		&cert_fingerprint(cert.0.as_ref()),
+		0,
+	)
 	.unwrap();
 	let state =
 		AppState::new(db, ca, Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()));

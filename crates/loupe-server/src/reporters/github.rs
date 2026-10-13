@@ -8,17 +8,18 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use loupe_core::report_limits::GITHUB_ISSUE_BODY_MAX_CHARS;
-use loupe_core::{format_finding_id, Finding, ReportingDestination, Severity};
+use loupe_core::{Finding, ReportingDestination, Severity};
 use loupe_provenance::Agent;
+use loupe_storage::reports::PreparedReport;
 use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
 
 use super::github_app::{self, GithubAppInfo, GithubAppKey, InstallationTokens};
-use super::{DispatchReceipt, ReportFinding, Reporter, ReporterCredential};
+use super::render::{IssueTitle, ReportBody, ReportBuilder, ReportError, ReportView};
+use super::{DispatchReceipt, Reporter, ReporterCredential};
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
-const MAX_TITLE_CHARS: usize = 100;
 /// Upper bounds on one GitHub API call; see `with_base` for why.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,6 +47,10 @@ impl GithubReporter {
 		// token, which means a GitHub call that never answers would stall
 		// every app-mode dispatch (and the worker `complete` handlers that
 		// await them) instead of just this one.
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "GitHub reporter constructs its bounded-timeout TLS client for selected repository reporting"
+		)]
 		let http = reqwest::Client::builder()
 			.user_agent("loupe-server/0.0.0")
 			.use_rustls_tls()
@@ -66,7 +71,7 @@ impl GithubReporter {
 	/// Resolve the bearer token for one dispatch: the stored PAT as-is, or
 	/// a repo-scoped installation token minted from the GitHub App.
 	async fn bearer_for<'a>(
-		&self, credential: &'a ReporterCredential, target_owner: &str, target_repo: &str,
+		&self, credential: &'a ReporterCredential<'_>, target_owner: &str, target_repo: &str,
 	) -> Result<DispatchBearer<'a>> {
 		match credential {
 			ReporterCredential::GithubPat(pat) => std::str::from_utf8(pat.expose())
@@ -118,12 +123,18 @@ impl GithubReporter {
 	async fn post_json<B: Serialize>(
 		&self, url: Url, body: &B, bearer: &str,
 	) -> reqwest::Result<reqwest::Response> {
-		github_app::github_request(self.http.post(url), bearer).json(body).send().await
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "GitHub reporter sends a render-admitted issue to its selected destination with the stored credential"
+		)]
+		let result =
+			github_app::github_request(self.http.post(url), bearer).json(body).send().await;
+		result
 	}
 }
 
 /// A PAT borrows its guarded DAO allocation for the dispatch lifetime.
-/// App tokens retain the existing installation-token cache ownership.
+/// App tokens share installation-token cache ownership.
 enum DispatchBearer<'a> {
 	Pat(&'a str),
 	App(std::sync::Arc<loupe_provenance::Secret<String>>),
@@ -143,7 +154,7 @@ impl DispatchBearer<'_> {
 /// the credential it started from and the bearer currently in use,
 /// which `post_with_refresh` may replace mid-dispatch.
 struct DispatchSession<'a> {
-	credential: &'a ReporterCredential,
+	credential: &'a ReporterCredential<'a>,
 	target_owner: &'a str,
 	target_repo: &'a str,
 	bearer: DispatchBearer<'a>,
@@ -151,8 +162,8 @@ struct DispatchSession<'a> {
 
 #[derive(Serialize)]
 struct CreateIssueBody<'a> {
-	title: &'a str,
-	body: String,
+	title: &'a IssueTitle,
+	body: ReportBody,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	labels: Vec<String>,
 }
@@ -164,6 +175,7 @@ struct CreateLabelBody<'a> {
 	description: &'a str,
 }
 
+// debug-ok: label names, colors and descriptions are fixed host-authored catalog literals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LabelSpec {
 	name: &'static str,
@@ -177,8 +189,30 @@ impl Reporter for GithubReporter {
 		"github_issue"
 	}
 
-	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[ReportFinding], credential: &ReporterCredential,
+	async fn dispatch(&self, batch: &PreparedReport) -> Result<DispatchReceipt> {
+		let findings = batch
+			.entries()
+			.iter()
+			.map(|entry| entry.content().map(ReportView::selected))
+			.collect::<Result<Vec<_>, _>>()?;
+		self.deliver(batch.repository(), &findings, &ReporterCredential::selected(batch)?).await
+	}
+}
+
+impl GithubReporter {
+	/// Deliver one immutable selected entry. The caller completes its receipt
+	/// before attempting the next entry, including that entry's render admission.
+	pub async fn dispatch_entry(
+		&self, batch: &PreparedReport, index: usize,
+	) -> Result<DispatchReceipt> {
+		let entry =
+			batch.entries().get(index).ok_or_else(|| anyhow!("report entry is unavailable"))?;
+		let finding = ReportView::selected(entry.content()?);
+		self.deliver(batch.repository(), &[finding], &ReporterCredential::selected(batch)?).await
+	}
+
+	async fn deliver(
+		&self, repo: &RepoRow, findings: &[ReportView<'_>], credential: &ReporterCredential<'_>,
 	) -> Result<DispatchReceipt> {
 		let (target_owner, target_repo) = match &repo.reporting {
 			ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
@@ -189,16 +223,12 @@ impl Reporter for GithubReporter {
 		if findings.is_empty() {
 			return Ok(DispatchReceipt { kind: self.kind(), external_id: None });
 		}
-		// Reject oversize before any GitHub call, including app-token
-		// lookup and minting. Reuse the validated bodies when posting.
-		let bodies = findings
-			.iter()
-			.map(|report_finding| {
-				let body = render_body(repo, report_finding);
-				validate_body(&body).map_err(anyhow::Error::msg)?;
-				Ok(body)
-			})
-			.collect::<Result<Vec<_>>>()?;
+		// Preflight all inputs without retaining an arbitrary vector of bodies.
+		// Production dispatch supplies one finding and completes its receipt
+		// before the next; the lower-level batch API preflights the whole batch.
+		for report_finding in findings {
+			validate_view(repo, *report_finding)?;
+		}
 		// One bearer per dispatch: labels and issues share it, and an
 		// app-mode dispatch mints at most one installation token up front
 		// (plus one more if GitHub rejects it mid-way; see
@@ -207,7 +237,8 @@ impl Reporter for GithubReporter {
 		let mut session = DispatchSession { credential, target_owner, target_repo, bearer };
 
 		let mut external_ids = Vec::new();
-		for (report_finding, body) in findings.iter().zip(bodies) {
+		for report_finding in findings {
+			let body = render_view(repo, *report_finding)?;
 			let finding = &report_finding.finding;
 			let severity = severity_label(finding.severity);
 			self.ensure_label(&mut session, severity).await?;
@@ -326,37 +357,12 @@ fn severity_label(severity: Severity) -> LabelSpec {
 	}
 }
 
-pub(crate) fn render_title(finding: &Finding<Agent>) -> String {
-	compact_title(finding.title.expose())
+pub(crate) fn render_title(finding: &Finding<Agent>) -> IssueTitle {
+	IssueTitle::from_finding(&finding.title)
 }
 
-fn compact_title(raw: &str) -> String {
-	let mut compact = String::new();
-	for word in raw.split_whitespace() {
-		if !compact.is_empty() {
-			compact.push(' ');
-		}
-		compact.push_str(word);
-	}
-	if compact.is_empty() {
-		compact.push_str("Untitled finding");
-	}
-	if compact.chars().count() <= MAX_TITLE_CHARS {
-		return compact;
-	}
-
-	let mut truncated: String = compact.chars().take(MAX_TITLE_CHARS - 3).collect();
-	while truncated.ends_with(char::is_whitespace) {
-		truncated.pop();
-	}
-	truncated.push_str("...");
-	truncated
-}
-
-pub(crate) fn validate_finding_body(
-	repo: &RepoRow, report_finding: &ReportFinding,
-) -> Result<(), String> {
-	validate_body(&render_body(repo, report_finding))
+pub(crate) fn validate_view(repo: &RepoRow, view: ReportView<'_>) -> Result<(), ReportError> {
+	layout(repo, view, ReportBuilder::github_sizing()).map(|_| ())
 }
 
 pub fn validate_body(body: &str) -> Result<(), String> {
@@ -371,80 +377,76 @@ pub fn validate_body(body: &str) -> Result<(), String> {
 	Ok(())
 }
 
-pub(crate) fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
-	let finding = &report_finding.finding;
-	let mut out = String::new();
-	out.push_str(&format!("## Finding {}\n\n", format_finding_id(report_finding.id)));
-	out.push_str(&format!(
-		"- repo: `{}/{}` (`{}`)\n",
-		repo.owner.expose(),
-		repo.repo.expose(),
-		repo.clone_url.expose()
-	));
-	match &report_finding.reviewed_revision {
-		Some(revision) => out.push_str(&format!("- reviewed revision: `{}`\n", revision.expose())),
-		None => out.push_str("- reviewed revision: _not recorded_\n"),
+pub(crate) fn render_view(repo: &RepoRow, view: ReportView<'_>) -> Result<ReportBody, ReportError> {
+	layout(repo, view, ReportBuilder::github())
+}
+
+fn layout(
+	repo: &RepoRow, view: ReportView<'_>, mut out: ReportBuilder,
+) -> Result<ReportBody, ReportError> {
+	let finding = view.finding;
+	out.finding_id(view.id)?;
+	out.field("repository owner", &repo.owner)?;
+	out.field("repository", &repo.repo)?;
+	out.field("clone URL", &repo.clone_url)?;
+	match view.reviewed_revision {
+		Some(revision) => out.field("reviewed revision", revision)?,
+		None => out.literal("- reviewed revision: not recorded\n")?,
 	}
-	out.push_str(&format!("- title: {}\n", finding.title.expose()));
-	out.push_str(&format!("- severity: `{}`\n", finding.severity));
-	if let Some(location) = render_location(finding) {
-		out.push_str(&format!("- location: {location}\n"));
+	out.field("title", &finding.title)?;
+	out.severity(finding.severity)?;
+	if let Some(path) = &finding.file_path {
+		out.path(path, finding.line_start, finding.line_end)?;
 	}
 	if let Some(cwe) = &finding.cwe {
-		out.push_str(&format!("- cwe: {}\n", cwe.expose()));
+		out.field("cwe", cwe)?;
 	}
-	out.push_str(&format!("- fingerprint: `{}`\n\n", finding.fingerprint.expose()));
-
-	out.push_str("## Description\n\n");
-	out.push_str(finding.description.expose());
-	out.push_str("\n\n");
-
+	out.field("fingerprint", &finding.fingerprint)?;
+	out.heading("Description")?;
+	out.field("description", &finding.description)?;
 	if let Some(poc) = &finding.poc_unified {
-		out.push_str("## Proof of Concept\n\n```diff\n");
-		out.push_str(poc.expose());
-		out.push_str("\n```\n\n");
+		out.heading("Proof of Concept")?;
+		out.diff("proof of concept", poc)?;
 	}
-
-	if let Some(patch) = &finding.patch_unified {
-		out.push_str("## Suggested Fix\n\n```diff\n");
-		out.push_str(patch.expose());
-		out.push_str("\n```\n\n");
+	if let Some(patch) = view.patch {
+		out.heading("Suggested Fix")?;
+		out.diff("suggested fix", patch)?;
 	}
-
-	out.push_str(
+	out.literal(
 		"_This finding was discovered by [Project Loupe](https://github.com/project-loupe/loupe)._\n",
-	);
-
-	out
+	)?;
+	out.render()
 }
 
 /// Observe the concrete issue sinks without adding a normal raw renderer API.
 #[cfg(fuzzing)]
 pub fn fuzz_render_title(finding: &Finding<Agent>) -> String {
-	render_title(finding)
+	render_title(finding).as_str().to_owned()
 }
 
 #[cfg(fuzzing)]
-pub fn fuzz_render_body(repo: &RepoRow, finding: &ReportFinding) -> String {
-	render_body(repo, finding)
-}
-
-fn render_location(finding: &Finding<Agent>) -> Option<String> {
-	let path = finding.file_path.as_ref()?;
-	let suffix = match (finding.line_start, finding.line_end) {
-		(Some(start), Some(end)) if end != start => format!(":{start}-{end}"),
-		(Some(start), _) => format!(":{start}"),
-		_ => String::new(),
-	};
-	Some(format!("`{}{suffix}`", path.expose()))
+pub fn fuzz_render_body(batch: &PreparedReport, index: usize) -> Result<String> {
+	let entry = batch.entries().get(index).ok_or_else(|| anyhow!("report entry is unavailable"))?;
+	Ok(render_view(batch.repository(), ReportView::selected(entry.content()?))?.into_string())
 }
 
 #[cfg(test)]
 mod tests {
 	use loupe_core::Severity;
 
-	use super::super::fixtures::{path, revision, text};
+	use super::super::fixtures::{path, revision, text, ReportFinding};
 	use super::*;
+	fn render_body(repo: &RepoRow, finding: &ReportFinding) -> Result<ReportBody, ReportError> {
+		super::render_view(repo, finding.view())
+	}
+	impl GithubReporter {
+		async fn dispatch(
+			&self, repo: &RepoRow, findings: &[ReportFinding], credential: &ReporterCredential<'_>,
+		) -> Result<DispatchReceipt> {
+			let views: Vec<_> = findings.iter().map(ReportFinding::view).collect();
+			self.deliver(repo, &views, credential).await
+		}
+	}
 
 	fn repo() -> RepoRow {
 		super::super::fixtures::repo(serde_json::json!({
@@ -471,7 +473,7 @@ mod tests {
 
 	#[test]
 	fn title_is_per_finding_without_loupe_or_severity_prefix() {
-		assert_eq!(render_title(&finding()), "Out-of-bounds index in idx");
+		assert_eq!(render_title(&finding()).as_str(), "Out-of-bounds index in idx");
 	}
 
 	#[test]
@@ -515,17 +517,17 @@ mod tests {
 			reviewed_revision: Some(revision(&"a".repeat(40))),
 		};
 		report.finding.description = text("");
-		let overhead = render_body(&repo(), &report).chars().count();
+		let overhead = render_body(&repo(), &report).unwrap().as_str().chars().count();
 		report.finding.description = text(&"é".repeat(65_536 - overhead));
 		assert!(
-			render_body(&repo(), &report).len() > 65_536,
+			render_body(&repo(), &report).unwrap().as_str().len() > 65_536,
 			"Unicode bytes must not set the limit"
 		);
 		reporter
 			.dispatch(
 				&repo(),
 				&[report.clone()],
-				&ReporterCredential::GithubPat(loupe_provenance::Secret::new(b"pat".to_vec())),
+				&ReporterCredential::GithubPat(&loupe_provenance::Secret::new(b"pat".to_vec())),
 			)
 			.await
 			.expect("exact character limit is accepted");
@@ -535,7 +537,7 @@ mod tests {
 			.dispatch(
 				&repo(),
 				&[report.clone()],
-				&ReporterCredential::GithubPat(loupe_provenance::Secret::new(b"pat".to_vec())),
+				&ReporterCredential::GithubPat(&loupe_provenance::Secret::new(b"pat".to_vec())),
 			)
 			.await
 			.unwrap_err();
@@ -562,13 +564,17 @@ mod tests {
 				finding: finding(),
 				reviewed_revision: Some(revision("abc123")),
 			},
-		);
+		)
+		.unwrap()
+		.into_string();
 		assert!(body.starts_with("## Finding LUP-1234\n\n"), "body: {body}");
-		assert!(body.contains("- repo: `acme/widget` (`https://github.com/acme/widget.git`)"));
-		assert!(body.contains("- reviewed revision: `abc123`"));
-		assert!(body.contains("- title: Out-of-bounds index in idx"));
-		assert!(body.contains("- severity: `high`"));
-		assert!(body.contains("- location: `src/lib.rs:4-6`"));
+		assert!(body.contains("- repository owner:\n```\nacme\n```"));
+		assert!(body.contains("- repository:\n```\nwidget\n```"));
+		assert!(body.contains("- clone URL:\n```\nhttps://github.com/acme/widget.git\n```"));
+		assert!(body.contains("- reviewed revision:\n```\nabc123\n```"));
+		assert!(body.contains("- title:\n```\nOut-of-bounds index in idx\n```"));
+		assert!(body.contains("- severity: high"));
+		assert!(body.contains("- location: ```src/lib.rs:4-6```"));
 		assert!(body.contains("## Proof of Concept"));
 		assert!(body.contains("## Suggested Fix"));
 		assert!(body.ends_with(
@@ -584,7 +590,9 @@ mod tests {
 		let body = render_body(
 			&repo(),
 			&ReportFinding { id: 1234, finding: finding(), reviewed_revision: None },
-		);
+		)
+		.unwrap()
+		.into_string();
 		assert!(!body.contains("- scanner:"), "body must omit the scanner header: {body}");
 	}
 
@@ -691,7 +699,7 @@ mod tests {
 		repo
 	}
 
-	fn app_credential() -> ReporterCredential {
+	fn app_credential() -> ReporterCredential<'static> {
 		ReporterCredential::GithubApp(Box::new(
 			GithubAppKey::from_pem(42, super::github_app::testing::APP_PRIVATE_KEY_PEM).unwrap(),
 		))
@@ -724,7 +732,7 @@ mod tests {
 		let issue_auths = gh.issue_auths.lock().unwrap().clone();
 		assert_eq!(issue_auths, vec!["ghs_1", "ghs_2"], "issue auths: {issue_auths:?}");
 
-		// A token that is refused even when freshly minted fails as before.
+		// A token refused immediately after minting is not retried again.
 		gh.rejected.lock().unwrap().push("ghs_2".into());
 		gh.rejected.lock().unwrap().push("ghs_3".into());
 		let err = reporter
@@ -746,7 +754,7 @@ mod tests {
 			.dispatch(
 				&repo(),
 				&one_finding(),
-				&ReporterCredential::GithubPat(loupe_provenance::Secret::new(
+				&ReporterCredential::GithubPat(&loupe_provenance::Secret::new(
 					b"ghp_stale".to_vec(),
 				)),
 			)

@@ -1,10 +1,11 @@
-//! Exact observations from the final typed Operator and Secret owners.
+//! Exact observations from typed Operator and Secret owners.
 use loupe_provenance::{Ingress, Untrusted};
 use serde_json::{json, Value};
 
 use super::*;
 use crate::fuzz_support::{error, Decoded};
 
+// debug-ok: closed operator request-kind discriminants contain no fuzz input bytes.
 #[derive(Clone, Copy, Debug)]
 pub enum OperatorRequest {
 	RegisterRepo,
@@ -23,7 +24,7 @@ pub enum OperatorValue {
 	Worker(loupe_proto::RegisterWorkerRequest<Operator>),
 }
 
-/// Concrete actual Operator outputs, for the final DTO serializer harness.
+/// Concrete Operator outputs for the DTO serializer harness.
 pub fn operator_value(kind: OperatorRequest, bytes: &[u8]) -> Option<OperatorValue> {
 	let input = original(bytes);
 	Some(match kind {

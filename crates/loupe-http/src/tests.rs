@@ -1,5 +1,5 @@
-//! Ownership acceptance checks for the private collector seam. The observer
-//! reads still-live memory; none of these new seams existed on the base.
+//! Collector ownership checks observe live storage after zeroisation,
+//! before its allocation is freed.
 
 use std::sync::{Arc, Mutex};
 
@@ -84,4 +84,19 @@ async fn cancellation_wipes_the_collected_prefix() {
 	assert!(drops(&audit).is_empty());
 	drop(pending);
 	assert_eq!(drops(&audit), vec![4]);
+}
+
+#[tokio::test]
+async fn transport_error_formatting_and_source_do_not_disclose_response_urls() {
+	let error = reqwest::get("http://[").await.unwrap_err().with_url(
+		reqwest::Url::parse("https://untrusted-response-sentinel.example/path?token=secret")
+			.unwrap(),
+	);
+	let error = collect(stream::iter([Err(error)]), ResponseBuffer::default()).await.unwrap_err();
+	assert_eq!(
+		(format!("{error:?}"), error.to_string(), std::error::Error::source(&error).is_some()),
+		("Transport([redacted])".to_owned(), "reading response body failed".to_owned(), false),
+		"response transport diagnostics must disclose only the error category"
+	);
+	assert_eq!(ResponseBodyError::TooLarge.to_string(), "response body exceeds 16777216 bytes");
 }

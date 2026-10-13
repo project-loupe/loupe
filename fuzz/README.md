@@ -310,17 +310,20 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `server_github_response` | All five production Reporter validators via fixed cfg-only fixtures; independent exact slug policy and raw schema oracles, compact escaped/unescaped 2 MiB boundary recipes, fixed errors and token redaction. Legacy status helpers remain separate compatibility controls; actual HTTP collection belongs to transport tests. |
 | `server_ingress_requests` | All six Worker/eight Operator body decoders and three queries; independent exact fields, Unicode/path/secret policies, original Agent spans and closed diagnostics |
 | `server_ingress_transport` | Actual request collection, live wipe and final-owner lifetime; authenticated router ordering and byte debt; all five Reporter HTTP consumers with caps, status precedence and retry counts |
-| `server_report_email` | Exact header boundary, CR/LF admission and finding-content isolation from headers |
-| `server_report_github` | Title normalization, title/body character caps and observed S3 fence-containment cases |
+| `server_report_email` | Independent header admission, literal body fields, finding-content isolation, header budgets and complete-message byte cap |
+| `server_report_github` | Title normalization, scalar/byte budgets, exact literal framing and containment of finding text and paths |
 | `server_request_parsers` | Protocol headers, state/kind filters, legacy clone URLs and exact FTS stripping/token admission |
 | `storage_source_refs` | Independent path admission, 32/64-item limits, raw and canonical byte budgets, preserved path bytes, aggregate Debug redaction |
 | `storage_identity` | Independent anchor recognition, equivalent spelling, metadata-only diagnostics, explicit identity framing and reference BLAKE3 |
 | `storage_policy_snapshot` | Independent campaign-policy admission, capped retry arithmetic, phase mapping and redacted conflict errors |
+| `storage_scope_sequence` | Real scope and report operations against an independent row-incarnation model; lease expiry, cross-repository/database rejection, rollback, reused IDs and atomic delivery failure |
 | `tls_fingerprint` | Exact SHA-256 of arbitrary DER bytes and repeatability |
 | `tls_input` | Actual guarded file/base64/argument owners, exact bytes, UTF-8 admission, fixed errors and redacted formatting |
 | `tls_pem` | Certificate/key/root parsing, successful CA reload, direct-loader controls and shared reqwest admission against its previous constructor |
 | `worker_broker_policy` | Actual Sandbox request owner, both provider policies, independent denial precedence, exact rewritten output and request headers |
 | `worker_broker_usage` | Actual Provider chunk admission, capture and counters; independent JSON/SSE accounting, reservation overflow and response header filtering |
+| `worker_canary_observe` | Original raw bytes and every valid quoted scalar run; independent serde scalar decoding, duplicate fields, malformed neighbors and exact Unicode bytes |
+| `worker_citation` | Actual post-admission validator versus an independent whole-window oracle: fences, exact ranged quotes, UTF-8, Unicode fingerprint normalization, bounded reads and cancellation; excludes file admission, job authority and egress |
 | `worker_client_ingress` | Six actual private Server decoders, original Agent token spans, independent schema/field admission, leased scanner compatibility and exact host outcomes |
 | `worker_config` | Actual Config file and native Clap owners, independent policy/error oracle, exact argument caps and native path bytes |
 | `worker_extract_json` | Independent character-based balanced-span oracle, quoted braces, escapes and malformed JSON |
@@ -335,13 +338,21 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_repo_observations` | Six actual private Repo validators: native paths, file bytes, fingerprint windows, Git diagnostics, binary OIDs and gitlink bytes |
 | `worker_sandbox_args` | Exact namespace/safety flags, supervisor framing, explicit environment names and bind operands, including flag-shaped values |
 | `worker_server_response` | Actual clients over chunked HTTP, independent private-decoder admission, exact byte budget and bounded errors |
-| `worker_source_discovery` | Actual Repo manifest/glob/exclusion parsing, independent exact exclusion values, native names, containment and complete fixture selection |
+| `worker_source_discovery` | Actual Repo manifest/glob/exclusion parsing, independent exclusion admission, native names, containment and exact filtered fixture selection |
 | `web_api` | Actual browser guards, no upstream call on rejected headers, JSON-enclosed diagnostics and bounded responses |
 
 `storage_source_refs` takes one policy byte (even: 32 items, odd: 64),
 followed by JSON reference bytes. Inputs up to 128 KiB exercise both sides of
 the 64 KiB raw and canonical limits. The corpus includes item-count, path-byte
 and serialized-size boundaries, malformed JSON and decomposed path spelling.
+
+`storage_scope_sequence` consumes at most 64 four-byte operations over two
+databases, two repositories per database and four retained report batches.
+The storage-owned fixture keeps SQL access and synthetic authority private.
+An independent model checks receipt membership, row incarnations and lease
+state after each operation, and snapshots pin unrelated rows. The seven seeds
+cover cross-database use, nonmembers, reused IDs, partial delivery, expired or
+revoked leases, rollback, malformed stored identities and incomplete framing.
 
 `storage_policy_snapshot` takes a little-endian u32 attempt count followed
 by policy JSON. `BoundedJson<Payload>` applies the raw input and JSON budgets
@@ -371,6 +382,23 @@ Its corpus records nine legacy-accepted classes rejected by strict RepoPath,
 plus whitespace-only input accepted by strict RepoPath but rejected by both
 legacy validators. MCP's lexical core remains on the actual submission path;
 filesystem containment stays separate. This target adds no path tightening.
+
+`worker_canary_observe` takes one watched-length byte modulo 65, those watched
+bytes and an original record of at most 4,096 bytes. The reference uses a
+separate JSON implementation for scalar decoding and checks raw matches, quoted
+runs, malformed-unit barriers, surrogate recovery and unclosed strings. It
+performs neither recursive decoding nor Unicode normalization. Its controls
+include empty watches and hits in ignored duplicate fields; it does not admit
+records or exercise job quarantine lifecycle, which has separate worker tests.
+
+`worker_citation` bounds source bytes to 32 KiB, description bytes to 16 KiB
+and file text to 256 bytes. Its independent oracle uses complete lines and
+whole-string Unicode lowercasing to check the streaming implementation. It
+also checks exact read counts and 8 KiB read requests, including cancellation
+before a read, during a read and at EOF. The 54 seeds include delimiter and
+range failures, split/invalid UTF-8, contextual sigma, CRLF and decomposed
+Unicode. Path/text admission, regular-file descriptors, PoC applicability,
+quarantine and network effects remain separate worker integration checks.
 
 `worker_extract_json` takes raw UTF-8 text and checks the first balanced brace
 span against an independent character-based quote and escape oracle. Balanced
@@ -435,13 +463,16 @@ whole-file product limit. The wire schema is a compatibility oracle, with
 independent post-parse owner/budget rules and exact fixed error-chain checks.
 Binary argv/environment/PEM precedence remains covered by process-owner tests.
 
-The report targets pass JSON findings to the actual renderers. Email input
-also supplies `from`, `to` and `subject`, whose newline checks must match
-admission and whose header block must stay independent of finding content.
-GitHub titles are capped at 100 Unicode scalar values and body admission at
-65,536. Static `escape-*` seeds preserve closing-fence escapes and a large
-email body for S3; these targets do not claim containment or an email-body
-cap that the current renderers do not provide.
+The report targets pass JSON findings through committed report fixtures to
+the actual renderers. Independent framing oracles preserve exact field bytes
+inside adaptive literal delimiters, including paths and closing-fence payloads.
+GitHub titles are capped at 100 Unicode scalar values; complete bodies admit
+at most 65,536 scalars and 262,144 bytes, including framing. Email input also
+supplies `from`, `to` and `subject`; the oracle checks prohibited characters,
+header/body separation, 8,192-byte header lines, a 65,536-byte header section
+and a 16 MiB complete-message limit. Static `escape-*` seeds and admitted
+companions exercise containment and destination admission. Process delivery
+and transaction authority remain separate integration-test responsibilities.
 
 `worker_regex_secrets` interprets byte zero as cancellation and exact/over
 one-MiB file-size modes; the remaining bytes supply file content and a bounded
@@ -454,6 +485,10 @@ contain only severity and line metadata even when the filename is a secret.
 build-script symlinks; remaining NUL-separated fields contain root/member
 Cargo manifests and an exclusion pattern. Bit 3 instead passes all remaining
 bytes directly to the root manifest. A 64 KiB input cap bounds fixture work.
+Every exclusion reaches the real scanner decoder; an independent text oracle
+checks admission before the adapter handles rejection. Valid inputs retain
+all walking assertions, with positive controls for nonempty filters and
+Unicode patterns whose surrounding spaces must remain significant.
 Known fixtures assert complete legitimate selection as well as containment;
 the canonical check does not make concurrent filesystem changes atomic.
 `runner::submodule_paths` remains owned by runner integration tests, including
@@ -495,18 +530,22 @@ saturating maximum of total tokens and input-plus-output tokens. Header
 fixtures use `hyper`; `tracing` and `tracing-subscriber` capture diagnostics
 and require the pure accounting and filtering paths to emit none.
 
-`worker_sandbox_args` projects raw JSON into the real builder's command without
-spawning it. It checks the complete option/operand sequence, supervisor and
-bubblewrap separators, explicit environment variables and binary binds. A
+`worker_sandbox_args` projects raw JSON through a cfg-only observer of the actual
+typed builder, without spawning or exposing a prepared command. Independent
+oracles check Config host text and complete network-policy admission, then the
+complete option/operand sequence, supervisor and bubblewrap separators,
+explicit environment variables and binary binds. Private synthetic operands
+retain the original path/argument/required-host domain without adding production
+constructors for unchecked values. A
 separate fixture directory keeps arbitrary entrypoint names from colliding
 with the package installation. Flag-shaped values remain operands in the
 oracle; the target does not mistake those values for security options.
 
-All 34 main-surface S1 targets plus smoke are registered. S3 additionally
-registers `core_text_exact` for the marked exact-text policies and `tls_input`
-for guarded PEM readers and exports. The text target now exercises the final
-source-bearing policies through its fixed Agent fixture; its independent
-oracle remains. Each real target has
+All 49 main-surface targets plus smoke are registered. S3 adds direct process
+ingress, guarded TLS input, exact text/JSON policies, prompt rendering,
+canary/citation checks and stateful storage-scope coverage to the S1 targets.
+The text target exercises the final source-bearing policies through its
+fixed Agent fixture; its independent oracle remains. Each real target has
 a retained corpus, a clean short campaign and a detected guard mutation.
 The broader ingress gaps below remain separate from this named target set.
 
@@ -538,9 +577,10 @@ serves CLI and web, whose own regressions cover their response paths. Its
 Pagination remains future work. `web_api` already reaches the real router,
 browser guards and extraction errors; those are not missing S1 targets.
 
-S3 owns prompt data blocks, report containment and destination caps, labelled
-logging/Debug, canary scanning and citation checks. The report `escape-*`
-seeds are its acceptance inputs. The retained JSON-span helper has no current
+S3 implements prompt data blocks, report containment and destination caps,
+labelled logging/Debug, canary scanning and citation checks. The report
+`escape-*` seeds and admitted companions are retained regression inputs.
+The retained JSON-span helper has no current
 production caller and is not evidence about the active MCP verdict path.
 
 After B4 actually lands, S1 items 30–35 add the ten `proto_review_<module>`

@@ -5,6 +5,7 @@ use loupe_provenance::Server;
 
 use crate::ingress_text::RevisionText;
 
+// debug-ok: The Server revision uses redacted BoundedText.
 #[derive(Clone, Debug)]
 pub struct ReviewedRevision(BoundedText<RevisionText, Server>);
 impl ReviewedRevision {
@@ -24,6 +25,7 @@ pub(crate) enum ReviewedRevisionFact {
 	Available(ReviewedRevision),
 }
 
+// debug-ok: Closed host failure variants with fixed messages and no payload.
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum CheckoutFailure {
 	#[error("creating temp worktree dir")]

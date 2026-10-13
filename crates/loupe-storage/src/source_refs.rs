@@ -43,6 +43,10 @@ impl<const MAX: usize, S: Source> SourceRefs<MAX, S> {
 		if bytes.len() > 65536 {
 			return Err(Error::new("source_refs", Rule::Bytes));
 		}
+		#[expect(
+			clippy::expect_used,
+			reason = "bytes are the unchanged output of the private canonical JSON serializer"
+		)]
 		let canonical = String::from_utf8(bytes).expect("JSON is UTF-8");
 		Ok(Self { refs, canonical })
 	}

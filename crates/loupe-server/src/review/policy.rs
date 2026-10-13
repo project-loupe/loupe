@@ -3,6 +3,7 @@ use std::fmt;
 
 use loupe_storage::scheduler::{CampaignPolicy, ClaimPolicy, PRIORITY_MAX};
 
+// debug-ok: review policy contains only numeric limits, durations and token budgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPolicy {
 	pub active_jobs_per_repo: i64,
@@ -67,6 +68,7 @@ impl Default for ReviewPolicy {
 	}
 }
 
+// debug-ok: violations are fixed schema field names and host-authored numeric policy checks, never submitted content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyError {
 	pub violations: Vec<String>,

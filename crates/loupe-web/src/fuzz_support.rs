@@ -8,6 +8,7 @@ use loupe_core::text::{BoundedText, TextPolicy};
 use loupe_provenance::Browser;
 
 /// Named implementation entries, recorded inside the real validators.
+// debug-ok: cfg(fuzzing) entry names are closed unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
 	Guard,
@@ -34,7 +35,8 @@ pub enum Entry {
 	ConfigFile,
 	ConfigSelected,
 }
-/// A fixed source-bearing query field observed before its temporary I exit.
+/// A fixed source-bearing query field observed during validation.
+// debug-ok: cfg(fuzzing) field names are closed unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserField {
 	Search,
@@ -42,6 +44,7 @@ pub enum BrowserField {
 	Kind,
 }
 /// Only fake fixture data is copied by these cfg-only observations.
+// debug-ok: cfg(fuzzing)-only oracle observations contain synthetic fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observation {
 	BufferAllocation(usize),
@@ -68,6 +71,7 @@ pub enum Observation {
 		debug: Option<String>,
 	},
 }
+// debug-ok: cfg(fuzzing)-only trace aggregates synthetic oracle observations.
 #[derive(Debug, Default)]
 pub struct Trace {
 	pub entries: Vec<Entry>,
@@ -128,7 +132,8 @@ impl Drop for Session {
 		crate::ingress::json::audit::stop();
 	}
 }
-/// Concrete callbacks only; they mint Config at their existing native boundary.
+/// Concrete callbacks only; they mint Config at their native input boundary.
+// debug-ok: cfg(fuzzing) parser choices are closed unit variants.
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigParser {
 	Url,
@@ -138,7 +143,7 @@ pub enum ConfigParser {
 pub fn config_parse(parser: ConfigParser, value: &OsStr) -> Result<Vec<u8>, String> {
 	crate::config::fuzz_parse(parser, value)
 }
-/// Actual selected read, including the existing raw/base64/file priority.
+/// Actual selected read, including raw/base64/file priority.
 pub fn config_selected(
 	raw: Option<&str>, base64: Option<&str>, path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {

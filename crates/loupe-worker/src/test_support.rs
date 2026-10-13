@@ -2,6 +2,35 @@
 //! decoders. These helpers do not assert that a network read occurred.
 use std::path::Path;
 
+#[derive(Clone, Default)]
+pub(crate) struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		self.0.lock().unwrap().extend_from_slice(bytes);
+		Ok(bytes.len())
+	}
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+impl LogCapture {
+	pub(crate) fn install(&self) {
+		let writer = self.clone();
+		tracing::subscriber::set_global_default(
+			tracing_subscriber::fmt()
+				.with_max_level(tracing::Level::DEBUG)
+				.without_time()
+				.with_ansi(false)
+				.with_writer(move || writer.clone())
+				.finish(),
+		)
+		.unwrap();
+	}
+	pub(crate) fn text(&self) -> String {
+		String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+	}
+}
+
 pub(crate) fn config_text(value: &str) -> crate::config::ConfiguredText {
 	use clap::builder::TypedValueParser;
 	crate::config_value_parsers::ConfiguredTextParser
@@ -22,8 +51,10 @@ pub(crate) fn scan_context(workdir: &Path, head: &str) -> crate::ScanContext {
 	std::fs::create_dir_all(cache.repo_path(&key)).unwrap();
 	cache.write_cursor(&key, head).unwrap();
 	crate::ScanContext {
+		security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		workdir: workdir.to_owned(),
+		sandbox_workdir: crate::sandbox::SandboxPath::fixture(workdir.to_owned()),
 		repo: env.repo,
 		repo_id: env.repo_id,
 		job_id: env.job_id,
@@ -32,6 +63,31 @@ pub(crate) fn scan_context(workdir: &Path, head: &str) -> crate::ScanContext {
 		base_sha: None,
 		config: None,
 		cancel: tokio_util::sync::CancellationToken::new(),
+	}
+}
+
+pub(crate) fn sandbox_network(
+	network: crate::sandbox::SandboxNetworkConfig,
+) -> crate::config::SandboxNetworkPolicy {
+	let mut config = crate::config::WorkerConfig::default();
+	config.sandbox = network;
+	config.sandbox_launch_config().unwrap().network().clone()
+}
+
+pub(crate) fn sandbox_agent(
+	codex: bool, agent: crate::llm::CliModelConfig,
+) -> crate::config::SandboxAgentConfig {
+	let mut config = crate::config::WorkerConfig::default();
+	if codex {
+		config.agents.codex = agent;
+	} else {
+		config.agents.claude = agent;
+	}
+	let launch = config.sandbox_launch_config().unwrap();
+	if codex {
+		launch.codex().clone()
+	} else {
+		launch.claude().clone()
 	}
 }
 

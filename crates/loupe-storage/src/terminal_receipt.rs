@@ -3,9 +3,9 @@ use loupe_core::text::policy::{Payload, Reason, RevisionText, Title};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState};
 use loupe_provenance::{Db, Source};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::review::{classify, optional, parsed, standalone, string_enum};
+use crate::review::{classify, optional, parsed, string_enum};
 use crate::{Conflict, Entity, Error, Result};
 // The receipt's phase is the job's kind; reusing `JobKind` keeps the two
 // from drifting when a kind is added.
@@ -54,6 +54,7 @@ impl std::fmt::Debug for Receipt {
 			.finish_non_exhaustive()
 	}
 }
+// debug-ok: rejection reasons are closed categories without capability hashes or payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
 	MissingJob,
@@ -63,6 +64,7 @@ pub enum Reject {
 	WrongCapability,
 	WrongDigest,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone)]
 pub enum Replayed {
 	Receipt(Box<Receipt>),
@@ -70,27 +72,34 @@ pub enum Replayed {
 }
 /// Lease validation and the job's terminal transition belong to the caller.
 pub fn insert<MetaS: Source, ReasonS: Source, TitleS: Source, RecipeS: Source, CountsS: Source>(
-	tx: &Transaction<'_>, new: &NewReceipt<'_, MetaS, ReasonS, TitleS, RecipeS, CountsS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>,
+	new: &NewReceipt<'_, MetaS, ReasonS, TitleS, RecipeS, CountsS>, now: i64,
 ) -> Result<i64> {
+	scope.require_operator()?;
+	let tx = scope.conn;
 	let phase = tx
-		.query_row("SELECT kind FROM jobs WHERE id=?1", [new.job_id], |r| {
-			crate::ingress::job_kind_text(r, 0)
-		})
+		.query_row(
+			"SELECT kind FROM jobs WHERE id=?1 AND repo_id=?2",
+			params![new.job_id, scope.repo_id],
+			|r| crate::ingress::job_kind_text(r, 0),
+		)
 		.optional()?
 		.ok_or(Error::NotFound(Entity::Job, new.job_id))?;
 	if !new.phase.is_known() || phase.expose() != new.phase.as_str() {
 		return Err(Error::Conflict(Conflict::TerminalReceipt));
 	}
 	tx.execute("INSERT INTO job_terminal_receipts (job_id,phase,terminal_reason,subject_title,subject_digest,pinned_commit_sha,effective_recipe,result_digest,evidence_rung,result_counts,finishing_capability_hash,created_at)
- VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![new.job_id,new.phase.as_str(),new.terminal_reason.expose(),new.subject_title.map(BoundedText::expose),new.subject_digest.map(|d|d.as_slice()),new.pinned_commit_sha.expose(),new.effective_recipe.expose(),new.result_digest.as_slice(),new.evidence_rung.map(EvidenceRung::as_str),new.result_counts.map(BoundedJson::expose),new.finishing_capability_hash.map(|d|d.as_slice()),now])
+ SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 WHERE EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND repo_id=?13)",params![new.job_id,new.phase.as_str(),new.terminal_reason.expose(),new.subject_title.map(BoundedText::expose),new.subject_digest.map(|d|d.as_slice()),new.pinned_commit_sha.expose(),new.effective_recipe.expose(),new.result_digest.as_slice(),new.evidence_rung.map(EvidenceRung::as_str),new.result_counts.map(BoundedJson::expose),new.finishing_capability_hash.map(|d|d.as_slice()),now,scope.repo_id])
  .map_err(|e|classify(e,"job_terminal_receipts.job_id",Conflict::TerminalReceipt))?;
 	Ok(tx.last_insert_rowid())
 }
-pub fn get(conn: &Connection, job: i64) -> Result<Option<Receipt>> {
-	Ok(conn
+pub fn get(scope: &crate::scope::RepoScope<'_>, job: i64) -> Result<Option<Receipt>> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	Ok(tx
 		.query_row(
-			&format!("SELECT {COLUMNS} FROM job_terminal_receipts WHERE job_id=?1"),
-			[job],
+			&format!("SELECT {COLUMNS} FROM job_terminal_receipts WHERE job_id=?1 AND EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND repo_id=?2)"),
+			params![job,scope.repo_id],
 			row,
 		)
 		.optional()?)
@@ -117,17 +126,24 @@ pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
 	crate::migrations::admission::scan(conn, "job_terminal_receipts", COLUMNS, row)
 }
 pub fn replay_terminal(
-	tx: &Transaction<'_>, job: i64, capability: &[u8; 32], digest: &[u8; 32],
+	scope: &crate::scope::RepoScope<'_>, job: i64, capability: &[u8; 32], digest: &[u8; 32],
 ) -> Result<Replayed> {
-	let state: Option<JobState> =
-		tx.query_row("SELECT state FROM jobs WHERE id=?1", [job], |r| parsed(r, 0)).optional()?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let state: Option<JobState> = tx
+		.query_row(
+			"SELECT state FROM jobs WHERE id=?1 AND repo_id=?2",
+			params![job, scope.repo_id],
+			|r| parsed(r, 0),
+		)
+		.optional()?;
 	let Some(state) = state else {
 		return Ok(Replayed::Reject(Reject::MissingJob));
 	};
 	if !state.is_terminal() {
 		return Ok(Replayed::Reject(Reject::NonterminalJob));
 	}
-	let Some(receipt) = get(tx, job)? else {
+	let Some(receipt) = get(scope, job)? else {
 		return Ok(Replayed::Reject(Reject::MissingReceipt));
 	};
 	let Some(stored) = &receipt.finishing_capability_hash else {
@@ -141,4 +157,3 @@ pub fn replay_terminal(
 	}
 	Ok(Replayed::Receipt(Box::new(receipt)))
 }
-standalone! {insert<MetaS, ReasonS, TitleS, RecipeS, CountsS>(new:&NewReceipt<'_, MetaS, ReasonS, TitleS, RecipeS, CountsS>,now:i64)->i64;}

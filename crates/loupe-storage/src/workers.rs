@@ -5,6 +5,7 @@ use loupe_core::text::BoundedText;
 use loupe_provenance::{Db, Source};
 use rusqlite::{params, Connection, OptionalExtension};
 
+// debug-ok: worker roles are closed discriminants with no identity content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerKind {
 	Worker,
@@ -20,6 +21,7 @@ impl WorkerKind {
 	}
 }
 
+// debug-ok: worker name redacts; certificate fingerprint is public identity metadata, never certificate or key bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRow {
 	pub id: i64,
@@ -34,7 +36,7 @@ pub struct WorkerRow {
 /// Insert a worker row. Returns the assigned id. Caller passes an
 /// already-hashed fingerprint (see `loupe-tls::cert_fingerprint`); this
 /// DAO never sees raw cert material.
-pub fn insert<S: Source>(
+pub(crate) fn insert<S: Source>(
 	conn: &Connection, name: &BoundedText<WorkerName, S>, kind: WorkerKind,
 	cert_fingerprint: &[u8], now: i64,
 ) -> rusqlite::Result<i64> {
@@ -46,7 +48,7 @@ pub fn insert<S: Source>(
 	Ok(conn.last_insert_rowid())
 }
 /// Initial administrator identity is a closed installation fact.
-pub fn insert_bootstrap_admin(
+pub(crate) fn insert_bootstrap_admin(
 	conn: &Connection, cert_fingerprint: &[u8], now: i64,
 ) -> rusqlite::Result<i64> {
 	conn.execute("INSERT INTO workers (name,kind,cert_fingerprint,created_at) VALUES ('admin','admin',?1,?2)", params![cert_fingerprint, now])?;
@@ -55,7 +57,7 @@ pub fn insert_bootstrap_admin(
 
 /// Look up a worker by certificate fingerprint. Returns `None` for
 /// unknown certs or revoked workers — the caller treats both as "deny".
-pub fn find_active_by_fingerprint(
+pub(crate) fn find_active_by_fingerprint(
 	conn: &Connection, cert_fingerprint: &[u8],
 ) -> rusqlite::Result<Option<WorkerRow>> {
 	conn.query_row(
@@ -68,7 +70,7 @@ pub fn find_active_by_fingerprint(
 	.optional()
 }
 
-pub fn revoke(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<bool> {
+pub(crate) fn revoke(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<bool> {
 	let n = conn.execute(
 		"UPDATE workers SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
 		params![now, id],
@@ -76,7 +78,7 @@ pub fn revoke(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<bool> {
 	Ok(n > 0)
 }
 
-pub fn touch_last_seen(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
+pub(crate) fn touch_last_seen(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
 	conn.execute("UPDATE workers SET last_seen_at = ?1 WHERE id = ?2", params![now, id])?;
 	Ok(())
 }

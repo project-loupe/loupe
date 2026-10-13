@@ -23,6 +23,7 @@ use unicode_normalization::UnicodeNormalization;
 pub use values::{Anchor, BoundedJson, BoundedText, Identifier, RepoPath, SourceRef};
 
 /// Whether field validation normalizes prose or retains admitted UTF-8 bytes.
+// debug-ok: closed normalization policy unit variants contain no text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Normalization {
 	Semantic,
@@ -30,6 +31,7 @@ pub enum Normalization {
 }
 
 /// Whether boundary whitespace and repeated blank lines are meaningful.
+// debug-ok: closed whitespace policy unit variants contain no text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Whitespace {
 	Prose,
@@ -59,6 +61,7 @@ pub trait JsonPolicy {
 	const MAX_NODES: usize;
 }
 
+// debug-ok: closed validation rule names contain no rejected input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
 	Character,
@@ -120,7 +123,7 @@ fn characters(
 }
 
 /// The character policy, independent of UTF-8 decoding and multiline exceptions.
-pub(crate) fn rejects_code_point(cp: u32) -> bool {
+pub fn rejects_code_point(cp: u32) -> bool {
 	let Some(c) = char::from_u32(cp) else { return true };
 	matches!(
 		get_general_category(c),

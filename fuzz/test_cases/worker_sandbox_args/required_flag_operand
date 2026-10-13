@@ -1,0 +1,1 @@
+{"network":1,"hosts":["example.com"],"required":["--","--allow-host"],"program":"--","args":["--clearenv"],"env":[[0,"--unshare-net"]],"binds":[["--","--ro-bind"]]}

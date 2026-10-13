@@ -1,8 +1,9 @@
-//! Actual stream transport controls for syntax versus new field-policy failures.
+//! Stream transport controls for syntax versus field-policy failures.
 use super::*;
 
 fn context(workdir: &Path) -> McpSessionContext {
 	McpSessionContext {
+		security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		client: Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),

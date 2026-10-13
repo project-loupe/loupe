@@ -40,6 +40,44 @@ fixture!(database, Db);
 fixture!(configured, Config);
 fixture!(repository, Repo);
 
+#[allow(unsafe_code)]
+pub(crate) fn operator_ingress() -> Ingress<loupe_provenance::Operator> {
+	// SAFETY: explicit synthetic Operator authority confined to cfg(test).
+	unsafe { Ingress::new() }
+}
+
+pub(crate) fn operated<T>(
+	raw: &str, f: impl for<'a> FnOnce(&'a str, &Mark<'a, loupe_provenance::Operator>) -> T,
+) -> T {
+	Untrusted::new(raw, operator_ingress()).validate(Fixture(f, std::marker::PhantomData)).unwrap()
+}
+
+/// White-box lifecycle fixtures already own their transaction and intentionally
+/// seed malformed rows. This private cfg(test) adapter supplies their scope;
+/// authority tests exercise the two real Db issuers instead.
+pub(crate) fn scope(conn: &rusqlite::Connection, repo_id: i64) -> crate::scope::RepoScope<'_> {
+	use std::sync::atomic::AtomicBool;
+	use std::sync::{Arc, LazyLock};
+	static IDENTITY: LazyLock<Arc<crate::db::DbIdentity>> =
+		LazyLock::new(|| Arc::new(crate::db::DbIdentity));
+	static UNCOMMITTED: LazyLock<Arc<AtomicBool>> =
+		LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+	crate::scope::RepoScope {
+		conn,
+		repo_id,
+		identity: &IDENTITY,
+		operator: true,
+		committed: &UNCOMMITTED,
+	}
+}
+
+pub(crate) fn scoped<T>(
+	conn: &mut rusqlite::Connection, repo: i64,
+	body: impl FnOnce(&crate::scope::RepoScope<'_>) -> crate::Result<T>,
+) -> crate::Result<T> {
+	crate::transaction::immediate(conn, |tx| body(&scope(tx, repo)))
+}
+
 pub(crate) fn text<P: TextPolicy>(raw: &str) -> Result<BoundedText<P, Agent>, Error> {
 	agent(raw, |raw, mark| BoundedText::new(mark, raw))
 }

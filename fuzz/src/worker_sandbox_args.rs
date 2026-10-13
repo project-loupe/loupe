@@ -2,11 +2,11 @@
 //! Values resembling flags are compared in their operand positions, not counted
 //! as option tokens. Both the supervisor and bwrap `--` are part of the oracle.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use clap::builder::TypedValueParser;
-use loupe_worker::sandbox::{SandboxBuilder, SandboxNetworkConfig, SandboxNetworkMode};
+use loupe_worker::sandbox::fuzzing::{self, ProjectionInput, ProjectionRejection};
+use loupe_worker::sandbox::SandboxNetworkMode;
 use serde::Deserialize;
 
 use crate::utils::test_logger;
@@ -31,35 +31,31 @@ pub fn do_test(data: &[u8]) {
 		return;
 	}
 	let Ok(input) = serde_json::from_slice::<Input>(data) else { return };
-	let mut builder = SandboxBuilder::new(&input.workdir);
 	let mut expected: Vec<OsString> = Vec::new();
 	let network = input.network % 3;
+	let hosts = &input.hosts[..input.hosts.len().min(16)];
+	let required = &input.required[..input.required.len().min(16)];
+	let mode = match network {
+		1 => Some(SandboxNetworkMode::Allowlist),
+		2 => Some(SandboxNetworkMode::Public),
+		_ => None,
+	};
+	let rejection = if network == 0 {
+		None
+	} else if let Some(index) =
+		hosts.iter().position(|host| !crate::worker_client_ingress::oracle::text(host, false))
+	{
+		Some(ProjectionRejection::HostText(index))
+	} else if (network == 2 && !hosts.is_empty())
+		|| hosts.iter().any(|host| !crate::worker_network_host::allowed(host))
+	{
+		Some(ProjectionRejection::ConfigPolicy)
+	} else {
+		None
+	};
 	if network != 0 {
 		let mode =
 			if network == 1 { SandboxNetworkMode::Allowlist } else { SandboxNetworkMode::Public };
-		let allowlist =
-			input
-				.hosts
-				.iter()
-				.take(16)
-				.map(|host| {
-					let admitted = loupe_worker::config_value_parsers::ConfiguredTextParser
-						.parse_ref(&clap::Command::new("sandbox-fixture"), None, host.as_ref());
-					assert_eq!(
-						admitted.is_ok(),
-						crate::worker_client_ingress::oracle::text(host, false),
-						"actual Config host argument admission differs"
-					);
-					admitted.ok()
-				})
-				.collect::<Option<Vec<_>>>();
-		let Some(allowlist) = allowlist else { return };
-		builder = builder
-			.with_network(
-				SandboxNetworkConfig { mode, allowlist },
-				input.required.iter().take(16).cloned().collect(),
-			)
-			.with_network_supervisor("/trusted/worker");
 		add(&mut expected, &["/trusted/worker", "sandbox-exec", "--network", mode.as_str()]);
 		for host in input.required.iter().take(16) {
 			add(&mut expected, &["--required-host", host]);
@@ -131,11 +127,13 @@ pub fn do_test(data: &[u8]) {
 			&path,
 		],
 	);
+	let mut binds = Vec::new();
 	for (source, destination) in input.binds.iter().take(16) {
-		builder = builder.bind_ro(source, destination);
+		binds.push((PathBuf::from(source), OsString::from(destination)));
 		add(&mut expected, &["--ro-bind-try", source, destination]);
 	}
 	let fixture = tempfile::tempdir().unwrap_or_else(|_| panic!("create sandbox argv fixture"));
+	let mut selected_binary = None;
 	if !input.binary_name.is_empty()
 		&& input.binary_name.len() <= 32
 		&& input
@@ -162,9 +160,7 @@ pub fn do_test(data: &[u8]) {
 			std::fs::write(&entry, b"fixture").unwrap_or_else(|_| panic!("write binary fixture"));
 			(entry.clone(), bin_dir)
 		};
-		builder = builder
-			.allow_binary(&entry.to_string_lossy())
-			.unwrap_or_else(|_| panic!("allow fixture binary"));
+		selected_binary = Some(entry);
 		for bind in [entry_bind, install] {
 			expected.extend([
 				OsString::from("--ro-bind-try"),
@@ -175,19 +171,32 @@ pub fn do_test(data: &[u8]) {
 	}
 	add(&mut expected, &["--ro-bind", &input.workdir, "/workdir", "--chdir", "/home/scanner"]);
 	const NAMES: [&str; 4] = ["FUZZ_VALUE", "HOME", "TMPDIR", "PATH"];
+	let mut env = Vec::new();
 	for (index, value) in input.env.iter().take(16) {
 		let name = NAMES[usize::from(*index) % NAMES.len()];
-		builder = builder.set_env(name, value);
+		env.push((name, OsString::from(value)));
 		add(&mut expected, &["--setenv", name, value]);
 	}
 	add(&mut expected, &["--", &input.program]);
 	expected.extend(input.args.iter().take(16).map(OsString::from));
-	let command =
-		builder.build_with_args(&input.program, input.args.iter().take(16).map(String::as_str));
-	let actual: Vec<_> = std::iter::once(command.as_std().get_program())
-		.chain(command.as_std().get_args())
-		.map(OsString::from)
-		.collect();
+	let args: Vec<_> = input.args.iter().take(16).map(OsString::from).collect();
+	let observed = fuzzing::observe(ProjectionInput {
+		workdir: OsStr::new(&input.workdir),
+		program: OsStr::new(&input.program),
+		args: &args,
+		env: &env,
+		binds: &binds,
+		network: mode,
+		hosts,
+		required,
+		binary: selected_binary.as_deref().map(Path::as_os_str),
+	});
+	if let Some(rejection) = rejection {
+		assert_eq!(observed.err(), Some(rejection), "sandbox configuration admission differs");
+		return;
+	}
+	let actual =
+		observed.unwrap_or_else(|error| panic!("valid sandbox projection rejected: {error:?}"));
 	// std::process::Command marks a NUL-containing operand as invalid and
 	// exposes this placeholder via get_args(); it would refuse to spawn.
 	// Compare the projected representation without starting the command.
@@ -196,11 +205,8 @@ pub fn do_test(data: &[u8]) {
 			*value = "<string-with-nul>".into();
 		}
 	}
-	assert_eq!(actual, expected, "sandbox argv differs from golden option/operand sequence");
-	assert_eq!(
-		command.as_std().get_envs().collect::<Vec<_>>(),
-		vec![(std::ffi::OsStr::new("PATH"), Some(std::ffi::OsStr::new(&path)))]
-	);
+	assert_eq!(actual.argv, expected, "sandbox argv differs from golden option/operand sequence");
+	assert_eq!(actual.env, vec![(OsString::from("PATH"), Some(OsString::from(path)))]);
 }
 
 fn add(output: &mut Vec<OsString>, values: &[&str]) {

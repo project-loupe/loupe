@@ -45,8 +45,7 @@ impl<'view, S: Source> Mark<'view, S> {
 /// workspace build can name it. What keeps it to ingress is that it is
 /// an `unsafe fn`: the workspace denies `unsafe_code`, so every call
 /// needs an `#[allow(unsafe_code)]` that `ci/check.sh` accepts only in
-/// the files listed in `ci/unsafe-allow.txt`. See `PRACTICES.md`,
-/// practice P3.
+/// the files listed in `ci/unsafe-allow.txt`.
 pub struct Ingress<S: Source>(PhantomData<S>);
 
 impl<S: Source> Ingress<S> {
@@ -65,7 +64,7 @@ impl<S: Source> Ingress<S> {
 	/// call it for bytes they made up. Every call site carries
 	/// `#[allow(unsafe_code)]` and is listed with its reason in
 	/// `ci/unsafe-allow.txt`, so the compiler, not a text search, finds
-	/// them all (`PRACTICES.md`, practice P3).
+	/// them all.
 	#[cfg(any(feature = "ingress", test, kani))]
 	#[allow(clippy::new_without_default)] // one named constructor, on purpose
 	#[must_use]
@@ -325,6 +324,7 @@ pub struct Unvalidated<'a, T, S = Unlabelled>(&'a T, PhantomData<fn() -> S>);
 /// [`Validate`] impl gets: not a [`Source`], so nothing that needs one
 /// (relabelling with [`Unvalidated::carry`]) is available there.
 /// Uninhabited; it only ever appears as a type.
+// debug-ok: uninhabited marker has neither values nor content.
 #[derive(Debug, Clone, Copy)]
 pub enum Unlabelled {}
 

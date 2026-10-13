@@ -7,18 +7,18 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use loupe_core::text::policy::RevisionText;
-use loupe_core::text::BoundedText;
-use loupe_core::{Finding, ReportingDestination};
-use loupe_provenance::{Agent, Db};
-use loupe_storage::repos::RepoRow;
+use loupe_core::ReportingDestination;
+use loupe_storage::reports::{PreparedReport, SelectedCredential};
 
+#[cfg(test)]
+mod containment_tests;
 pub mod email;
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 pub mod github;
 pub mod github_app;
 mod ingress;
+pub mod render;
 pub use email::EmailReporter;
 pub use github::GithubReporter;
 #[cfg(fuzzing)]
@@ -26,42 +26,31 @@ pub(crate) use ingress::fuzz_support as ingress_fuzz;
 
 /// Result of a successful dispatch — opaque receipt the caller can stamp
 /// onto `findings.reported_at` (or scan_history) for audit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DispatchReceipt {
 	pub kind: &'static str,
 	pub external_id: Option<String>,
 }
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ReportFinding {
-	/// Stored finding ID, used to render the public `LUP-…` reference.
-	pub id: i64,
-	pub finding: Finding<Agent>,
-	pub reviewed_revision: Option<BoundedText<RevisionText, Db>>,
-}
-
-impl std::fmt::Debug for ReportFinding {
+impl std::fmt::Debug for DispatchReceipt {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("ReportFinding")
-			.field("id", &self.id)
-			.field("finding", &"[redacted]")
-			.field("reviewed_revision", &"[redacted]")
-			.finish()
+		f.write_str("DispatchReceipt([redacted])")
 	}
 }
 
+pub use loupe_storage::reports::ReportFinding;
+
 /// What the dispatcher resolved from the secrets table for one repo.
 /// Reporters that need no credential (email) ignore it.
-pub enum ReporterCredential {
+enum ReporterCredential<'a> {
 	None,
 	/// A personal access token stored for this repo.
-	GithubPat(loupe_provenance::Secret<Vec<u8>>),
+	GithubPat(&'a loupe_provenance::Secret<Vec<u8>>),
 	/// The server-wide GitHub App; the reporter mints a short-lived,
 	/// repo-scoped installation token from it per dispatch.
 	GithubApp(Box<github_app::GithubAppKey>),
 }
 
-impl std::fmt::Debug for ReporterCredential {
+impl std::fmt::Debug for ReporterCredential<'_> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::None => f.write_str("None"),
@@ -71,12 +60,29 @@ impl std::fmt::Debug for ReporterCredential {
 	}
 }
 
+/// Observe the production wrapper's redaction without exposing its constructor.
+#[cfg(fuzzing)]
+pub fn fuzz_github_pat_debug(secret: &loupe_provenance::Secret<Vec<u8>>) -> String {
+	format!("{:?}", ReporterCredential::GithubPat(secret))
+}
+
+impl<'a> ReporterCredential<'a> {
+	fn selected(batch: &'a PreparedReport) -> Result<Self> {
+		batch.check_committed()?;
+		Ok(match batch.credential() {
+			SelectedCredential::None => Self::None,
+			SelectedCredential::Pat(pat) => Self::GithubPat(pat),
+			SelectedCredential::App(stored) => Self::GithubApp(Box::new(
+				github_app::GithubAppKey::from_pem(stored.app_id, stored.private_key_pem.expose())?,
+			)),
+		})
+	}
+}
+
 #[async_trait::async_trait]
 pub trait Reporter: Send + Sync {
 	fn kind(&self) -> &'static str;
-	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[ReportFinding], credential: &ReporterCredential,
-	) -> Result<DispatchReceipt>;
+	async fn dispatch(&self, batch: &PreparedReport) -> Result<DispatchReceipt>;
 }
 
 /// Pick the right reporter for `repo.reporting`. Returns `None` for
@@ -85,9 +91,9 @@ pub trait Reporter: Send + Sync {
 /// build doesn't understand (forward compatibility — older builds
 /// shouldn't crash on a future variant).
 pub fn select(
-	repo: &RepoRow, github: Arc<GithubReporter>, email: Arc<EmailReporter>,
+	batch: &PreparedReport, github: Arc<GithubReporter>, email: Arc<EmailReporter>,
 ) -> Option<Arc<dyn Reporter>> {
-	match &repo.reporting {
+	match &batch.repository().reporting {
 		ReportingDestination::GithubIssue { .. } => Some(github),
 		ReportingDestination::Email { .. } => Some(email),
 		ReportingDestination::Manual => None,

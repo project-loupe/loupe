@@ -71,11 +71,11 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 			)?,
 			0
 		);
-		let scan = crate::transaction::immediate(conn, |tx| crate::scheduler::claim(tx, &crate::scheduler::ClaimRequest {
+		let scan = crate::transaction::immediate(conn, |tx| crate::scheduler::claim_raw(tx, &crate::scheduler::ClaimRequest {
 			worker_id:1,kinds:&[loupe_core::JobKind::<loupe_provenance::Db>::Scan],now:100,legacy_lease_seconds:600,capability_hash:&[0xa1;32],policy:&crate::scheduler::ClaimPolicy::default(),
 		}))?.unwrap().job;
 		assert_eq!(scan.id, 7);
-		let verify = crate::transaction::immediate(conn, |tx| crate::scheduler::claim(tx, &crate::scheduler::ClaimRequest {
+		let verify = crate::transaction::immediate(conn, |tx| crate::scheduler::claim_raw(tx, &crate::scheduler::ClaimRequest {
 			worker_id:1,kinds:&[loupe_core::JobKind::<loupe_provenance::Db>::Scan,loupe_core::JobKind::<loupe_provenance::Db>::Verify],now:100,legacy_lease_seconds:600,capability_hash:&[0xa2;32],policy:&crate::scheduler::ClaimPolicy::default(),
 		}))?.unwrap().job;
 		assert_eq!(verify.id, 8);
@@ -202,7 +202,7 @@ fn legacy_retry_conflicts_instead_of_tripping_the_active_verify_index() {
 	// The settled fixture holds a failed verify (job 6) and a queued verify
 	// (job 8) for finding 2; the migration admits that on purpose. Retrying
 	// job 6 must answer with the endpoint's usual Conflict, not surface the
-	// new partial unique index as an internal error.
+	// partial unique index as an internal error.
 	let mut conn = Connection::open_in_memory().unwrap();
 	settled(&mut conn);
 	apply_pending(&mut conn).unwrap();

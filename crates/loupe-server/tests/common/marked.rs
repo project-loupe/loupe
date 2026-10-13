@@ -1,6 +1,6 @@
 //! Fixed-source synthetic fixtures for direct typed APIs, never HTTP decoders.
 //!
-//! HTTP test requests use historical wire shapes and real server ingress.
+//! HTTP test requests use independent wire fixtures and real server ingress.
 //! Config inputs use the actual parser/read helpers in the parent module.
 use loupe_core::text::{BoundedJson, BoundedText, JsonPolicy, TextPolicy};
 use loupe_provenance::{Ingress, Mark, Untrusted, Unvalidated, Validate};
@@ -23,7 +23,7 @@ macro_rules! source_fixture {
 				}
 			}
 			#[allow(unsafe_code)]
-			fn fixture<T>(
+			pub(super) fn fixture<T>(
 				raw: &str, f: impl for<'a> FnOnce(&'a str, &Mark<'a, $source>) -> T,
 			) -> T {
 				// SAFETY: private integration-test synthetic bytes of this fixed source.
@@ -55,3 +55,16 @@ macro_rules! source_fixture {
 source_fixture!(agent, loupe_provenance::Agent);
 source_fixture!(repo, loupe_provenance::Repo);
 source_fixture!(operator, loupe_provenance::Operator);
+
+/// Synthetic authenticated Operator authority for direct integration fixtures.
+#[allow(unsafe_code)]
+pub fn operator_ingress() -> Ingress<loupe_provenance::Operator> {
+	// SAFETY: test-only authority for authored fixture setup and stored assertions.
+	unsafe { Ingress::new() }
+}
+
+pub fn scanner_config(raw: &str) -> loupe_core::ScannerDocument<loupe_provenance::Operator> {
+	operator::fixture(raw, |raw, mark| {
+		loupe_core::ScannerDocument::registered(mark, serde_json::from_str(raw).unwrap())
+	})
+}

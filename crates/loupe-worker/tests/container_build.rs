@@ -204,8 +204,8 @@ fn exported_script(dir: &Path) -> PathBuf {
 
 #[test]
 fn source_exports_default_their_image_tag_without_git() {
-	// Without LOUPE_IMAGE_TAG the script used to call git for the tag before
-	// the revision fallback could run, aborting every source-export build.
+	// A source export has no Git metadata; both the default tag and revision
+	// lookup must tolerate that when LOUPE_IMAGE_TAG is unset.
 	let scratch = tempfile::tempdir().unwrap();
 	let script = exported_script(scratch.path());
 	let engine = fake_engine(scratch.path());

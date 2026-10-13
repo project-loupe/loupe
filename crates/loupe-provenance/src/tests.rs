@@ -1,5 +1,4 @@
-//! Unit tests. Each test names the practice from `PRACTICES.md` that
-//! it checks.
+//! Unit tests for source labels, validation lifetimes and secret ownership.
 //!
 //! The compile-fail checks (no `Deref`, no `AsRef`, no construction
 //! without a token, `Unvalidated` cannot escape) are doc tests on the
@@ -43,6 +42,7 @@ fn wrap<S: Source>(bytes: &[u8]) -> Untrusted<Vec<u8>, S> {
 /// `Vec` (the owning path) so it works for any `AsRef<[u8]>` payload.
 struct LengthPrefixed;
 
+// debug-ok: test parser error contains only lengths and closed categories.
 #[derive(Debug, PartialEq, Eq)]
 enum ParseError {
 	Empty,
@@ -86,7 +86,6 @@ impl<'a, S: Source> Validate<&'a [u8], S> for FirstTwo {
 
 #[test]
 fn untrusted_debug_contains_no_payload_byte() {
-	// P1, P8
 	fn check<S: Source>() {
 		let u = wrap::<S>(PAYLOAD);
 		let out = format!("{u:?}");
@@ -111,7 +110,7 @@ fn untrusted_debug_contains_no_payload_byte() {
 
 #[test]
 fn untrusted_debug_does_not_need_the_payload_to_be_debug() {
-	// P1: the impl must not be a derive, which would require T: Debug
+	// A derived impl would require T: Debug
 	// and print it.
 	struct Opaque(#[allow(dead_code)] Vec<u8>);
 	let u = Untrusted::new(Opaque(PAYLOAD.to_vec()), minted_ingress::<Worker>());
@@ -120,7 +119,6 @@ fn untrusted_debug_does_not_need_the_payload_to_be_debug() {
 
 #[test]
 fn secret_debug_and_display_are_redacted() {
-	// P7, P8
 	let s = Secret::new(String::from("0123456789ABCXYZ"));
 	assert_eq!(format!("{s:?}"), "[redacted]");
 	assert_eq!(format!("{s}"), "[redacted]");
@@ -137,7 +135,7 @@ fn secret_debug_and_display_are_redacted() {
 
 #[test]
 fn len_and_is_empty_report_the_byte_length() {
-	// P6: len and is_empty are total and count bytes, for every
+	// len and is_empty are total and count bytes, for every
 	// AsRef<[u8]> payload including the empty one.
 	let v = wrap::<Worker>(PAYLOAD);
 	assert_eq!(v.len(), PAYLOAD.len());
@@ -159,7 +157,6 @@ fn len_and_is_empty_report_the_byte_length() {
 
 #[test]
 fn validate_runs_the_validator_and_returns_its_output() {
-	// P2
 	let u = wrap::<Worker>(b"\x03abc");
 	assert_eq!(u.validate(LengthPrefixed), Ok(b"abc".to_vec()));
 
@@ -169,7 +166,7 @@ fn validate_runs_the_validator_and_returns_its_output() {
 
 #[test]
 fn validate_returns_the_validators_error_unchanged() {
-	// P2, P6: the crate adds no error of its own and never panics on
+	// The crate adds no error of its own and never panics on
 	// what the validator rejects.
 	assert_eq!(wrap::<Worker>(b"").validate(LengthPrefixed), Err(ParseError::Empty));
 	assert_eq!(
@@ -181,7 +178,7 @@ fn validate_returns_the_validators_error_unchanged() {
 
 #[test]
 fn validate_can_return_a_value_borrowed_from_the_input() {
-	// P5: the borrowed output outlives the Untrusted wrapper that was
+	// The borrowed output outlives the Untrusted wrapper that was
 	// consumed, because it borrows the original buffer, not the view.
 	let buffer: Vec<u8> = b"xyz".to_vec();
 	let out: &[u8] = {
@@ -193,7 +190,6 @@ fn validate_can_return_a_value_borrowed_from_the_input() {
 
 #[test]
 fn map_ref_reslices_without_unwrapping_and_keeps_the_source() {
-	// P2, P4
 	let owned = wrap::<Provider>(b"\x03abcTRAILING");
 	let view: Untrusted<&[u8], Provider> = owned.map_ref(|v| v.get(..4).unwrap_or(&[]));
 	assert_eq!(view.len(), 4);
@@ -213,7 +209,7 @@ fn map_ref_reslices_without_unwrapping_and_keeps_the_source() {
 
 #[test]
 fn as_bytes_and_split_at_reslice_without_a_closure() {
-	// P2: the closed helpers carry the source and never panic; a
+	// The closed helpers carry the source and never panic; a
 	// split past the end is `None`, not a panic.
 	let owned = wrap::<Sandbox>(b"\x02abTAIL");
 	let view: Untrusted<&[u8], Sandbox> = owned.as_bytes();
@@ -234,7 +230,7 @@ fn as_bytes_and_split_at_reslice_without_a_closure() {
 
 #[test]
 fn framing_loop_keeps_the_input_lifetime() {
-	// P5: parsers return values borrowed from the input. Several
+	// Parsers return values borrowed from the input. Several
 	// frames parsed from one buffer all borrow the buffer, not the
 	// view, so they outlive the loop's views.
 	fn frames(buffer: &Untrusted<Vec<u8>, Worker>) -> Result<Vec<&[u8]>, ParseError> {
@@ -283,7 +279,7 @@ fn untrusted_secret_zeroises_without_exposing() {
 
 #[test]
 fn clone_of_untrusted_is_still_untrusted() {
-	// P1: Clone exists for moving values around; it yields the same
+	// Clone exists for moving values around; it yields the same
 	// opaque type, never the payload.
 	let u = wrap::<Agent>(PAYLOAD);
 	let c: Untrusted<Vec<u8>, Agent> = u.clone();
@@ -293,7 +289,6 @@ fn clone_of_untrusted_is_still_untrusted() {
 
 #[test]
 fn source_names_are_the_eleven_sources_and_distinct() {
-	// P4
 	let names = [
 		Agent::NAME,
 		Repo::NAME,
@@ -335,7 +330,7 @@ fn untrusted_is_send_and_sync_when_the_payload_is() {
 
 #[test]
 fn secret_expose_returns_the_value() {
-	// P7: expose returns the wrapped value. That it is the only way is
+	// expose returns the wrapped value. That it is the only way is
 	// proven by the compile_fail doc tests on `Secret`.
 	let s = Secret::new(String::from("hunter2"));
 	assert_eq!(s.expose(), "hunter2");
@@ -361,7 +356,6 @@ impl Zeroise for Borrowed<'_> {
 
 #[test]
 fn secret_drop_zeroises_the_bytes_it_owns() {
-	// P9, P10
 	let mut buffer = [0xAAu8; 24];
 	{
 		let secret = Secret::new(Borrowed(&mut buffer));
@@ -378,7 +372,6 @@ fn secret_drop_zeroises_the_bytes_it_owns() {
 
 #[test]
 fn zeroise_covers_array_slice_vec_string_and_box() {
-	// P9, P10
 	let mut arr = [0xFFu8; 16];
 	arr.zeroise();
 	assert_eq!(arr, [0; 16]);
@@ -404,7 +397,6 @@ fn zeroise_covers_array_slice_vec_string_and_box() {
 
 #[test]
 fn zeroise_of_empty_values_does_nothing_and_does_not_panic() {
-	// P6
 	let mut arr: [u8; 0] = [];
 	arr.zeroise();
 	let mut v: Vec<u8> = Vec::new();
@@ -422,7 +414,7 @@ fn zeroise_of_empty_values_does_nothing_and_does_not_panic() {
 
 #[test]
 fn vec_and_string_zeroise_keep_their_capacity() {
-	// P10: the whole allocation is wiped in place, not freed and
+	// The whole allocation is wiped in place, not freed and
 	// replaced; the capacity staying put is the observable sign that
 	// the same buffer was written.
 	let mut v = Vec::with_capacity(64);
@@ -442,7 +434,7 @@ fn vec_and_string_zeroise_keep_their_capacity() {
 
 #[test]
 fn ingress_token_is_a_copyable_zero_sized_marker() {
-	// P3: an ingress module keeps one token and reuses it; the token
+	// An ingress module keeps one token and reuses it; the token
 	// carries no data, only the right to construct.
 	let token = minted_ingress::<Worker>();
 	let a = Untrusted::new(vec![1u8], token);
@@ -458,7 +450,7 @@ fn ingress_token_is_a_copyable_zero_sized_marker() {
 
 #[test]
 fn to_vec_keeps_the_source_and_the_bytes() {
-	// P13: an owned copy of a view is still labelled and still unread.
+	// An owned copy of a view is still labelled and still unread.
 	let owned = wrap::<Worker>(b"\x02ab");
 	let copy: Untrusted<Vec<u8>, Worker> = owned.as_bytes().to_vec();
 	assert_eq!(copy.len(), 3);
@@ -515,7 +507,7 @@ impl<S: Source> Validate<&[u8], S> for Copied {
 
 #[test]
 fn carry_relabels_a_sub_slice_to_agent() {
-	// P13: Worker, Sandbox, Db and Server bytes may be carried on as Agent.
+	// Worker, Sandbox, Db and Server bytes may be carried on as Agent.
 	assert_eq!(carried::<Worker>(b"\x02abc"), Ok(b"ab".to_vec()));
 	assert_eq!(carried::<Worker>(b"\x00"), Ok(Vec::new()));
 	assert_eq!(carried::<Sandbox>(b"\x02abc"), Ok(b"ab".to_vec()));
@@ -526,7 +518,7 @@ fn carry_relabels_a_sub_slice_to_agent() {
 
 #[test]
 fn carry_out_of_range_is_none() {
-	// P6, P13: a range past the end or reversed is refused, no panic.
+	// A range past the end or reversed is refused, without panicking.
 	assert_eq!(carried::<Worker>(b"\x05ab"), Err(ParseError::Short { want: 5, have: 2 }));
 	struct Reversed;
 	impl<'a> ValidateCarrying<&'a [u8], Worker> for Reversed {
@@ -542,7 +534,7 @@ fn carry_out_of_range_is_none() {
 
 #[test]
 fn receive_buffer_operations_keep_the_label() {
-	// P13: a receive buffer that grows, splits and drops its front
+	// A receive buffer can grow, split and drop its front
 	// without its bytes leaving the label.
 	let mut buf = Untrusted::new(Vec::new(), minted_ingress::<Sandbox>());
 	assert!(buf.is_empty());
@@ -588,7 +580,7 @@ impl<T: AsRef<[u8]>, S: Source> Validate<T, S> for TextFields {
 
 #[test]
 fn plain_marks_construct_owned_outputs_of_the_actual_source() {
-	// P3, P4, P5: both outputs own their bytes and outlive the validation call.
+	// Both outputs own their bytes and outlive the validation call.
 	fn check<S: Source>(bytes: &[u8]) {
 		let (first, second): (CheckedText<S>, CheckedText<S>) =
 			wrap::<S>(bytes).validate(TextFields).expect("valid UTF-8 fixture");
@@ -604,7 +596,7 @@ fn plain_marks_construct_owned_outputs_of_the_actual_source() {
 
 #[test]
 fn carrying_marks_keep_the_source_and_nested_validation_uses_agent() {
-	// P4, P5, P13: the carrying mark is Worker; only the carried span is Agent.
+	// The carrying mark is Worker; only the carried span is Agent.
 	struct Record;
 	impl<'a> ValidateCarrying<&'a [u8], Worker> for Record {
 		type Output = (CheckedText<Worker>, Untrusted<Vec<u8>, Agent>);
@@ -627,8 +619,7 @@ fn carrying_marks_keep_the_source_and_nested_validation_uses_agent() {
 	assert_eq!(second.text, first.text);
 }
 
-/// Labelled input for this test. Minting is a security contract
-/// (practice P3), so the constructor is `unsafe`.
+/// Labelled input for this test. Only synthetic fixture bytes may be minted.
 #[allow(unsafe_code)]
 fn minted_ingress<S: crate::Source>() -> crate::Ingress<S> {
 	// SAFETY: test fixture: the label marks bytes this test made up; no

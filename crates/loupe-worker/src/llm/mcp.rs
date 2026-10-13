@@ -4,7 +4,9 @@
 //! The trusted worker process retains the server client, mTLS key,
 //! job capability, repository id, and job id.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,17 +36,17 @@ const BROKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct McpContext {
-	pub worker_binary: PathBuf,
+	pub worker_binary: crate::sandbox::SandboxPath,
 	pub client: Arc<ServerClient>,
-	pub bkb_mcp_path: Option<PathBuf>,
-	pub bkb_api_url: crate::config::ConfiguredText,
+	pub bkb_mcp_path: Option<crate::sandbox::SandboxPath>,
+	pub bkb_api_url: crate::config::ConfigNonSecret,
 }
 
 /// One invocation's trusted broker. Dropping it aborts an unclaimed
 /// socket listener; `finish` releases an unclaimed listener and waits
 /// for verify-session flushing on a claimed one.
 pub struct McpBroker {
-	dir: tempfile::TempDir,
+	dir: Arc<tempfile::TempDir>,
 	task: Option<JoinHandle<Result<()>>>,
 	/// Releases the listener when the agent exited without ever
 	/// connecting. Signalled only from `finish`, and only observed
@@ -63,6 +65,7 @@ impl McpBroker {
 		let job_id = request.job_id;
 		let finding_id = request.finding_id;
 		let tool_boundary = request.tool_boundary;
+		let security = request.security.clone();
 		if finding_id.is_some() && job_id.is_none() {
 			anyhow::bail!("verify-mode MCP broker requires both finding_id and job_id");
 		}
@@ -94,6 +97,7 @@ impl McpBroker {
 			let (read, write) = stream.into_split();
 			crate::mcp::run_stream_server(
 				crate::mcp::McpSessionContext {
+					security,
 					tool_boundary,
 					client,
 					job_capability,
@@ -107,7 +111,7 @@ impl McpBroker {
 			)
 			.await
 		});
-		Ok(Self { dir, task: Some(task), shutdown })
+		Ok(Self { dir: Arc::new(dir), task: Some(task), shutdown })
 	}
 
 	pub fn sandbox_args(&self) -> Vec<String> {
@@ -117,6 +121,9 @@ impl McpBroker {
 	pub fn host_dir(&self) -> &Path {
 		self.dir.path()
 	}
+	pub(crate) fn mount_owner(&self) -> Arc<tempfile::TempDir> {
+		self.dir.clone()
+	}
 
 	/// Wait for the session to drain. Call this on every path out of an
 	/// agent invocation, including failure and timeout: the broker
@@ -124,6 +131,10 @@ impl McpBroker {
 	/// verdict still reaches the server even when the CLI itself died.
 	pub async fn finish(mut self) -> Result<()> {
 		self.shutdown.cancel();
+		#[allow(
+			clippy::expect_used,
+			reason = "Consuming finish owns the sole task slot; only finish or Drop can take it."
+		)]
 		let mut task = self.task.take().expect("broker task is present until finish");
 		match tokio::time::timeout(BROKER_SHUTDOWN_TIMEOUT, &mut task).await {
 			Ok(result) => {
@@ -155,7 +166,7 @@ pub fn bind_mcp_into_sandbox(
 ) -> SandboxBuilder {
 	let mut sandbox = sandbox
 		.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN)
-		.bind_ro(broker.host_dir(), SANDBOX_MCP_DIR);
+		.bind_ro(crate::sandbox::SandboxPath::mcp_broker(broker), SANDBOX_MCP_DIR);
 	if let Some(bkb_path) = &ctx.bkb_mcp_path {
 		sandbox = sandbox.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
 	}
@@ -172,20 +183,22 @@ mod tests {
 
 	fn test_context() -> McpContext {
 		McpContext {
-			worker_binary: "/usr/bin/true".into(),
+			worker_binary: crate::sandbox::SandboxPath::fixture("/usr/bin/true".into()),
 			client: Arc::new(ServerClient::from_parts(
 				reqwest::Client::new(),
 				"https://loupe-server:8443".parse().unwrap(),
 			)),
 			bkb_mcp_path: None,
-			bkb_api_url: crate::config::ConfiguredText::Builtin(DEFAULT_BKB_API_URL),
+			bkb_api_url: crate::config::SandboxLaunchConfig::default().bkb_api_url().clone(),
 		}
 	}
 
 	fn test_request() -> LlmRequest {
 		LlmRequest {
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
+			sandbox_workdir: crate::sandbox::SandboxPath::fixture(PathBuf::from("/tmp")),
 			workdir: PathBuf::from("/tmp"),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -273,14 +286,95 @@ mod tests {
 	#[test]
 	fn mcp_bind_adds_no_loupe_credentials() {
 		let dir = tempfile::tempdir().unwrap();
-		let broker = McpBroker { dir, task: None, shutdown: CancellationToken::new() };
+		let broker =
+			McpBroker { dir: Arc::new(dir), task: None, shutdown: CancellationToken::new() };
 		let ctx = test_context();
-		let cmd =
-			bind_mcp_into_sandbox(SandboxBuilder::new("/tmp"), &ctx, &broker).build("/bin/true");
+		let cmd = bind_mcp_into_sandbox(SandboxBuilder::fixture("/tmp"), &ctx, &broker)
+			.build_fixture("/bin/true");
 		let rendered = format!("{:?}", cmd.as_std());
 		assert!(!rendered.contains("worker.key"), "private key leaked into sandbox: {rendered}");
 		assert!(!rendered.contains("worker.pem"), "worker certificate leaked: {rendered}");
 		assert!(!rendered.contains("loupe-server:8443"), "server endpoint leaked: {rendered}");
 		assert!(!rendered.contains("LOUPE_WORKER_"), "worker credentials leaked: {rendered}");
+	}
+
+	async fn wait_for_source_descriptor(path: &Path, open: bool) -> bool {
+		tokio::time::timeout(Duration::from_secs(1), async {
+			loop {
+				let observed = std::fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+					entry.ok().and_then(|entry| std::fs::read_link(entry.path()).ok()).as_deref()
+						== Some(path)
+				});
+				if observed == open {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(2)).await;
+			}
+		})
+		.await
+		.is_ok()
+	}
+
+	async fn active_citation_stops_with_broker(deadline: bool) {
+		let workdir = tempfile::tempdir().unwrap();
+		let path = workdir.path().join("source.rs");
+		{
+			use std::io::Write;
+			let mut source = std::fs::File::create(&path).unwrap();
+			source.write_all(b"fn vulnerable() {}\n").unwrap();
+			// A private sparse regular file keeps the actual streaming traversal
+			// active without allocating its logical size. Close this writer before
+			// observing the descriptor opened by the MCP citation validator.
+			source.set_len(16 * 1024 * 1024 * 1024).unwrap();
+		}
+		let mut request = test_request();
+		request.workdir = workdir.path().to_owned();
+		request.sandbox_workdir = crate::sandbox::SandboxPath::fixture(request.workdir.clone());
+		let broker = McpBroker::start_for_request(&test_context(), &request).await.unwrap();
+		let mut client = UnixStream::connect(broker.host_dir().join("session.sock")).await.unwrap();
+		let input = format!(
+			"{}\n",
+			serde_json::json!({
+				"jsonrpc": "2.0", "id": 81, "method": "tools/call",
+				"params": {"name": "submit_finding", "arguments": {
+					"protocol_version": 1,
+					"severity": "high", "title": "Unchecked operation terminates the service",
+					"description": "An attacker-controlled request reaches this operation without validation and terminates the service.\n```rust\nfn vulnerable() {}\n```",
+					"file": "source.rs", "line_start": 1, "line_end": 1,
+					"poc_unified": "--- /dev/null\n+++ b/regression.rs\n@@ -0,0 +1 @@\n+#[test] fn demonstrates_failure() {}\n"
+				}}
+			})
+		);
+		client.write_all(input.as_bytes()).await.unwrap();
+		let opened = wait_for_source_descriptor(&path, true).await;
+		if deadline {
+			let error = broker.finish().await.expect_err("active citation must hit the deadline");
+			assert!(error.to_string().contains("timed out"));
+		} else {
+			drop(broker);
+		}
+		let closed = wait_for_source_descriptor(&path, false).await;
+		let shared_cancelled = request.security.cancellation().is_cancelled();
+		let quarantined = request.security.is_quarantined();
+		// Stop any retained scan before asserting; detached blocking work can
+		// otherwise delay runtime shutdown.
+		if !closed {
+			request.security.cancellation().cancel();
+			assert!(wait_for_source_descriptor(&path, false).await, "cleanup did not stop scan");
+		}
+		assert!(opened, "actual MCP citation traversal never opened its source");
+		assert!(!shared_cancelled, "ending one citation operation cancelled shared job security");
+		assert!(!quarantined, "ending one citation operation quarantined the job");
+		assert!(closed, "forced broker shutdown left the active citation source descriptor open");
+	}
+
+	#[tokio::test]
+	async fn broker_drop_stops_active_citation_traversal() {
+		active_citation_stops_with_broker(false).await;
+	}
+
+	#[tokio::test]
+	async fn broker_deadline_stops_active_citation_traversal() {
+		active_citation_stops_with_broker(true).await;
 	}
 }

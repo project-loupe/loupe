@@ -1,4 +1,18 @@
 #![deny(unsafe_code)]
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 //! `loupe-server` library surface.
 //!
 //! Exposed for integration tests; the binary in `main.rs` is a thin

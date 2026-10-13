@@ -1,10 +1,11 @@
-//! Exact observations from the final typed Worker request owners.
+//! Exact observations from typed Worker request owners.
 use loupe_provenance::{Ingress, Untrusted};
 use serde_json::{json, Value};
 
 use super::*;
 use crate::fuzz_support::{error, CarriedSpan, Decoded};
 
+// debug-ok: closed request-kind discriminants contain no fuzz input bytes.
 #[derive(Clone, Copy, Debug)]
 pub enum WorkerRequest {
 	Heartbeat,
@@ -15,9 +16,9 @@ pub enum WorkerRequest {
 	Lease,
 }
 
-/// Concrete final DTOs produced by the same named Worker decoders. This lets
+/// Concrete DTOs produced by the same named Worker decoders. This lets
 /// the DTO harness exercise their real Serialize implementations without
-/// restoring a normal-build Deserialize or choosing a source parameter.
+/// exposing a normal-build Deserialize or choosing a source parameter.
 pub enum WorkerValue {
 	Lease(loupe_proto::LeaseRequest<Worker>),
 	Complete(loupe_proto::CompleteRequest<Worker, Worker>),

@@ -23,6 +23,8 @@ impl FuzzSession {
 		mode: crate::llm::prompt::DataMode,
 	) -> Self {
 		Self(Arc::new(Session {
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap_or_else(|_| panic!("fuzz job security fixture")),
 			tool_boundary: crate::llm::prompt::JobToolBoundary::from_test_bytes([0x11; 16]),
 			data_mode: mode,
 			client,
@@ -67,6 +69,7 @@ pub fn fingerprint(workdir: &Path, file: &str, start: u32, end: u32) -> String {
 	fingerprint_for(workdir, file, start, end).for_submission().to_owned()
 }
 
+// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 #[derive(Debug)]
 pub struct FindingObservation {
 	pub file_path: String,
@@ -75,7 +78,7 @@ pub struct FindingObservation {
 	pub fingerprint: String,
 }
 /// Original MCP admission and mixed-source submission construction, before
-/// the final strict protocol validator. No temporary projection remains.
+/// the strict protocol validator.
 pub fn finding(workdir: &Path, args: &Value) -> Result<FindingObservation> {
 	let finding = ingress::fuzz_support::finding_fixture(workdir, args)?;
 	Ok(FindingObservation {

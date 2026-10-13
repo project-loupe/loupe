@@ -22,6 +22,7 @@ use crate::secret::{export_key, RcgenKey};
 /// let bundle = ca.mint_client("test-client").unwrap();
 /// let duplicated = bundle.clone();
 /// ```
+// debug-ok: certificate is public; private key delegates to Secret redaction.
 #[derive(Debug)]
 pub struct CertBundle {
 	pub cert_pem: String,
@@ -31,8 +32,7 @@ pub struct CertBundle {
 /// In-memory certificate authority used to mint client and server certs.
 ///
 /// `Ca::new` generates a fresh self-signed CA. `Ca::from_pem` rebuilds
-/// one from previously persisted PEM (the server reloads its CA from the
-/// envelope-encrypted `secrets` row on startup).
+/// one from persisted or configured PEM.
 pub struct Ca {
 	cert: rcgen::Certificate,
 	key: RcgenKey,

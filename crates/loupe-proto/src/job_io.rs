@@ -7,12 +7,14 @@ use loupe_provenance::Source;
 use serde::{Deserialize, Serialize};
 
 /// Body of `POST /v1/jobs/:id/heartbeat` (worker, lease holder).
+// debug-ok: heartbeat request contains only a numeric protocol version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
 	pub protocol_version: u16,
 }
 
 /// Response body of `POST /v1/jobs/:id/heartbeat`.
+// debug-ok: heartbeat response contains only protocol and numeric expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
 	pub protocol_version: u16,
@@ -75,7 +77,7 @@ pub fn validate_llm_finding_submission<S: Source>(
 
 /// Borrowed strict-submission checks shared by the server DTO and the worker's
 /// mixed-source submission. The independently computed fingerprint is checked
-/// only for its existing hexadecimal shape; this view neither labels nor owns
+/// only for its hexadecimal shape; this view neither labels nor owns
 /// it and is not a serialization or raw-content construction API.
 pub struct LlmFindingValidation<'a, S: Source> {
 	pub title: &'a BoundedText<FindingTitle, S>,
@@ -162,7 +164,7 @@ fn validate_llm_poc(poc: &str) -> Result<(), String> {
 		if in_hunk
 			&& line.starts_with('+')
 			&& !line.starts_with("+++")
-			&& !line[1..].trim().is_empty()
+			&& line.strip_prefix('+').is_some_and(|added| !added.trim().is_empty())
 		{
 			has_substantive_addition = true;
 		}
@@ -175,9 +177,8 @@ fn validate_llm_poc(poc: &str) -> Result<(), String> {
 	Ok(())
 }
 
-/// Body of `POST /v1/jobs/:id/verdict` (worker, verify-kind only). One
-/// verdict per verify job — that's the entire reason to split the
-/// endpoint from `findings`.
+/// Body of `POST /v1/jobs/:id/verdict` (worker, verify-kind only).
+/// Each verify job submits one verdict.
 #[derive(Serialize)]
 #[serde(bound(serialize = ""))]
 pub struct VerdictSubmission<S: Source> {
@@ -199,6 +200,7 @@ pub struct CompleteRequest<RevisionS: Source, DiagnosticS: Source> {
 }
 record_impls!(CompleteRequest<RevisionS, DiagnosticS> { protocol_version, outcome, head_sha, error });
 
+// debug-ok: completion is a closed enum of unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompleteOutcome {
@@ -356,9 +358,8 @@ mod tests {
 
 	#[test]
 	fn strict_llm_submission_requires_headers_before_the_first_hunk() {
-		// A unified diff carries its ---/+++ headers ahead of the first
-		// hunk. Accepting them anywhere let hunk-body text that merely
-		// looks like a header stand in for the real thing.
+		// Header-like hunk content cannot substitute for the ---/+++ headers
+		// required ahead of the first hunk.
 		let mut finding = valid_llm_submission();
 		finding.poc_unified =
 			text("@@ -1,1 +1,2 @@\n--- not a header\n+++ also not a header\n+real addition\n");

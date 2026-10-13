@@ -5,6 +5,7 @@ use crate::text::json::CheckedJson;
 use crate::text::policy::{Payload, RevisionText};
 use crate::text::{BoundedJson, BoundedText, Error};
 
+// debug-ok: closed trigger categories contain no request content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FollowUpTrigger {
 	Manual,
@@ -24,6 +25,7 @@ impl FollowUpTrigger {
 		}
 	}
 }
+// debug-ok: closed review intent unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewIntent {
 	FullReview,
@@ -39,7 +41,7 @@ impl ReviewIntent {
 }
 
 /// Prior database content and the current request remain distinct owners.
-/// Canonicalization preserves the historical Payload policy, including its
+/// Canonicalization applies the Payload policy, including its
 /// semantic string normalization, limits, and unknown trigger entries.
 pub struct PendingFollowUp<'a, S: Source> {
 	_previous: Option<&'a BoundedJson<Payload, Db>>,

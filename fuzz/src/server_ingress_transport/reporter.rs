@@ -2,10 +2,10 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use loupe_provenance::Secret;
 use loupe_server::reporters::github_app::{GithubAppKey, InstallationTokens};
-use loupe_server::reporters::{GithubReporter, ReportFinding, Reporter, ReporterCredential};
-use loupe_storage::repos::RepoRow;
+use loupe_server::reporters::{GithubReporter, Reporter};
+use loupe_storage::reports::PreparedReport;
+use loupe_storage::Db;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 const ORDINARY: usize = 16 * 1024 * 1024;
@@ -16,18 +16,17 @@ fn key() -> GithubAppKey {
 		.unwrap_or_else(|error| panic!("fixture app key: {error}"))
 }
 
-fn report() -> (RepoRow, ReportFinding) {
-	let repo = crate::server_common::repo_with_reporting(serde_json::json!({
-		"kind":"github_issue", "target_owner":"example", "target_repo":"repo", "pat_secret_id":null
-	}))
-	.unwrap_or_else(|e| panic!("reporter repository: {e}"));
-	let finding = ReportFinding {
-		id: 1,
-		reviewed_revision: None,
-		finding: crate::server_common::finding(br#"{"scanner_id":"fixture","severity":"high","title":"title","description":"description","fingerprint":"fixture"}"#)
-			.unwrap_or_else(|| panic!("reporter finding admission")),
-	};
-	(repo, finding)
+fn report(app: bool) -> (Db, Box<PreparedReport>) {
+	let finding = crate::server_common::finding(br#"{"scanner_id":"fixture","severity":"high","title":"title","description":"description","fingerprint":"fixture"}"#)
+		.unwrap_or_else(|| panic!("reporter finding admission"));
+	crate::server_common::prepared_report(
+		serde_json::json!({
+			"kind":"github_issue", "target_owner":"example", "target_repo":"repo", "pat_secret_id":null
+		}),
+		&finding,
+		app,
+	)
+	.unwrap_or_else(|e| panic!("reporter preparation: {e}"))
 }
 
 fn prefix(stage: usize, body: u8) -> &'static [u8] {
@@ -227,13 +226,8 @@ pub(super) fn run(data: &[u8]) {
 						token.expose().to_owned()
 					})
 			} else {
-				let credential = if app {
-					ReporterCredential::GithubApp(Box::new(key()))
-				} else {
-					ReporterCredential::GithubPat(Secret::new(b"fake-test-pat".to_vec()))
-				};
-				let (repo, finding) = report();
-				reporter.dispatch(&repo, &[finding], &credential).await.map(|receipt| {
+				let (_db, batch) = report(app);
+				reporter.dispatch(&batch).await.map(|receipt| {
 					assert_eq!(receipt.kind, "github_issue");
 					receipt.external_id.unwrap_or_default()
 				})

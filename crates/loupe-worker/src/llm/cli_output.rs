@@ -24,6 +24,11 @@ impl std::fmt::Debug for CliOutputText {
 	}
 }
 impl CliOutputText {
+	pub fn char_count(&self) -> usize {
+		self.0.chars().count()
+	}
+	/// Synthetic and integration assertions only; production has no text sink.
+	#[cfg(any(test, feature = "test-support"))]
 	pub fn for_log(&self) -> &str {
 		&self.0
 	}
@@ -58,18 +63,33 @@ impl std::fmt::Debug for CliFailureDiagnostic {
 	}
 }
 
+// debug-ok: fixed backend/status plus explicitly redacted stream owners.
 #[derive(Debug)]
 pub(crate) struct CliProcessFailure {
 	pub backend: &'static str,
 	pub status: std::process::ExitStatus,
 	pub stderr: CliFailureDiagnostic,
 	pub stdout: CliFailureDiagnostic,
+	#[cfg(test)]
 	pub max_chars: usize,
 }
 impl std::fmt::Display for CliProcessFailure {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(
 			f,
+			"{} CLI exited with {}: stderr(chars={})=[redacted] stdout(chars={})=[redacted]",
+			self.backend,
+			self.status,
+			self.stderr.0.chars().count(),
+			self.stdout.0.chars().count()
+		)
+	}
+}
+#[cfg(test)]
+impl CliProcessFailure {
+	/// Preserve exact bounded head/tail assertions without opening a host log sink.
+	pub(crate) fn test_diagnostic(&self) -> String {
+		format!(
 			"{} CLI exited with {}: stderr(chars={})=`{}` stdout(chars={})=`{}`",
 			self.backend,
 			self.status,
@@ -82,6 +102,7 @@ impl std::fmt::Display for CliProcessFailure {
 }
 impl std::error::Error for CliProcessFailure {}
 impl CliFailureDiagnostic {
+	#[cfg(test)]
 	pub(crate) fn for_log(&self) -> &str {
 		&self.0
 	}
@@ -99,9 +120,6 @@ impl Validate<&[u8], Sandbox> for CliFailureDecoder {
 impl CapturedOutput {
 	pub(crate) fn len(&self) -> usize {
 		self.bytes.len()
-	}
-	pub(crate) fn is_empty(&self) -> bool {
-		self.bytes.is_empty()
 	}
 	pub(crate) fn text(&self) -> Result<CliOutputText, std::str::Utf8Error> {
 		self.bytes.as_bytes().validate(CliOutputDecoder)
@@ -210,4 +228,23 @@ mod tests {
 		assert_eq!(bytes[..half], input[..half]);
 		assert_eq!(bytes[half..], input[input.len() - half..]);
 	}
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn public_cli_failure_chain_does_not_disclose_captured_streams() {
+	use std::os::unix::process::ExitStatusExt;
+	let captured = collect_cli_output(b"captured-private-error-sentinel".as_slice()).await.unwrap();
+	let failure = CliProcessFailure {
+		backend: "fixture",
+		status: std::process::ExitStatus::from_raw(256),
+		stderr: captured.diagnostic(),
+		stdout: captured.diagnostic(),
+		max_chars: 2000,
+	};
+	let error = anyhow::Error::new(failure).context("CLI failed");
+	assert!(
+		!format!("{error:#}").contains("captured-private-error-sentinel"),
+		"captured sandbox bytes must not reach the public error chain"
+	);
 }

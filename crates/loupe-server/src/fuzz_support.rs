@@ -14,6 +14,7 @@ pub use crate::ingress::registry::fuzz::{
 
 pub type Decoded = Result<serde_json::Value, (u16, String)>;
 
+// debug-ok: fuzz observations contain a fixed schema field name and numeric byte offsets.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CarriedSpan {
 	pub field: &'static str,
@@ -57,7 +58,7 @@ pub use crate::reporters::ingress_fuzz::{
 	label as reporter_label,
 };
 
-/// Historical pure clone-URL grammar fixture. Actual Operator coverage is
+/// Pure clone-URL grammar fixture. Actual Operator coverage is
 /// `operator_request(RegisterRepo, ..)`; this observation creates no labelled value.
 pub fn legacy_clone_url(url: &str) -> Option<(String, String, String)> {
 	crate::routes::repos::parse_github_clone_url(url)

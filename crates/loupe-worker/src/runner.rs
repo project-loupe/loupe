@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use loupe_core::security_event::Operation;
 use loupe_core::text::policy::RevisionText;
 use loupe_core::text::BoundedText;
 use loupe_proto::{
@@ -37,6 +38,31 @@ const LEASE_WAIT_SECONDS: u32 = 25;
 /// per-repo default. The runner fails the job rather than fill the
 /// worker host. Operators can override per-runner.
 pub const DEFAULT_MAX_WORKDIR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Successful repository checkout, retained independently of each scanner task.
+/// Its constructor is private to the actual checkout owner below.
+#[derive(Clone)]
+pub struct CheckedOutWorktree {
+	directory: Arc<tempfile::TempDir>,
+	pin: Option<Arc<crate::repo_cache::PinGuard>>,
+}
+impl std::fmt::Debug for CheckedOutWorktree {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("CheckedOutWorktree([redacted])")
+	}
+}
+impl CheckedOutWorktree {
+	pub fn path(&self) -> &Path {
+		self.directory.path()
+	}
+	fn pinned(mut self, pin: crate::repo_cache::PinGuard) -> Self {
+		self.pin = Some(Arc::new(pin));
+		self
+	}
+	pub fn sandbox_path(&self) -> crate::sandbox::SandboxPath {
+		crate::sandbox::SandboxPath::checkout(self)
+	}
+}
 
 #[derive(serde::Serialize)]
 #[serde(untagged)]
@@ -69,6 +95,7 @@ pub struct Runner {
 	scanners: Vec<Arc<dyn Scanner>>,
 	capabilities: Vec<&'static str>,
 	max_workdir_bytes: u64,
+	credential_watches: Vec<crate::llm::model_broker::CredentialWatch>,
 }
 
 impl Runner {
@@ -77,7 +104,20 @@ impl Runner {
 	) -> Self {
 		let capabilities: Vec<&'static str> =
 			scanners.iter().flat_map(|s| s.capabilities().iter().copied()).collect();
-		Self { client, cache, scanners, capabilities, max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES }
+		Self {
+			client,
+			cache,
+			scanners,
+			capabilities,
+			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
+			credential_watches: Vec::new(),
+		}
+	}
+	pub fn with_credential_watches(
+		mut self, watches: Vec<crate::llm::model_broker::CredentialWatch>,
+	) -> Self {
+		self.credential_watches = watches;
+		self
 	}
 
 	/// Override the per-job workdir size cap. A scan whose checkout
@@ -109,8 +149,8 @@ impl Runner {
 		while !cancel.is_cancelled() {
 			match self.step(&cancel).await {
 				Ok(_) => {},
-				Err(e) => {
-					tracing::warn!(error = %e, "runner step failed; backing off");
+				Err(_) => {
+					tracing::warn!("runner step failed; backing off");
 					tokio::select! {
 						_ = tokio::time::sleep(Duration::from_secs(5)) => {},
 						_ = cancel.cancelled() => break,
@@ -128,17 +168,42 @@ impl Runner {
 	) -> Result<()> {
 		let job_id = env.job_id;
 		let job_capability = env.job_capability.clone();
-		tracing::info!(job_id, repo = %env.repo.clone_url.expose(), "leased job");
+		tracing::info!(job_id, "leased job");
 		let scan_cancel = cancel.child_token();
+		let security = crate::canary::JobSecurity::new(
+			loupe_core::security_event::EventContext {
+				job_id: Some(job_id),
+				repo_id: Some(env.repo_id),
+				..Default::default()
+			},
+			self.credential_watches.clone(),
+		)?;
 		let heartbeat = self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone());
+		let execution_cancel = scan_cancel.child_token();
+		let task_cancel = execution_cancel.clone();
+		let quarantine_cancel = security.cancellation();
+		let cancellation = tokio::spawn(async move {
+			tokio::select! {
+				biased;
+				_ = quarantine_cancel.cancelled() => task_cancel.cancel(),
+				_ = task_cancel.cancelled() => {},
+			}
+		});
 
-		let outcome =
-			self.execute(env, reviewed_revision, scanner_patch, scan_cancel.clone()).await;
+		let outcome = self
+			.execute(env, reviewed_revision, scanner_patch, execution_cancel, security.clone())
+			.await;
+		let outcome = if security.is_quarantined() {
+			Err(crate::canary::JobQuarantined.into())
+		} else {
+			outcome
+		};
 
 		// Stop the heartbeat task before completing — otherwise it might
 		// race the complete and turn into a 403.
 		scan_cancel.cancel();
 		let _ = heartbeat.await;
+		let _ = cancellation.await;
 
 		match outcome {
 			Ok((head_sha, _findings_count)) => {
@@ -148,30 +213,52 @@ impl Runner {
 					head_sha,
 					error: None,
 				};
-				self.client.complete_runner(job_id, &job_capability, &req).await?;
+				if let Err(error) = security
+					.run(
+						Operation::CompleteJob,
+						self.client.complete_runner(job_id, &job_capability, &req),
+					)
+					.await
+				{
+					if security.is_quarantined() {
+						self.complete_failed(
+							job_id,
+							&job_capability,
+							crate::canary::JobQuarantined.into(),
+						)
+						.await;
+						return Ok(());
+					}
+					return Err(error);
+				}
 				tracing::info!(job_id, "job succeeded");
 			},
 			Err(e) => {
-				tracing::warn!(job_id, error = %e, "job failed");
-				let req = RunnerCompletion {
-					protocol_version: PROTOCOL_VERSION,
-					outcome: CompleteOutcome::Failed,
-					head_sha: None,
-					error: Some(CompletionDiagnostic(e)),
-				};
-				if let Err(ce) = self.client.complete_runner(job_id, &job_capability, &req).await {
-					tracing::warn!(job_id, error = %ce, "complete(Failed) call failed too");
-				}
+				self.complete_failed(job_id, &job_capability, e).await;
 			},
 		}
 		Ok(())
+	}
+
+	async fn complete_failed(&self, job_id: i64, capability: &JobCapability, error: anyhow::Error) {
+		tracing::warn!(job_id, "job failed");
+		let req = RunnerCompletion {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some(CompletionDiagnostic(error)),
+		};
+		// The host completion authority remains available after quarantine.
+		if self.client.complete_runner(job_id, capability, &req).await.is_err() {
+			tracing::warn!(job_id, "complete(Failed) call failed too");
+		}
 	}
 
 	/// Returns (head_sha, findings_count).
 	async fn execute(
 		&self, env: LeaseEnvelope<Agent, Server>, reviewed_revision: ReviewedRevisionFact,
 		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
-		cancel: CancellationToken,
+		cancel: CancellationToken, security: Arc<crate::canary::JobSecurity>,
 	) -> Result<(Option<CompletionRevision>, usize)> {
 		let tool_boundary = crate::llm::prompt::JobToolBoundary::new()?;
 		let key =
@@ -192,12 +279,12 @@ impl Runner {
 						&env.job_capability,
 						finding_id,
 						HostVerifyReason::MissingReviewedRevision,
+						&security,
 					)
 					.await?;
 					return Ok((None, 0));
 				};
-				// This operational view comes from the original Server mark retained
-				// by the lease decoder, never from the legacy envelope String.
+				// The lease decoder retains the Server mark through this operational view.
 				let reviewed_sha = revision.clone().into_revision();
 				let (workdir, head_sha) =
 					match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
@@ -229,6 +316,7 @@ impl Runner {
 												.copied()
 												.unwrap_or(CheckoutFailure::Task),
 										},
+										&security,
 									)
 									.await?;
 									return Ok((
@@ -239,6 +327,7 @@ impl Runner {
 							}
 						},
 					};
+				let workdir = workdir.pinned(ensured._pin);
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
@@ -247,6 +336,8 @@ impl Runner {
 					);
 				}
 				let vctx = VerifyContext {
+					sandbox_workdir: workdir.sandbox_path(),
+					security: security.clone(),
 					tool_boundary,
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
@@ -258,10 +349,8 @@ impl Runner {
 					config: scanner_patch,
 					cancel: cancel.clone(),
 				};
-				// Pick the first scanner advertising any verify:* tag.
-				// Refining to per-tag matching can come later; today
-				// the server already filtered the lease so we know
-				// some verifier on this worker is eligible.
+				// The server filters leases by advertised capabilities. This worker
+				// selects the first scanner with any verify:* tag, without per-tag matching.
 				let verifier = self
 					.scanners
 					.iter()
@@ -272,10 +361,18 @@ impl Runner {
 						)
 					})?;
 				let outcome = verifier.verify(&vctx).await?;
+				security.admit(Operation::SubmitVerdict)?;
 				match outcome {
 					crate::VerifyOutcome::Host(reason) => {
-						self.client
-							.submit_host_verdict(env.job_id, &env.job_capability, reason)
+						security
+							.run(
+								Operation::SubmitVerdict,
+								self.client.submit_host_verdict(
+									env.job_id,
+									&env.job_capability,
+									reason,
+								),
+							)
 							.await?;
 					},
 					crate::VerifyOutcome::Verdict(verdict) => {
@@ -285,11 +382,17 @@ impl Runner {
 							verifier = verifier.id(),
 							"submitting verdict (in-process verifier)"
 						);
-						self.client
-							.submit_verdict(
-								env.job_id,
-								&env.job_capability,
-								&VerdictSubmission { protocol_version: PROTOCOL_VERSION, verdict },
+						security
+							.run(
+								Operation::SubmitVerdict,
+								self.client.submit_verdict(
+									env.job_id,
+									&env.job_capability,
+									&VerdictSubmission {
+										protocol_version: PROTOCOL_VERSION,
+										verdict,
+									},
+								),
 							)
 							.await?;
 					},
@@ -332,13 +435,9 @@ impl Runner {
 							.await?
 					},
 				};
+				let workdir = workdir.pinned(ensured._pin);
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
-				tracing::info!(
-					job_id = env.job_id,
-					head_sha = %head_sha.expose(),
-					workdir_bytes = workdir_size,
-					"worktree ready"
-				);
+				tracing::info!(job_id = env.job_id, workdir_bytes = workdir_size, "worktree ready");
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
 						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
@@ -346,6 +445,8 @@ impl Runner {
 					);
 				}
 				let ctx = ScanContext {
+					sandbox_workdir: workdir.sandbox_path(),
+					security: security.clone(),
 					tool_boundary,
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
@@ -360,8 +461,11 @@ impl Runner {
 
 				let mut all = Vec::new();
 				for s in &self.scanners {
+					security.admit(Operation::SubmitFindings)?;
 					tracing::info!(job_id = env.job_id, scanner = s.id(), "running scanner");
-					match s.scan(&ctx).await {
+					let result = s.scan(&ctx).await;
+					security.admit(Operation::SubmitFindings)?;
+					match result {
 						Ok(mut findings) => {
 							// `returned_count` is the number of findings the
 							// scanner handed back for the runner to batch-POST
@@ -381,13 +485,18 @@ impl Runner {
 							);
 							all.append(&mut findings);
 						},
-						Err(e) => tracing::warn!(scanner = s.id(), error = %e, "scanner failed"),
+						Err(_) => tracing::warn!(scanner = s.id(), "scanner failed"),
 					}
 				}
 				if !all.is_empty() {
 					let batch =
 						FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all.clone() };
-					self.client.submit_findings(env.job_id, &env.job_capability, &batch).await?;
+					security
+						.run(
+							Operation::SubmitFindings,
+							self.client.submit_findings(env.job_id, &env.job_capability, &batch),
+						)
+						.await?;
 				}
 				Ok((Some(CompletionRevision::CheckedOut(head_sha)), all.len()))
 			},
@@ -396,14 +505,19 @@ impl Runner {
 
 	async fn submit_revision_unavailable_verdict(
 		&self, job_id: i64, job_capability: &JobCapability, finding_id: i64,
-		reason: HostVerifyReason,
+		reason: HostVerifyReason, security: &crate::canary::JobSecurity,
 	) -> Result<()> {
 		tracing::warn!(
 			job_id,
 			finding_id,
 			"submitting terminal inconclusive verdict for unavailable verify revision",
 		);
-		self.client.submit_host_verdict(job_id, job_capability, reason).await
+		security
+			.run(
+				Operation::SubmitVerdict,
+				self.client.submit_host_verdict(job_id, job_capability, reason),
+			)
+			.await
 	}
 
 	fn spawn_heartbeat(
@@ -415,8 +529,8 @@ impl Runner {
 				tokio::select! {
 					_ = cancel.cancelled() => return,
 					_ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-						if let Err(e) = client.heartbeat(job_id, &job_capability).await {
-							tracing::warn!(job_id, error = %e, "heartbeat failed");
+						if client.heartbeat(job_id, &job_capability).await.is_err() {
+							tracing::warn!(job_id, "heartbeat failed");
 						}
 					},
 				}
@@ -430,7 +544,7 @@ impl Runner {
 /// worktree dir (a `TempDir` for cleanup) plus the resolved commit SHA.
 pub async fn checkout_latest(
 	bare: &Path, branch: Option<&str>,
-) -> Result<(tempfile::TempDir, BoundedText<RevisionText, Repo>)> {
+) -> Result<(CheckedOutWorktree, BoundedText<RevisionText, Repo>)> {
 	checkout(bare, CheckoutTarget::Latest { branch: branch.map(str::to_owned) }).await
 }
 
@@ -438,7 +552,7 @@ pub async fn checkout_latest(
 /// to one exact commit SHA.
 pub async fn checkout_revision(
 	bare: &Path, sha: &str,
-) -> Result<(tempfile::TempDir, BoundedText<RevisionText, Repo>)> {
+) -> Result<(CheckedOutWorktree, BoundedText<RevisionText, Repo>)> {
 	checkout(bare, CheckoutTarget::Revision(sha.to_owned())).await
 }
 
@@ -446,9 +560,6 @@ enum CheckoutTarget {
 	Latest { branch: Option<String> },
 	Revision(String),
 }
-
-/// Cap on how many submodule paths we name in the warning below.
-const SUBMODULE_PATH_LIMIT: usize = 10;
 
 /// Collect the gitlink paths in `tree`. A checkout materializes these
 /// as empty directories, so scanners never see submodule contents.
@@ -475,74 +586,66 @@ fn submodule_paths(tree: &git2::Tree<'_>) -> Result<Vec<repo_ingress::Repository
 
 async fn checkout(
 	bare: &Path, target: CheckoutTarget,
-) -> Result<(tempfile::TempDir, BoundedText<RevisionText, Repo>)> {
+) -> Result<(CheckedOutWorktree, BoundedText<RevisionText, Repo>)> {
 	let bare = bare.to_path_buf();
-	let tmp = tempfile::tempdir().context(CheckoutFailure::CreateWorktree)?;
+	let tmp = tempfile::tempdir().map_err(|_| CheckoutFailure::CreateWorktree)?;
 	let workdir = tmp.path().to_path_buf();
 	let head_sha =
 		tokio::task::spawn_blocking(move || -> Result<BoundedText<RevisionText, Repo>> {
-			let repo = git2::Repository::open_bare(&bare)
-				.context(CheckoutFailure::OpenRepository)
-				.with_context(|| format!("opening bare repo at {}", bare.display()))?;
+			let repo =
+				git2::Repository::open_bare(&bare).map_err(|_| CheckoutFailure::OpenRepository)?;
 			let commit = match target {
 				CheckoutTarget::Latest { branch } => {
 					let target_ref = match branch.as_deref() {
 						Some(b) => repo
 							.find_reference(&format!("refs/remotes/origin/{b}"))
 							.or_else(|_| repo.find_reference(&format!("refs/heads/{b}")))
-							.context(CheckoutFailure::LocateBranch)
-							.with_context(|| format!("locating ref for branch {b}"))?,
+							.map_err(|_| CheckoutFailure::LocateBranch)?,
 						None => repo
 							.find_reference("refs/remotes/origin/HEAD")
 							.or_else(|_| repo.find_reference("HEAD"))
-							.context(CheckoutFailure::LocateHead)?,
+							.map_err(|_| CheckoutFailure::LocateHead)?,
 					};
-					target_ref.peel_to_commit().context(CheckoutFailure::ResolveReference)?
+					target_ref.peel_to_commit().map_err(|_| CheckoutFailure::ResolveReference)?
 				},
 				CheckoutTarget::Revision(sha) => {
-					let oid = git2::Oid::from_str(&sha)
-						.context(CheckoutFailure::ParseRevision)
-						.with_context(|| format!("parsing reviewed revision {sha}"))?;
-					let object = repo
-						.find_object(oid, None)
-						.context(CheckoutFailure::LocateRevision)
-						.with_context(|| format!("locating reviewed revision {sha}"))?;
-					object.peel_to_commit().context(CheckoutFailure::ResolveRevision)?
+					let oid =
+						git2::Oid::from_str(&sha).map_err(|_| CheckoutFailure::ParseRevision)?;
+					let object =
+						repo.find_object(oid, None).map_err(|_| CheckoutFailure::LocateRevision)?;
+					object.peel_to_commit().map_err(|_| CheckoutFailure::ResolveRevision)?
 				},
 			};
-			let tree = commit.tree().context(CheckoutFailure::ResolveTree)?;
+			let tree = commit.tree().map_err(|_| CheckoutFailure::ResolveTree)?;
 			// Diagnostics only: never fail a checkout over the warning.
 			match submodule_paths(&tree) {
 				Ok(paths) if !paths.is_empty() => {
 					let count = paths.len();
-					let diagnostics = paths
+					let path_bytes = paths
 						.iter()
-						.take(SUBMODULE_PATH_LIMIT)
-						.map(repo_ingress::RepositoryGitlinkPath::for_log)
-						.collect::<Vec<_>>();
+						.map(repo_ingress::RepositoryGitlinkPath::byte_count)
+						.sum::<usize>();
 					tracing::warn!(
-						bare_repo = %bare.display(),
-						head_sha = %commit.id(),
 						submodule_count = count,
-						submodules = ?diagnostics,
+						submodule_path_bytes = path_bytes,
 						"checkout leaves submodules unpopulated; their contents are not scanned",
 					);
 				},
 				Ok(_) => {},
-				Err(e) => tracing::debug!(error = ?e, "could not inspect submodules for warning"),
+				Err(_) => tracing::debug!("could not inspect submodules for warning"),
 			}
 			// `target_dir` alone leaves the handle bare, and libgit2 refuses
 			// to resolve a gitlink without a working tree. Point this handle
 			// at the temp dir; with `update_gitlink` false nothing is
 			// persisted, so the shared bare cache is untouched.
-			repo.set_workdir(&workdir, false).context(CheckoutFailure::AttachWorktree)?;
+			repo.set_workdir(&workdir, false).map_err(|_| CheckoutFailure::AttachWorktree)?;
 			let mut opts = git2::build::CheckoutBuilder::new();
 			// Never touch the index in the bare cache: it is shared by every
 			// job checking out of this mirror, and the checkout is
 			// content-only, so scanners read the files directly.
 			opts.target_dir(&workdir).recreate_missing(true).force().update_index(false);
 			repo.checkout_tree(tree.as_object(), Some(&mut opts))
-				.context(CheckoutFailure::CheckoutTree)?;
+				.map_err(|_| CheckoutFailure::CheckoutTree)?;
 			let oid = commit.id();
 			// SAFETY: binary object id read from the actual checked-out Git commit,
 			// before hexadecimal String formatting.
@@ -551,19 +654,69 @@ async fn checkout(
 			Ok(oid.validate(repo_ingress::CheckedOutRevisionDecoder)?.into_revision())
 		})
 		.await
-		.map_err(|e| anyhow::anyhow!("checkout task panicked: {e}"))
-		.context(CheckoutFailure::Task)??;
-	Ok((tmp, head_sha))
+		.map_err(|_| CheckoutFailure::Task)??;
+	Ok((CheckedOutWorktree { directory: Arc::new(tmp), pin: None }, head_sha))
 }
 
 #[cfg(test)]
 mod tests {
+	#[tokio::test]
+	async fn checkout_diagnostics_omit_repo_paths_and_revision() {
+		if !crate::test_env::in_env(
+			"runner::tests::checkout_diagnostics_omit_repo_paths_and_revision",
+			"checkout-i8",
+			&[],
+		) {
+			return;
+		}
+		let capture = crate::test_support::LogCapture::default();
+		capture.install();
+		let remote = tempfile::tempdir().unwrap();
+		init_git_repo(remote.path());
+		let commit = commit_file(remote.path(), "original\n", "Original");
+		let revision = commit_submodule_gitlink(remote.path(), &commit);
+		let cache =
+			tempfile::Builder::new().prefix("private-checkout-path-sentinel").tempdir().unwrap();
+		let bare = cache.path().join("repo.git");
+		clone_bare(remote.path(), &bare);
+		let (workdir, observed) = checkout_revision(&bare, &revision).await.unwrap();
+		assert_eq!(observed.expose(), revision);
+		assert!(workdir.path().join("vendor/dependency").is_dir());
+		let logs = capture.text();
+		assert!(logs.contains("checkout leaves submodules unpopulated"));
+		assert_eq!(
+			(
+				logs.contains("private-checkout-path-sentinel"),
+				logs.contains("vendor/dependency"),
+				logs.contains(&revision)
+			),
+			(false, false, false),
+			"repository paths and revision must stay out of checkout diagnostics"
+		);
+	}
+
+	#[tokio::test]
+	async fn checkout_path_errors_omit_original_bytes_from_the_chain() {
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("private-checkout-path-sentinel/missing.git");
+		let error = super::checkout_latest(&path, None).await.unwrap_err();
+		assert!(
+			error.downcast_ref::<crate::host_outcome::CheckoutFailure>().is_some(),
+			"checkout must retain its operational failure category"
+		);
+		assert!(
+			!format!("{error:#}").contains("private-checkout-path-sentinel"),
+			"checkout path leaked through the public error chain"
+		);
+	}
 	use std::process::Command;
 
 	use super::*;
 
 	#[path = "ingress_tests.rs"]
 	mod ingress_tests;
+
+	mod quarantine_tests;
 
 	struct StubScanner {
 		id: &'static str,
@@ -688,7 +841,7 @@ mod tests {
 			submodule_paths(&tree)
 				.unwrap()
 				.iter()
-				.map(repo_ingress::RepositoryGitlinkPath::for_log)
+				.map(repo_ingress::RepositoryGitlinkPath::fixture_text)
 				.collect::<Vec<_>>(),
 			vec!["vendor/dependency".to_owned()]
 		);

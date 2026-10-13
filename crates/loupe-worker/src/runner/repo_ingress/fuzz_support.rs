@@ -12,6 +12,7 @@ pub fn revision(original: &[u8]) -> Result<String, String> {
 		.map(|v| v.into_revision().expose().to_owned())
 		.map_err(|e| e.to_string())
 }
+// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Gitlink {
 	Relative(String),

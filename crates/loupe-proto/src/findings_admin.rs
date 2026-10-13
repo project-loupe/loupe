@@ -27,6 +27,7 @@ record_impls!(ListFindingsResponse<ContentS, AuditS> { protocol_version, finding
 /// verifier work but are no longer represented correctly in the
 /// queue. `dry_run = true` returns the counts that would be applied
 /// without mutating findings or jobs.
+// debug-ok: request contains only protocol, flags, numeric ID and limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryVerifyRequest {
 	pub protocol_version: u16,
@@ -45,6 +46,7 @@ pub struct RetryVerifyRequest {
 	pub limit: Option<i64>,
 }
 
+// debug-ok: response contains only protocol, flags and aggregate counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryVerifyResponse {
 	pub protocol_version: u16,

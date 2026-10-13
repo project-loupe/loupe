@@ -19,6 +19,7 @@ use crate::text::BoundedText;
 ///   │                │
 ///   └── reap (attempts < max) ◄── lease_expires_at < now
 /// ```
+// debug-ok: closed job lifecycle unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {

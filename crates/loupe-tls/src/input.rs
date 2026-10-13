@@ -92,6 +92,10 @@ impl PemBuffer {
 		std::str::from_utf8(&self.bytes[..self.used])
 			.map_err(|_| anyhow::anyhow!("PEM input is not valid UTF-8"))?;
 		self.bytes.truncate(self.used);
+		#[expect(
+			clippy::expect_used,
+			reason = "the identical byte range passed from_utf8 above, and truncate/take do not alter those bytes"
+		)]
 		let text = String::from_utf8(std::mem::take(&mut self.bytes))
 			.expect("PEM bytes were validated as UTF-8");
 		Ok(Secret::new(text))
@@ -132,6 +136,10 @@ pub fn encode_pem_base64(pem: &str) -> Result<Secret<String>> {
 /// Read PEM text with guarded growth and UTF-8 validation. Certificate inputs
 /// need the same owner: accepted mixed bundles can contain private sections.
 pub fn read_pem_file(path: &Path) -> Result<Secret<String>> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "TLS PEM ingress opens the caller-selected configuration file before guarded reading and validation"
+	)]
 	let mut file = std::fs::File::open(path).context("opening PEM file")?;
 	read_pem(&mut file)
 }

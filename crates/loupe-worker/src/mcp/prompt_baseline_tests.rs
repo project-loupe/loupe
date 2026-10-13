@@ -1,4 +1,4 @@
-//! Baselines use the real MCP decoder/dispatcher and Server response owner.
+//! Prompt framing checks use the MCP decoder/dispatcher and Server response owner.
 
 use super::*;
 use crate::llm::prompts::prompt_baseline_tests::block;
@@ -48,6 +48,7 @@ async fn session_with(
 	let url = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
 	let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 	let session = Arc::new(Session {
+		security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		data_mode: crate::llm::prompt::DataMode::Delimited,
 		client: Arc::new(ServerClient::from_parts(reqwest::Client::new(), url)),

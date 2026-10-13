@@ -11,14 +11,66 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 pub const VALIDATING_DEADLINE_EXPIRED_NOTE: &str = "validating_deadline expired";
 
+pub fn get(scope: &crate::scope::RepoScope<'_>, id: i64) -> crate::Result<Option<FindingRow>> {
+	Ok(scope
+		.conn
+		.query_row(
+			&format!("SELECT {FINDING_COLUMNS} FROM findings WHERE id=?1 AND repo_id=?2"),
+			params![id, scope.repo_id],
+			row_to_finding,
+		)
+		.optional()?)
+}
+
+pub fn list_for_repo(
+	scope: &crate::scope::RepoScope<'_>, limit: i64,
+) -> crate::Result<Vec<FindingRow>> {
+	Ok(list_for_repo_raw(scope.conn, scope.repo_id, limit)?)
+}
+
+pub fn list_for_job(
+	scope: &crate::scope::RepoScope<'_>, job: i64,
+) -> crate::Result<Vec<FindingRow>> {
+	let mut stmt = scope.conn.prepare(&format!(
+		"SELECT {FINDING_COLUMNS} FROM findings WHERE job_id=?1 AND repo_id=?2 ORDER BY id"
+	))?;
+	Ok(stmt
+		.query_map(params![job, scope.repo_id], row_to_finding)?
+		.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn search<S: Source>(
+	scope: &crate::scope::RepoScope<'_>, query: &SearchQuery<S>, limit: i64,
+) -> crate::Result<Vec<FindingRow>> {
+	Ok(search_raw(scope.conn, scope.repo_id, query, limit)?)
+}
+
+/// Worker submission derives both repository and producing job from the live lease.
+pub fn submit(
+	scope: &crate::scope::AssignmentScope<'_>, finding: &Finding<Agent>,
+) -> crate::Result<Option<i64>> {
+	if scope.job.kind != loupe_core::JobKind::Scan {
+		return Err(crate::Error::ScopeDenied);
+	}
+	let repo = crate::repos::get(&scope.repo)?.ok_or(crate::Error::ScopeDenied)?;
+	Ok(insert_or_ignore(
+		scope.repo.conn,
+		scope.repo.repo_id,
+		scope.job.id,
+		finding,
+		repo.verification_enabled,
+		scope.lease.now,
+	)?)
+}
+
 /// The two real verification writers. The fixed deadline tuple never acquires
 /// an Agent prose label merely because it shares a SQL column with submissions.
 pub enum VerificationInput<'a> {
 	Submitted { job_id: i64, verdict: &'a loupe_core::Verdict<Agent> },
 	DeadlineExpired,
 }
-pub fn insert_verification(
-	conn: &Connection, finding_id: i64, input: VerificationInput<'_>, now: i64,
+pub(crate) fn insert_verification(
+	conn: &Connection, repo_id: i64, finding_id: i64, input: VerificationInput<'_>, now: i64,
 ) -> rusqlite::Result<i64> {
 	let (job_id, outcome, notes) = match input {
 		VerificationInput::Submitted { job_id, verdict } => {
@@ -39,7 +91,10 @@ pub fn insert_verification(
 			(None, "inconclusive", Some(VALIDATING_DEADLINE_EXPIRED_NOTE))
 		},
 	};
-	conn.execute("INSERT INTO finding_verifications(finding_id,job_id,verdict,notes,created_at,source) VALUES(?1,?2,?3,?4,?5,'agent')", params![finding_id,job_id,outcome,notes,now])?;
+	let changed = conn.execute("INSERT INTO finding_verifications(finding_id,job_id,verdict,notes,created_at,source) SELECT ?1,?2,?3,?4,?5,'agent' WHERE EXISTS(SELECT 1 FROM findings WHERE id=?1 AND repo_id=?6) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM jobs WHERE id=?2 AND repo_id=?6 AND target_finding_id=?1 AND kind='verify'))", params![finding_id,job_id,outcome,notes,now,repo_id])?;
+	if changed == 0 {
+		return Err(rusqlite::Error::QueryReturnedNoRows);
+	}
 	Ok(conn.last_insert_rowid())
 }
 
@@ -89,6 +144,7 @@ impl std::fmt::Debug for FindingIdentity {
 	}
 }
 
+// debug-ok: all finding text and row identity delegate to redacted owners; other fields are IDs, times and closed states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingRow {
 	pub id: i64,
@@ -147,7 +203,7 @@ impl FindingRow {
 /// `validating` (the verify flow will confirm or dismiss it) or goes
 /// straight through. Inserted rows start as `pending`; the complete
 /// handler is what flips them.
-pub fn insert_or_ignore(
+pub(crate) fn insert_or_ignore(
 	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding<Agent>, verification_required: bool,
 	now: i64,
 ) -> rusqlite::Result<Option<i64>> {
@@ -201,13 +257,17 @@ fn insert_with_identity(
 
 /// Column list for `row_to_finding`. Centralised so adding a column
 /// is one edit, not four.
-const FINDING_COLUMNS: &str = "id, repo_id, job_id, scanner_id, severity, title, description,
+pub(crate) const FINDING_COLUMNS: &str =
+	"id, repo_id, job_id, scanner_id, severity, title, description,
         file_path, line_start, line_end, cwe, patch_unified,
         poc_unified, fingerprint, state, verification_required, created_at,
         approved_at, approved_by_cn, rejected_at, rejected_by_cn,
         patch_proposed_at, patch_proposed_by_cn, patch_notes, report_identity, source";
 
-pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<FindingRow>> {
+#[cfg(test)]
+pub(crate) fn list_for_job_raw(
+	conn: &Connection, job_id: i64,
+) -> rusqlite::Result<Vec<FindingRow>> {
 	let mut stmt = conn.prepare(&format!(
 		"SELECT {FINDING_COLUMNS}
 		 FROM findings WHERE job_id = ?1 ORDER BY id ASC"
@@ -216,8 +276,9 @@ pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<Find
 	rows.collect()
 }
 
-pub fn transition_scan_findings_after_success(
-	conn: &Connection, job_id: i64, require_approval: bool, validating_deadline: i64, now: i64,
+pub(crate) fn transition_scan_findings_after_success(
+	conn: &Connection, repo_id: i64, job_id: i64, require_approval: bool, validating_deadline: i64,
+	now: i64,
 ) -> rusqlite::Result<usize> {
 	let source_state = FindingState::Pending;
 	let auto_transition = if require_approval {
@@ -234,30 +295,32 @@ pub fn transition_scan_findings_after_success(
 		conn.execute(
 			"UPDATE findings
 			   SET state = ?1
-			 WHERE job_id = ?2 AND verification_required = 0 AND state = ?3",
-			(auto_target.as_str(), job_id, source_state.as_str()),
+			 WHERE job_id = ?2 AND verification_required = 0 AND state = ?3 AND repo_id=?4",
+			(auto_target.as_str(), job_id, source_state.as_str(), repo_id),
 		)?
 	} else {
 		conn.execute(
 			"UPDATE findings
 			   SET state = ?1, confirmed_at = ?2
-			 WHERE job_id = ?3 AND verification_required = 0 AND state = ?4",
-			(auto_target.as_str(), now, job_id, source_state.as_str()),
+			 WHERE job_id = ?3 AND verification_required = 0 AND state = ?4 AND repo_id=?5",
+			(auto_target.as_str(), now, job_id, source_state.as_str(), repo_id),
 		)?
 	};
 	let verify_count = conn.execute(
 		"UPDATE findings
 		   SET state = ?1, validating_deadline = ?2
-		 WHERE job_id = ?3 AND verification_required = 1 AND state = ?4",
-		(verify_target.as_str(), validating_deadline, job_id, source_state.as_str()),
+		 WHERE job_id = ?3 AND verification_required = 1 AND state = ?4 AND repo_id=?5",
+		(verify_target.as_str(), validating_deadline, job_id, source_state.as_str(), repo_id),
 	)?;
 	Ok(auto_count + verify_count)
 }
 
-pub fn delete_pending_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<usize> {
+pub(crate) fn delete_pending_for_job(
+	conn: &Connection, repo_id: i64, job_id: i64,
+) -> rusqlite::Result<usize> {
 	conn.execute(
-		"DELETE FROM findings WHERE job_id = ?1 AND state = ?2",
-		(job_id, FindingState::Pending.as_str()),
+		"DELETE FROM findings WHERE job_id = ?1 AND state = ?2 AND repo_id=?3",
+		(job_id, FindingState::Pending.as_str(), repo_id),
 	)
 }
 
@@ -266,49 +329,50 @@ pub fn delete_pending_for_job(conn: &Connection, job_id: i64) -> rusqlite::Resul
 /// system-issued `inconclusive` verdict in `finding_verifications`
 /// (with `job_id = NULL`) and transitions to `dismissed`. Returns the
 /// number of findings reaped.
-pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> {
+pub(crate) fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> {
 	let source_state = FindingState::Validating;
 	let target_state = source_state
 		.apply(FindingTransition::DeadlineExpire)
 		.map_err(sql_state_transition_error)?;
-	let tx = conn.transaction()?;
-	let stale: Vec<i64> = {
+	let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+	let stale: Vec<(i64, i64)> = {
 		let mut stmt = tx.prepare(
-			"SELECT id FROM findings
+			"SELECT id,repo_id FROM findings
 			 WHERE state = ?2
 			   AND validating_deadline IS NOT NULL
 			   AND validating_deadline < ?1",
 		)?;
-		let rows = stmt.query_map((now, source_state.as_str()), |r| r.get::<_, i64>(0))?;
-		rows.collect::<rusqlite::Result<Vec<i64>>>()?
+		let rows = stmt.query_map((now, source_state.as_str()), |r| Ok((r.get(0)?, r.get(1)?)))?;
+		rows.collect::<rusqlite::Result<_>>()?
 	};
-	for fid in &stale {
-		insert_verification(&tx, *fid, VerificationInput::DeadlineExpired, now)?;
+	for (fid, repo) in &stale {
+		insert_verification(&tx, *repo, *fid, VerificationInput::DeadlineExpired, now)?;
 		tx.execute(
 			"UPDATE findings SET state = ?1, dismissed_at = ?2
-			 WHERE id = ?3 AND state = ?4",
-			(target_state.as_str(), now, fid, source_state.as_str()),
+			 WHERE id = ?3 AND state = ?4 AND repo_id=?5",
+			(target_state.as_str(), now, fid, source_state.as_str(), repo),
 		)?;
 	}
 	tx.commit()?;
 	Ok(stale.len())
 }
 
-pub fn roll_up_verdicts_for_finding(
-	conn: &Connection, finding_id: i64, terminal_inconclusive: bool, require_approval: bool,
-	now: i64,
+pub(crate) fn roll_up_verdicts_for_finding(
+	conn: &Connection, repo_id: i64, finding_id: i64, terminal_inconclusive: bool,
+	require_approval: bool, now: i64,
 ) -> rusqlite::Result<Option<FindingState>> {
-	let current = get(conn, finding_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?.state;
+	let current =
+		get_selected(conn, repo_id, finding_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?.state;
 	let has_dismissed: bool = conn.query_row(
 		"SELECT EXISTS(SELECT 1 FROM finding_verifications
-		                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
-		[finding_id],
+		                 WHERE finding_id = ?1 AND verdict = 'dismissed' AND EXISTS(SELECT 1 FROM findings WHERE id=?1 AND repo_id=?2))",
+		[finding_id,repo_id],
 		|r| r.get(0),
 	)?;
 	let has_confirmed: bool = conn.query_row(
 		"SELECT EXISTS(SELECT 1 FROM finding_verifications
-		                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
-		[finding_id],
+		                 WHERE finding_id = ?1 AND verdict = 'confirmed' AND EXISTS(SELECT 1 FROM findings WHERE id=?1 AND repo_id=?2))",
+		[finding_id,repo_id],
 		|r| r.get(0),
 	)?;
 	let next = roll_up_verdicts(
@@ -323,13 +387,13 @@ pub fn roll_up_verdicts_for_finding(
 		_ => "",
 	};
 	conn.execute(
-		&format!("UPDATE findings SET state = ?1{stamp_clause} WHERE id = ?3"),
-		(next_state.as_str(), now, finding_id),
+		&format!("UPDATE findings SET state = ?1{stamp_clause} WHERE id = ?3 AND repo_id=?4"),
+		(next_state.as_str(), now, finding_id, repo_id),
 	)?;
 	Ok(Some(next_state))
 }
 
-pub fn is_deadline_dismissed_without_terminal_verdict(
+pub(crate) fn is_deadline_dismissed_without_terminal_verdict(
 	conn: &Connection, finding_id: i64,
 ) -> rusqlite::Result<bool> {
 	conn.query_row(
@@ -351,10 +415,10 @@ pub fn is_deadline_dismissed_without_terminal_verdict(
 	)
 }
 
-pub fn retry_verification(
-	conn: &Connection, finding_id: i64, validating_deadline: i64,
+pub(crate) fn retry_verification(
+	conn: &Connection, repo_id: i64, finding_id: i64, validating_deadline: i64,
 ) -> rusqlite::Result<bool> {
-	let Some(row) = get(conn, finding_id)? else { return Ok(false) };
+	let Some(row) = get_selected(conn, repo_id, finding_id)? else { return Ok(false) };
 	let target_state = row
 		.state
 		.apply(FindingTransition::RetryVerification)
@@ -364,15 +428,15 @@ pub fn retry_verification(
 		   SET state = ?1,
 		       dismissed_at = NULL,
 		       validating_deadline = ?2
-		 WHERE id = ?3 AND state = ?4",
-		(target_state.as_str(), validating_deadline, finding_id, row.state.as_str()),
+		 WHERE id = ?3 AND state = ?4 AND repo_id=?5",
+		(target_state.as_str(), validating_deadline, finding_id, row.state.as_str(), repo_id),
 	)?;
 	Ok(updated > 0)
 }
 
 /// List findings for one repo, most recent first. `limit` caps the
 /// page size (callers should pass something reasonable, e.g. 100).
-pub fn list_for_repo(
+pub(crate) fn list_for_repo_raw(
 	conn: &Connection, repo_id: i64, limit: i64,
 ) -> rusqlite::Result<Vec<FindingRow>> {
 	let mut stmt = conn.prepare(&format!(
@@ -395,7 +459,7 @@ pub fn list_for_repo(
 /// double-quotes each token, and gives "every token must appear"
 /// semantics, which is what an agent calling
 /// `query_prior_findings(keywords=...)` reasonably expects.
-pub fn search<S: Source>(
+pub(crate) fn search_raw<S: Source>(
 	conn: &Connection, repo_id: i64, query: &SearchQuery<S>, limit: i64,
 ) -> rusqlite::Result<Vec<FindingRow>> {
 	// FINDING_COLUMNS is unqualified; the FTS join puts a second
@@ -443,7 +507,7 @@ pub fn sanitize_fts_query(input: &str) -> String {
 }
 
 /// Fetch one finding by id. Returns `None` if it doesn't exist.
-pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<FindingRow>> {
+pub(crate) fn get_raw(conn: &Connection, id: i64) -> rusqlite::Result<Option<FindingRow>> {
 	conn.query_row(
 		&format!("SELECT {FINDING_COLUMNS} FROM findings WHERE id = ?1"),
 		params![id],
@@ -452,18 +516,19 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<FindingRow>> {
 	.optional()
 }
 
-pub fn get_for_repo(
-	conn: &Connection, repo_id: i64, fingerprint: &str,
+pub(crate) fn get_selected(
+	conn: &Connection, repo: i64, id: i64,
 ) -> rusqlite::Result<Option<FindingRow>> {
 	conn.query_row(
-		&format!("SELECT {FINDING_COLUMNS} FROM findings WHERE repo_id = ?1 AND fingerprint = ?2"),
-		params![repo_id, fingerprint],
+		&format!("SELECT {FINDING_COLUMNS} FROM findings WHERE id=?1 AND repo_id=?2"),
+		params![id, repo],
 		row_to_finding,
 	)
 	.optional()
 }
 
 /// Outcome of an `attach_proposed_patch` call.
+// debug-ok: attachment outcomes are closed variants without patch content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchAttachOutcome {
 	/// The row had no patch yet; we wrote one and stamped the audit.
@@ -492,21 +557,23 @@ pub enum PatchAttachOutcome {
 /// state. Pairing it with the verdict-insert in the same tx (see
 /// `routes/jobs.rs::submit_verdict`) is what enforces the invariant
 /// that a patch can only ride on a confirmed verdict.
-pub fn attach_proposed_patch(
-	conn: &Connection, finding_id: i64, patch_unified: &BoundedText<PatchUnified, Agent>,
-	notes: &BoundedText<PatchNotes, Agent>, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
+pub(crate) fn attach_proposed_patch(
+	conn: &Connection, repo_id: i64, finding_id: i64,
+	patch_unified: &BoundedText<PatchUnified, Agent>, notes: &BoundedText<PatchNotes, Agent>,
+	by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
 ) -> rusqlite::Result<PatchAttachOutcome> {
 	let n = conn.execute(
 		"UPDATE findings
 		    SET patch_unified = ?1, patch_notes = ?2,
 		        patch_proposed_by_cn = ?3, patch_proposed_at = ?4
-		  WHERE id = ?5 AND patch_unified IS NULL",
-		params![patch_unified.expose(), notes.expose(), by_cn.expose(), now, finding_id],
+		  WHERE id = ?5 AND patch_unified IS NULL AND repo_id=?6",
+		params![patch_unified.expose(), notes.expose(), by_cn.expose(), now, finding_id, repo_id],
 	)?;
 	Ok(if n > 0 { PatchAttachOutcome::Attached } else { PatchAttachOutcome::AlreadyPresent })
 }
 
 /// Outcome of an `approve`/`reject` call.
+// debug-ok: approval outcomes are closed variants without finding content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOutcome {
 	/// The finding was in `awaiting_approval` and got transitioned.
@@ -523,8 +590,8 @@ pub enum ApprovalOutcome {
 /// transitions `awaiting_approval → confirmed` so the dispatcher can
 /// pick it up. Idempotent on already-approved rows: re-running on a
 /// `confirmed` row returns `NotPending` rather than re-stamping.
-pub fn approve(
-	conn: &Connection, id: i64, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
+pub(crate) fn approve(
+	conn: &Connection, repo_id: i64, id: i64, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
 ) -> rusqlite::Result<ApprovalOutcome> {
 	let target_state = FindingState::AwaitingApproval
 		.apply(FindingTransition::Approve)
@@ -532,80 +599,50 @@ pub fn approve(
 	let n = conn.execute(
 		"UPDATE findings
 		    SET state = ?1, approved_at = ?2, approved_by_cn = ?3
-		  WHERE id = ?4 AND state = ?5",
+		  WHERE id = ?4 AND state = ?5 AND repo_id=?6",
 		params![
 			target_state.as_str(),
 			now,
 			by_cn.expose(),
 			id,
-			FindingState::AwaitingApproval.as_str()
+			FindingState::AwaitingApproval.as_str(),
+			repo_id
 		],
 	)?;
 	Ok(if n > 0 {
 		ApprovalOutcome::Applied
 	} else {
-		match get(conn, id)? {
+		match get_selected(conn, repo_id, id)? {
 			Some(_) => ApprovalOutcome::NotPending,
 			None => ApprovalOutcome::NotFound,
 		}
 	})
 }
 
-/// Reject a finding sitting in `awaiting_approval`. Transitions to
-/// terminal `dismissed` with `rejected_at`/`rejected_by_cn` stamped.
-/// `dismissed_at` is also stamped so dashboards that group on
-/// `dismissed_at` don't need to special-case the rejection path.
 pub fn reject(
-	conn: &Connection, id: i64, by_cn: &BoundedText<WorkerName, DbSource>, now: i64,
-) -> rusqlite::Result<ApprovalOutcome> {
+	scope: &crate::scope::RepoScope<'_>, id: i64, by_cn: &BoundedText<WorkerName, DbSource>,
+	now: i64,
+) -> crate::Result<ApprovalOutcome> {
+	scope.require_operator()?;
 	let target_state = FindingState::AwaitingApproval
 		.apply(FindingTransition::Reject)
 		.map_err(sql_state_transition_error)?;
-	let n = conn.execute(
-		"UPDATE findings
-		    SET state = ?1, dismissed_at = ?2,
-		        rejected_at = ?2, rejected_by_cn = ?3
-		  WHERE id = ?4 AND state = ?5",
-		params![
-			target_state.as_str(),
-			now,
-			by_cn.expose(),
-			id,
-			FindingState::AwaitingApproval.as_str()
-		],
-	)?;
-	Ok(if n > 0 {
+	let changed = scope.conn.execute("UPDATE findings SET state=?1,dismissed_at=?2,rejected_at=?2,rejected_by_cn=?3 WHERE id=?4 AND state=?5 AND repo_id=?6",
+		params![target_state.as_str(),now,by_cn.expose(),id,FindingState::AwaitingApproval.as_str(),scope.repo_id])?;
+	Ok(if changed != 0 {
 		ApprovalOutcome::Applied
+	} else if get(scope, id)?.is_some() {
+		ApprovalOutcome::NotPending
 	} else {
-		match get(conn, id)? {
-			Some(_) => ApprovalOutcome::NotPending,
-			None => ApprovalOutcome::NotFound,
-		}
+		ApprovalOutcome::NotFound
 	})
-}
-
-pub fn mark_reported(conn: &Connection, ids: &[i64], now: i64) -> rusqlite::Result<usize> {
-	let target_state = FindingState::Confirmed
-		.apply(FindingTransition::MarkReported)
-		.map_err(sql_state_transition_error)?;
-	let tx = conn.unchecked_transaction()?;
-	let mut n = 0usize;
-	for id in ids {
-		n += tx.execute(
-			"UPDATE findings SET reported_at = ?1, state = ?2
-			 WHERE id = ?3 AND state = ?4",
-			(now, target_state.as_str(), id, FindingState::Confirmed.as_str()),
-		)?;
-	}
-	tx.commit()?;
-	Ok(n)
 }
 
 fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 	rusqlite::Error::InvalidParameterName(error.to_string())
 }
 
-fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
+pub(crate) fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 	crate::ingress::require_agent_source(row, 25)?;
 	let identity = match row.get_ref(24)? {
 		rusqlite::types::ValueRef::Blob(bytes) => {
@@ -694,7 +731,7 @@ pub(crate) fn validate_stored_history(conn: &Connection) -> crate::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use loupe_core::{ReportingDestination, Severity};
 
 	use super::*;
@@ -703,7 +740,7 @@ mod tests {
 	use crate::secrets::{self, SecretKind};
 	use crate::Db;
 
-	pub(super) fn fixture() -> (Db, i64, i64) {
+	pub(crate) fn fixture() -> (Db, i64, i64) {
 		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
 		let secret_id =
 			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
@@ -734,7 +771,7 @@ mod tests {
 			.unwrap();
 		let job_id = db
 			.with_conn(|c| {
-				jobs::enqueue(
+				jobs::enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
@@ -751,7 +788,7 @@ mod tests {
 		(db, repo_id, job_id)
 	}
 
-	pub(super) fn sample(fingerprint: &str) -> Finding<loupe_provenance::Agent> {
+	pub(crate) fn sample(fingerprint: &str) -> Finding<loupe_provenance::Agent> {
 		Finding {
 			scanner_id: crate::test_support::text("regex").unwrap(),
 			severity: Severity::High,
@@ -769,7 +806,7 @@ mod tests {
 
 	#[test]
 	fn verdict_summary_is_scoped_and_independent_of_insertion_order() {
-		// This is an invariant test on the existing EXISTS-based aggregation.
+		// EXISTS-based aggregation depends on presence, not verdict order/count.
 		// Insert each complete multiset before one rollup; terminal states are
 		// deliberately not revisited as individual verdicts arrive.
 		let (db, repo_id, job_id) = fixture();
@@ -821,7 +858,7 @@ mod tests {
 					for index in order {
 						conn.execute("INSERT INTO finding_verifications (finding_id, verdict, created_at) VALUES (?1, ?2, 0)", (id, verdicts[index]))?;
 					}
-					assert_eq!(roll_up_verdicts_for_finding(conn, id, terminal, approval, 42)?, expected,
+					assert_eq!(roll_up_verdicts_for_finding(conn, repo_id, id, terminal, approval, 42)?, expected,
 						"SQL verdict summary changed with permutation {order:?} in case {case}");
 					let (state, confirmed_at, dismissed_at): (String, Option<i64>, Option<i64>) = conn.query_row(
 						"SELECT state, confirmed_at, dismissed_at FROM findings WHERE id = ?1", [id],
@@ -843,7 +880,7 @@ mod tests {
 			.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 100)?))
 			.unwrap()
 			.unwrap();
-		let listed = db.with_conn(|c| Ok(list_for_job(c, job_id)?)).unwrap();
+		let listed = db.with_conn(|c| Ok(list_for_job_raw(c, job_id)?)).unwrap();
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, id);
 		assert_eq!(listed[0].severity, Severity::High);
@@ -952,26 +989,26 @@ mod tests {
 
 		// Single-keyword match.
 		let q = SearchQuery::keywords(crate::test_support::text("underflow").unwrap());
-		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
+		let hits = db.with_conn(|c| Ok(search_raw(c, repo_id, &q, 10)?)).unwrap();
 		assert_eq!(hits.len(), 1);
 		assert!(hits[0].title.expose().contains("Integer underflow"));
 
 		// Multi-keyword AND: must hit a row that contains both.
 		let q = SearchQuery::keywords(crate::test_support::text("vec capacity").unwrap());
-		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
+		let hits = db.with_conn(|c| Ok(search_raw(c, repo_id, &q, 10)?)).unwrap();
 		assert_eq!(hits.len(), 1);
 		assert!(hits[0].title.expose().contains("Unbounded allocation"));
 
 		// Path-component match (file_path is one of the indexed
 		// columns).
 		let q = SearchQuery::keywords(crate::test_support::text("closing.rs").unwrap());
-		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
+		let hits = db.with_conn(|c| Ok(search_raw(c, repo_id, &q, 10)?)).unwrap();
 		assert_eq!(hits.len(), 1);
 		assert!(hits[0].title.expose().contains("Race"));
 
 		// No matches → empty Vec, not an error.
 		let q = SearchQuery::keywords(crate::test_support::text("no-such-token-anywhere").unwrap());
-		let hits = db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap();
+		let hits = db.with_conn(|c| Ok(search_raw(c, repo_id, &q, 10)?)).unwrap();
 		assert!(hits.is_empty());
 	}
 
@@ -1011,7 +1048,7 @@ mod tests {
 			.unwrap();
 		let job_id_b = db
 			.with_conn(|c| {
-				jobs::enqueue(
+				jobs::enqueue_raw(
 					c,
 					&jobs::NewJob {
 						repo_id: repo_id_b,
@@ -1035,10 +1072,10 @@ mod tests {
 		db.with_conn(|c| Ok(insert_or_ignore(c, repo_id_b, job_id_b, &f_b, false, 0)?)).unwrap();
 
 		let q = SearchQuery::keywords(crate::test_support::text("overflow").unwrap());
-		let hits_a = db.with_conn(|c| Ok(search(c, repo_id_a, &q, 10)?)).unwrap();
+		let hits_a = db.with_conn(|c| Ok(search_raw(c, repo_id_a, &q, 10)?)).unwrap();
 		assert_eq!(hits_a.len(), 1, "search must filter by repo_id; got {hits_a:?}");
 		assert_eq!(hits_a[0].repo_id, repo_id_a);
-		let hits_b = db.with_conn(|c| Ok(search(c, repo_id_b, &q, 10)?)).unwrap();
+		let hits_b = db.with_conn(|c| Ok(search_raw(c, repo_id_b, &q, 10)?)).unwrap();
 		assert_eq!(hits_b.len(), 1);
 		assert_eq!(hits_b[0].repo_id, repo_id_b);
 	}
@@ -1057,7 +1094,7 @@ mod tests {
 			.unwrap();
 		// Search hits.
 		let q = SearchQuery::keywords(crate::test_support::text("deletable phrase").unwrap());
-		assert_eq!(db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap().len(), 1);
+		assert_eq!(db.with_conn(|c| Ok(search_raw(c, repo_id, &q, 10)?)).unwrap().len(), 1);
 		// Delete the finding.
 		db.with_conn(|c| {
 			c.execute("DELETE FROM findings WHERE id = ?1", [id])?;
@@ -1065,7 +1102,7 @@ mod tests {
 		})
 		.unwrap();
 		// Search now empty — the trigger reaped the FTS row.
-		assert!(db.with_conn(|c| Ok(search(c, repo_id, &q, 10)?)).unwrap().is_empty());
+		assert!(db.with_conn(|c| Ok(search_raw(c, repo_id, &q, 10)?)).unwrap().is_empty());
 	}
 
 	#[test]
@@ -1094,6 +1131,7 @@ mod tests {
 			.with_conn(|c| {
 				Ok(attach_proposed_patch(
 					c,
+					repo_id,
 					id,
 					&crate::test_support::text("--- a/x\n+++ b/x\n@@\n-old\n+new\n").unwrap(),
 					&crate::test_support::text("swap operator").unwrap(),
@@ -1104,7 +1142,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(outcome, PatchAttachOutcome::Attached);
 
-		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		assert_eq!(
 			row.patch_unified.as_ref().map(loupe_core::text::BoundedText::expose),
 			Some("--- a/x\n+++ b/x\n@@\n-old\n+new\n")
@@ -1138,6 +1176,7 @@ mod tests {
 			.with_conn(|c| {
 				Ok(attach_proposed_patch(
 					c,
+					repo_id,
 					id,
 					&crate::test_support::text("first patch").unwrap(),
 					&crate::test_support::text("first reason").unwrap(),
@@ -1151,6 +1190,7 @@ mod tests {
 			.with_conn(|c| {
 				Ok(attach_proposed_patch(
 					c,
+					repo_id,
 					id,
 					&crate::test_support::text("second patch").unwrap(),
 					&crate::test_support::text("second reason").unwrap(),
@@ -1161,7 +1201,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(second, PatchAttachOutcome::AlreadyPresent);
 
-		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, id)?)).unwrap().unwrap();
 		assert_eq!(
 			row.patch_unified.as_ref().map(loupe_core::text::BoundedText::expose),
 			Some("first patch")
@@ -1187,7 +1227,7 @@ mod tests {
 			db.with_conn(|c| Ok(insert_or_ignore(c, repo_id, job_id, &f, false, 200)?)).unwrap();
 		assert!(first.is_some());
 		assert!(second.is_none(), "second insert must be ignored");
-		assert_eq!(db.with_conn(|c| Ok(list_for_job(c, job_id)?)).unwrap().len(), 1);
+		assert_eq!(db.with_conn(|c| Ok(list_for_job_raw(c, job_id)?)).unwrap().len(), 1);
 	}
 }
 

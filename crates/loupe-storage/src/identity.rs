@@ -4,6 +4,7 @@ use loupe_core::text::policy::{AnchorText, Family, InstanceKey};
 use loupe_core::text::{Anchor, Identifier};
 use loupe_provenance::Source;
 
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug)]
 pub struct Identity<S: Source> {
 	pub family: Identifier<Family, S>,

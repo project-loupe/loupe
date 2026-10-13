@@ -65,6 +65,10 @@ pub(crate) fn anchor<P: AnchorPolicy>(raw: &str) -> Result<String, Error> {
 		return Err(Error::new(P::FIELD, Rule::Empty));
 	}
 	limits::<P>(&text)?;
+	#[expect(
+		clippy::unwrap_used,
+		reason = "the checked-in literal regex has no runtime input and is exercised by anchor tests"
+	)]
 	static TRANSIENT_ID: LazyLock<Regex> = LazyLock::new(|| {
 		Regex::new(r"(?-u:\b(job|campaign|generation|unit|lead|finding|line)[ #_-]?[0-9]+\b)")
 			.unwrap()

@@ -36,6 +36,7 @@ impl BrowserRequest {
 	}
 }
 
+// debug-ok: closed rejection unit variants contain no browser input.
 #[derive(Debug)]
 pub(crate) enum Failure {
 	Context,
@@ -131,7 +132,12 @@ impl BrowserLimit {
 		if let Some(limit) = self.0 {
 			request = request.query(&[("limit", limit)]);
 		}
-		request.send().await
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "dashboard list egress sends only the admitted numeric Browser limit"
+		)]
+		let response = request.send().await;
+		response
 	}
 }
 impl FromRequestParts<WebState> for BrowserLimit {

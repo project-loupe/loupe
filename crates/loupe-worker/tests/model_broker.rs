@@ -37,8 +37,11 @@ fn bwrap_present() -> bool {
 		.unwrap_or(false)
 }
 
-fn model_only_allowlist() -> SandboxNetworkConfig {
-	SandboxNetworkConfig { mode: SandboxNetworkMode::Allowlist, allowlist: Vec::new() }
+fn model_only_allowlist() -> loupe_worker::config::SandboxNetworkPolicy {
+	let mut config = loupe_worker::config::WorkerConfig::default();
+	config.sandbox =
+		SandboxNetworkConfig { mode: SandboxNetworkMode::Allowlist, allowlist: Vec::new() };
+	config.sandbox_launch_config().unwrap().network().clone()
 }
 
 fn cli_from_env(name: &str) -> Option<PathBuf> {
@@ -106,18 +109,23 @@ async fn claude_reaches_fake_upstream_only_through_the_broker() {
 	std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
 
 	let context = ModelBrokerContext::new(
-		worker_binary,
+		loupe_worker::sandbox::SandboxPath::fixture(worker_binary),
 		upstream,
 		ModelCredential::anthropic_api_key("host-anthropic-secret"),
 		ModelBrokerLimits::default(),
 	);
-	let backend = ClaudeCliBackend::with_bin(fake_claude.to_string_lossy())
+	let backend = ClaudeCliBackend::with_bin(fake_claude.as_os_str())
 		.with_network_config(model_only_allowlist())
 		.with_model_broker_context(context);
 	let response = backend
 		.run(LlmRequest {
+			security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap(),
 			tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt: loupe_worker::llm::prompts::Prompt::instruction("ignored by fake CLI").unwrap(),
+			sandbox_workdir: loupe_worker::sandbox::SandboxPath::fixture(
+				workdir.path().to_path_buf(),
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(10),
 			cancel: CancellationToken::new(),
@@ -208,18 +216,23 @@ exec /usr/bin/curl --silent --show-error --fail-with-body -X POST "${base_url}/r
 	std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
 
 	let context = ModelBrokerContext::new(
-		worker_binary,
+		loupe_worker::sandbox::SandboxPath::fixture(worker_binary),
 		upstream,
 		ModelCredential::openai_api_key("host-openai-secret"),
 		ModelBrokerLimits::default(),
 	);
-	let backend = CodexCliBackend::with_bin(fake_codex.to_string_lossy())
+	let backend = CodexCliBackend::with_bin(fake_codex.as_os_str())
 		.with_network_config(model_only_allowlist())
 		.with_model_broker_context(context);
 	let response = backend
 		.run(LlmRequest {
+			security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap(),
 			tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt: loupe_worker::llm::prompts::Prompt::instruction("ignored by fake CLI").unwrap(),
+			sandbox_workdir: loupe_worker::sandbox::SandboxPath::fixture(
+				workdir.path().to_path_buf(),
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(10),
 			cancel: CancellationToken::new(),
@@ -272,22 +285,29 @@ async fn selected_claude_cli_reaches_the_messages_contract() {
 	});
 
 	let context = ModelBrokerContext::new(
-		PathBuf::from(env!("CARGO_BIN_EXE_loupe-worker")),
+		loupe_worker::sandbox::SandboxPath::fixture(PathBuf::from(env!(
+			"CARGO_BIN_EXE_loupe-worker"
+		))),
 		upstream,
 		ModelCredential::anthropic_api_key("host-anthropic-secret"),
 		ModelBrokerLimits::default(),
 	);
-	let backend = ClaudeCliBackend::with_bin(claude.to_string_lossy())
+	let backend = ClaudeCliBackend::with_bin(claude.as_os_str())
 		.with_network_config(model_only_allowlist())
 		.with_model_broker_context(context);
 	let workdir = tempfile::tempdir().unwrap();
 	let cli_result = backend
 		.run(LlmRequest {
+			security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap(),
 			tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt: loupe_worker::llm::prompts::Prompt::instruction(
 				"Return OK and do nothing else.",
 			)
 			.unwrap(),
+			sandbox_workdir: loupe_worker::sandbox::SandboxPath::fixture(
+				workdir.path().to_path_buf(),
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(3),
 			cancel: CancellationToken::new(),
@@ -341,22 +361,29 @@ async fn selected_codex_cli_reaches_the_responses_contract() {
 	});
 
 	let context = ModelBrokerContext::new(
-		PathBuf::from(env!("CARGO_BIN_EXE_loupe-worker")),
+		loupe_worker::sandbox::SandboxPath::fixture(PathBuf::from(env!(
+			"CARGO_BIN_EXE_loupe-worker"
+		))),
 		upstream,
 		ModelCredential::openai_api_key("host-openai-secret"),
 		ModelBrokerLimits::default(),
 	);
-	let backend = CodexCliBackend::with_bin(codex.to_string_lossy())
+	let backend = CodexCliBackend::with_bin(codex.as_os_str())
 		.with_network_config(model_only_allowlist())
 		.with_model_broker_context(context);
 	let workdir = tempfile::tempdir().unwrap();
 	let cli_result = backend
 		.run(LlmRequest {
+			security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap(),
 			tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt: loupe_worker::llm::prompts::Prompt::instruction(
 				"Return OK and do nothing else.",
 			)
 			.unwrap(),
+			sandbox_workdir: loupe_worker::sandbox::SandboxPath::fixture(
+				workdir.path().to_path_buf(),
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(3),
 			cancel: CancellationToken::new(),
@@ -428,12 +455,14 @@ async fn selected_claude_cli_completes_a_local_response_with_the_exact_prompt() 
 		axum::serve(listener, app).await.unwrap();
 	});
 	let context = ModelBrokerContext::new(
-		PathBuf::from(env!("CARGO_BIN_EXE_loupe-worker")),
+		loupe_worker::sandbox::SandboxPath::fixture(PathBuf::from(env!(
+			"CARGO_BIN_EXE_loupe-worker"
+		))),
 		upstream,
 		ModelCredential::anthropic_api_key("host-anthropic-secret"),
 		ModelBrokerLimits::default(),
 	);
-	let backend = ClaudeCliBackend::with_bin(claude.to_string_lossy())
+	let backend = ClaudeCliBackend::with_bin(claude.as_os_str())
 		.with_network_config(model_only_allowlist())
 		.with_model_broker_context(context);
 	let workdir = tempfile::tempdir().unwrap();
@@ -444,8 +473,11 @@ async fn selected_claude_cli_completes_a_local_response_with_the_exact_prompt() 
 	let expected = prompt.expose().to_owned();
 	let result = backend
 		.run(LlmRequest {
+			security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap(),
 			tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt,
+			sandbox_workdir: loupe_worker::sandbox::SandboxPath::fixture(workdir.path().to_owned()),
 			workdir: workdir.path().to_owned(),
 			timeout: Duration::from_secs(15),
 			cancel: CancellationToken::new(),
@@ -622,16 +654,21 @@ async fn selected_codex_cli_completes_commands_and_mcp_under_the_worker_policy()
 	});
 	let worker_binary = PathBuf::from(env!("CARGO_BIN_EXE_loupe-worker"));
 	let model = ModelBrokerContext::new(
-		worker_binary.clone(),
+		loupe_worker::sandbox::SandboxPath::fixture(worker_binary.clone()),
 		upstream.clone(),
 		ModelCredential::openai_api_key("host-openai-secret"),
 		ModelBrokerLimits::default(),
 	);
 	let mcp = McpContext {
-		worker_binary,
+		worker_binary: loupe_worker::sandbox::SandboxPath::fixture(worker_binary),
 		client: Arc::new(ServerClient::from_parts(reqwest::Client::new(), upstream)),
 		bkb_mcp_path: None,
-		bkb_api_url: loupe_worker::config::ConfiguredText::Builtin("https://example.invalid"),
+		bkb_api_url: {
+			let mut config = loupe_worker::config::WorkerConfig::default();
+			config.bkb.api_url =
+				loupe_worker::config::ConfiguredText::Builtin("https://example.invalid");
+			config.sandbox_launch_config().unwrap().bkb_api_url().clone()
+		},
 	};
 	let workdir = tempfile::tempdir().unwrap();
 	std::fs::write(workdir.path().join("input.txt"), "repo-readable").unwrap();
@@ -646,13 +683,18 @@ async fn selected_codex_cli_completes_commands_and_mcp_under_the_worker_policy()
 	)
 	.unwrap();
 	let expected_prompt = prompt.expose().to_owned();
-	let result = CodexCliBackend::with_bin(codex.to_string_lossy())
+	let result = CodexCliBackend::with_bin(codex.as_os_str())
 		.with_network_config(model_only_allowlist())
 		.with_model_broker_context(model)
 		.with_mcp_context(mcp)
 		.run(LlmRequest {
+			security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+				.unwrap(),
 			tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 			prompt,
+			sandbox_workdir: loupe_worker::sandbox::SandboxPath::fixture(
+				workdir.path().to_path_buf(),
+			),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(30),
 			cancel: CancellationToken::new(),

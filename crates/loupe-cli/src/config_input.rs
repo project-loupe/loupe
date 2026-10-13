@@ -118,6 +118,7 @@ impl ConfiguredPath {
 	}
 }
 
+// debug-ok: configured name delegates to redacted text; default is fieldless.
 #[derive(Clone, Debug)]
 pub(super) enum CertificateCommonName {
 	Default,
@@ -323,8 +324,8 @@ impl Validate<&str, Config> for PemRead {
 	fn validate<'v>(
 		self, _: Unvalidated<'v, &str>, _: Mark<'v, Config>,
 	) -> Result<Self::Output, Self::Error> {
-		// The existing guarded TLS reader already enforces UTF-8. PEM syntax
-		// and trust remain with the existing operation-specific constructors.
+		// The guarded TLS reader enforces UTF-8. Operation-specific constructors
+		// check PEM syntax and trust.
 		Ok(PhantomData)
 	}
 }
@@ -373,6 +374,7 @@ pub(super) fn mints() -> usize {
 	MINTS.with(std::cell::Cell::get)
 }
 #[cfg(fuzzing)]
+// debug-ok: cfg(fuzzing)-only oracle captures synthetic PAT fixtures.
 #[derive(Debug)]
 #[allow(dead_code)] // The library fixture exposes this observation; the binary does not.
 pub struct PatObservation {

@@ -13,7 +13,3 @@ imports_granularity = "Module"
 normalize_comments = true
 normalize_doc_attributes = true
 style_edition = "2021"
-# TBD: do we want comment and string wrapping?
-#wrap_comments = true
-#format_strings = true
-#overflow_delimited_expr = true

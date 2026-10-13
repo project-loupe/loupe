@@ -1,3 +1,17 @@
+// Tests may unwrap fixture setup errors; production code must handle them.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 #![deny(unsafe_code)]
 //! Entry point for the loupe scan/verify worker.
 //!
@@ -12,13 +26,13 @@
 //!   supervises one sandboxed agent while provider authority stays in
 //!   the parent worker's per-job model broker.
 
+#[cfg(test)]
 use std::ffi::OsString;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use loupe_worker::config::{LoggingConfig, WorkerConfig};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
@@ -31,10 +45,16 @@ use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
 mod config_arguments;
+#[path = "sandbox/model_proxy_launcher.rs"]
+mod model_proxy_launcher;
 use config_arguments::WorkerOverridesDecoder;
 use config_value_parsers::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
 use loupe_worker::config_value_parsers;
+#[cfg(test)]
+use model_proxy_launcher::replace_model_base_url;
+use model_proxy_launcher::Args as ModelProxyArgs;
 
+// debug-ok: Nested argument types redact private inputs; other fields are closed modes, booleans and numeric limits.
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe scan/verify worker")]
 struct Cli {
@@ -44,11 +64,11 @@ struct Cli {
 	run: RunArgs,
 }
 
+// debug-ok: Nested argument types redact private inputs; other fields are closed modes, booleans and numeric limits.
 #[derive(Debug, Subcommand)]
 enum Cmd {
 	/// Run the long-running scan/verify worker loop. Default when no
-	/// subcommand is given, so the existing
-	/// `loupe-worker --server-url ... ...` invocation keeps working.
+	/// subcommand is given: `loupe-worker --server-url ...` starts this mode.
 	Run(Box<RunArgs>),
 	/// Bridge MCP stdio to one host-side Unix socket. This subcommand
 	/// receives no server URL, mTLS credentials, job id, or capability.
@@ -64,13 +84,19 @@ enum Cmd {
 	GitCredential(GitCredentialArgs),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 struct GitCredentialArgs {
 	#[arg(long)]
 	socket: PathBuf,
 	operation: String,
 }
+impl std::fmt::Debug for GitCredentialArgs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("GitCredentialArgs([redacted])")
+	}
+}
 
+// debug-ok: Nested argument types redact private inputs; other fields are closed modes, booleans and numeric limits.
 #[derive(Debug, Parser)]
 struct RunArgs {
 	/// Path to worker config TOML. CLI/env values override file settings.
@@ -130,7 +156,7 @@ struct RunArgs {
 	/// Emit structured JSON logs.
 	#[arg(long, env = "LOUPE_LOG_JSON", value_parser = clap::builder::BoolishValueParser::new())]
 	log_json: Option<bool>,
-	/// Dump full successful agent stdout/stderr at info level.
+	/// Log successful agent output counts at info level; content stays private.
 	#[arg(long, env = "LOUPE_LOG_AGENT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
 	log_agent_output: Option<bool>,
 	/// Agent backend for LLM scan jobs: auto, claude, or codex.
@@ -174,44 +200,32 @@ struct RunArgs {
 	broker_token_ceiling: Option<u64>,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 struct McpProxyArgs {
 	#[arg(long)]
 	socket: PathBuf,
 }
-
-#[derive(Debug, Parser)]
-struct ModelProxyArgs {
-	#[arg(long)]
-	socket: PathBuf,
-	#[arg(long, default_value = "127.0.0.1:0")]
-	listen: SocketAddr,
-	#[arg(long)]
-	port_file: PathBuf,
-	#[arg(long, value_enum, default_value = "claude")]
-	provider: ModelProxyProvider,
-	#[arg(last = true, required = true, allow_hyphen_values = true)]
-	command: Vec<OsString>,
+impl std::fmt::Debug for McpProxyArgs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("McpProxyArgs([redacted])")
+	}
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ModelProxyProvider {
-	Claude,
-	Codex,
-}
-
-const MODEL_BASE_URL_PLACEHOLDER: &str = "@LOUPE_MODEL_BASE_URL@";
-
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 struct SandboxExecArgs {
 	#[arg(long, value_enum)]
 	network: SandboxNetworkMode,
 	#[arg(long)]
-	required_host: Vec<String>,
+	required_host: Vec<ConfiguredText>,
 	#[arg(long)]
-	allow_host: Vec<String>,
+	allow_host: Vec<ConfiguredText>,
 	#[arg(last = true, required = true, allow_hyphen_values = true)]
-	command: Vec<OsString>,
+	command: Vec<config_value_parsers::SupervisorCommandArgument>,
+}
+impl std::fmt::Debug for SandboxExecArgs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("SandboxExecArgs([redacted])")
+	}
 }
 
 #[tokio::main]
@@ -240,7 +254,7 @@ async fn main() -> Result<()> {
 		},
 		Some(Cmd::ModelProxy(args)) => {
 			init_tracing_from_env();
-			let status = run_model_proxy(args).await?;
+			let status = model_proxy_launcher::run(args).await?;
 			std::process::exit(status.code().unwrap_or(1));
 		},
 		Some(Cmd::SandboxExec(args)) => {
@@ -252,8 +266,7 @@ async fn main() -> Result<()> {
 			)?;
 			std::process::exit(status.code().unwrap_or(1));
 		},
-		// Default subcommand for backwards compatibility with the
-		// existing `loupe-worker --server-url ...` invocation pattern.
+		// Top-level worker options select run mode without a subcommand.
 		None => {
 			let cfg = load_worker_config(&cli.run)?;
 			init_tracing(&cfg.logging);
@@ -300,10 +313,8 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 
 	// LLM scanners wire through worker-local job-agent policy:
 	//
-	// - [agents].scan = "auto" preserves the historical discovery
-	//   default: use claude when ready, otherwise advertise verify-only.
-	// - [agents].verify = "auto" preserves the historical verifier
-	//   default: prefer codex, falling back to claude.
+	// - [agents].scan = "auto": use claude when ready, otherwise verify-only.
+	// - [agents].verify = "auto": prefer codex, falling back to claude.
 	// - explicit claude/codex selections fail startup when unavailable.
 	// - no authenticated CLI still hard-fatals at startup. Docker
 	//   images can install both CLIs, but missing credentials should fail
@@ -337,8 +348,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// missing binary or attempted bypass is a startup error.
 	sandbox::probe_at_startup(cfg.runtime.disable_sandbox)
 		.context("LLM scanner requires bubblewrap")?;
-	sandbox::smoketest(cache_dir.for_filesystem(), cfg.sandbox.clone())
-		.context("bubblewrap sandbox smoketest failed")?;
+	let launch = cfg.sandbox_launch_config()?;
+	let sandbox_worker = sandbox::SandboxBinary::current_worker()?;
+	sandbox::smoketest(&launch).context("bubblewrap sandbox smoketest failed")?;
 	tracing::info!(
 		network = %cfg.sandbox.mode,
 		allowlist_hosts = cfg.sandbox.allowlist.len(),
@@ -351,12 +363,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// historical-context lookups on bitcoin-shaped projects. The
 	// presence is a single PATH probe — no opt-in flag, no install at
 	// runtime; absence is silent.
-	let bkb_mcp_path = bkb_mcp_available();
-	if let Some(path) = &bkb_mcp_path {
-		tracing::info!(
-			path = %path.display(),
-			"bkb-mcp detected; attaching to discovery agent's MCP config"
-		);
+	let bkb_mcp_path = bkb_mcp_available(&launch);
+	if bkb_mcp_path.is_some() {
+		tracing::info!("bkb-mcp detected; attaching to discovery agent's MCP config");
 	} else {
 		tracing::info!(
 			"bkb-mcp not on PATH; discovery agent will run without Bitcoin-context tools \
@@ -368,28 +377,31 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// a per-invocation Unix socket. The authenticated client remains in
 	// the trusted parent process.
 	let mcp_ctx = McpContext {
-		worker_binary: worker_binary.clone(),
+		worker_binary: sandbox_worker.clone(),
 		client: client.clone(),
 		bkb_mcp_path: bkb_mcp_path.clone(),
-		bkb_api_url: cfg.bkb.api_url.clone(),
+		bkb_api_url: launch.bkb_api_url().clone(),
 	};
 
+	let mut credential_watches = Vec::new();
 	if let Some(backend) = build_scan_backend(
 		Some(mcp_ctx.clone()),
 		cfg.agents.scan,
 		claude,
 		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		launch.codex().clone(),
+		launch.claude().clone(),
 		BackendRuntimeConfig {
-			network: cfg.sandbox.clone(),
+			network: launch.network().clone(),
+			launch: launch.clone(),
 			log_agent_output: cfg.logging.agent_output,
 			model_broker: Some(ModelBrokerRuntimeConfig {
-				worker_binary: worker_binary.clone(),
+				worker_binary: sandbox_worker.clone(),
 				limits: cfg.broker,
 			}),
 		},
 	)? {
+		credential_watches.extend(backend.credential_watch());
 		scanners.push(Arc::new(
 			LlmCodeReviewScanner::new(backend)
 				.with_config(cfg.scanner_defaults.clone())
@@ -407,19 +419,25 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		cfg.agents.verify,
 		claude,
 		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		launch.codex().clone(),
+		launch.claude().clone(),
 		BackendRuntimeConfig {
-			network: cfg.sandbox.clone(),
+			network: launch.network().clone(),
+			launch,
 			log_agent_output: cfg.logging.agent_output,
-			model_broker: Some(ModelBrokerRuntimeConfig { worker_binary, limits: cfg.broker }),
+			model_broker: Some(ModelBrokerRuntimeConfig {
+				worker_binary: sandbox_worker,
+				limits: cfg.broker,
+			}),
 		},
 	)?;
+	credential_watches.extend(backend.credential_watch());
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
-	let runner =
-		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
+	let runner = Runner::new(client, cache, scanners)
+		.with_max_workdir_bytes(cfg.runtime.max_workdir_bytes)
+		.with_credential_watches(credential_watches);
 
 	let cancel = CancellationToken::new();
 	let cancel_for_signal = cancel.clone();
@@ -454,69 +472,6 @@ async fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
 	};
 	tokio::try_join!(to_broker, from_broker)?;
 	Ok(())
-}
-
-async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatus> {
-	use loupe_worker::llm::model_proxy::ModelProxy;
-
-	let proxy = ModelProxy::bind(args.socket, args.listen, &args.port_file).await?;
-	let base_url = proxy.base_url();
-	let mut relay = tokio::spawn(proxy.relay());
-	let (program, command_args) = args.command.split_first().expect("clap requires a command");
-	let mut child = tokio::process::Command::new(program);
-	child.args(
-		command_args.iter().cloned().map(|argument| replace_model_base_url(argument, &base_url)),
-	);
-	// Fail closed even if this internal mode is invoked outside the
-	// normal Bubblewrap path: the supervised process sees only a fixed,
-	// non-secret gateway sentinel, never a host provider credential.
-	child.env_clear();
-	for name in ["PATH", "HOME", "TMPDIR"] {
-		if let Some(value) = std::env::var_os(name) {
-			child.env(name, value);
-		}
-	}
-	match args.provider {
-		ModelProxyProvider::Claude => {
-			child.env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered");
-			child.env("ANTHROPIC_BASE_URL", base_url);
-			child.env("DISABLE_AUTOUPDATER", "1");
-			child.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-			child.env("DISABLE_TELEMETRY", "1");
-			child.env("DISABLE_ERROR_REPORTING", "1");
-			child.env("DISABLE_BUG_COMMAND", "1");
-		},
-		ModelProxyProvider::Codex => {
-			child.env("CODEX_API_KEY", "loupe-brokered");
-		},
-	}
-	child.kill_on_drop(true);
-	let mut child = child.spawn().context("spawning model-proxied agent command")?;
-
-	tokio::select! {
-		biased;
-		status = child.wait() => {
-			relay.abort();
-			let _ = relay.await;
-			status.context("waiting for model-proxied agent command")
-		},
-		result = &mut relay => {
-			match result.context("model proxy relay task panicked")? {
-				Ok(()) => child.wait().await.context("waiting for model-proxied agent command"),
-				Err(error) => {
-					let _ = child.kill().await;
-					Err(error)
-				},
-			}
-		},
-	}
-}
-
-fn replace_model_base_url(argument: OsString, base_url: &str) -> OsString {
-	match argument.into_string() {
-		Ok(argument) => OsString::from(argument.replace(MODEL_BASE_URL_PLACEHOLDER, base_url)),
-		Err(argument) => argument,
-	}
 }
 
 fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
@@ -800,6 +755,34 @@ mod tests {
 		assert_eq!(args.listen, "127.0.0.1:0".parse().unwrap());
 		assert_eq!(args.port_file, PathBuf::from("/tmp/model.port"));
 		assert_eq!(args.command, [OsString::from("/bin/true")]);
+	}
+
+	#[test]
+	fn internal_launcher_debug_omits_paths_commands_and_operation_tokens() {
+		let sentinel = "private-launch-sentinel";
+		let cases = [
+			vec!["loupe-worker", "git-credential", "--socket", sentinel, sentinel],
+			vec!["loupe-worker", "mcp-proxy", "--socket", sentinel],
+			vec![
+				"loupe-worker",
+				"model-proxy",
+				"--socket",
+				sentinel,
+				"--port-file",
+				sentinel,
+				"--",
+				sentinel,
+			],
+			vec!["loupe-worker", "sandbox-exec", "--network", "public", "--", sentinel],
+		];
+		let mut leaks = Vec::new();
+		for arguments in cases {
+			let cli = Cli::try_parse_from(&arguments).unwrap();
+			if format!("{cli:?}").contains(sentinel) {
+				leaks.push(arguments[1]);
+			}
+		}
+		assert!(leaks.is_empty(), "private launcher inputs leaked through Debug: {leaks:?}");
 	}
 
 	#[test]

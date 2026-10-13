@@ -62,6 +62,10 @@ impl ServerClient {
 	) -> Result<Self> {
 		let tls =
 			loupe_tls::reqwest_client_config(client_cert_pem, client_key_pem, server_cert_pem)?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "ServerClient owns the configured mutual-TLS HTTP transport."
+		)]
 		let http = reqwest::Client::builder()
 			.use_preconfigured_tls(tls)
 			.build()
@@ -94,6 +98,10 @@ impl ServerClient {
 		}
 		let req =
 			BuiltinLeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Lease HTTP egress carries only the closed worker capability catalog to the configured server."
+		)]
 		let resp = self
 			.with_protocol(self.http.post(url))
 			.json(&req)
@@ -109,6 +117,10 @@ impl ServerClient {
 	) -> Result<HeartbeatResponse> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/heartbeat"));
 		let req = HeartbeatRequest { protocol_version: PROTOCOL_VERSION };
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Heartbeat HTTP egress is bound to the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(&req)
@@ -123,6 +135,10 @@ impl ServerClient {
 		&self, job_id: i64, job_capability: &JobCapability, batch: &FindingsBatch<Repo>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/findings"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Finding HTTP egress uses typed Repo findings and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(batch)
@@ -137,6 +153,10 @@ impl ServerClient {
 		finding: &crate::mcp::McpFindingSubmission,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/llm-findings"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "LLM finding HTTP egress uses typed Agent fields and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(finding)
@@ -151,6 +171,10 @@ impl ServerClient {
 		req: &CompleteRequest<RevisionS, DiagnosticS>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Completion HTTP egress retains source-typed revisions and diagnostics under the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
@@ -164,6 +188,10 @@ impl ServerClient {
 		&self, job_id: i64, job_capability: &JobCapability, req: &VerdictSubmission<Agent>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Verdict HTTP egress uses typed Agent data and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
@@ -177,6 +205,10 @@ impl ServerClient {
 		&self, job_id: i64, job_capability: &JobCapability, req: &crate::runner::RunnerCompletion,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Runner completion HTTP egress carries closed host outcomes under the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
@@ -191,6 +223,10 @@ impl ServerClient {
 		reason: crate::host_outcome::HostVerifyReason,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Host verdict HTTP egress carries only a closed host outcome under the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(&reason.into_submission())
@@ -208,6 +244,10 @@ impl ServerClient {
 		query: &loupe_core::text::BoundedText<crate::mcp::QueryText, Agent>, limit: i64,
 	) -> Result<ListFindingsResponse<Agent, Server>> {
 		let url = self.url(&format!("/v1/repos/{repo_id}/findings/search"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Finding query HTTP egress preserves repository scope and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(
 				self.http.get(url).query(&[("q", query.expose()), ("limit", &limit.to_string())]),
@@ -228,6 +268,10 @@ impl ServerClient {
 		&self, id: i64, job_capability: &JobCapability,
 	) -> Result<FindingDetail<Agent, Server>> {
 		let url = self.url(&format!("/v1/findings/{id}"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Finding lookup HTTP egress preserves finding ID and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.get(url), job_capability)
 			.send()
@@ -238,6 +282,10 @@ impl ServerClient {
 	}
 
 	fn url(&self, path: &str) -> Url {
+		#[allow(
+			clippy::expect_used,
+			reason = "The validated absolute base URL is joined only with static absolute API paths and numeric IDs."
+		)]
 		self.base.join(path).expect("path is always valid")
 	}
 
@@ -263,6 +311,7 @@ async fn read_server_response(
 	Ok(Untrusted::new(bytes, unsafe { Ingress::<Server>::new() }))
 }
 
+// debug-ok: HTTP status is numeric and ServerDiagnostic has an opaque Debug formatter.
 #[derive(Debug)]
 struct ServerResponseError {
 	status: reqwest::StatusCode,

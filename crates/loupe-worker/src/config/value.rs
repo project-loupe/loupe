@@ -21,6 +21,7 @@ macro_rules! policy {
 policy!(WorkerArgument, "worker_argument");
 policy!(WorkerFileText, "worker_config");
 
+// debug-ok: Dynamic Config text uses redacted BoundedText; Builtin contains only host static literals.
 #[derive(Clone, Debug)]
 pub enum ConfiguredText {
 	Builtin(&'static str),

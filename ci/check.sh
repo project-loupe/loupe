@@ -1,12 +1,12 @@
 #!/bin/sh
-# The gate. `ci/check.sh` runs what every commit must pass; `--full`
-# adds the slow parts that run per section of work and in CI.
+# `--full` also runs fuzz corpus replay, Kani and optional integration tests.
 #
-# The derived-Debug gate is enabled as the source-labelled holders land.
+# Content-bearing types require an explicitly reviewed Debug implementation.
 set -eu
 cd "$(dirname "$0")/.."
 . ci/env.sh
 . ci/gates.sh
+. ci/production-lints.sh
 FULL=0; [ "${1:-}" = "--full" ] && FULL=1
 export CARGO_TERM_COLOR=always
 # Scratch space private to this run, so parallel worktrees cannot race.
@@ -23,6 +23,7 @@ say "no production environment forwarding"
 gate_no_forward_env . || exit 1
 
 say "clippy (stable, warnings are errors)"
+production_clippy --workspace --lib --bins --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 # The runner binaries have a main only when a backend feature is chosen.
 (cd fuzz && RUSTFLAGS="--cfg=fuzzing" cargo clippy --workspace --all-targets --features loupe-fuzz-runners/stdin_fuzz -- -D warnings)
@@ -43,33 +44,22 @@ while read -r m has_lib; do
 done < "$SCRATCH/packages"
 
 say "unsafe code only where listed"
-# Minting a provenance label is `unsafe` (loupe-provenance practice P3):
-# the compiler finds every site, and this decides where they may be.
+# Unchecked provenance construction requires unsafe code; its owning file
+# must appear in the reviewed allow-list.
 gate_unsafe_allow . || { echo "unsafe code outside ci/unsafe-allow.txt"; exit 1; }
 gate_lints ./Cargo.toml ./fuzz/Cargo.toml || { echo "a package does not deny unsafe code"; exit 1; }
 gate_no_tool_deps . || exit 1
 gate_sources . || { echo "a source the checks cannot see"; exit 1; }
 # The gates above must reject every known bypass form on every check.
 ci/gate-selftest.sh
+ci/production-lint-selftest.sh
 
 say "no derived Debug on content-holding types without a reason"
 # Types that may hold agent, repository, sandbox or secret bytes
 # implement Debug by hand. A derive is allowed only with
 # `// debug-ok: <reason>` on the line above it (or on the derive line),
 # stating why the type holds no such content.
-if [ -n "${LOUPE_DEBUG_GATE_CRATES:-}" ]; then
-	bad=0
-	for c in $LOUPE_DEBUG_GATE_CRATES; do
-		[ -d "crates/$c/src" ] || continue
-		if find "crates/$c/src" -name '*.rs' -exec awk '
-			/derive\([^)]*Debug/ && $0 !~ /debug-ok:/ && prev !~ /debug-ok:/ { print FILENAME ":" FNR ": " $0; found=1 }
-			{ prev=$0 }
-			END { exit found ? 0 : 1 }' {} + ; then bad=1; fi
-	done
-	[ "$bad" -eq 0 ] || { echo "derived Debug without a debug-ok reason"; exit 1; }
-else
-	echo "not enabled yet (set LOUPE_DEBUG_GATE_CRATES to the crates under the rule)"
-fi
+gate_derived_debug . || exit 1
 
 say "docs build without warnings"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --quiet

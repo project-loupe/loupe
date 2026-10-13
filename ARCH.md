@@ -535,6 +535,64 @@ and is explicitly listed as no verdict; runtime and fuzz evidence are not a
 substitute proof. CLI terminal rendering separately escapes control characters.
 Searching for formatting sites is an audit aid, not proof of sink safety.
 
+Report builders accept labelled fields and paths. GitHub descriptions and
+diffs use backtick fences longer than every run in the input; paths use
+literal code spans, so a path cannot create a link or HTML element. Complete
+issue bodies, including their framing, must fit 65,536 Unicode scalars and
+262,144 bytes. Email uses a fixed host layout and selected stored settings
+for headers; finding text belongs in the body. Each complete header line is
+limited to 8,192 bytes, the header section to 65,536 bytes and the complete
+message to 16 MiB. Rejected output is not truncated into a different report.
+
+### Sandbox operands and job containment
+
+Sandbox arguments and environment values come from static literals, numerical
+ports, admitted nonsecret configuration or concrete path owners. Configuration
+captures the host PATH once. Mounted paths and path-valued environment entries
+retain their checkout, binary, broker or scratch owners through the prepared
+command and child lifetime. The public prepared command exposes lifecycle and
+stdio operations; it cannot append arbitrary arguments or environment values.
+
+Every worker job owns a random fake credential in a read-only sandbox file.
+MCP records and model-broker requests are checked for that value and selected
+host credentials in raw bytes and valid JSON string runs. A match publishes
+irreversible quarantine and cancellation before emitting a closed security
+event. Pending broker work stops, further job operations are refused, and the
+host can still report failed completion. This detects exact watched values,
+including JSON escapes; it does not detect every possible encoding or prove
+that a model follows instructions.
+
+Finding citations must match exact, nonempty fenced bytes within the submitted
+inclusive line range. One opened regular-file descriptor supplies the check
+and fingerprint; special-file opening is nonblocking before descriptor
+admission. An 8 KiB streaming reader checks UTF-8 and cancellation while
+retaining the existing fingerprint normalization, including Unicode lowercase
+context. Citation matching itself preserves original whitespace, line endings
+and Unicode bytes. Failures expose a closed reason and numerical location,
+without source paths or quoted text.
+
+### Transaction and delivery authority
+
+The storage crate owns raw SQLite connections. Public repository DAOs take a
+`RepoScope` borrowed from a synchronous transaction callback. Authenticated
+Operator authority selects a repository, job or finding; worker operations
+receive an `AssignmentScope` only after checking the exact worker, capability,
+job and expiry under an IMMEDIATE transaction. Scopes cannot be constructed,
+cloned, deserialized or retained beyond that callback. Queries and mutations
+also retain explicit repository predicates. Global scheduling, recovery and
+registration have named storage owners instead of a public SQL callback.
+
+Report preparation selects owned content, destination settings and credentials
+inside the same transaction. Its completion receipt remains inactive until
+commit and binds the original database, repository and exact finding
+incarnations. Delivery then runs without the transaction or database mutex.
+GitHub marks each successful issue separately; a later failure preserves those
+completed rows. Email marks the selected batch atomically after successful
+sendmail exit. Rollback, a different database, a nonmember or a replaced row
+cannot authorize completion. A failed or oversized report remains available
+for explicit retry, and size rejections emit a closed `report_output` budget
+event without including report contents.
+
 The future phase endpoints must enforce HTTP body caps before
 deserialization, validate payload field semantics and job-specific
 budgets, and validate the lease before first finalization. Proof capture,
@@ -543,10 +601,10 @@ this storage layer.
 
 ## Cross-references
 
-- Finding state machine details (verdict rollup policy, approval
-  gate audit trail): `crates/loupe-server/src/routes/jobs.rs` —
-  `submit_verdict` and `complete` handlers walk through the
-  transitions inline.
+- Finding state machine and report completion:
+  `crates/loupe-storage/src/reports.rs` owns the scoped transitions and
+  receipts; `crates/loupe-server/src/routes/jobs.rs` dispatches the committed
+  results after the transaction ends.
 - Sandbox mount layout (which host paths get bind-mounted where):
   `crates/loupe-worker/src/sandbox.rs` module docs.
 - MCP tool catalogue: `crates/loupe-worker/src/mcp.rs` —

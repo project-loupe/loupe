@@ -1,3 +1,17 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 #![forbid(unsafe_code)]
 //! mTLS helpers for loupe: in-memory CA, server/client config builders,
 //! and a deterministic cert fingerprint used as the lookup key in the

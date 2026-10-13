@@ -1,5 +1,5 @@
 //! Actual GitHub response capture, with fixed concrete Reporter schemas.
-//! Ordinary responses use the existing guarded 16 MiB HTTP collector; the
+//! Ordinary responses use the guarded 16 MiB HTTP collector; the
 //! confidential token endpoint keeps its separate 256 KiB collector.
 use bytes::Bytes;
 #[cfg(fuzzing)]
@@ -26,6 +26,7 @@ pub(super) async fn read(
 	Ok(Untrusted::new(bytes, token))
 }
 
+// debug-ok: this error retains only a fixed response-operation label, never response content or a cause.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}: invalid response body")]
 pub(super) struct ReporterDecodeError(pub(super) &'static str);
@@ -82,7 +83,7 @@ impl Validate<&[u8], Reporter> for IssueReceiptDecoder {
 	fn validate<'view>(
 		self, input: Unvalidated<'view, &[u8]>, _: Mark<'view, Reporter>,
 	) -> Result<Self::Output, Self::Error> {
-		// Retain the legacy Value grammar and missing/noninteger -> None behavior.
+		// Missing or noninteger IDs decode to None under the Value grammar.
 		// Its bounded dependency-owned scratch is discarded inside this decoder.
 		let body: serde_json::Value = serde_json::from_slice(input.get())
 			.map_err(|_| ReporterDecodeError("parsing issue response"))?;

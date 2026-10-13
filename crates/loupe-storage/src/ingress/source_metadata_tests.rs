@@ -1,6 +1,6 @@
 //! Acceptance fixtures for the currently write-only proof/detail APIs. These
 //! closed read projections exercise actual SQLite columns and source metadata;
-//! they do not claim a new production read endpoint or restore source types
+//! they expose no production read endpoint and cannot restore source types
 //! from a runtime string. Non-Agent content remains Db on read.
 use super::*;
 use crate::{finding_details as details, proofs, test_support as input, transaction};
@@ -110,8 +110,8 @@ fn mixed_proof_inputs_record_only_the_designated_group_and_read_exclusions_as_db
         let revision = input::repository("repo cafe\u{301}  ", |raw, mark| BoundedText::<policy::RevisionText, loupe_provenance::Repo>::new(mark, raw)).unwrap();
         let request = input::json::<policy::Payload>(r#"["agent-request"]"#).unwrap();
         let limits = input::config_json::<policy::Payload>(r#"{"unknown":"configured-limit"}"#).unwrap();
-        let run = proofs::insert_execution(tx, &proofs::NewExecution {
-            repo_id:1, produced_by_job:101, target_commit_sha:&revision, clean_tree:true,
+        let run = proofs::insert_execution(&crate::test_support::scope(tx, 1), &proofs::NewExecution {
+             produced_by_job:101, target_commit_sha:&revision, clean_tree:true,
             argv:&request, working_dir:&proofs::WorkingDirectory::Root, env_names:&request,
             fixture_artifact_ids:None, network_policy:proofs::NetworkPolicy::Isolated, limits:&limits,
             timeout_seconds:10, started_at:1, duration_ms:2, exit_status:Some(0), term_signal:None,
@@ -124,11 +124,11 @@ fn mixed_proof_inputs_record_only_the_designated_group_and_read_exclusions_as_db
             assert_eq!(value.expose(),request.expose()); assert_eq!(revision.expose(),"repo cafe\u{301}  "); assert_eq!(policy.expose(),limits.expose());
             assert_eq!(row.get::<_,String>(4)?,"."); assert!(is_null(row,5)?); Ok(())
         })?;
-        let blob = proofs::insert_blob(tx,1,&input::artifact_bytes(b"opaque repository artifact"),0)?;
+        let blob = proofs::insert_blob(&crate::test_support::scope(tx, 1),&input::artifact_bytes(b"opaque repository artifact"),0)?;
         let media = input::config_text("text/plain").unwrap();
         let name = input::config_text("configured-name.txt").unwrap();
-        let artifact = proofs::insert_artifact(tx,&proofs::NewArtifact { repo_id:1,blob_id:blob,role:proofs::Role::CraftedInput,media_type:&media,label:None,original_name:&name,produced_by_job:Some(101) },0)?;
-        let staged = proofs::insert_staged_artifact(tx,&proofs::NewStagedArtifact { repo_id:1,job_id:101,blob_id:blob,role:proofs::Role::CraftedInput,media_type:&media,label:None,original_name:&name },0)?;
+        let artifact = proofs::insert_artifact(&crate::test_support::scope(tx, 1),&proofs::NewArtifact { blob_id:blob,role:proofs::Role::CraftedInput,media_type:&media,label:None,original_name:&name,produced_by_job:Some(101) },0)?;
+        let staged = proofs::insert_staged_artifact(&crate::test_support::scope(tx, 1),&proofs::NewStagedArtifact { job_id:101,blob_id:blob,role:proofs::Role::CraftedInput,media_type:&media,label:None,original_name:&name },0)?;
         for (table,key,id) in [("proof_artifacts","proof_artifact_id",artifact),("staged_proof_artifacts","staged_proof_artifact_id",staged)] {
             let sql=format!("SELECT original_name,source,label FROM {table} WHERE {key}=?1");
             tx.query_row(&sql,[id],|row| {
@@ -138,13 +138,13 @@ fn mixed_proof_inputs_record_only_the_designated_group_and_read_exclusions_as_db
         }
         let raw:Vec<u8>=tx.query_row("SELECT content FROM proof_artifact_blobs WHERE proof_artifact_blob_id=?1",[blob],|r|r.get(0))?;
         assert_eq!(raw,b"opaque repository artifact");
-        let proof=proofs::insert_proof(tx,&proofs::NewProof{repo_id:1,finding_id:11,verification_id:11,rung:proofs::Rung::L3,pinned_commit_sha:&revision,manifest:&limits},0)?;
+        let proof=proofs::insert_proof(&crate::test_support::scope(tx, 1),&proofs::NewProof{finding_id:11,verification_id:11,rung:proofs::Rung::L3,pinned_commit_sha:&revision,manifest:&limits},0)?;
         tx.query_row("SELECT manifest,source,pinned_commit_sha FROM verification_proofs WHERE verification_proof_id=?1",[proof],|row|{
             let PayloadRead::RecordedContent{source,value}=payload_read(row,0,1)? else {panic!("Config manifest remains Db on read");};
             assert_eq!(source,RecordedSource::Config); assert_eq!(value.expose(),limits.expose()); assert_eq!(super::revision(row,2)?.expose(),revision.expose()); Ok(())
         })?;
         let narrative=input::config_text("configured rationale").unwrap();
-        details::insert_attempt_details(tx,&details::NewAttempt{verification_id:11,repo_id:1,workflow_contract_version:1,checkout_commit_sha:&revision,established_rung:None,e2e_applicability:details::Applicability::NotApplicable,e2e_rationale:Some(&narrative),blocker:None,retry_condition:None,verification_proof:None,terminal_digest:&[7;32]},0)?;
+        details::insert_attempt_details(&crate::test_support::scope(tx, 1),&details::NewAttempt{verification_id:11,workflow_contract_version:1,checkout_commit_sha:&revision,established_rung:None,e2e_applicability:details::Applicability::NotApplicable,e2e_rationale:Some(&narrative),blocker:None,retry_condition:None,verification_proof:None,terminal_digest:&[7;32]},0)?;
         tx.query_row("SELECT e2e_rationale,source,checkout_commit_sha,blocker,retry_condition FROM verification_attempt_details WHERE verification_id=11",[],|row|{
             let Some(ReasonRead::RecordedContent{source,value})=reason_read(row)? else {panic!("Config narrative remains Db on read");};
             assert_eq!(source,RecordedSource::Config); assert_eq!(value.expose(),narrative.expose()); assert_eq!(super::revision(row,2)?.expose(),revision.expose()); assert!(is_null(row,3)?); assert!(is_null(row,4)?); Ok(())
@@ -222,10 +222,10 @@ fn fixed_agent_review_readers_refuse_other_source_metadata_without_rewriting_row
         INSERT INTO lead_observations(lead_id,observation_payload,observation_digest,commit_sha,created_at) VALUES(41,'{}',zeroblob(32),'repo-revision',0);")?;
         for source in ["agent","repo","config","Agent","agent ","unknown-private-source"] {
             for table in ["review_units","review_unit_results","leads","lead_observations"] {conn.execute(&format!("UPDATE {table} SET source=?1"),[source])?;}
-            assert_eq!(crate::review_units::get(conn,31).is_ok(),source=="agent");
-            assert_eq!(crate::review_unit_results::list(conn,31).is_ok(),source=="agent");
-            assert_eq!(crate::leads::get(conn,41).is_ok(),source=="agent");
-            assert_eq!(crate::lead_observations::list(conn,41).is_ok(),source=="agent");
+            assert_eq!(crate::review_units::get(&crate::test_support::scope(conn, 1),31).is_ok(),source=="agent");
+            assert_eq!(crate::review_unit_results::list(&crate::test_support::scope(conn, 1),31).is_ok(),source=="agent");
+            assert_eq!(crate::leads::get(&crate::test_support::scope(conn, 1),41).is_ok(),source=="agent");
+            assert_eq!(crate::lead_observations::list(&crate::test_support::scope(conn, 1),41).is_ok(),source=="agent");
             for table in ["review_units","review_unit_results","leads","lead_observations"] {assert_eq!(conn.query_row(&format!("SELECT source FROM {table}"),[],|r|r.get::<_,String>(0))?,source);}
         }
         Ok(())

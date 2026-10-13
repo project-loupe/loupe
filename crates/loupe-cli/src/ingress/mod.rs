@@ -35,6 +35,7 @@ fn invalid() -> anyhow::Error {
 
 // Record the function actually entered, independently of the fixture selector.
 #[cfg(fuzzing)]
+// debug-ok: cfg(fuzzing) entry names are closed unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
 	ShowApp,
@@ -119,7 +120,7 @@ impl std::fmt::Debug for TerminalDiagnostic {
 }
 impl std::fmt::Display for TerminalDiagnostic {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		// The CLI's final error boundary escapes terminal controls, as before.
+		// The CLI's final error boundary escapes terminal controls.
 		write!(
 			f,
 			"{}: {} — {}",

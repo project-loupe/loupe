@@ -13,11 +13,13 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use futures_util::StreamExt;
+use loupe_core::security_event::{emit, BudgetResource, EventContext, SecurityEvent};
 use loupe_provenance::{Ingress, Worker};
 use serde::Deserialize;
 
 use crate::ingress::{CapturedWorkerBody, RequestBuffer};
 
+// debug-ok: bucket configuration contains only numeric capacity and refill rate.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketConfig {
@@ -25,6 +27,7 @@ pub struct BucketConfig {
 	pub refill_per_second: u64,
 }
 
+// debug-ok: worker budget configuration contains numeric capacities, rates, counts and durations.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerBudgetConfig {
@@ -64,6 +67,7 @@ impl WorkerBudgetConfig {
 }
 
 /// Arithmetic decision only; no clock or shared state access.
+// debug-ok: arithmetic budget state contains only token counts and a monotonic timestamp.
 #[derive(Clone, Debug)]
 pub(crate) struct Budget {
 	pub(crate) capacity: u64,
@@ -114,6 +118,7 @@ impl Entry {
 	}
 }
 
+// debug-ok: a closed charge kind and byte count contain no request bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Charge {
 	Request,
@@ -183,6 +188,10 @@ impl WorkerBudgets {
 				},
 			);
 		}
+		#[expect(
+			clippy::expect_used,
+			reason = "the same mutex guard just inserted this worker entry and no removal occurs before this lookup"
+		)]
 		let entry = entries.get_mut(&worker).expect("entry was inserted under the same lock");
 		entry.last_seen = entry.last_seen.max(now);
 		let (bucket, cost) = match charge {
@@ -209,12 +218,21 @@ impl WorkerBudgets {
 			));
 		}
 		result.map_err(|category| {
-			tracing::warn!(
-				event = "worker_budget_exhausted",
-				category,
-				worker_id = worker,
-				"worker budget exhausted"
-			);
+			let resource = match category {
+				"requests" => Some((BudgetResource::WorkerRequests, self.config.requests.capacity)),
+				"bytes" => Some((BudgetResource::WorkerBytes, self.config.bytes.capacity)),
+				"leases" => Some((BudgetResource::WorkerLeases, self.config.leases.capacity)),
+				"workers" => Some((BudgetResource::WorkerEntries, self.config.max_workers as u64)),
+				_ => None,
+			};
+			if let Some((resource, limit)) = resource {
+				emit(SecurityEvent::BudgetExhausted {
+					context: EventContext { worker_id: Some(worker), ..Default::default() },
+					resource,
+					used: None,
+					limit: Some(limit),
+				});
+			}
 			StatusCode::TOO_MANY_REQUESTS
 		})
 	}
@@ -226,15 +244,26 @@ impl WorkerBudgets {
 		if request.method() == Method::POST && request.uri().path() == "/v1/jobs/lease" {
 			self.charge(worker, Charge::Lease)?;
 		}
-		// Axum's existing JSON/Bytes extractor cap is 2 MiB. Keep that cap
-		// while charging actual chunks even for handlers that ignore the body.
+		// Match Axum's 2 MiB JSON/Bytes cap while charging actual chunks,
+		// including for handlers that ignore the body.
 		let body = std::mem::replace(request.body_mut(), Body::empty());
 		let mut stream = body.into_data_stream();
 		let mut buffered = RequestBuffer::default();
 		while let Some(chunk) = stream.next().await {
 			let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
 			self.charge(worker, Charge::Bytes(chunk.len() as u64))?;
-			buffered.append(&chunk)?;
+			buffered.append(&chunk).inspect_err(|_| {
+				emit(SecurityEvent::BudgetExhausted {
+					context: EventContext { worker_id: Some(worker), ..Default::default() },
+					resource: BudgetResource::RequestBodyBytes,
+					used: buffered
+						.as_ref()
+						.len()
+						.checked_add(chunk.len())
+						.and_then(|n| u64::try_from(n).ok()),
+					limit: Some(crate::ingress::BODY_CAP as u64),
+				});
+			})?;
 		}
 		request.extensions_mut().insert(CapturedWorkerBody::new(buffered, token));
 		Ok(())
@@ -244,6 +273,38 @@ impl WorkerBudgets {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn actual_admission_emits_closed_budget_events_but_arithmetic_does_not() {
+		let (_guard, events) = crate::test_support::capture_security_events();
+		for (charge, expected) in [
+			(Charge::Request, "worker_requests"),
+			(Charge::Lease, "worker_leases"),
+			(Charge::Bytes(1), "worker_bytes"),
+		] {
+			let config = WorkerBudgetConfig {
+				requests: BucketConfig { capacity: 1, refill_per_second: 1 },
+				leases: BucketConfig { capacity: 1, refill_per_second: 1 },
+				bytes: BucketConfig { capacity: 1, refill_per_second: 1 },
+				..Default::default()
+			};
+			let budgets = WorkerBudgets::new(config).unwrap();
+			assert!(budgets.charge_at(7, 0, charge).is_ok());
+			assert!(budgets.charge_at(7, 0, charge).is_err());
+			assert!(events.lock().unwrap().is_empty(), "pure accounting must not emit");
+			assert_eq!(budgets.charge(7, charge), Err(StatusCode::TOO_MANY_REQUESTS));
+			let emitted = std::mem::take(&mut *events.lock().unwrap());
+			assert_eq!(
+				emitted.len(),
+				1,
+				"actual worker budget rejection must emit the closed event"
+			);
+			assert_eq!(emitted[0]["variant"], "BudgetExhausted");
+			assert_eq!(emitted[0]["resource"], expected);
+			assert_eq!(emitted[0]["worker_id"], "7");
+			assert!(!emitted[0].contains_key("job_id"));
+		}
+	}
 
 	#[test]
 	fn backward_clock_and_overflow_never_mint_extra_credit() {

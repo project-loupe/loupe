@@ -9,6 +9,7 @@ pub use crate::config_input::PatObservation;
 pub use crate::ingress::{Entry, Field, FieldObservation, FieldSource};
 use crate::{config_input as config, ingress};
 
+// debug-ok: cfg(fuzzing) response selectors are closed unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseCase {
 	ShowApp,
@@ -44,6 +45,7 @@ impl ResponseCase {
 		Self::DiscardSuccess,
 	];
 }
+// debug-ok: cfg(fuzzing) response observations use typed redacted DTO owners.
 #[derive(Debug)]
 pub enum ResponseValue {
 	App(loupe_proto::GithubAppResponse<Server>),
@@ -58,10 +60,12 @@ pub enum ResponseValue {
 	Verification(loupe_proto::RetryVerifyResponse),
 	Discard,
 }
+// debug-ok: cfg(fuzzing) rejection is a fieldless category.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rejection {
 	SchemaOrPolicy,
 }
+// debug-ok: cfg(fuzzing)-only response trace contains synthetic fixtures.
 #[derive(Debug)]
 pub struct ResponseObservation {
 	pub case: ResponseCase,
@@ -128,6 +132,7 @@ pub fn observe_response(case: ResponseCase, raw: &[u8]) -> ResponseObservation {
 	ResponseObservation { case, result, spans, typed, entries: ingress::take_entries() }
 }
 
+// debug-ok: cfg(fuzzing) config selectors are closed unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigCase {
 	CloneUrl,
@@ -159,12 +164,14 @@ impl ConfigCase {
 		Self::Pat,
 	];
 }
+// debug-ok: cfg(fuzzing) argument-source choices are closed unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommonNameSource {
 	CommandLine,
 	Environment,
 	Default,
 }
+// debug-ok: cfg(fuzzing)-only configuration oracle holds synthetic fixtures.
 #[derive(Debug)]
 pub enum ConfigValue {
 	Text(String),
@@ -173,6 +180,7 @@ pub enum ConfigValue {
 	Pem(String),
 	Pat(PatObservation),
 }
+// debug-ok: cfg(fuzzing)-only trace aggregates synthetic config observations.
 #[derive(Debug)]
 pub struct ConfigObservation {
 	pub case: ConfigCase,
@@ -248,8 +256,7 @@ pub fn observe_config(
 		Rejection::SchemaOrPolicy
 	});
 	let (callbacks, typed_text) = config::take_callbacks();
-	// Preserve the independent target's historical observation vocabulary.
-	// Events still originate in the actual callback, never the case selector.
+	// Events originate in the callback, independently of the case selector.
 	let callbacks = callbacks
 		.into_iter()
 		.map(|callback| match callback {

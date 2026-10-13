@@ -29,7 +29,7 @@ pub struct AppState {
 	/// Server-wide default for the human-in-the-loop approval gate.
 	/// Used when a repo has `require_approval = NULL` (the wire-side
 	/// default — i.e. the operator didn't pin a per-repo override).
-	/// `false` keeps the existing immediate-dispatch behaviour.
+	/// `false` allows immediate dispatch.
 	pub require_approval_default: bool,
 	/// Server-wide default for the verify flow. Used when a repo
 	/// registration omits `verification_enabled`; the resolved value is
@@ -81,6 +81,14 @@ impl AppState {
 
 impl AppState {
 	pub fn new(db: Arc<Db>, ca: Arc<Ca>, github_reporter: Arc<GithubReporter>) -> Self {
+		#[expect(
+			clippy::expect_used,
+			reason = "the compiled default worker budget constants meet the same validator exercised by default-budget tests"
+		)]
+		let worker_budgets = crate::request_budget::WorkerBudgets::new(
+			crate::request_budget::WorkerBudgetConfig::default(),
+		)
+		.expect("default worker budgets are valid");
 		Self {
 			db,
 			ca,
@@ -88,12 +96,7 @@ impl AppState {
 			email_reporter: Arc::new(EmailReporter::new()),
 			job_arrived: Arc::new(Notify::new()),
 			review_policy: Arc::new(crate::review::policy::ReviewPolicy::default()),
-			worker_budgets: Arc::new(
-				crate::request_budget::WorkerBudgets::new(
-					crate::request_budget::WorkerBudgetConfig::default(),
-				)
-				.expect("default worker budgets are valid"),
-			),
+			worker_budgets: Arc::new(worker_budgets),
 			require_approval_default: false,
 			verification_default: false,
 			github_app_allowed_owners: None,

@@ -3,13 +3,14 @@ mod claim;
 mod policy;
 #[cfg(test)]
 use claim::claim_kinds;
-pub use claim::{claim, ClaimRequest, Claimed};
+pub(crate) use claim::claim_raw;
+pub use claim::{ClaimRequest, Claimed};
 use loupe_core::text::policy::{Payload, Reason};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_core::{JobKind, JobState, WORKFLOW_CONTRACT_VERSION};
 use loupe_provenance::{Db, Source};
 pub use policy::{CampaignPolicy, PhasePolicy};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
 use crate::review::{changed, is_unique};
 use crate::{campaigns, jobs, ownership, Conflict, Entity, Error, Ownership, Result};
@@ -18,8 +19,61 @@ fn invalid(field: &'static str) -> Error {
 	loupe_core::text::Error::new(field, loupe_core::text::Rule::Identifier).into()
 }
 
+/// Owned lease data selected before the claiming transaction commits.
+pub struct ClaimedLease {
+	pub claimed: Claimed,
+	pub repository: crate::repos::RepoRow,
+	pub target: Option<crate::findings::FindingRow>,
+	pub reviewed_revision: Option<BoundedText<loupe_core::text::policy::RevisionText, Db>>,
+}
+
+pub fn claim<S: Source>(
+	db: &crate::Db, request: &ClaimRequest<'_, S>,
+) -> Result<Option<ClaimedLease>> {
+	db.with_conn(|conn| {
+		crate::transaction::immediate(conn, |tx| {
+			let Some(claimed) = claim_raw(tx, request)? else {
+				return Ok(None);
+			};
+			let job = &claimed.job;
+			let repository = crate::repos::get_raw(tx, job.repo_id)?.ok_or(Error::ScopeDenied)?;
+			let (target, reviewed_revision) = if job.kind == JobKind::Verify {
+				let target_id = job.target_finding_id.ok_or(Error::ScopeDenied)?;
+				use rusqlite::OptionalExtension;
+				let target = tx
+					.query_row(
+						&format!(
+							"SELECT {} FROM findings WHERE id=?1 AND repo_id=?2",
+							crate::findings::FINDING_COLUMNS
+						),
+						params![target_id, job.repo_id],
+						crate::findings::row_to_finding,
+					)
+					.optional()?
+					.ok_or(Error::ScopeDenied)?;
+				let reviewed_id = job.parent_job_id.unwrap_or(target.job_id);
+				let reviewed = tx
+					.query_row(
+						&format!(
+							"SELECT {} FROM jobs WHERE id=?1 AND repo_id=?2 AND kind='scan'",
+							jobs::JOB_COLUMNS
+						),
+						params![reviewed_id, job.repo_id],
+						jobs::row_to_job,
+					)
+					.optional()?
+					.and_then(|row| row.head_sha);
+				(Some(target), reviewed)
+			} else {
+				(None, None)
+			};
+			Ok(Some(ClaimedLease { claimed, repository, target, reviewed_revision }))
+		})
+	})
+}
+
 /// Connection-local, transactional scheduling history. It resets on restart.
-pub fn ensure_state(conn: &Connection) -> Result<()> {
+pub(crate) fn ensure_state(conn: &Connection) -> Result<()> {
 	conn.execute_batch(
 		"CREATE TEMP TABLE IF NOT EXISTS scheduler_repo_state (
 		repo_id INTEGER PRIMARY KEY, last_claim_seq INTEGER NOT NULL DEFAULT 0,
@@ -32,6 +86,7 @@ pub fn ensure_state(conn: &Connection) -> Result<()> {
 }
 
 /// Host survey recipes have a closed shape and vocabulary.
+// debug-ok: survey recipes are closed host scheduling categories.
 #[derive(Debug, Clone, Copy)]
 pub enum SurveyRecipe {
 	Bootstrap,
@@ -58,18 +113,23 @@ impl<S: Source> PhaseRecipeInput<'_, S> {
 		match self {
 			Self::Submitted(value) => value.expose().to_owned(),
 			Self::Survey(recipe) => {
-				String::from_utf8(loupe_core::canonical::canonical_bytes(&serde_json::json!({
-					"version": 1, "phase": "survey", "recipe": recipe.as_str(),
-					"assignment_key": "ordinary"
-				})))
-				.expect("fixed survey recipe is UTF-8")
+				#[expect(
+					clippy::expect_used,
+					reason = "fixed survey JSON contains only static strings and integers and its serializer emits UTF-8"
+				)]
+				let canonical =
+					String::from_utf8(loupe_core::canonical::canonical_bytes(&serde_json::json!({
+						"version": 1, "phase": "survey", "recipe": recipe.as_str(),
+						"assignment_key": "ordinary"
+					})))
+					.expect("fixed survey recipe is UTF-8");
+				canonical
 			},
 		}
 	}
 }
 
 pub struct NewPhaseJob<'a, S: Source> {
-	pub repo_id: i64,
 	pub kind: JobKind<S>,
 	pub campaign_id: i64,
 	pub generation_id: Option<i64>,
@@ -86,15 +146,16 @@ pub struct NewPhaseJob<'a, S: Source> {
 
 /// Caller owns the transaction; shape and scope checks precede insertion.
 pub fn enqueue_phase<S: Source>(
-	tx: &Transaction<'_>, new: &NewPhaseJob<'_, S>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewPhaseJob<'_, S>, now: i64,
 ) -> Result<i64> {
+	scope.require_operator()?;
+	let tx = scope.conn;
 	if !matches!(new.kind, JobKind::Survey | JobKind::Drilldown | JobKind::Verify) {
 		return Err(invalid("job_kind"));
 	}
-	let campaign = campaigns::get(tx, new.campaign_id)?
-		.ok_or(Error::NotFound(Entity::Campaign, new.campaign_id))?;
+	let campaign =
+		campaigns::get(scope, new.campaign_id)?.ok_or(Error::Conflict(Conflict::CampaignState))?;
 	if campaign.state != campaigns::State::Active
-		|| campaign.repo_id != new.repo_id
 		|| campaign.deadline_at.is_some_and(|at| at <= now)
 	{
 		return Err(Error::Conflict(Conflict::CampaignState));
@@ -120,15 +181,15 @@ pub fn enqueue_phase<S: Source>(
 	if new.token_budget.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
 		return Err(invalid("token_budget"));
 	}
-	ownership::job_links(tx, new.repo_id, new.generation_id, new.assigned_lead_id)?;
+	ownership::job_links(tx, scope.repo_id, new.generation_id, new.assigned_lead_id)?;
 	if let (Some(lead), Some(generation)) = (new.assigned_lead_id, new.generation_id) {
 		ownership::lead_in_generation(tx, lead, generation, Ownership::JobLead)?;
 	}
 	if let Some(finding) = new.target_finding_id {
-		ownership::finding(tx, finding, new.repo_id, Ownership::JobFinding)?;
+		ownership::finding(tx, finding, scope.repo_id, Ownership::JobFinding)?;
 	}
 	if let Some(parent) = new.continuation_of_job_id {
-		ownership::require(tx, "SELECT repo_id,campaign_id FROM jobs WHERE id=?1 AND kind=?2 AND state IN ('succeeded','failed','cancelled')", params![parent,new.kind.as_str()], crate::scope::Scope { campaign: Some(new.campaign_id), ..crate::scope::Scope::repository(new.repo_id) }, Ownership::JobContinuation, |r| Ok(crate::scope::Subject { campaign: r.get(1)?, ..crate::scope::Subject::repository(r.get(0)?) }))?;
+		ownership::require(tx, "SELECT repo_id,campaign_id FROM jobs WHERE id=?1 AND kind=?2 AND repo_id=?3 AND state IN ('succeeded','failed','cancelled')", params![parent,new.kind.as_str(),scope.repo_id], crate::scope::Scope { campaign: Some(new.campaign_id), ..crate::scope::Scope::repository(scope.repo_id) }, Ownership::JobContinuation, |r| Ok(crate::scope::Subject { campaign: r.get(1)?, ..crate::scope::Subject::repository(r.get(0)?) }))?;
 	}
 	let policy = CampaignPolicy::from_snapshot(&campaign.effective_policy)?;
 	let limit = if new.handoff && new.kind != JobKind::Survey {
@@ -136,15 +197,27 @@ pub fn enqueue_phase<S: Source>(
 	} else {
 		policy.campaign_max_jobs - policy.campaign_handoff_reserve
 	};
-	let count: i64 =
-		tx.query_row("SELECT COUNT(*) FROM jobs WHERE campaign_id=?1", [new.campaign_id], |r| {
-			r.get(0)
-		})?;
+	let count: i64 = tx.query_row(
+		"SELECT COUNT(*) FROM jobs WHERE campaign_id=?1 AND repo_id=?2",
+		params![new.campaign_id, scope.repo_id],
+		|r| r.get(0),
+	)?;
 	if count >= limit {
+		use loupe_core::security_event::{emit, BudgetResource, EventContext, SecurityEvent};
+		emit(SecurityEvent::BudgetExhausted {
+			context: EventContext {
+				repo_id: Some(scope.repo_id),
+				campaign_id: Some(new.campaign_id),
+				..Default::default()
+			},
+			resource: BudgetResource::CampaignJobs,
+			used: u64::try_from(count).ok(),
+			limit: u64::try_from(limit).ok(),
+		});
 		return Err(Error::Conflict(Conflict::CampaignBudget));
 	}
 	tx.execute("INSERT INTO jobs (repo_id,kind,state,enqueued_at,campaign_id,generation_id,assigned_lead_id,target_finding_id,continuation_of_job_id,scheduling_band,effective_priority,eligible_at,token_budget,recipe,workflow_contract_version)
-	VALUES (?1,?2,'queued',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![new.repo_id,new.kind.as_str(),now,new.campaign_id,new.generation_id,new.assigned_lead_id,new.target_finding_id,new.continuation_of_job_id,new.band.as_str(),new.effective_priority.min(PRIORITY_MAX),new.eligible_at,new.token_budget.map(|n|n as i64),new.recipe.canonical(),WORKFLOW_CONTRACT_VERSION])
+	SELECT ?1,?2,'queued',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14 WHERE EXISTS(SELECT 1 FROM review_campaigns WHERE campaign_id=?4 AND repo_id=?1)", params![scope.repo_id,new.kind.as_str(),now,new.campaign_id,new.generation_id,new.assigned_lead_id,new.target_finding_id,new.continuation_of_job_id,new.band.as_str(),new.effective_priority.min(PRIORITY_MAX),new.eligible_at,new.token_budget.map(|n|n as i64),new.recipe.canonical(),WORKFLOW_CONTRACT_VERSION])
 	.map_err(|error| {
 		if is_unique(&error, "jobs.assigned_lead_id") { Error::Conflict(Conflict::ActiveDrilldown) }
 		else if is_unique(&error, "jobs.target_finding_id") { Error::Conflict(Conflict::ActiveVerify) }
@@ -153,6 +226,7 @@ pub fn enqueue_phase<S: Source>(
 	Ok(tx.last_insert_rowid())
 }
 
+// debug-ok: retry outcomes contain only a closed state and eligibility timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryOutcome {
 	Requeued { eligible_at: i64 },
@@ -172,18 +246,23 @@ impl<S: Source> FailureReason<'_, S> {
 		}
 	}
 }
-pub fn retry_or_fail<S: Source>(
-	tx: &Transaction<'_>, job_id: i64, now: i64, error: FailureReason<'_, S>,
+pub(crate) fn retry_or_fail<S: Source>(
+	tx: &Connection, job_id: i64, now: i64, error: FailureReason<'_, S>,
 ) -> Result<RetryOutcome> {
-	let job = jobs::get(tx, job_id)?.ok_or(Error::NotFound(Entity::Job, job_id))?;
+	let job = jobs::get_raw(tx, job_id)?.ok_or(Error::NotFound(Entity::Job, job_id))?;
 	if job.state != JobState::Leased
 		|| !matches!(job.kind, JobKind::Survey | JobKind::Drilldown | JobKind::Verify)
+		|| (matches!(error, FailureReason::LeaseExpired)
+			&& job.lease_expires_at.is_none_or(|deadline| deadline >= now))
 	{
 		return Err(Error::Conflict(Conflict::JobState));
 	}
 	let campaign_id = job.campaign_id.ok_or(Error::Conflict(Conflict::CampaignState))?;
-	let campaign =
-		campaigns::get(tx, campaign_id)?.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
+	let campaign = campaigns::get_raw(tx, campaign_id)?
+		.ok_or(Error::NotFound(Entity::Campaign, campaign_id))?;
+	if campaign.repo_id != job.repo_id {
+		return Err(Error::Ownership(Ownership::CampaignJob));
+	}
 	let inactive_reason;
 	let failure = if campaign.state != campaigns::State::Active {
 		inactive_reason = format!("campaign {}", campaign.state.as_str());
@@ -196,36 +275,39 @@ pub fn retry_or_fail<S: Source>(
 			let eligible_at = now
 				.checked_add(policy.retry_delay(job.attempts))
 				.ok_or_else(|| invalid("eligible_at"))?;
-			changed(tx.execute("UPDATE jobs SET state='queued',worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL,eligible_at=?2,hard_deadline_at=NULL,soft_deadline_at=NULL,submit_by=NULL WHERE id=?1 AND state='leased'", params![job_id,eligible_at])?, Conflict::JobState)?;
+			changed(tx.execute("UPDATE jobs SET state='queued',worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL,eligible_at=?2,hard_deadline_at=NULL,soft_deadline_at=NULL,submit_by=NULL WHERE id=?1 AND repo_id=?3 AND state='leased'", params![job_id,eligible_at,job.repo_id])?, Conflict::JobState)?;
 			return Ok(RetryOutcome::Requeued { eligible_at });
 		}
 	};
-	changed(tx.execute("UPDATE jobs SET state='failed',error=?2,finished_at=?3,worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL WHERE id=?1 AND state='leased'", params![job_id,failure,now])?, Conflict::JobState)?;
+	changed(tx.execute("UPDATE jobs SET state='failed',error=?2,finished_at=?3,worker_id=NULL,lease_expires_at=NULL,job_capability_hash=NULL WHERE id=?1 AND repo_id=?4 AND state='leased'", params![job_id,failure,now,job.repo_id])?, Conflict::JobState)?;
 	Ok(RetryOutcome::Failed)
 }
 
-pub fn cancel_queued_children<S: Source>(
-	tx: &Transaction<'_>, campaign_id: i64, now: i64, reason: &BoundedText<Reason, S>,
+pub(crate) fn cancel_queued_children<S: Source>(
+	scope: &crate::scope::RepoScope<'_>, campaign_id: i64, now: i64,
+	reason: &BoundedText<Reason, S>,
 ) -> Result<usize> {
-	Ok(tx.execute("UPDATE jobs SET state='cancelled',error=?2,finished_at=?3,job_capability_hash=NULL WHERE campaign_id=?1 AND state='queued'", params![campaign_id,reason.expose(),now])?)
+	scope.require_operator()?;
+	Ok(scope.conn.execute("UPDATE jobs SET state='cancelled',error=?2,finished_at=?3,job_capability_hash=NULL WHERE campaign_id=?1 AND repo_id=?4 AND state='queued'", params![campaign_id,reason.expose(),now,scope.repo_id])?)
 }
-pub fn cancel_queued_at_deadline(
-	tx: &Transaction<'_>, campaign_id: i64, now: i64,
+pub(crate) fn cancel_queued_at_deadline(
+	scope: &crate::scope::RepoScope<'_>, campaign_id: i64, now: i64,
 ) -> Result<usize> {
-	Ok(tx.execute("UPDATE jobs SET state='cancelled',error='campaign deadline',finished_at=?2,job_capability_hash=NULL WHERE campaign_id=?1 AND state='queued'", params![campaign_id,now])?)
+	Ok(scope.conn.execute("UPDATE jobs SET state='cancelled',error='campaign deadline',finished_at=?2,job_capability_hash=NULL WHERE campaign_id=?1 AND repo_id=?3 AND state='queued'", params![campaign_id,now,scope.repo_id])?)
 }
 #[cfg(test)]
 mod tests;
 pub use crate::review_units::Priority as Band;
 
 /// Campaign job kinds this binary can lease *and finish through the phase
-/// endpoints*. Empty until B4 lands those endpoints; widen it together with
-/// `jobs::RUNTIME_KINDS` and the handlers, never ahead of them.
+/// endpoints*. Empty because those endpoints are unavailable. Keep this list
+/// aligned with `jobs::RUNTIME_KINDS` and the handlers.
 pub const PHASE_RUNTIME_KINDS: &[JobKind<Db>] = &[];
 
 pub const PRIORITY_MAX: u32 = 1000;
 
 /// Live deployment knobs; never substituted for campaign-owned budgets.
+// debug-ok: claim policy contains only numeric concurrency limits and durations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimPolicy {
 	pub active_jobs_per_repo: i64,

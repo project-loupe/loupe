@@ -1,4 +1,18 @@
 #![deny(unsafe_code)]
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,6 +29,7 @@ use loupe_server::{serve, AppState, Config, FileConfig};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
 
+// debug-ok: parsed Config wrappers redact all paths, hostnames and credential arguments; other options are scalars.
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe security-scanning daemon")]
 struct Cli {
@@ -22,6 +37,7 @@ struct Cli {
 	cmd: Cmd,
 }
 
+// debug-ok: parsed Config wrappers redact content; remaining options are booleans, counts and socket addresses.
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
@@ -34,6 +50,7 @@ enum Cmd {
 	Serve(ServeArgs),
 }
 
+// debug-ok: parsed Config wrappers redact content; remaining options are booleans, counts and socket addresses.
 #[derive(Debug, Parser)]
 struct InitArgs {
 	#[arg(long, env = "LOUPE_DATA_DIR", value_parser = PathParser)]
@@ -56,6 +73,7 @@ struct InitArgs {
 	no_persist_secrets: bool,
 }
 
+// debug-ok: parsed Config wrappers redact content; remaining options are booleans, counts and socket addresses.
 #[derive(Debug, Parser)]
 struct ServeArgs {
 	/// Optional path to a TOML config file. Settings the file
@@ -215,10 +233,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 	let review_policy = file_cfg.review.resolve()?;
 	file_cfg.worker_budgets.validate()?;
 
-	let bind_addr = args
-		.bind
-		.or(file_cfg.server.bind)
-		.unwrap_or_else(|| "127.0.0.1:8443".parse().expect("hardcoded socket addr is valid"));
+	let bind_addr =
+		args.bind.or(file_cfg.server.bind).unwrap_or(SocketAddr::from(([127, 0, 0, 1], 8443)));
 	let db_path = args
 		.db
 		.or(file_cfg.paths.db)
@@ -363,6 +379,10 @@ fn read_master_key_from_env() -> Result<Option<MasterKey>> {
 }
 
 fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "configuration credential ingress reads the selected master-key file directly into its guarded owner before decoding"
+	)]
 	let raw = loupe_provenance::Secret::new(
 		std::fs::read_to_string(path)
 			.with_context(|| format!("reading master key file at {}", path.display()))?,
@@ -375,6 +395,7 @@ fn read_master_key_from_file(path: &Path) -> Result<MasterKey> {
 		.with_context(|| format!("master key file at {}", path.display()))
 }
 
+// debug-ok: the credential error retains only the supplied character count.
 #[derive(Debug, thiserror::Error)]
 enum CredentialInputError {
 	#[error("expected 64 hex characters, got {0} chars")]
@@ -399,7 +420,17 @@ fn parse_master_key_hex(s: &str) -> Result<MasterKey> {
 	let mut bytes = [0u8; 32];
 	for (i, byte) in bytes.iter_mut().enumerate() {
 		// Indexing is safe: we just confirmed the string is 64 ASCII chars.
+		#[expect(
+			clippy::expect_used,
+			clippy::string_slice,
+			reason = "the unchanged string was checked for exactly 64 ASCII hex bytes before these bounded single-digit slices"
+		)]
 		let hi = u8::from_str_radix(&s[i * 2..i * 2 + 1], 16).expect("ascii hex digit");
+		#[expect(
+			clippy::expect_used,
+			clippy::string_slice,
+			reason = "the unchanged string was checked for exactly 64 ASCII hex bytes before these bounded single-digit slices"
+		)]
 		let lo = u8::from_str_radix(&s[i * 2 + 1..i * 2 + 2], 16).expect("ascii hex digit");
 		*byte = (hi << 4) | lo;
 	}
@@ -414,15 +445,7 @@ mod tests {
 
 	#[test]
 	fn init_default_hostnames_cover_localhost_and_loopback_ip() {
-		// Regression guard: a fresh `loupe-server init` (no
-		// --hostname flag) must mint a cert valid for BOTH
-		// `localhost` AND `127.0.0.1`. Clients connecting via the
-		// loopback IP otherwise hit
-		//   `invalid peer certificate: certificate not valid for
-		//    name "127.0.0.1"`
-		// at handshake time, because the cert SAN list lacks the IP.
-		// Pinning the default catches anyone shrinking it back to
-		// just `localhost` for "tidiness."
+		// DNS and IP loopback connections require distinct SAN entries.
 		let tmp = tempfile::tempdir().unwrap();
 		let cli = Cli::try_parse_from([
 			std::ffi::OsStr::new("loupe-server"),
@@ -525,13 +548,19 @@ mod tests {
 		let exported_key = parse_master_key_hex(assignments[0].1.expose()).unwrap();
 		let reopened =
 			loupe_storage::Db::open(out.layout.db_path.as_path(), &exported_key).unwrap();
-		let admin_count = reopened
-			.with_conn(|c| {
-				Ok(c.query_row("SELECT COUNT(*) FROM workers WHERE kind = 'admin'", [], |row| {
-					row.get::<_, i64>(0)
-				})?)
+		// Retain the independent SQL count on this test-owned initialization file.
+		// Close the production handle before opening the offline observer.
+		drop(reopened);
+		let offline = rusqlite::Connection::open(out.layout.db_path.as_path()).unwrap();
+		offline
+			.pragma_update(None, "key", format!("x'{}'", exported_key.to_hex().expose()))
+			.unwrap();
+		let admin_count = offline
+			.query_row("SELECT COUNT(*) FROM workers WHERE kind = 'admin'", [], |row| {
+				row.get::<_, i64>(0)
 			})
 			.unwrap();
+		offline.close().unwrap();
 		assert_eq!(admin_count, 1, "exported master key must recover the initialized database");
 
 		use base64::Engine as _;

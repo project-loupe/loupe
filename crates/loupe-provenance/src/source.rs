@@ -1,6 +1,5 @@
-//! The sources a value can arrive from. Sealed: the set is the one
-//! `SECURITY-FIRST-REFACTOR.md` section 2 lists, and a crate outside
-//! this one cannot add another.
+//! The sources a value can arrive from. Sealed so downstream crates cannot
+//! invent labels that bypass the permitted source transitions.
 
 mod sealed {
 	pub trait Sealed {}
@@ -24,6 +23,7 @@ macro_rules! sources {
     ($($(#[$doc:meta])* $name:ident = $text:literal;)*) => {
         $(
             $(#[$doc])*
+            // debug-ok: source labels are fieldless marker types, not values.
             #[derive(Debug, Clone, Copy)]
             pub struct $name;
 

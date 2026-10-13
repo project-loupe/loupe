@@ -61,6 +61,7 @@ impl<P: TextPolicy> ScannerList<P> {
 /// build / vendor / test dirs across those ecosystems. Tighten or loosen
 /// per-repo by sending a partial JSON override (see
 /// `ScannerConfigPatch`).
+// debug-ok: Numeric scanner limits and redacted source-typed scanner lists.
 #[derive(Debug, Clone)]
 pub struct ScannerConfig {
 	pub max_concurrent_files: usize,
@@ -99,6 +100,7 @@ impl Default for ScannerConfig {
 /// writes `{"include_extensions":["c","h"]}` for a C-only repo they
 /// almost always *don't* want our default Rust/JS/Python/etc.
 /// extensions silently appended.
+// debug-ok: Numeric scanner limits and redacted source-typed scanner lists.
 #[derive(Debug, Default, Clone)]
 pub struct ScannerConfigPatch {
 	pub max_concurrent_files: Option<usize>,
@@ -196,28 +198,51 @@ fn default_excludes() -> ScannerList<ScannerExcludePattern> {
 /// All walks honour the extension allowlist, exclude patterns, and
 /// per-file size cap. `.git` and any excluded directory is skipped
 /// wholesale.
+#[cfg(any(test, fuzzing))]
 pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<DiscoveredSourcePath> {
+	walk_source_files_cancellable(workdir, cfg, &Default::default())
+}
+
+pub(crate) fn walk_source_files_cancellable(
+	workdir: &Path, cfg: &ScannerConfig, cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<DiscoveredSourcePath> {
+	if cancel.is_cancelled() {
+		return Vec::new();
+	}
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Source discovery canonicalizes the selected checkout root for containment decisions."
+	)]
 	let Ok(canonical_workdir) = workdir.canonicalize() else {
 		return Vec::new();
 	};
-	let roots = discover_roots(workdir, cfg);
+	let roots = discover_roots(workdir, cfg, cancel);
 	let mut out = Vec::new();
 
 	if roots.roots.is_empty() && roots.files.is_empty() {
-		collect_from_root(workdir, workdir, cfg, &mut out);
+		collect_from_root(workdir, workdir, cfg, &mut out, cancel);
 	} else {
 		for file in roots.files {
+			if cancel.is_cancelled() {
+				return Vec::new();
+			}
 			if is_within_workdir(&file, &canonical_workdir) {
 				collect_file(workdir, &file, cfg, &mut out);
 			}
 		}
 		for root in roots.roots {
+			if cancel.is_cancelled() {
+				return Vec::new();
+			}
 			if is_within_workdir(&root, &canonical_workdir) {
-				collect_from_root(workdir, &root, cfg, &mut out);
+				collect_from_root(workdir, &root, cfg, &mut out, cancel);
 			}
 		}
 	}
 
+	if cancel.is_cancelled() {
+		return Vec::new();
+	}
 	out.sort_by(|a, b| a.native.cmp(&b.native));
 	out.dedup_by(|a, b| a.native == b.native);
 	out
@@ -227,6 +252,10 @@ pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<Disc
 // its root. Package src directories and direct build.rs files therefore need
 // this check before traversal or collection. Preserve in-workdir symlinks.
 fn is_within_workdir(path: &Path, canonical_workdir: &Path) -> bool {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Source discovery resolves a candidate once and admits it only within the canonical checkout."
+	)]
 	path.canonicalize().map(|path| path.starts_with(canonical_workdir)).unwrap_or(false)
 }
 
@@ -236,11 +265,13 @@ struct DiscoveryRoots {
 	files: Vec<PathBuf>,
 }
 
-fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
+fn discover_roots(
+	workdir: &Path, cfg: &ScannerConfig, cancel: &tokio_util::sync::CancellationToken,
+) -> DiscoveryRoots {
 	let mut roots = DiscoveryRoots::default();
-	add_cargo_roots(workdir, cfg, &mut roots);
-	add_marker_roots(workdir, cfg, &mut roots);
-	add_dotnet_roots(workdir, cfg, &mut roots);
+	add_cargo_roots(workdir, cfg, &mut roots, cancel);
+	add_marker_roots(workdir, cfg, &mut roots, cancel);
+	add_dotnet_roots(workdir, cfg, &mut roots, cancel);
 	roots.roots.sort();
 	roots.roots.dedup();
 	roots.files.sort();
@@ -248,12 +279,18 @@ fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
 	roots
 }
 
-fn add_cargo_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
-	let workspace_exclude = parse_workspace(&workdir.join("Cargo.toml"))
+fn add_cargo_roots(
+	workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
+	let workspace_exclude = parse_workspace_cancellable(&workdir.join("Cargo.toml"), cancel)
 		.map(|workspace| workspace.exclude)
 		.unwrap_or_default();
 
-	for manifest in cargo_package_manifests(workdir, cfg, &workspace_exclude) {
+	for manifest in cargo_package_manifests(workdir, cfg, &workspace_exclude, cancel) {
+		if cancel.is_cancelled() {
+			return;
+		}
 		if let Some(package_dir) = manifest.parent() {
 			add_rust_package_roots(package_dir, roots);
 		}
@@ -271,45 +308,91 @@ fn add_rust_package_roots(package: &Path, roots: &mut DiscoveryRoots) {
 	}
 }
 
+// debug-ok: Every Repo exclusion pattern uses redacted BoundedText.
 #[derive(Debug, Default)]
 struct WorkspaceManifest {
 	exclude: Vec<BoundedText<ScannerExcludePattern, Repo>>,
 }
 
+#[cfg(any(test, fuzzing))]
 fn parse_workspace(cargo_toml: &Path) -> Option<WorkspaceManifest> {
-	let manifest = parse_manifest(cargo_toml)?;
+	parse_workspace_cancellable(cargo_toml, &Default::default())
+}
+fn parse_workspace_cancellable(
+	cargo_toml: &Path, cancel: &tokio_util::sync::CancellationToken,
+) -> Option<WorkspaceManifest> {
+	let manifest = parse_manifest(cargo_toml, cancel)?;
 	manifest.exclude.map(|exclude| WorkspaceManifest { exclude })
 }
 
 fn cargo_package_manifests(
 	workdir: &Path, cfg: &ScannerConfig,
 	workspace_exclude: &[BoundedText<ScannerExcludePattern, Repo>],
+	cancel: &tokio_util::sync::CancellationToken,
 ) -> Vec<PathBuf> {
 	let mut out: Vec<PathBuf> = walkdir::WalkDir::new(workdir)
 		.into_iter()
 		.filter_entry(|entry| {
-			!is_excluded_dir(entry.path(), cfg)
+			!cancel.is_cancelled()
+				&& !is_excluded_dir(entry.path(), cfg)
 				&& !is_workspace_excluded_descendant(workdir, entry.path(), workspace_exclude)
 		})
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file() && entry.file_name() == "Cargo.toml")
 		.map(|entry| entry.into_path())
-		.filter(|manifest| manifest_has_package(manifest))
+		.filter(|manifest| manifest_has_package(manifest, cancel))
 		.collect();
 	out.sort();
 	out.dedup();
 	out
 }
 
-fn manifest_has_package(cargo_toml: &Path) -> bool {
-	let Some(manifest) = parse_manifest(cargo_toml) else {
+fn manifest_has_package(cargo_toml: &Path, cancel: &tokio_util::sync::CancellationToken) -> bool {
+	let Some(manifest) = parse_manifest(cargo_toml, cancel) else {
 		return false;
 	};
 	manifest.has_package
 }
 
-fn parse_manifest(cargo_toml: &Path) -> Option<CargoDiscoveryManifest> {
-	let bytes = std::fs::read(cargo_toml).ok()?;
+fn parse_manifest(
+	cargo_toml: &Path, cancel: &tokio_util::sync::CancellationToken,
+) -> Option<CargoDiscoveryManifest> {
+	use std::io::Read;
+	use std::os::unix::fs::OpenOptionsExt;
+	if cancel.is_cancelled() {
+		return None;
+	}
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Discovery opens the fixed Repo manifest once without waiting for a special-file writer."
+	)]
+	let mut file = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+		.open(cargo_toml)
+		.ok()?;
+	if !file.metadata().ok()?.is_file() {
+		return None;
+	}
+	let mut bytes = Vec::new();
+	let mut chunk = [0u8; 8192];
+	loop {
+		if cancel.is_cancelled() {
+			return None;
+		}
+		let count = match file.read(&mut chunk) {
+			Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+			other => other.ok()?,
+		};
+		if cancel.is_cancelled() {
+			return None;
+		}
+		if count == 0 {
+			break;
+		}
+		bytes.extend_from_slice(&chunk[..count]);
+	}
 	// SAFETY: original repository Cargo.toml bytes, before UTF-8/TOML parsing.
 	#[allow(unsafe_code)]
 	let bytes = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
@@ -368,7 +451,7 @@ pub mod fuzz_support {
 
 	pub fn parse_manifest(path: &Path) -> Option<toml::Value> {
 		// Fuzz-only original syntax oracle; no production generic Value exit.
-		super::parse_manifest(path).map(|manifest| manifest.original)
+		super::parse_manifest(path, &Default::default()).map(|manifest| manifest.original)
 	}
 
 	pub fn workspace_excludes(path: &Path) -> Option<Vec<String>> {
@@ -412,8 +495,14 @@ fn is_workspace_excluded_descendant(
 		.any(|candidate| matches_workspace_exclude(candidate, excludes))
 }
 
-fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
-	for marker_dir in marker_dirs(workdir, cfg, "package.json") {
+fn add_marker_roots(
+	workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
+	for marker_dir in marker_dirs(workdir, cfg, "package.json", cancel) {
+		if cancel.is_cancelled() {
+			return;
+		}
 		add_existing_dirs(
 			&marker_dir,
 			&["src", "lib", "app", "server", "client", "packages"],
@@ -422,7 +511,10 @@ fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRo
 	}
 
 	for marker in ["CMakeLists.txt", "meson.build", "Makefile", "compile_commands.json"] {
-		for marker_dir in marker_dirs(workdir, cfg, marker) {
+		for marker_dir in marker_dirs(workdir, cfg, marker, cancel) {
+			if cancel.is_cancelled() {
+				return;
+			}
 			roots.roots.push(marker_dir.clone());
 			add_existing_dirs(
 				&marker_dir,
@@ -433,29 +525,39 @@ fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRo
 	}
 }
 
-fn add_dotnet_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
+fn add_dotnet_roots(
+	workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
 	for marker_dir in
-		dotnet_marker_dirs(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"])
+		dotnet_marker_dirs(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"], cancel)
 	{
 		roots.roots.push(marker_dir);
 	}
 }
 
-fn marker_dirs(workdir: &Path, cfg: &ScannerConfig, marker: &str) -> Vec<PathBuf> {
+fn marker_dirs(
+	workdir: &Path, cfg: &ScannerConfig, marker: &str, cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<PathBuf> {
 	walkdir::WalkDir::new(workdir)
 		.max_depth(5)
 		.into_iter()
-		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_entry(|entry| !cancel.is_cancelled() && !is_excluded_dir(entry.path(), cfg))
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file() && entry.file_name() == marker)
 		.filter_map(|entry| entry.path().parent().map(Path::to_path_buf))
 		.collect()
 }
 
-fn dotnet_marker_dirs(workdir: &Path, cfg: &ScannerConfig, exts: &[&str]) -> Vec<PathBuf> {
+fn dotnet_marker_dirs(
+	workdir: &Path, cfg: &ScannerConfig, exts: &[&str],
+	cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<PathBuf> {
 	walkdir::WalkDir::new(workdir)
 		.into_iter()
-		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_entry(|entry| !cancel.is_cancelled() && !is_excluded_dir(entry.path(), cfg))
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| {
 			entry.file_type().is_file()
@@ -481,10 +583,12 @@ fn add_existing_dirs(base: &Path, names: &[&str], out: &mut Vec<PathBuf>) {
 
 fn collect_from_root(
 	workdir: &Path, root: &Path, cfg: &ScannerConfig, out: &mut Vec<DiscoveredSourcePath>,
+	cancel: &tokio_util::sync::CancellationToken,
 ) {
 	walkdir::WalkDir::new(root)
 		.into_iter()
-		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_entry(|entry| !cancel.is_cancelled() && !is_excluded_dir(entry.path(), cfg))
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file())
 		.for_each(|entry| collect_file(workdir, entry.path(), cfg, out));
@@ -526,6 +630,10 @@ impl Validate<PathBuf, Repo> for DiscoveredSourcePathDecoder<'_> {
 		self, u: Unvalidated<'view, PathBuf>, mark: Mark<'view, Repo>,
 	) -> Result<Self::Output, Self::Error> {
 		let path = u.get();
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Discovery uses admitted file metadata solely for the configured size limit."
+		)]
 		if !has_allowed_extension(path, &self.cfg.include_extensions)
 			|| is_excluded_path(path, &self.cfg.exclude_path_substrings)
 			|| !path.metadata().map(|m| m.len() <= self.cfg.max_file_bytes).unwrap_or(false)
@@ -596,6 +704,10 @@ fn is_dotnet_output_path(path: &Path, output_dir: &str) -> bool {
 }
 
 fn has_dotnet_project_marker(dir: &Path) -> bool {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Discovery walks entries under the selected checkout and applies containment and exclusion admission."
+	)]
 	let Ok(entries) = std::fs::read_dir(dir) else {
 		return false;
 	};
@@ -809,30 +921,6 @@ mod tests {
 		));
 		assert!(cfg.include_extensions.iter().next().is_none());
 		assert!(cfg.exclude_path_substrings.iter().next().is_none());
-	}
-
-	#[test]
-	fn legacy_patch_decoder_accepts_embedded_controls_without_rewriting() {
-		// Baseline evidence for the deliberate new single-line admission rule;
-		// this acceptance is not a requirement of the future marked decoder.
-		// Frozen historical serde oracle; this does not exercise production admission.
-		#[derive(Default, serde::Deserialize)]
-		#[serde(default)]
-		#[allow(dead_code)]
-		struct LegacyPatch {
-			max_concurrent_files: Option<usize>,
-			max_file_bytes: Option<u64>,
-			per_request_timeout_seconds: Option<u64>,
-			include_extensions: Option<Vec<String>>,
-			exclude_path_substrings: Option<Vec<String>>,
-		}
-		let raw = "case\r\ncafe\u{301}\t\0";
-		let patch: LegacyPatch = serde_json::from_value(serde_json::json!({
-			"include_extensions": [raw], "exclude_path_substrings": [raw]
-		}))
-		.unwrap();
-		assert_eq!(patch.include_extensions.unwrap()[0].as_bytes(), raw.as_bytes());
-		assert_eq!(patch.exclude_path_substrings.unwrap()[0].as_bytes(), raw.as_bytes());
 	}
 
 	#[test]

@@ -1,9 +1,9 @@
 //! Exercise all five actual Reporter validators through fixed-source fixtures.
-//! Legacy helpers separately pin historical status/schema behavior; they do not
+//! Status helpers separately pin status/schema behavior; they do not
 //! stand in for actual typed decoding, HTTP collection or authentication.
 use http::StatusCode;
 use loupe_server::fuzz_support;
-use loupe_server::reporters::{github, github_app, ReporterCredential};
+use loupe_server::reporters::{fuzz_github_pat_debug, github, github_app};
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserializer;
 use serde_json::Value;
@@ -165,9 +165,8 @@ fn check_actual_decoder(kind: u8, body: &[u8]) {
 }
 
 pub fn do_test(data: &[u8]) {
-	// Compact boundary recipes preserve the existing kind/status/raw format
-	// for all ordinary corpus cases. Even escaped expansion stays below the
-	// actual 16 MiB response budget; no giant seed file is needed.
+	// Compact recipes reach the slug boundary without giant seeds. Even escaped
+	// expansion stays below the actual 16 MiB response budget.
 	if let [255, b'B', encoding @ (b'N' | b'X'), edge, ..] = data {
 		let length = 2 * 1024 * 1024 - 1 + usize::from(edge % 3);
 		let token = if *encoding == b'X' { "\\u0073" } else { "s" };
@@ -185,8 +184,8 @@ pub fn do_test(data: &[u8]) {
 
 fn check_response(kind: u8, status: StatusCode, body: &[u8]) {
 	check_actual_decoder(kind, body);
-	// These cfg-only status helpers now return final typed owners. App admission
-	// therefore also requires its exact field policy; status/field comparisons stay.
+	// Status helpers return typed owners, so app admission also requires the
+	// slug's exact-text policy to pass.
 	match kind {
 		0 => {
 			let expected = Fields(&["id", "slug"]).decode(body).filter(|fields| {
@@ -271,11 +270,10 @@ fn check_response(kind: u8, status: StatusCode, body: &[u8]) {
 						expected.as_ref().and_then(|fields| fields.first()).and_then(Value::as_str),
 						Some(token.expose().as_str())
 					);
-					let credential = ReporterCredential::GithubPat(loupe_provenance::Secret::new(
-						token.expose().as_bytes().to_vec(),
-					));
+					let credential =
+						loupe_provenance::Secret::new(token.expose().as_bytes().to_vec());
 					assert_redacted(
-						&format!("{credential:?}"),
+						&fuzz_github_pat_debug(&credential),
 						token.expose().as_bytes(),
 						&Redaction::baseline("GithubPat(redacted)"),
 					);

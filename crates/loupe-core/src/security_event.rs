@@ -6,8 +6,9 @@
 //! Pure parsers, accounting helpers and fuzz seams must not emit.
 //!
 //! IdentityConflict, ArtifactPolicyViolation and FanOutLimit currently have no
-//! runtime producer. Canary and citation integrations belong to their later S3
-//! owners. Schema tests and direct emitter calls do not count as those producers.
+//! runtime producer. The worker emits CanaryHit after publishing quarantine and
+//! CitationMismatch after its local citation check fails. Schema tests and
+//! direct emitter calls do not count as runtime producers.
 
 use std::fmt;
 
@@ -167,6 +168,7 @@ BudgetResource {
 	ModelTokens => "model_tokens",
 	ModelConnections => "model_connections",
 	CampaignJobs => "campaign_jobs",
+	ReportOutput => "report_output",
 }
 }
 
@@ -181,7 +183,7 @@ pub enum SecurityEvent {
 		requested: RequestedTarget,
 		reason: CapabilityDenial,
 	},
-	/// Dormant until the actual identity-admission caller is integrated.
+	/// Reserved identity-admission event; no runtime producer emits it.
 	IdentityConflict {
 		context: EventContext,
 		submitted_finding_id: i64,

@@ -30,11 +30,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# Production crate roots and CI deny this. Independent test targets permit
+# direct I/O for fixture setup.
+disallowed_methods = "allow"
 
 [workspace.dependencies]
 # Every dep below sets `default-features = false` and lists exactly the
-# features we use. Two reasons: it documents our usage so a future
-# tightener can verify nothing's unused, and it keeps the dep tree
+# features we use to keep the dependency tree
 # small (most notably: keeps `aws-lc-rs` out of the rustls subtree —
 # default rustls pulls both ring AND aws-lc-rs, the latter is a
 # vendored LibCrypto fork worth tens of MB of build artefacts).

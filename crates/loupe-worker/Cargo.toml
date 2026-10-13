@@ -54,6 +54,8 @@ tracing-subscriber = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+# Explicit fixture authority for this crate's integration tests only.
+loupe-worker = { path = ".", features = ["test-support"] }
 axum = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

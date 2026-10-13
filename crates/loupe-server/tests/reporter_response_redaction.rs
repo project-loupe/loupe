@@ -5,9 +5,8 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Router;
-use loupe_core::{Finding, Severity};
 use loupe_server::reporters::github_app::GithubAppKey;
-use loupe_server::reporters::{GithubReporter, ReportFinding, Reporter, ReporterCredential};
+use loupe_server::reporters::{GithubReporter, Reporter};
 
 const SECRET: &str = "ghs_private_marker_37a0849d";
 
@@ -49,28 +48,7 @@ async fn error_for(stage: &'static str) -> anyhow::Error {
 	let error = if matches!(stage, "metadata" | "decode") {
 		reporter.verify_app(&key).await.unwrap_err()
 	} else {
-		let repo = common::reporter_repo();
-		let finding = ReportFinding {
-			id: 1,
-			reviewed_revision: None,
-			finding: Finding {
-				scanner_id: common::marked::agent::text("fixture"),
-				severity: Severity::High,
-				title: common::marked::agent::text("title"),
-				description: common::marked::agent::text("description"),
-				file_path: None,
-				line_start: None,
-				line_end: None,
-				cwe: None,
-				patch_unified: None,
-				poc_unified: None,
-				fingerprint: common::marked::agent::text("fixture"),
-			},
-		};
-		reporter
-			.dispatch(&repo, &[finding], &ReporterCredential::GithubApp(Box::new(key)))
-			.await
-			.unwrap_err()
+		reporter.dispatch(&common::prepared_report(true)).await.unwrap_err()
 	};
 	server.abort();
 	let _ = server.await;

@@ -5,6 +5,7 @@ use serde_json::json;
 
 use super::*;
 
+// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 #[derive(Debug)]
 pub struct RequestObservation {
 	pub id: Option<Value>,
@@ -12,6 +13,7 @@ pub struct RequestObservation {
 	pub tool: String,
 	pub arguments: Result<Value, String>,
 }
+// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 #[derive(Debug)]
 pub enum RecordObservation {
 	Blank { length: usize },

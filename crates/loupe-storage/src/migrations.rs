@@ -77,13 +77,14 @@ pub const LATEST_SCHEMA_VERSION: u32 = {
 
 /// Apply any migrations whose version is higher than `schema_meta.version`.
 /// The bootstrap migration (`v0 → v1`) creates `schema_meta` itself.
-pub fn apply_pending(conn: &mut Connection) -> crate::Result<()> {
+#[cfg(test)]
+pub(crate) fn apply_pending(conn: &mut Connection) -> crate::Result<()> {
 	apply_pending_with_finalizer(conn, |_, _| Ok(()))
 }
 
 /// Run startup checks and initialization before the upgrade commits. The
 /// boolean identifies an actual upgrade, as opposed to reopening current data.
-pub fn apply_pending_with_finalizer(
+pub(crate) fn apply_pending_with_finalizer(
 	conn: &mut Connection, finalize: impl FnOnce(&Connection, bool) -> crate::Result<()>,
 ) -> crate::Result<()> {
 	apply_with_finalizer(conn, MIGRATIONS, finalize, &mut |_, _| Ok(()))
@@ -104,7 +105,7 @@ fn set_version(conn: &Connection, version: u32) -> rusqlite::Result<()> {
 }
 
 /// Highest applied migration version — `0` if `schema_meta` doesn't yet exist.
-pub fn current_schema_version(conn: &Connection) -> rusqlite::Result<u32> {
+pub(crate) fn current_schema_version(conn: &Connection) -> rusqlite::Result<u32> {
 	read_current_version(conn)
 }
 

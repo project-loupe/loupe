@@ -1,5 +1,4 @@
-//! Atomic M identity/read acceptance, executed first against v5/v6 with the
-//! unchanged pre-M DAO. These are not claims about a pre-v5 identity API.
+//! Finding identity generation, collision handling and read validation.
 use rusqlite::types::Value;
 
 use super::tests::{fixture, sample};
@@ -92,7 +91,7 @@ fn atomic_m_dao_rejects_unidentified_stored_finding() {
 	db.with_conn(|conn| {
 		conn.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,verification_required,created_at) VALUES(?1,?2,'regex','high','title','description','missing-identity','pending',0,0)",[repo,job])?;
 		let id=conn.last_insert_rowid();
-		assert!(get(conn,id).is_err(),"typed finding read must reject missing report identity");
+		assert!(get_raw(conn,id).is_err(),"typed finding read must reject missing report identity");
 		Ok(())
 	}).unwrap();
 }
@@ -102,9 +101,12 @@ fn atomic_m_dao_rejects_unrecognized_content_source() {
 	let (db, repo, job) = fixture();
 	db.with_conn(|conn| {
 		let id = historical(conn, repo, job, "unknown-source")?;
-		assert!(get(conn, id)?.is_some(), "recognized agent content is admitted");
+		assert!(get_raw(conn, id)?.is_some(), "recognized agent content is admitted");
 		conn.execute("UPDATE findings SET source='unrecognized-source' WHERE id=?1", [id])?;
-		assert!(get(conn, id).is_err(), "typed finding read must reject unknown content source");
+		assert!(
+			get_raw(conn, id).is_err(),
+			"typed finding read must reject unknown content source"
+		);
 		Ok(())
 	})
 	.unwrap();
@@ -154,4 +156,47 @@ fn atomic_m_dao_entropy_failure_leaves_no_partially_created_finding() {
 		Ok(())
 	})
 	.unwrap();
+}
+
+#[test]
+fn report_completion_must_not_mark_a_recycled_finding_id() {
+	let (db, repo, job) = fixture();
+	let selected = db
+		.with_conn(|conn| {
+			let selected =
+				insert_or_ignore(conn, repo, job, &sample("selected"), false, 0)?.unwrap();
+			conn.execute("UPDATE findings SET state='confirmed' WHERE id=?1", [selected])?;
+			Ok(selected)
+		})
+		.unwrap();
+	let mut prepared = match crate::scope::with_operator_repository(
+		&db,
+		&crate::test_support::operator_ingress(),
+		crate::scope::OperatorTarget::Finding(selected),
+		|scope| crate::reports::prepare_operator(scope, selected),
+	)
+	.unwrap()
+	{
+		crate::reports::Preparation::Ready(prepared) => prepared,
+		_ => panic!("selected confirmed finding must prepare"),
+	};
+	db.with_conn(|conn| {
+		let original_identity = identity(conn, selected)?;
+		conn.execute("DELETE FROM findings WHERE id=?1", [selected])?;
+		let replacement =
+			insert_or_ignore(conn, repo, job, &sample("selected"), false, 0)?.unwrap();
+		assert_eq!(selected, replacement, "exercise real SQLite row-id reuse");
+		assert_ne!(original_identity, identity(conn, replacement)?);
+		conn.execute("UPDATE findings SET state='confirmed' WHERE id=?1", [replacement])?;
+		Ok(())
+	})
+	.unwrap();
+	assert!(
+		matches!(prepared.mark_one(&db, selected, 1), Err(crate::Error::ReportReceipt)),
+		"completion must reject a replacement row selected only by stale ID"
+	);
+	assert_eq!(
+		db.with_conn(|conn| Ok(get_raw(conn, selected)?.unwrap().state)).unwrap(),
+		FindingState::Confirmed
+	);
 }

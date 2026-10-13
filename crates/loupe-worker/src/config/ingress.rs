@@ -1,10 +1,11 @@
 //! Original Config file bytes, parsed in one fixed mark scope. Scalar defaults
-//! and final effective-config validation remain in the existing owner.
+//! and final effective-config validation belong to WorkerConfig.
 
 use loupe_provenance::{Config, Mark, Unvalidated, Validate};
 
 use super::value::{ConfiguredPath, ConfiguredText};
 
+// debug-ok: Private decoder result; text/path fields are redacted and scalars have had their raw fields taken.
 #[derive(Debug)]
 pub(super) struct DecodedWorkerFileConfig {
 	#[cfg(fuzzing)]
@@ -26,6 +27,7 @@ pub(super) struct DecodedWorkerFileConfig {
 pub(super) struct WorkerFileConfigDecoder;
 /// Parser failures deliberately retain no TOML error object: it owns the
 /// source document and interpolates arbitrary keys/values in Display/Debug.
+// debug-ok: Only a closed parser category and numeric byte offsets; never the TOML document.
 #[derive(Debug, thiserror::Error)]
 #[error("worker_config: {reason} at bytes {start}..{end}")]
 struct ConfigSyntaxError {

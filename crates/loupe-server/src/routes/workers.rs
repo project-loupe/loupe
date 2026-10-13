@@ -9,17 +9,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::Extension;
 use loupe_proto::{RegisterWorkerResponse, PROTOCOL_VERSION};
-use loupe_storage::workers::{self, WorkerKind};
+use loupe_storage::registry;
 use loupe_tls::cert_fingerprint;
 use rustls_pemfile::certs;
 
+use crate::auth::AuthedWorker;
 use crate::state::AppState;
 
 /// `POST /v1/workers` — admin-only. Mints a worker client cert and
 /// records its fingerprint as a `kind = 'worker'` row.
 pub async fn create(
-	State(state): State<AppState>, body: crate::ingress::OperatorJson,
+	State(state): State<AppState>, Extension(operator): Extension<AuthedWorker>,
+	body: crate::ingress::OperatorJson,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
 	let req = crate::ingress::registry::RegisterWorkerDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
@@ -40,10 +43,14 @@ pub async fn create(
 	let fingerprint = first_cert_fingerprint(&bundle.cert_pem)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("fingerprint failed: {e}")))?;
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	let id = state
-		.db
-		.with_conn(|c| Ok(workers::insert(c, &req.name, WorkerKind::Worker, &fingerprint, now)?))
-		.map_err(|e| (StatusCode::CONFLICT, format!("insert failed: {e}")))?;
+	let id = registry::register_worker(
+		&state.db,
+		&operator.require_operator()?,
+		&req.name,
+		&fingerprint,
+		now,
+	)
+	.map_err(|e| (StatusCode::CONFLICT, format!("insert failed: {e}")))?;
 
 	let resp = RegisterWorkerResponse {
 		protocol_version: PROTOCOL_VERSION,
@@ -60,11 +67,10 @@ pub async fn create(
 /// middleware.
 pub async fn revoke(
 	State(state): State<AppState>, Path(id): Path<i64>,
+	Extension(operator): Extension<AuthedWorker>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	let revoked = state
-		.db
-		.with_conn(|c| Ok(workers::revoke(c, id, now)?))
+	let revoked = registry::revoke_worker(&state.db, &operator.require_operator()?, id, now)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("revoke failed: {e}")))?;
 	if revoked {
 		Ok(StatusCode::NO_CONTENT)

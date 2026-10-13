@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Conflict, Error, Result};
 
+// debug-ok: campaign policy contains only numeric versions, limits, durations and token budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignPolicy {
@@ -53,6 +54,7 @@ impl Default for CampaignPolicy {
 }
 
 /// Per-attempt deadlines and token budget from the owning campaign.
+// debug-ok: phase policy contains only numeric durations and token budget.
 #[derive(Debug, Clone, Copy)]
 pub struct PhasePolicy {
 	pub deadline_seconds: i64,
@@ -64,6 +66,12 @@ impl CampaignPolicy {
 	pub fn from_snapshot<S: Source>(snapshot: &BoundedJson<Payload, S>) -> Result<Self> {
 		let policy: Self = serde_json::from_str(snapshot.expose())
 			.map_err(|_| Error::Conflict(Conflict::CampaignPolicy))?;
+		policy.validate()?;
+		Ok(policy)
+	}
+
+	pub fn validate(&self) -> Result<()> {
+		let policy = self;
 		let valid = policy.version == 1
 			&& (1..=32).contains(&policy.survey_units_per_job)
 			&& policy.max_attempts > 0
@@ -72,16 +80,20 @@ impl CampaignPolicy {
 			&& policy.campaign_handoff_reserve < policy.campaign_max_jobs
 			&& policy.retry_backoff_base_seconds >= 1
 			&& policy.retry_backoff_base_seconds <= policy.retry_backoff_cap_seconds
-			&& [JobKind::<S>::Survey, JobKind::Drilldown, JobKind::Verify].iter().all(|kind| {
-				let phase = policy.phase(kind).expect("known phase");
-				phase.deadline_seconds > 0
-					&& phase.submit_margin_seconds >= 0
-					&& phase.submit_margin_seconds < phase.deadline_seconds
-					&& policy.campaign_deadline_seconds >= phase.deadline_seconds
-					&& phase.token_budget.is_none_or(|n| n > 0 && n <= i64::MAX as u64)
-			});
+			&& [JobKind::<loupe_provenance::Db>::Survey, JobKind::Drilldown, JobKind::Verify]
+				.iter()
+				.all(|kind| {
+					let Ok(phase) = policy.phase(kind) else {
+						return false;
+					};
+					phase.deadline_seconds > 0
+						&& phase.submit_margin_seconds >= 0
+						&& phase.submit_margin_seconds < phase.deadline_seconds
+						&& policy.campaign_deadline_seconds >= phase.deadline_seconds
+						&& phase.token_budget.is_none_or(|n| n > 0 && n <= i64::MAX as u64)
+				});
 		if valid {
-			Ok(policy)
+			Ok(())
 		} else {
 			Err(Error::Conflict(Conflict::CampaignPolicy))
 		}

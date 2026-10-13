@@ -12,6 +12,7 @@ use crate::version::PROTOCOL_VERSION;
 /// `loupe_core::ReportingDestination` referencing the resulting
 /// `pat_secret_id`. PAT material never travels back out of the server
 /// in any response.
+// debug-ok: reporting text and optional PAT delegate to redacted owners.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
 pub enum ReportingSetup<S: Source> {
@@ -45,6 +46,7 @@ pub enum ReportingSetup<S: Source> {
 }
 
 /// Body of `POST /v1/repos`.
+// debug-ok: all text, configuration and reporting owners redact their content.
 #[derive(Debug, Serialize)]
 #[serde(bound(serialize = ""))]
 pub struct RegisterRepoRequest<S: Source> {
@@ -93,6 +95,7 @@ impl<S: Source> RegisterRepoRequest<S> {
 	}
 }
 
+// debug-ok: registration response contains only numeric protocol and repo ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRepoResponse {
 	pub protocol_version: u16,
@@ -100,6 +103,7 @@ pub struct RegisterRepoResponse {
 }
 
 /// Body of `POST /v1/repos/:id/reporting/github-pat`.
+// debug-ok: PAT delegates to Secret redaction; other field is protocol.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RotateRepoPatRequest {
 	pub protocol_version: u16,
@@ -109,6 +113,7 @@ pub struct RotateRepoPatRequest {
 
 /// Body of `PUT /v1/repos/:id/reporting/github`. Omitting `github_pat`
 /// switches the repo to the server's GitHub App.
+// debug-ok: target text and optional PAT delegate to redacted owners.
 #[derive(Debug, Serialize)]
 #[serde(bound(serialize = ""))]
 pub struct SetRepoGithubReportingRequest<S: Source> {
@@ -177,6 +182,7 @@ record_impls!(GithubAppResponse<S> { protocol_version, app });
 /// pin per-repo. To clear the per-repo override back to "inherit
 /// server default", set `inherit_require_approval = true` instead.
 /// The server rejects requests that set both at once.
+// debug-ok: update contains only protocol, booleans and numeric interval.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UpdateRepoRequest {
 	pub protocol_version: u16,
@@ -206,8 +212,8 @@ record_impls!(ListReposResponse<S> { protocol_version, repos });
 
 /// Which credential a GitHub issue destination files issues with.
 ///
-/// Defaults to `Pat` because that is the only mode servers predating
-/// GitHub App support had; a listing without the field is one of theirs.
+/// A listing that omits the authentication mode denotes a PAT credential.
+// debug-ok: authentication mode is a closed enum of unit variants.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GithubReportingAuth {
@@ -226,6 +232,7 @@ pub enum GithubReportingAuth {
 /// is only meaningful for a PAT-backed `GithubIssue`, and the server 400s
 /// a rotation attempt against anything else — but the storage-side secret
 /// id has no meaning off the server and must never leave it.
+// debug-ok: target/address text is redacted; authentication mode is closed.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", bound(serialize = ""))]
 pub enum ReportingSummary<S: Source> {
@@ -330,9 +337,7 @@ pub struct RepoSummary<S: Source> {
 	pub last_scanned_at: Option<i64>,
 	pub created_at: i64,
 	/// Which reporter this repo is configured for, without secret
-	/// material. `Option` because the field is additive: a client built
-	/// against a newer protocol must still deserialize responses from a
-	/// server that predates it.
+	/// material. Responses may omit the reporting field.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reporting: Option<ReportingSummary<S>>,
 }
@@ -360,6 +365,7 @@ record_impls!(RegisterWorkerRequest<S> { protocol_version, name });
 /// ```
 /// let metadata: fn(&loupe_proto::RegisterWorkerResponse) -> i64 = |response| response.worker_id;
 /// ```
+// debug-ok: only public client certificate and IDs print; keys/CA use Secret.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterWorkerResponse {
 	pub protocol_version: u16,
@@ -461,7 +467,7 @@ mod tests {
 	#[test]
 	fn registration_scanner_presence_preserves_wire_omission() {
 		// None represents host absence without manufacturing a source mark.
-		// An explicitly sourced null document retains its existing omission;
+		// An explicitly sourced null document is also omitted;
 		// other sourced JSON values must survive even when false or empty.
 		for (document, expected) in [
 			(None, None),

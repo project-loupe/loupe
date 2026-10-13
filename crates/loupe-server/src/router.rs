@@ -20,11 +20,15 @@ use crate::state::AppState;
 use crate::{auth, routes, tls, Config};
 
 /// Request extension carrying the peer's leaf certificate (DER bytes), if
-/// the connection presented one. The auth middleware (added in a later
-/// commit) reads this to identify the worker; route handlers should not
-/// touch it directly.
-#[derive(Debug, Clone)]
+/// the connection presented one. The auth middleware reads this to identify
+/// the worker; route handlers use the authenticated worker instead.
+#[derive(Clone)]
 pub struct PeerCert(pub CertificateDer<'static>);
+impl std::fmt::Debug for PeerCert {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("PeerCert([redacted])")
+	}
+}
 
 /// Build the axum `Router` for the server. Pure function — exposed so
 /// integration tests can mount it without spinning up TLS.
@@ -85,9 +89,11 @@ pub fn router(state: AppState) -> Router {
 		.layer(axum::middleware::from_fn(
 			|req: axum::extract::Request, next: axum::middleware::Next| async move {
 				let mut resp = next.run(req).await;
+				#[expect(clippy::expect_used, reason = "decimal formatting of the fixed u16 protocol version produces only ASCII header digits")]
+				let version = PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value");
 				resp.headers_mut().insert(
 					PROTOCOL_VERSION_HEADER,
-					PROTOCOL_VERSION.to_string().parse().expect("u16 parses as header value"),
+					version,
 				);
 				resp
 			},
@@ -204,12 +210,8 @@ async fn handle_connection(
 	let tls_stream = match acceptor.accept(sock).await {
 		Ok(s) => s,
 		Err(e) => {
-			// Log loudly: in mTLS the handshake failing usually means
-			// either a stale CA on one side after a rotation, a worker
-			// connecting before its cert is registered, or a port
-			// scanner — all worth surfacing at info+. At debug level
-			// these were invisible by default and the operator had no
-			// way to know why their workers couldn't connect.
+			// Surface failed handshakes at info so operators can diagnose
+			// trust-configuration failures without enabling debug logs.
 			tracing::error!(peer = %peer_addr, error = %e, "tls handshake failed");
 			return;
 		},

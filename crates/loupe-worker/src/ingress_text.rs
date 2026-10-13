@@ -12,6 +12,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
+// debug-ok: Closed syntax/policy categories, fixed field labels and numeric positions only.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DecodeError {
 	#[error("invalid JSON syntax")]

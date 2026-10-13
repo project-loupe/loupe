@@ -3,6 +3,17 @@ use std::sync::Mutex;
 
 use super::*;
 
+#[test]
+fn submitted_membership_path_errors_omit_original_bytes_from_the_chain() {
+	let (workdir, submission) = super::tests::valid_local_submission();
+	let missing = workdir.path().join("private-membership-path-sentinel/missing");
+	let error = check_submitted_membership(&missing, &submission.file_path).err().unwrap();
+	assert!(
+		!format!("{error:#}").contains("private-membership-path-sentinel"),
+		"submitted membership path leaked through the public error chain"
+	);
+}
+
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
 
@@ -27,6 +38,7 @@ fn subscriber(capture: Capture) -> impl tracing::Subscriber + Send + Sync {
 
 fn context(workdir: &Path) -> McpSessionContext {
 	McpSessionContext {
+		security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		client: Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),
@@ -105,6 +117,7 @@ async fn rejected_arguments_never_reach_tool_failure_logs() {
 	let workdir = tempfile::tempdir().unwrap();
 	let context = context(workdir.path());
 	let session = Arc::new(Session {
+		security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
 		data_mode: crate::llm::prompt::DataMode::Delimited,
 		client: context.client,

@@ -22,11 +22,12 @@ use anyhow::{bail, Context, Result};
 use loupe_storage::secrets::MasterKey;
 #[cfg(test)]
 use loupe_storage::workers::WorkerKind;
-use loupe_storage::{workers, Db};
+use loupe_storage::Db;
 use loupe_tls::{cert_fingerprint, Ca, CertBundle};
 
 use crate::config::{ConfiguredHostname, ConfiguredPath};
 
+// debug-ok: initialization options contain only the persist-secrets boolean, never secret bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct InitOptions {
 	/// Persist generated PEM/key files under the data dir. Production
@@ -83,7 +84,14 @@ impl DataDirLayout {
 			&self.db_path,
 		]
 		.iter()
-		.any(|p| p.as_path().exists())
+		.any(|p| {
+			#[allow(
+				clippy::disallowed_methods,
+				reason = "initialization refuses existing files in its Config-selected bundle layout"
+			)]
+			let exists = p.as_path().exists();
+			exists
+		})
 	}
 }
 
@@ -133,6 +141,10 @@ pub fn run_init_with_options(
 ) -> Result<InitOutput> {
 	let layout = DataDirLayout::at(data_dir);
 
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "initialization creates its Config-selected data directory before exclusive bundle writes"
+	)]
 	std::fs::create_dir_all(layout.root.as_path())
 		.with_context(|| format!("creating data dir {}", layout.root.as_path().display()))?;
 	if layout.any_exists() {
@@ -174,7 +186,7 @@ pub fn run_init_with_options(
 	let admin_der = pem_first_cert_der(&admin.cert_pem)?;
 	let fingerprint = cert_fingerprint(&admin_der);
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-	db.with_conn(|c| Ok(workers::insert_bootstrap_admin(c, &fingerprint, now)?))
+	loupe_storage::registry::bootstrap_admin(&db, &fingerprint, now)
 		.context("recording admin in workers table")?;
 
 	let (ca_cert_pem, ca_key_pem) = ca.into_pem();
@@ -199,14 +211,23 @@ fn write_secret_parts(path: &Path, parts: &[&[u8]]) -> Result<()> {
 	#[cfg(unix)]
 	let mut file = {
 		use std::os::unix::fs::OpenOptionsExt;
-		std::fs::OpenOptions::new()
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "initialization exports generated secret bytes only by exclusive creation with mode 0600 in its selected layout"
+		)]
+		let file = std::fs::OpenOptions::new()
 			.write(true)
 			.create_new(true)
 			.mode(0o600)
 			.open(path)
-			.with_context(|| format!("creating {}", path.display()))?
+			.with_context(|| format!("creating {}", path.display()))?;
+		file
 	};
 	#[cfg(not(unix))]
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "initialization writes generated bundle material to its Config-selected layout on non-Unix hosts"
+	)]
 	let mut file =
 		std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
 	for part in parts {
@@ -276,8 +297,7 @@ mod tests {
 		let db = Db::open(out.layout.db_path.as_path(), &key).unwrap();
 		let admin_der = pem_first_cert_der(&out.admin_bundle.cert_pem).unwrap();
 		let fp = cert_fingerprint(&admin_der);
-		let row = db
-			.with_conn(|c| Ok(workers::find_active_by_fingerprint(c, &fp)?))
+		let row = loupe_storage::registry::authenticate(&db, &fp)
 			.unwrap()
 			.expect("admin must be registered after init");
 		assert_eq!(row.kind, WorkerKind::Admin);
@@ -329,8 +349,7 @@ mod tests {
 		let db = Db::open(out.layout.db_path.as_path(), &out.master_key).unwrap();
 		let admin_der = pem_first_cert_der(&out.admin_bundle.cert_pem).unwrap();
 		let fp = cert_fingerprint(&admin_der);
-		let row = db
-			.with_conn(|c| Ok(workers::find_active_by_fingerprint(c, &fp)?))
+		let row = loupe_storage::registry::authenticate(&db, &fp)
 			.unwrap()
 			.expect("admin must be registered after env-only init");
 		assert_eq!(row.kind, WorkerKind::Admin);

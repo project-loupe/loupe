@@ -2,9 +2,9 @@
 use loupe_core::text::policy::{Argument, Payload, Reason, RevisionText};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_provenance::{Agent, Db, Source};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
-use crate::review::{changed, parsed, standalone, string_enum};
+use crate::review::{changed, parsed, string_enum};
 use crate::source_refs::InspectedRefs;
 use crate::{inventory, ownership, Conflict, Error, Ownership, Result};
 string_enum!(Disposition { LeadCreated=>"lead_created", NoLeadFound=>"no_lead_found", NotApplicable=>"not_applicable", NeedsFollowUp=>"needs_follow_up" });
@@ -22,6 +22,7 @@ pub struct NewResult<'a, RevisionS: Source> {
 	pub corroborates_result: Option<i64>,
 	pub corroborates_exclusion: Option<i64>,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone)]
 pub struct UnitResult {
 	pub result_id: i64,
@@ -41,8 +42,11 @@ pub struct UnitResult {
 	pub created_at: i64,
 }
 pub fn insert<RevisionS: Source>(
-	tx: &Transaction<'_>, new: &NewResult<'_, RevisionS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewResult<'_, RevisionS>, now: i64,
 ) -> Result<i64> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	ownership::generation(tx, scope.repo_id, new.generation_id, Ownership::ResultUnit)?;
 	ownership::unit_in_generation(tx, new.unit_id, new.generation_id, Ownership::ResultUnit)?;
 	if let Some(job) = new.produced_by_job {
 		ownership::job_for_generation(tx, job, new.generation_id, Ownership::ResultJob)?;
@@ -60,13 +64,14 @@ pub fn insert<RevisionS: Source>(
 			ownership::generation_scope(tx, new.generation_id, Ownership::CorroboratedExclusion)?;
 		ownership::require(tx,"SELECT g.repo_id,i.generation_id FROM generation_inventory i JOIN review_generations g ON g.generation_id=i.generation_id WHERE i.inventory_entry_id=?1 AND i.disposition='excluded'",[id],scope,Ownership::CorroboratedExclusion,ownership::generation_row)?;
 	}
-	inventory::verify_refs(tx, new.generation_id, new.inspected_refs.as_slice())?;
+	inventory::verify_refs(scope, new.generation_id, new.inspected_refs.as_slice())?;
 	tx.execute("INSERT INTO review_unit_results (review_unit_id,produced_by_job_id,commit_sha,profile_version,disposition,inspected_refs,counterevidence,proof_gaps,result_payload,result_digest,corroborates_review_unit_result_id,corroborates_inventory_exclusion_id,created_at)
- VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![new.unit_id,new.produced_by_job,new.commit_sha.expose(),new.profile_version,new.disposition.as_str(),new.inspected_refs.expose(),new.counterevidence.map(BoundedText::expose),new.proof_gaps.map(BoundedText::expose),new.payload.expose(),new.payload.digest().as_slice(),new.corroborates_result,new.corroborates_exclusion,now])?;
+ SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13 WHERE EXISTS(SELECT 1 FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.review_unit_id=?1 AND g.repo_id=?14)",params![new.unit_id,new.produced_by_job,new.commit_sha.expose(),new.profile_version,new.disposition.as_str(),new.inspected_refs.expose(),new.counterevidence.map(BoundedText::expose),new.proof_gaps.map(BoundedText::expose),new.payload.expose(),new.payload.digest().as_slice(),new.corroborates_result,new.corroborates_exclusion,now,scope.repo_id])?;
 	Ok(tx.last_insert_rowid())
 }
-pub fn list(conn: &Connection, unit: i64) -> Result<Vec<UnitResult>> {
-	Ok(conn.prepare(&format!("SELECT {COLUMNS} FROM review_unit_results WHERE review_unit_id=?1 ORDER BY review_unit_result_id"))?.query_map([unit],row)?.collect::<rusqlite::Result<_>>()?)
+pub fn list(scope: &crate::scope::RepoScope<'_>, unit: i64) -> Result<Vec<UnitResult>> {
+	let tx = scope.conn;
+	Ok(tx.prepare(&format!("SELECT {COLUMNS} FROM review_unit_results WHERE review_unit_id=?1 AND EXISTS(SELECT 1 FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.review_unit_id=review_unit_results.review_unit_id AND g.repo_id=?2) ORDER BY review_unit_result_id"))?.query_map(params![unit,scope.repo_id],row)?.collect::<rusqlite::Result<_>>()?)
 }
 const COLUMNS: &str = "review_unit_result_id,review_unit_id,produced_by_job_id,commit_sha,profile_version,disposition,inspected_refs,counterevidence,proof_gaps,result_payload,invalidated,invalidated_reason,corroborates_review_unit_result_id,corroborates_inventory_exclusion_id,created_at,source";
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UnitResult> {
@@ -96,8 +101,9 @@ pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
 	})
 }
 pub fn invalidate<S: Source>(
-	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>,
+	scope: &crate::scope::RepoScope<'_>, id: i64, reason: &BoundedText<Reason, S>,
 ) -> Result<()> {
-	changed(tx.execute("UPDATE review_unit_results SET invalidated=1,invalidated_reason=?2 WHERE review_unit_result_id=?1 AND invalidated=0",params![id,reason.expose()])?,Conflict::Corroboration)
+	scope.require_operator()?;
+	let tx = scope.conn;
+	changed(tx.execute("UPDATE review_unit_results SET invalidated=1,invalidated_reason=?2 WHERE review_unit_result_id=?1 AND EXISTS(SELECT 1 FROM review_units u JOIN review_generations g ON g.generation_id=u.generation_id WHERE u.review_unit_id=review_unit_results.review_unit_id AND g.repo_id=?3) AND invalidated=0",params![id,reason.expose(),scope.repo_id])?,Conflict::Corroboration)
 }
-standalone! {insert<RevisionS>(new:&NewResult<'_, RevisionS>,now:i64)->i64;invalidate<S>(id:i64,reason:&BoundedText<Reason, S>)->();}

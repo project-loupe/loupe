@@ -2,9 +2,9 @@
 use loupe_core::text::policy::{Payload, Reason, RevisionText};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_provenance::{Db, Source};
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::review::{changed, classify, optional, parsed, standalone, string_enum};
+use crate::review::{changed, classify, optional, parsed, string_enum};
 use crate::{ownership, Conflict, Entity, Error, Ownership, Result};
 
 string_enum!(Recipe { Bootstrap => "bootstrap", Incremental => "incremental", Reconciliation => "reconciliation", Corroboration => "corroboration" });
@@ -21,15 +21,19 @@ impl<S: Source> CampaignPolicyInput<'_, S> {
 	fn canonical(&self) -> Vec<u8> {
 		match self {
 			Self::Submitted(value) => value.canonical().to_vec(),
-			Self::Resolved(value) => loupe_core::canonical::canonical_bytes(
-				&serde_json::to_value(value).expect("numeric campaign policy serializes"),
-			),
+			Self::Resolved(value) => {
+				#[expect(
+					clippy::expect_used,
+					reason = "CampaignPolicy contains only fixed keys and integer fields; its derived serializer cannot fail"
+				)]
+				let json = serde_json::to_value(value).expect("numeric campaign policy serializes");
+				loupe_core::canonical::canonical_bytes(&json)
+			},
 		}
 	}
 }
 
 pub struct NewCampaign<'a, RevisionS: Source, PolicyS: Source> {
-	pub repo_id: i64,
 	pub recipe: Recipe,
 	pub trigger: Trigger,
 	pub requested_base_sha: Option<&'a BoundedText<RevisionText, RevisionS>>,
@@ -40,6 +44,7 @@ pub struct NewCampaign<'a, RevisionS: Source, PolicyS: Source> {
 	pub root_campaign_id: Option<i64>,
 	pub continuation_of_campaign_id: Option<i64>,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone)]
 pub struct Campaign {
 	pub campaign_id: i64,
@@ -60,6 +65,7 @@ pub struct Campaign {
 	pub created_at: i64,
 	pub finished_at: Option<i64>,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSummary {
 	campaign_id: i64,
@@ -68,6 +74,7 @@ pub struct TerminalSummary {
 }
 
 type CountGroup = Vec<(loupe_core::text::Identifier<loupe_core::text::policy::JsonKey, Db>, i64)>;
+// debug-ok: JobCount contains redacted Db text owners and one count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JobCount {
 	kind: BoundedText<loupe_core::text::policy::JobKindName, Db>,
@@ -172,26 +179,32 @@ pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
 	})
 }
 pub fn create<RevisionS: Source, PolicyS: Source>(
-	tx: &Transaction<'_>, new: &NewCampaign<'_, RevisionS, PolicyS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewCampaign<'_, RevisionS, PolicyS>, now: i64,
 ) -> Result<i64> {
+	scope.require_operator()?;
+	let tx = scope.conn;
 	if let Some(id) = new.generation_id {
-		ownership::generation(tx, new.repo_id, id, Ownership::CampaignGeneration)?;
+		ownership::generation(tx, scope.repo_id, id, Ownership::CampaignGeneration)?;
 	}
 	if let Some(id) = new.root_campaign_id {
-		ownership::campaign(tx, new.repo_id, id, Ownership::CampaignRoot)?;
+		ownership::campaign(tx, scope.repo_id, id, Ownership::CampaignRoot)?;
 	}
 	if let Some(id) = new.continuation_of_campaign_id {
-		ownership::campaign(tx, new.repo_id, id, Ownership::CampaignContinuation)?;
+		ownership::campaign(tx, scope.repo_id, id, Ownership::CampaignContinuation)?;
 	}
 	let policy = new.effective_policy.canonical();
+	#[expect(
+		clippy::expect_used,
+		reason = "both private CampaignPolicyInput branches return only canonical JSON UTF-8"
+	)]
 	let policy_text = std::str::from_utf8(&policy).expect("canonical policy is UTF-8");
 	let policy_digest = loupe_core::canonical::digest(&policy);
 	tx.execute("INSERT INTO review_campaigns (repo_id,recipe,trigger,requested_base_sha,target_commit_sha,generation_id,state,effective_policy,effective_policy_digest,deadline_at,root_campaign_id,continuation_of_campaign_id,created_at)
-	VALUES (?1,?2,?3,?4,?5,?6,'active',?7,?8,?9,?10,?11,?12)", params![new.repo_id,new.recipe.as_str(),new.trigger.as_str(),new.requested_base_sha.map(BoundedText::expose),new.target_commit_sha.expose(),new.generation_id,policy_text,policy_digest.as_slice(),new.deadline_at,new.root_campaign_id,new.continuation_of_campaign_id,now])
+	VALUES (?1,?2,?3,?4,?5,?6,'active',?7,?8,?9,?10,?11,?12)", params![scope.repo_id,new.recipe.as_str(),new.trigger.as_str(),new.requested_base_sha.map(BoundedText::expose),new.target_commit_sha.expose(),new.generation_id,policy_text,policy_digest.as_slice(),new.deadline_at,new.root_campaign_id,new.continuation_of_campaign_id,now])
 		.map_err(|e| classify(e,"review_campaigns.repo_id",Conflict::ActiveCampaign))?;
 	Ok(tx.last_insert_rowid())
 }
-pub fn get(conn: &Connection, id: i64) -> Result<Option<Campaign>> {
+pub(crate) fn get_raw(conn: &Connection, id: i64) -> Result<Option<Campaign>> {
 	Ok(conn
 		.query_row(
 			&format!("SELECT {COLUMNS} FROM review_campaigns WHERE campaign_id=?1"),
@@ -200,25 +213,39 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Campaign>> {
 		)
 		.optional()?)
 }
-pub fn list_for_repo(conn: &Connection, repo: i64) -> Result<Vec<Campaign>> {
-	Ok(conn.prepare(&format!("SELECT {COLUMNS} FROM review_campaigns WHERE repo_id=?1 ORDER BY created_at DESC,campaign_id DESC"))?.query_map([repo],row)?.collect::<rusqlite::Result<_>>()?)
+
+pub fn get(scope: &crate::scope::RepoScope<'_>, id: i64) -> Result<Option<Campaign>> {
+	Ok(scope
+		.conn
+		.query_row(
+			&format!("SELECT {COLUMNS} FROM review_campaigns WHERE campaign_id=?1 AND repo_id=?2"),
+			params![id, scope.repo_id],
+			row,
+		)
+		.optional()?)
 }
-fn counts(tx: &Transaction<'_>, sql: &str, id: Option<i64>) -> Result<CountGroup> {
+pub fn list_for_repo(scope: &crate::scope::RepoScope<'_>) -> Result<Vec<Campaign>> {
+	let tx = scope.conn;
+	Ok(tx.prepare(&format!("SELECT {COLUMNS} FROM review_campaigns WHERE repo_id=?1 ORDER BY created_at DESC,campaign_id DESC"))?.query_map([scope.repo_id],row)?.collect::<rusqlite::Result<_>>()?)
+}
+fn counts(scope: &crate::scope::RepoScope<'_>, sql: &str, id: Option<i64>) -> Result<CountGroup> {
+	let tx = scope.conn;
 	let mut object = Vec::new();
 	let mut statement = tx.prepare(sql)?;
-	for pair in statement
-		.query_map([id], |r| Ok((crate::ingress::count_json_key(r, 0)?, r.get::<_, i64>(1)?)))?
-	{
+	for pair in statement.query_map(params![id, scope.repo_id], |r| {
+		Ok((crate::ingress::count_json_key(r, 0)?, r.get::<_, i64>(1)?))
+	})? {
 		let (key, count) = pair?;
 		object.push((key, count));
 	}
 	Ok(object)
 }
-pub fn summarize(tx: &Transaction<'_>, id: i64) -> Result<TerminalSummary> {
-	let campaign = get(tx, id)?.ok_or(Error::NotFound(Entity::Campaign, id))?;
+pub fn summarize(scope: &crate::scope::RepoScope<'_>, id: i64) -> Result<TerminalSummary> {
+	let tx = scope.conn;
+	let campaign = get(scope, id)?.ok_or(Error::NotFound(Entity::Campaign, id))?;
 	let coverage = if let Some(generation) = campaign.generation_id {
 		ownership::generation(tx, campaign.repo_id, generation, Ownership::CampaignGeneration)?;
-		crate::generations::get(tx, generation)?
+		crate::generations::get(scope, generation)?
 			.ok_or(Error::NotFound(Entity::Generation, generation))?
 			.coverage
 	} else {
@@ -230,10 +257,10 @@ pub fn summarize(tx: &Transaction<'_>, id: i64) -> Result<TerminalSummary> {
 	// CHECK-constrained snake_case and remain object keys.
 	let mut jobs = Vec::new();
 	let mut statement = tx.prepare(
-		"SELECT kind,state,COUNT(*) FROM jobs WHERE campaign_id=?1
+		"SELECT kind,state,COUNT(*) FROM jobs WHERE campaign_id=?1 AND repo_id=?2
 		 GROUP BY kind,state ORDER BY kind,state",
 	)?;
-	for record in statement.query_map([id], |r| {
+	for record in statement.query_map(params![id, scope.repo_id], |r| {
 		Ok(JobCount {
 			kind: crate::ingress::job_kind_text(r, 0)?,
 			leaf: crate::ingress::count_json_leaf(r, 0)?,
@@ -245,29 +272,33 @@ pub fn summarize(tx: &Transaction<'_>, id: i64) -> Result<TerminalSummary> {
 	}
 	let generation = campaign.generation_id;
 	let counts = CampaignCounts { jobs,
-		lead_status: counts(tx,"SELECT status,COUNT(*) FROM leads WHERE generation_id=?1 GROUP BY status",generation)?,
-		lead_disposition: counts(tx,"SELECT disposition,COUNT(*) FROM leads WHERE generation_id=?1 AND disposition IS NOT NULL GROUP BY disposition",generation)?,
-		findings: counts(tx,"SELECT f.state,COUNT(*) FROM findings f JOIN finding_review_details d ON d.finding_id=f.id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 GROUP BY f.state",generation)?,
-		verdicts: counts(tx,"SELECT v.verdict,COUNT(*) FROM finding_verifications v JOIN finding_review_details d ON d.finding_id=v.finding_id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 GROUP BY v.verdict",generation)?, canonical: String::new() }.finish()?;
+		lead_status: counts(scope,"SELECT status,COUNT(*) FROM leads WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2) GROUP BY status",generation)?,
+		lead_disposition: counts(scope,"SELECT disposition,COUNT(*) FROM leads WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2) AND disposition IS NOT NULL GROUP BY disposition",generation)?,
+		findings: counts(scope,"SELECT f.state,COUNT(*) FROM findings f JOIN finding_review_details d ON d.finding_id=f.id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 AND f.repo_id=?2 GROUP BY f.state",generation)?,
+		verdicts: counts(scope,"SELECT v.verdict,COUNT(*) FROM finding_verifications v JOIN finding_review_details d ON d.finding_id=v.finding_id JOIN leads l ON l.lead_id=d.origin_lead_id WHERE l.generation_id=?1 AND EXISTS(SELECT 1 FROM findings f WHERE f.id=v.finding_id AND f.repo_id=?2) GROUP BY v.verdict",generation)?, canonical: String::new() }.finish()?;
 	Ok(TerminalSummary { campaign_id: id, coverage, counts })
 }
 pub fn finish<S: Source>(
-	tx: &Transaction<'_>, id: i64, summary: &TerminalSummary, reason: &BoundedText<Reason, S>,
-	now: i64,
+	scope: &crate::scope::RepoScope<'_>, id: i64, summary: &TerminalSummary,
+	reason: &BoundedText<Reason, S>, now: i64,
 ) -> Result<()> {
-	finish_with_reason(tx, id, summary, reason.expose(), now)
+	scope.require_operator()?;
+	finish_with_reason(scope, id, summary, reason.expose(), now)
 }
 /// Scheduler outcomes are closed host facts, not attributed input text.
+// debug-ok: completion reasons are closed host scheduling outcomes.
 #[derive(Debug, Clone, Copy)]
 pub enum FinishedReason {
 	Completed,
 	Deadline,
 }
-pub fn finish_scheduled(
-	tx: &Transaction<'_>, id: i64, summary: &TerminalSummary, reason: FinishedReason, now: i64,
+pub(crate) fn finish_scheduled(
+	scope: &crate::scope::RepoScope<'_>, id: i64, summary: &TerminalSummary,
+	reason: FinishedReason, now: i64,
 ) -> Result<()> {
+	scope.require_operator()?;
 	finish_with_reason(
-		tx,
+		scope,
 		id,
 		summary,
 		match reason {
@@ -278,26 +309,24 @@ pub fn finish_scheduled(
 	)
 }
 fn finish_with_reason(
-	tx: &Transaction<'_>, id: i64, summary: &TerminalSummary, reason: &str, now: i64,
+	scope: &crate::scope::RepoScope<'_>, id: i64, summary: &TerminalSummary, reason: &str, now: i64,
 ) -> Result<()> {
+	scope.require_operator()?;
+	let tx = scope.conn;
 	if summary.campaign_id != id {
 		return Err(Error::Ownership(Ownership::CampaignSummary));
 	}
-	if summarize(tx, id)? != *summary {
+	if summarize(scope, id)? != *summary {
 		return Err(Error::Conflict(Conflict::CampaignSummary));
 	}
-	changed(tx.execute("UPDATE review_campaigns SET state='finished',terminal_reason=?2,coverage_at_finish=?3,terminal_counts=?4,finished_at=?5 WHERE campaign_id=?1 AND state='active'",params![id,reason,summary.coverage.as_str(),summary.counts.expose(),now])?,Conflict::CampaignState)
+	changed(tx.execute("UPDATE review_campaigns SET state='finished',terminal_reason=?2,coverage_at_finish=?3,terminal_counts=?4,finished_at=?5 WHERE campaign_id=?1 AND repo_id=?6 AND state='active'",params![id,reason,summary.coverage.as_str(),summary.counts.expose(),now,scope.repo_id])?,Conflict::CampaignState)
 }
 pub fn cancel<S: Source>(
-	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, id: i64, reason: &BoundedText<Reason, S>, now: i64,
 ) -> Result<()> {
-	let summary = summarize(tx, id)?;
-	changed(tx.execute("UPDATE review_campaigns SET state='cancelled',terminal_reason=?2,coverage_at_finish=?3,terminal_counts=?4,finished_at=?5 WHERE campaign_id=?1 AND state='active'",params![id,reason.expose(),summary.coverage.as_str(),summary.counts.expose(),now])?,Conflict::CampaignState)
-}
-standalone! {
-	create<RevisionS, PolicyS>(new: &NewCampaign<'_, RevisionS, PolicyS>, now: i64) -> i64;
-	finish<S>(id: i64, summary: &TerminalSummary, reason: &BoundedText<Reason, S>, now: i64) -> ();
-	cancel<S>(id: i64, reason: &BoundedText<Reason, S>, now: i64) -> ();
+	scope.require_operator()?;
+	let summary = summarize(scope, id)?;
+	changed(scope.conn.execute("UPDATE review_campaigns SET state='cancelled',terminal_reason=?2,coverage_at_finish=?3,terminal_counts=?4,finished_at=?5 WHERE campaign_id=?1 AND repo_id=?6 AND state='active'",params![id,reason.expose(),summary.coverage.as_str(),summary.counts.expose(),now,scope.repo_id])?,Conflict::CampaignState)
 }
 
 #[cfg(test)]

@@ -47,7 +47,7 @@ struct StoredAppWrite<'a> {
 }
 
 /// Store (or replace) the credential.
-pub fn set<S: Source>(
+pub(crate) fn set<S: Source>(
 	conn: &Connection, app: &StoredGithubApp<S>, now: i64,
 ) -> rusqlite::Result<()> {
 	let record = StoredAppWrite {
@@ -71,7 +71,7 @@ pub fn set<S: Source>(
 }
 
 /// Read the credential. `Ok(None)` when no app has been configured.
-pub fn get(conn: &Connection) -> rusqlite::Result<Option<StoredGithubApp<Db>>> {
+pub(crate) fn get(conn: &Connection) -> rusqlite::Result<Option<StoredGithubApp<Db>>> {
 	conn.query_row(
 		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
 		params![SecretKind::GithubApp.as_str(), LABEL],
@@ -82,7 +82,7 @@ pub fn get(conn: &Connection) -> rusqlite::Result<Option<StoredGithubApp<Db>>> {
 
 /// Read display metadata without allocating a decoded PEM string. Full
 /// credential existence/validity checks must continue to use get.
-pub fn summary(conn: &Connection) -> rusqlite::Result<Option<StoredGithubAppSummary>> {
+pub(crate) fn summary(conn: &Connection) -> rusqlite::Result<Option<StoredGithubAppSummary>> {
 	conn.query_row(
 		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
 		params![SecretKind::GithubApp.as_str(), LABEL],
@@ -92,7 +92,7 @@ pub fn summary(conn: &Connection) -> rusqlite::Result<Option<StoredGithubAppSumm
 }
 
 /// Remove the credential. Returns whether one was stored.
-pub fn clear(conn: &Connection) -> rusqlite::Result<bool> {
+pub(crate) fn clear(conn: &Connection) -> rusqlite::Result<bool> {
 	let n = conn.execute(
 		"DELETE FROM secrets WHERE kind = ?1 AND label = ?2",
 		params![SecretKind::GithubApp.as_str(), LABEL],

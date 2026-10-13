@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::*;
 use crate::host_outcome::{CheckoutFailure, HostVerifyReason, ReviewedRevisionFact};
 
+// debug-ok: Closed fieldless variants; no dynamic content.
 #[derive(Clone, Copy, Debug)]
 pub enum ResponseCase {
 	Lease,
@@ -15,6 +16,7 @@ pub enum ResponseCase {
 	ErrorDiagnostic,
 	Submission,
 }
+// debug-ok: Cfg-only closed host outcome selection, with no dynamic payload.
 #[derive(Clone, Copy, Debug)]
 pub enum HostCase {
 	Scanner,
@@ -22,6 +24,7 @@ pub enum HostCase {
 	Checkout(CheckoutFailure),
 }
 
+// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 #[derive(Debug)]
 pub struct Observation {
 	pub result: Result<Value, String>,

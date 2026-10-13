@@ -20,14 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
-use loupe_core::{FindingState, JobKind, JobState};
+use loupe_core::{JobKind, JobState};
 use loupe_proto::{
 	CompleteOutcome, HeartbeatResponse, JobCapability, JobInfo, LeaseEnvelope, LeasePayload,
 	LeaseResponse, ScanResponse, LLM_CODE_REVIEW_SCANNER_ID, PROTOCOL_VERSION,
 };
 use loupe_provenance::{Agent, Db, Operator};
-use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
-use loupe_storage::{findings, repos, secrets};
+use loupe_storage::jobs::{self, JobRow, QueuedJob, DEFAULT_LEASE_SECONDS};
+use loupe_storage::{findings, reports, repos, scope};
 use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
@@ -82,7 +82,7 @@ fn job_to_info(row: &JobRow) -> JobInfo<Db> {
 	}
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ListQuery {
 	#[serde(default)]
 	pub limit: Option<i64>,
@@ -93,6 +93,11 @@ pub struct ListQuery {
 	pub state: Option<String>,
 	#[serde(default)]
 	pub kind: Option<String>,
+}
+impl std::fmt::Debug for ListQuery {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ListQuery([redacted])")
+	}
 }
 
 /// Parse the `state=` filter. Rejects unknown values loudly rather than
@@ -144,26 +149,25 @@ pub fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind<Operator>>, (Statu
 
 /// `POST /v1/repos/:id/scan` — admin enqueues a scan job for `id`.
 pub async fn enqueue_scan(
-	State(state): State<AppState>, Path(repo_id): Path<i64>, body: crate::ingress::OperatorJson,
+	State(state): State<AppState>, Path(repo_id): Path<i64>,
+	Extension(operator): Extension<AuthedWorker>, body: crate::ingress::OperatorJson,
 ) -> Result<(StatusCode, Json<ScanResponse>), (StatusCode, String)> {
 	let req = crate::ingress::registry::EnqueueScanDecoder::decode(body)?;
 	check_version(req.protocol_version)?;
 	let now = now_secs();
 
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, repo_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
-		.ok_or((StatusCode::NOT_FOUND, format!("no repo with id {repo_id}")))?;
-
-	let since_sha = if req.incremental { repo.last_scanned_sha.clone() } else { None };
-	let job_id = state
-		.db
-		.with_conn(|c| {
-			jobs::enqueue(
-				c,
-				&NewJob {
-					repo_id: repo.id,
+	let job_id = scope::with_operator_repository(
+		&state.db,
+		&operator.require_operator()?,
+		scope::OperatorTarget::Repository(repo_id),
+		|scope| {
+			let Some(repo) = repos::get(scope)? else {
+				return Ok(None);
+			};
+			let since_sha = if req.incremental { repo.last_scanned_sha } else { None };
+			Ok(Some(jobs::enqueue(
+				scope,
+				&QueuedJob {
 					kind: JobKind::Scan,
 					incremental: req.incremental,
 					since_sha,
@@ -171,9 +175,11 @@ pub async fn enqueue_scan(
 					target_finding_id: None,
 				},
 				now,
-			)
-		})
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue: {e}")))?;
+			)?))
+		},
+	)
+	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue: {e}")))?
+	.ok_or((StatusCode::NOT_FOUND, format!("no repo with id {repo_id}")))?;
 
 	state.job_arrived.notify_waiters();
 	Ok((StatusCode::CREATED, Json(ScanResponse { protocol_version: PROTOCOL_VERSION, job_id })))
@@ -183,12 +189,10 @@ pub async fn enqueue_scan(
 /// `kind` narrow the result server-side so a caller watching one part of
 /// the queue doesn't have to pull the whole table and filter locally.
 pub async fn list(
-	State(state): State<AppState>,
+	State(state): State<AppState>, Extension(operator): Extension<AuthedWorker>,
 	crate::ingress::query::OperatorJobQuery(filter): crate::ingress::query::OperatorJobQuery,
 ) -> Result<Json<Vec<JobInfo<Db>>>, (StatusCode, String)> {
-	let rows = state
-		.db
-		.with_conn(|c| Ok(jobs::list(c, &filter)?))
+	let rows = jobs::catalog(&state.db, &operator.require_operator()?, &filter)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list jobs: {e}")))?;
 	Ok(Json(rows.iter().map(job_to_info).collect()))
 }
@@ -196,12 +200,21 @@ pub async fn list(
 /// `GET /v1/jobs/:id` — admin gets one job.
 pub async fn get(
 	State(state): State<AppState>, Path(id): Path<i64>,
+	Extension(operator): Extension<AuthedWorker>,
 ) -> Result<Json<JobInfo<Db>>, (StatusCode, String)> {
-	let row = state
-		.db
-		.with_conn(|c| Ok(jobs::get(c, id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
-		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no job with id {id}")))?;
+	let row = scope::with_operator_repository(
+		&state.db,
+		&operator.require_operator()?,
+		scope::OperatorTarget::Job(id),
+		|scope| jobs::get(scope, id),
+	)
+	.map_err(|e| match e {
+		loupe_storage::Error::NotFound(loupe_storage::Entity::Job, _) => {
+			(StatusCode::NOT_FOUND, format!("no job with id {id}"))
+		},
+		other => (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {other}")),
+	})?
+	.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no job with id {id}")))?;
 	Ok(Json(job_to_info(&row)))
 }
 
@@ -216,12 +229,17 @@ pub async fn get(
 /// deliberately rather than revive it by accident.
 pub async fn retry(
 	State(state): State<AppState>, Path(id): Path<i64>,
+	Extension(operator): Extension<AuthedWorker>,
 ) -> Result<Json<JobInfo<Db>>, (StatusCode, String)> {
 	let now = now_secs();
-	let result = state
-		.db
-		.with_conn(|c| Ok(jobs::retry_failed(c, id, now, now + DEFAULT_VALIDATING_BUDGET_SECS)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry job: {e}")))?;
+	let result = loupe_storage::recovery::retry_job(
+		&state.db,
+		&operator.require_operator()?,
+		id,
+		now,
+		now + DEFAULT_VALIDATING_BUDGET_SECS,
+	)
+	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry job: {e}")))?;
 
 	match result {
 		jobs::RetryOutcome::Retried(row) => {
@@ -241,12 +259,12 @@ pub async fn retry(
 /// `POST /v1/jobs/:id/cancel` — admin cancels queued or leased work.
 pub async fn cancel(
 	State(state): State<AppState>, Path(id): Path<i64>,
+	Extension(operator): Extension<AuthedWorker>,
 ) -> Result<Json<JobInfo<Db>>, (StatusCode, String)> {
 	let now = now_secs();
-	let outcome = state
-		.db
-		.with_conn(|c| Ok(jobs::cancel(c, id, now)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel job: {e}")))?;
+	let outcome =
+		loupe_storage::recovery::cancel_job(&state.db, &operator.require_operator()?, id, now)
+			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel job: {e}")))?;
 	match outcome {
 		jobs::CancelOutcome::Cancelled(row) => Ok(Json(job_to_info(&row))),
 		jobs::CancelOutcome::NotFound => {
@@ -278,17 +296,15 @@ pub(crate) const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
 /// `wait_seconds` for server-side long-polling: when the queue is empty
 /// the server waits on `state.job_arrived` for up to that many seconds
 /// (capped) before returning `Empty`. `wait_seconds = 0` is the
-/// historical poll-and-return-empty behaviour.
+/// non-blocking poll-and-return-empty behavior.
 pub async fn lease(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	body: crate::ingress::WorkerJson,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
 	let req = crate::ingress::jobs::LeaseRequestDecoder::decode(body)?;
 	check_version(req.protocol_version)?;
-	// A worker is eligible for verify jobs iff it advertised at least
-	// one `verify:*` capability. Fine-grained tag matching (e.g.
-	// `verify:secrets` only matches secret-flavoured verify jobs) is a
-	// follow-up; today we only have one tag in flight.
+	// Any `verify:*` capability makes the worker eligible for verify jobs;
+	// the tag suffix does not restrict which findings it can verify.
 	let accepts_verify = req.capabilities.iter().any(|c| c.expose().starts_with("verify:"));
 
 	if let Some(env) = try_lease(&state, worker.id(), accepts_verify)? {
@@ -345,21 +361,18 @@ fn try_lease(
 		now,
 		&job_capability_hash,
 	)
-	.map(|claimed| claimed.map(|c| c.job))
 	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
 	let Some(row) = row else { return Ok(None) };
-	let env = build_lease_envelope(state, &row, job_capability)
+	let env = build_lease_envelope(row, job_capability)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")))?;
 	Ok(Some(env))
 }
 
 fn build_lease_envelope(
-	state: &AppState, row: &JobRow, job_capability: JobCapability,
+	selected: loupe_storage::scheduler::ClaimedLease, job_capability: JobCapability,
 ) -> anyhow::Result<LeaseEnvelope<Agent, Db>> {
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?
-		.ok_or_else(|| anyhow::anyhow!("repo {} for leased job not found", row.repo_id))?;
+	let repo = selected.repository;
+	let row = selected.claimed.job;
 	// No clone-side credential is stored separately. We deliberately do
 	// not ship the reporting PAT to the worker.
 	let github_pat = None;
@@ -370,9 +383,8 @@ fn build_lease_envelope(
 			let target_id = row
 				.target_finding_id
 				.ok_or_else(|| anyhow::anyhow!("verify job missing target_finding_id"))?;
-			let finding_row = state
-				.db
-				.with_conn(|c| Ok(findings::get(c, target_id)?))?
+			let finding_row = selected
+				.target
 				.ok_or_else(|| anyhow::anyhow!("verify target finding not found"))?;
 			if finding_row.repo_id != row.repo_id {
 				anyhow::bail!(
@@ -382,11 +394,7 @@ fn build_lease_envelope(
 					row.repo_id
 				);
 			}
-			let reviewed_job_id = row.parent_job_id.unwrap_or(finding_row.job_id);
-			let reviewed_sha = state
-				.db
-				.with_conn(|c| Ok(jobs::get(c, reviewed_job_id)?))?
-				.and_then(|j| if j.kind == JobKind::Scan { j.head_sha } else { None });
+			let reviewed_sha = selected.reviewed_revision;
 			let finding = finding_row.into_finding();
 			LeasePayload::Verify { finding_id: target_id, finding: Box::new(finding), reviewed_sha }
 		},
@@ -424,21 +432,25 @@ pub async fn heartbeat(
 		check_version(req.protocol_version)?;
 	}
 	let now = now_secs();
-	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
-	let lease_until = state
-		.db
-		.with_conn(|c| {
-			Ok(jobs::heartbeat(
-				c,
-				job_id,
-				worker.id(),
-				now,
-				DEFAULT_LEASE_SECONDS,
-				&authorized.capability_hash,
-			)?)
+	let authorized = job_capability::authorize_for_job(
+		&state,
+		&worker,
+		&headers,
+		job_id,
+		now,
+		loupe_core::security_event::Operation::Heartbeat,
+	)?;
+	let lease_until =
+		scope::with_active_lease(&state.db, authorized.active_lease(worker.id(), now), |scope| {
+			jobs::extend_lease(scope, DEFAULT_LEASE_SECONDS)
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("heartbeat: {e}")))?
-		.ok_or_else(|| (StatusCode::FORBIDDEN, "lease not held by this worker".to_owned()))?;
+		.flatten()
+		.ok_or_else(|| {
+			authorized
+				.deny(&worker, loupe_core::security_event::CapabilityDenial::LeaseInvalidated);
+			(StatusCode::FORBIDDEN, "lease not held by this worker".to_owned())
+		})?;
 	Ok(Json(HeartbeatResponse {
 		protocol_version: PROTOCOL_VERSION,
 		lease_expires_at: lease_until,
@@ -454,9 +466,17 @@ pub async fn submit_findings(
 	check_version(batch.protocol_version)?;
 	let now = now_secs();
 
-	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let authorized = job_capability::authorize_for_job(
+		&state,
+		&worker,
+		&headers,
+		job_id,
+		now,
+		loupe_core::security_event::Operation::SubmitFindings,
+	)?;
 	let row = &authorized.row;
 	if !route_admits_kind(Route::Findings, &row.kind) {
+		authorized.deny(&worker, loupe_core::security_event::CapabilityDenial::UnsupportedJobKind);
 		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
 	}
 	if batch
@@ -464,47 +484,32 @@ pub async fn submit_findings(
 		.iter()
 		.any(|finding| finding.scanner_id.expose() == LLM_CODE_REVIEW_SCANNER_ID)
 	{
+		authorized
+			.deny(&worker, loupe_core::security_event::CapabilityDenial::StrictEndpointRequired);
 		return Err((
 			StatusCode::BAD_REQUEST,
 			"LLM findings must use the strict /llm-findings endpoint".into(),
 		));
 	}
 
-	// Look up the repo's verification policy so the inserted findings
-	// carry the right verification_required flag.
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
-		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".to_owned()))?;
-	let verification_required = repo.verification_enabled;
-	for finding in &batch.findings {
-		validate_report_size(&repo, finding, row.head_sha.as_ref())?;
-	}
-
-	let submitted = state
-		.db
-		.with_conn(|c| {
-			jobs::with_active_lease_transaction(
-				c,
-				authorized.active_lease(worker.id(), now),
-				|tx, active| {
-					for f in &batch.findings {
-						findings::insert_or_ignore(
-							tx,
-							active.repo_id,
-							active.id,
-							f,
-							verification_required,
-							now,
-						)?;
-					}
-					Ok(())
-				},
-			)
+	let submitted =
+		scope::with_active_lease(&state.db, authorized.active_lease(worker.id(), now), |scope| {
+			let repo = repos::get(scope.repo())?.ok_or(loupe_storage::Error::ScopeDenied)?;
+			for finding in &batch.findings {
+				if let Err(error) =
+					validate_report_size(&repo, finding, scope.job().head_sha.as_ref())
+				{
+					report_budget_event(repo.id, Some(scope.job().id), Some(worker.id()));
+					return Ok(Err(error));
+				}
+			}
+			for finding in &batch.findings {
+				findings::submit(scope, finding)?;
+			}
+			Ok(Ok(()))
 		})
 		.map_err(|e| storage_write_error("submit findings", e))?;
-	submitted.ok_or_else(job_capability::forbidden)?;
+	submitted.ok_or_else(|| authorized.lease_invalidated(&worker))??;
 	Ok(StatusCode::NO_CONTENT)
 }
 
@@ -514,10 +519,13 @@ fn storage_write_error(context: &str, error: loupe_storage::Error) -> (StatusCod
 		Error::Validation(_) | Error::UnknownPaths(_) => StatusCode::BAD_REQUEST,
 		Error::Conflict(_) => StatusCode::CONFLICT,
 		Error::Ownership(_) => StatusCode::FORBIDDEN,
+		Error::ScopeDenied => StatusCode::FORBIDDEN,
+		Error::ReportReceipt => StatusCode::CONFLICT,
 		Error::NotFound(_, _) => StatusCode::NOT_FOUND,
-		Error::Sqlite(_) | Error::Migration(_) | Error::UnknownJobKinds(_) => {
-			StatusCode::INTERNAL_SERVER_ERROR
-		},
+		Error::Sqlite(_)
+		| Error::Migration(_)
+		| Error::UnknownJobKinds(_)
+		| Error::DatabaseUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
 	};
 	(status, format!("{context}: {error}"))
 }
@@ -528,24 +536,29 @@ fn validate_report_size(
 		&loupe_core::text::BoundedText<loupe_core::text::policy::RevisionText, Db>,
 	>,
 ) -> Result<(), (StatusCode, String)> {
+	validate_report_with_patch(repo, finding, reviewed_revision, None)
+}
+
+fn validate_report_with_patch(
+	repo: &repos::RepoRow, finding: &loupe_core::Finding<Agent>,
+	reviewed_revision: Option<
+		&loupe_core::text::BoundedText<loupe_core::text::policy::RevisionText, Db>,
+	>,
+	patch: Option<&loupe_core::text::BoundedText<loupe_core::text::policy::PatchUnified, Agent>>,
+) -> Result<(), (StatusCode, String)> {
 	if matches!(repo.reporting, loupe_core::ReportingDestination::GithubIssue { .. }) {
 		loupe_core::report_limits::validate_report_content(
 			finding.description.expose(),
 			finding.poc_unified.as_ref().map(|v| v.expose()),
-			finding.patch_unified.as_ref().map(|v| v.expose()),
+			patch.or(finding.patch_unified.as_ref()).map(|v| v.expose()),
 		)
 		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-		reporters::github::validate_finding_body(
-			repo,
-			&reporters::ReportFinding {
-				// The finding may not have an ID yet. Reserve the full
-				// width of a stored ID for its public report reference.
-				id: i64::MAX,
-				finding: finding.clone(),
-				reviewed_revision: reviewed_revision.cloned(),
-			},
-		)
-		.map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+		let mut view = reporters::render::ReportView::new(i64::MAX, finding, reviewed_revision);
+		if let Some(patch) = patch {
+			view = view.with_patch(patch);
+		}
+		reporters::github::validate_view(repo, view)
+			.map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
 	}
 	Ok(())
 }
@@ -558,39 +571,34 @@ pub async fn submit_llm_finding(
 	let submission = crate::ingress::jobs::LlmFindingDecoder::decode(body)?;
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
-	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let authorized = job_capability::authorize_for_job(
+		&state,
+		&worker,
+		&headers,
+		job_id,
+		now,
+		loupe_core::security_event::Operation::SubmitLlmFinding,
+	)?;
 	let row = &authorized.row;
 	if !route_admits_kind(Route::LlmFinding, &row.kind) {
+		authorized.deny(&worker, loupe_core::security_event::CapabilityDenial::UnsupportedJobKind);
 		return Err((StatusCode::BAD_REQUEST, "verify-kind jobs cannot post findings".into()));
 	}
 	submission.validate().map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-	let repo = state
-		.db
-		.with_conn(|conn| Ok(repos::get(conn, row.repo_id)?))
-		.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {error}")))?
-		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".into()))?;
 	let finding = submission.into_finding();
-	validate_report_size(&repo, &finding, row.head_sha.as_ref())?;
-	let submitted = state
-		.db
-		.with_conn(|conn| {
-			jobs::with_active_lease_transaction(
-				conn,
-				authorized.active_lease(worker.id(), now),
-				|tx, active| {
-					Ok(findings::insert_or_ignore(
-						tx,
-						active.repo_id,
-						active.id,
-						&finding,
-						repo.verification_enabled,
-						now,
-					)?)
-				},
-			)
+	let submitted =
+		scope::with_active_lease(&state.db, authorized.active_lease(worker.id(), now), |scope| {
+			let repo = repos::get(scope.repo())?.ok_or(loupe_storage::Error::ScopeDenied)?;
+			if let Err(error) = validate_report_size(&repo, &finding, scope.job().head_sha.as_ref())
+			{
+				report_budget_event(repo.id, Some(scope.job().id), Some(worker.id()));
+				return Ok(Err(error));
+			}
+			findings::submit(scope, &finding)?;
+			Ok(Ok(()))
 		})
 		.map_err(|error| storage_write_error("submit LLM finding", error))?;
-	submitted.ok_or_else(job_capability::forbidden)?;
+	submitted.ok_or_else(|| authorized.lease_invalidated(&worker))??;
 	Ok(StatusCode::NO_CONTENT)
 }
 
@@ -603,14 +611,24 @@ pub async fn submit_verdict(
 	check_version(submission.protocol_version)?;
 	let now = now_secs();
 
-	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let authorized = job_capability::authorize_for_job(
+		&state,
+		&worker,
+		&headers,
+		job_id,
+		now,
+		loupe_core::security_event::Operation::SubmitVerdict,
+	)?;
 	let row = &authorized.row;
 	if !route_admits_kind(Route::Verdict, &row.kind) {
+		authorized.deny(&worker, loupe_core::security_event::CapabilityDenial::UnsupportedJobKind);
 		return Err((StatusCode::BAD_REQUEST, "scan-kind jobs cannot post verdicts".into()));
 	}
-	let target_finding_id = row
-		.target_finding_id
-		.ok_or((StatusCode::BAD_REQUEST, "verify job missing target finding".into()))?;
+	let target_finding_id = row.target_finding_id.ok_or_else(|| {
+		authorized
+			.deny(&worker, loupe_core::security_event::CapabilityDenial::MissingAssignedTarget);
+		(StatusCode::BAD_REQUEST, "verify job missing target finding".into())
+	})?;
 
 	let terminal_inconclusive =
 		matches!(&submission.verdict, loupe_core::Verdict::Inconclusive { terminal: true, .. });
@@ -622,80 +640,43 @@ pub async fn submit_verdict(
 		_ => None,
 	};
 	let by_cn = worker.name().to_owned();
-	// Resolve effective approval mode for this finding's repo before
-	// the tx so the rollup can route a `confirmed` verdict either to
-	// `confirmed` (immediate dispatch) or `awaiting_approval` (parked
-	// for human sign-off).
 	let server_default = state.require_approval_default;
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
-		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "repo for leased job missing".into()))?;
-	let require_approval = repo.effective_require_approval(server_default);
-	if let Some((patch_unified, _)) = patch_to_attach {
-		let finding_row = state
-			.db
-			.with_conn(|c| Ok(findings::get(c, target_finding_id)?))
-			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
-			.ok_or((StatusCode::NOT_FOUND, "target finding missing".into()))?;
-		let mut report = report_finding_from_row(&state, finding_row)
-			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get report: {e}")))?;
-		report.finding.patch_unified = Some(patch_unified.clone());
-		validate_report_size(&repo, &report.finding, report.reviewed_revision.as_ref())?;
-	}
 	// Insert the verdict + apply the rollup policy in a single
 	// transaction so a concurrent verdict from a second verifier
 	// can't catch us mid-state-flip and observe "confirmed AND
 	// dismissed" simultaneously.
-	let new_state: Option<FindingState> = state
-		.db
-		.with_conn(|c| {
-			jobs::with_active_lease_transaction(
-				c,
-				authorized.active_lease(worker.id(), now),
-				|tx, active| {
-					findings::insert_verification(
-						tx,
-						target_finding_id,
-						findings::VerificationInput::Submitted {
-							job_id: active.id,
-							verdict: &submission.verdict,
-						},
-						now,
-					)?;
-					// Attach a verifier-proposed patch (when Confirmed and one
-					// was supplied) inside the same tx as the verdict insert,
-					// so by the time `dispatch_finding` runs after commit the
-					// GitHub reporter sees the patch in the row. The storage
-					// layer's NULL-check guards against a second verifier
-					// overwriting an earlier patch — first writer wins, the
-					// audit columns pin provenance to that writer.
-					if let Some((patch_unified, patch_notes)) = patch_to_attach {
-						let _ = loupe_storage::findings::attach_proposed_patch(
-							tx,
-							target_finding_id,
-							patch_unified,
-							patch_notes,
-							&by_cn,
-							now,
-						)?;
-					}
-					Ok(loupe_storage::findings::roll_up_verdicts_for_finding(
-						tx,
-						target_finding_id,
-						terminal_inconclusive,
-						require_approval,
-						now,
-					)?)
-				},
-			)
+	let (_, preparation) =
+		scope::with_active_lease(&state.db, authorized.active_lease(worker.id(), now), |scope| {
+			let repo = repos::get(scope.repo())?.ok_or(loupe_storage::Error::ScopeDenied)?;
+			if let Some((patch_unified, _)) = patch_to_attach {
+				let Some(finding) = findings::get(scope.repo(), target_finding_id)? else {
+					return Ok(Err((StatusCode::NOT_FOUND, "target finding missing".into())));
+				};
+				let revision =
+					jobs::get(scope.repo(), finding.job_id)?.and_then(|job| job.head_sha);
+				if let Err(error) = validate_report_with_patch(
+					&repo,
+					&finding.into_finding(),
+					revision.as_ref(),
+					Some(patch_unified),
+				) {
+					report_budget_event(repo.id, Some(scope.job().id), Some(worker.id()));
+					return Ok(Err(error));
+				}
+			}
+			Ok(Ok(reports::submit_verdict(
+				scope,
+				&submission.verdict,
+				&by_cn,
+				terminal_inconclusive,
+				server_default,
+			)?))
 		})
 		.map_err(|e| storage_write_error("submit verdict", e))?
-		.ok_or_else(job_capability::forbidden)?;
+		.ok_or_else(|| authorized.lease_invalidated(&worker))??;
 
-	if matches!(new_state, Some(FindingState::Confirmed))
-		&& let Err(e) = dispatch_finding(&state, target_finding_id, now).await
+	if let Err(e) =
+		dispatch_prepared(&state, preparation, DispatchScope::Finding(target_finding_id), now).await
 	{
 		tracing::warn!(
 			finding_id = target_finding_id,
@@ -721,7 +702,14 @@ pub async fn complete(
 	};
 	let now = now_secs();
 
-	let authorized = job_capability::authorize_for_job(&state, &worker, &headers, job_id, now)?;
+	let authorized = job_capability::authorize_for_job(
+		&state,
+		&worker,
+		&headers,
+		job_id,
+		now,
+		loupe_core::security_event::Operation::CompleteJob,
+	)?;
 	let job = &authorized.row;
 	// Same set the storage guards use; the two must never drift apart.
 	if !jobs::RUNTIME_KINDS.contains(&job.kind) {
@@ -744,20 +732,13 @@ pub async fn complete(
 				}
 			},
 			JobKind::Verify => {
-				let has_verdict = state
-					.db
-					.with_conn(|c| {
-						Ok(c.query_row(
-							"SELECT EXISTS(
-							   SELECT 1 FROM finding_verifications WHERE job_id = ?1
-							 )",
-							[job_id],
-							|r| r.get::<_, bool>(0),
-						)?)
-					})
-					.map_err(|e| {
-						(StatusCode::INTERNAL_SERVER_ERROR, format!("check verdict: {e}"))
-					})?;
+				let has_verdict = scope::with_active_lease(
+					&state.db,
+					authorized.active_lease(worker.id(), now),
+					jobs::has_verdict,
+				)
+				.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("check verdict: {e}")))?
+				.ok_or_else(|| authorized.lease_invalidated(&worker))?;
 				if !has_verdict {
 					return Err((
 						StatusCode::CONFLICT,
@@ -771,81 +752,20 @@ pub async fn complete(
 		}
 	}
 
-	// Resolve effective approval mode once, outside the tx, so the
-	// state-transition SQL can branch on it. `dispatch_for_job` later
-	// also reads the repo, but that's a separate call path.
-	let server_default = state.require_approval_default;
-	let require_approval = if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan
-	{
-		state
-			.db
-			.with_conn(|c| Ok(repos::get(c, job.repo_id)?))
-			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
-			.map(|r| r.effective_require_approval(server_default))
-			.unwrap_or(false)
-	} else {
-		false
-	};
-	state
-		.db
-		.with_conn(|c| {
-			let tx = c.transaction()?;
-			let updated = jobs::complete(
-				&tx,
-				authorized.lease_identity(worker.id()),
+	let preparation =
+		scope::with_active_lease(&state.db, authorized.active_lease(worker.id(), now), |scope| {
+			reports::complete_assignment(
+				scope,
 				new_state,
 				req.head_sha.as_ref(),
 				req.error.as_ref(),
-				now,
-			)?;
-			if !updated {
-				// Lease was reaped between our read and write — bail
-				// without touching scan_history.
-				return Ok(false);
-			}
-			if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan {
-				if let Some(sha) = req.head_sha.as_ref() {
-					tx.execute(
-						"UPDATE registered_repos
-						   SET last_scanned_sha = ?1, last_scanned_at = ?2
-						 WHERE id = ?3",
-						(sha.expose(), now, job.repo_id),
-					)?;
-				}
-				tx.execute(
-					"INSERT INTO scan_history
-					   (repo_id, job_id, head_sha, base_sha, finding_count, duration_ms, finished_at)
-					 SELECT ?1, ?2, ?3, ?4,
-					        (SELECT COUNT(*) FROM findings WHERE job_id = ?2),
-					        ?5, ?6",
-					(
-						job.repo_id,
-						job_id,
-						req.head_sha.as_ref().map(|v| v.expose()).unwrap_or(""),
-						job.since_sha.as_ref().map(|v| v.expose()),
-						job.started_at.map(|s| (now - s) * 1_000).unwrap_or(0),
-						now,
-					),
-				)?;
-
-				findings::transition_scan_findings_after_success(
-					&tx,
-					job_id,
-					require_approval,
-					now + DEFAULT_VALIDATING_BUDGET_SECS,
-					now,
-				)?;
-				jobs::enqueue_verify_jobs_for_scan(&tx, job.repo_id, job_id, now)?;
-			} else if matches!(new_state, JobState::Failed) && job.kind == JobKind::Scan {
-				findings::delete_pending_for_job(&tx, job_id)?;
-			}
-			tx.commit()?;
-			Ok(true)
+				state.require_approval_default,
+				now + DEFAULT_VALIDATING_BUDGET_SECS,
+			)
 		})
 		.map_err(|e: loupe_storage::Error| {
 			(StatusCode::INTERNAL_SERVER_ERROR, format!("complete: {e}"))
 		})?
-		.then_some(())
 		.ok_or((StatusCode::CONFLICT, "lease reaped before complete".into()))?;
 
 	if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan {
@@ -853,7 +773,9 @@ pub async fn complete(
 		// (also covers the auto-confirmed-only case — extra notify is
 		// harmless).
 		state.job_arrived.notify_waiters();
-		if let Err(e) = dispatch_for_job(&state, job.repo_id, job.id, now).await {
+		if let Err(e) =
+			dispatch_prepared(&state, preparation, DispatchScope::Job(job.id), now).await
+		{
 			// Dispatch failures don't roll back the job. Confirmed
 			// findings remain retryable via the admin retry-report route.
 			tracing::warn!(job_id = job.id, error = %format_error_chain(&e), "dispatch failed");
@@ -875,191 +797,99 @@ pub(super) fn format_error_chain(error: &anyhow::Error) -> String {
 	rendered
 }
 
-/// Dispatch a single finding that has just transitioned to `confirmed`
-/// (typical caller: the verdict handler after a verify worker confirms
-/// it, or the approval handler after a human signs off). Skips
-/// findings that aren't in the right state — defends against
-/// double-dispatch races.
-pub(super) async fn dispatch_finding(
-	state: &AppState, finding_id: i64, now: i64,
-) -> anyhow::Result<()> {
-	let row = state
-		.db
-		.with_conn(|c| Ok(findings::get(c, finding_id)?))?
-		.ok_or_else(|| anyhow::anyhow!("finding {finding_id} disappeared before dispatch"))?;
-	if row.state != FindingState::Confirmed {
-		anyhow::bail!("finding {finding_id} is not confirmed; current state is {}", row.state);
-	}
-	let repo = state.db.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?.ok_or_else(|| {
-		anyhow::anyhow!("repo {} for finding {} missing", row.repo_id, finding_id)
-	})?;
-	dispatch_confirmed_rows(state, &repo, vec![row], DispatchScope::Finding(finding_id), now)
-		.await?;
-	Ok(())
-}
-
-/// After a scan succeeds, ferry its (auto-confirmed) findings through
-/// the appropriate reporter. Marks `findings.reported_at` on success
-/// so later scans that re-emit the same fingerprint don't re-notify
-/// (UNIQUE(repo_id, fingerprint) already prevents the row insert;
-/// reported_at is the "we told someone" stamp).
-async fn dispatch_for_job(
-	state: &AppState, repo_id: i64, job_id: i64, now: i64,
-) -> anyhow::Result<()> {
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, repo_id)?))?
-		.ok_or_else(|| anyhow::anyhow!("repo {repo_id} disappeared before dispatch"))?;
-	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;
-	dispatch_confirmed_rows(state, &repo, rows, DispatchScope::Job(job_id), now).await?;
-	Ok(())
-}
-
+// debug-ok: report selection contains only a closed target kind and integer row ID.
 #[derive(Debug, Clone, Copy)]
-enum DispatchScope {
+pub(super) enum DispatchScope {
 	Finding(i64),
 	Job(i64),
 }
 
-async fn dispatch_confirmed_rows(
-	state: &AppState, repo: &repos::RepoRow, rows: Vec<findings::FindingRow>, scope: DispatchScope,
-	now: i64,
+fn report_budget_event(repo_id: i64, job_id: Option<i64>, worker_id: Option<i64>) {
+	use loupe_core::security_event::{emit, BudgetResource, EventContext, SecurityEvent};
+	emit(SecurityEvent::BudgetExhausted {
+		context: EventContext { repo_id: Some(repo_id), job_id, worker_id, ..Default::default() },
+		resource: BudgetResource::ReportOutput,
+		used: None,
+		limit: None,
+	});
+}
+
+fn report_dispatch_error(error: &anyhow::Error, repo_id: i64, origin: DispatchScope) {
+	if error.is::<reporters::render::ReportError>() || reporters::email::is_budget_error(error) {
+		let job_id = match origin {
+			DispatchScope::Job(id) => Some(id),
+			DispatchScope::Finding(_) => None,
+		};
+		report_budget_event(repo_id, job_id, None);
+	}
+}
+
+/// All database selection has committed before this asynchronous operation.
+pub(super) async fn dispatch_prepared(
+	state: &AppState, preparation: reports::Preparation, origin: DispatchScope, now: i64,
 ) -> anyhow::Result<()> {
 	use loupe_core::ReportingDestination;
 
-	let confirmed_rows: Vec<_> =
-		rows.into_iter().filter(|r| r.state == FindingState::Confirmed).collect();
-	if confirmed_rows.is_empty() {
-		return Ok(());
+	use crate::reporters::Reporter;
+	let mut batch = match preparation {
+		reports::Preparation::NoReport => return Ok(()),
+		reports::Preparation::Unavailable(error) => return Err(error.into()),
+		reports::Preparation::Ready(batch) => batch,
+	};
+	if let ReportingDestination::GithubIssue { target_owner, pat_secret_id: None, .. } =
+		&batch.repository().reporting
+	{
+		state.check_github_app_target_owner(target_owner).map_err(anyhow::Error::msg)?;
 	}
-	let ids: Vec<i64> = confirmed_rows.iter().map(|r| r.id).collect();
-
-	if matches!(repo.reporting, ReportingDestination::Manual) {
-		match scope {
-			DispatchScope::Finding(finding_id) => tracing::info!(
-				finding_id,
-				"manual mode: finding left confirmed without external dispatch"
-			),
-			DispatchScope::Job(job_id) => tracing::info!(
-				job_id,
-				count = ids.len(),
-				"manual mode: findings left confirmed without external dispatch"
-			),
-		}
-		return Ok(());
-	}
-
-	let credential = reporter_credential(state, repo)?;
-	let reporter =
-		reporters::select(repo, state.github_reporter.clone(), state.email_reporter.clone())
-			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
-
-	if matches!(repo.reporting, ReportingDestination::GithubIssue { .. }) {
-		for row in confirmed_rows {
-			let finding_id = row.id;
-			let report_finding = report_finding_from_row(state, row)?;
-			let findings_for_report = [report_finding];
-			let receipt = reporter.dispatch(repo, &findings_for_report, &credential).await?;
-			match scope {
+	if matches!(batch.repository().reporting, ReportingDestination::GithubIssue { .. }) {
+		for index in 0..batch.entries().len() {
+			let id = batch.entries()[index].id();
+			let delivered =
+				state.github_reporter.dispatch_entry(&batch, index).await.inspect_err(|error| {
+					report_dispatch_error(error, batch.repository().id, origin)
+				})?;
+			batch.mark_one(&state.db, id, now)?;
+			match origin {
 				DispatchScope::Finding(_) => tracing::info!(
-					finding_id,
-					external_id = receipt.external_id.as_deref(),
+					finding_id = id,
+					external_id = delivered.external_id.as_deref(),
 					"dispatched finding"
 				),
 				DispatchScope::Job(job_id) => tracing::info!(
 					job_id,
-					finding_id,
-					external_id = receipt.external_id.as_deref(),
+					finding_id = id,
+					external_id = delivered.external_id.as_deref(),
 					"dispatched finding"
 				),
 			}
-			mark_reported(state, &[finding_id], now)?;
 		}
-		return Ok(());
+	} else {
+		let delivered = state
+			.email_reporter
+			.dispatch(&batch)
+			.await
+			.inspect_err(|error| report_dispatch_error(error, batch.repository().id, origin))?;
+		batch.mark_all(&state.db, now)?;
+		match origin {
+			DispatchScope::Finding(finding_id) => tracing::info!(
+				finding_id,
+				external_id = delivered.external_id.as_deref(),
+				"dispatched finding"
+			),
+			DispatchScope::Job(job_id) => tracing::info!(
+				job_id,
+				count = batch.entries().len(),
+				external_id = delivered.external_id.as_deref(),
+				"dispatched findings"
+			),
+		}
 	}
-
-	let findings_for_report: Vec<_> = confirmed_rows
-		.into_iter()
-		.map(|row| report_finding_from_row(state, row))
-		.collect::<anyhow::Result<_>>()?;
-	let receipt = reporter.dispatch(repo, &findings_for_report, &credential).await?;
-	match scope {
-		DispatchScope::Finding(finding_id) => tracing::info!(
-			finding_id,
-			external_id = receipt.external_id.as_deref(),
-			"dispatched finding"
-		),
-		DispatchScope::Job(job_id) => tracing::info!(
-			job_id,
-			count = findings_for_report.len(),
-			external_id = receipt.external_id.as_deref(),
-			"dispatched findings"
-		),
-	}
-
-	mark_reported(state, &ids, now)?;
 	Ok(())
 }
 
-/// Load whatever the repo's reporter needs to authenticate: its own PAT,
-/// or the server-wide GitHub App key for PAT-less GitHub destinations.
-fn reporter_credential(
-	state: &AppState, repo: &repos::RepoRow,
-) -> anyhow::Result<reporters::ReporterCredential> {
-	use loupe_core::ReportingDestination;
-
-	match &repo.reporting {
-		ReportingDestination::GithubIssue { pat_secret_id: Some(pat_secret_id), .. } => {
-			let bytes = state
-				.db
-				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
-				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
-			std::str::from_utf8(bytes.expose())
-				.map_err(|_| anyhow::anyhow!("stored PAT is not valid UTF-8"))?;
-			Ok(reporters::ReporterCredential::GithubPat(bytes))
-		},
-		ReportingDestination::GithubIssue { pat_secret_id: None, target_owner, .. } => {
-			// Enforced again here, not only at registration, so tightening
-			// `allowed_target_owners` later also stops already-registered
-			// repos (and rows edited behind the server's back).
-			state
-				.check_github_app_target_owner(target_owner)
-				.map_err(|msg| anyhow::anyhow!(msg))?;
-			let stored = state
-				.db
-				.with_conn(|c| Ok(loupe_storage::github_app::get(c)?))?
-				.ok_or_else(|| {
-					anyhow::anyhow!(
-						"repo {} reports through the GitHub App but none is configured",
-						repo.id
-					)
-				})?;
-			let key = reporters::github_app::GithubAppKey::from_pem(
-				stored.app_id,
-				stored.private_key_pem.expose(),
-			)?;
-			Ok(reporters::ReporterCredential::GithubApp(Box::new(key)))
-		},
-		ReportingDestination::Email { .. } => Ok(reporters::ReporterCredential::None),
-		ReportingDestination::Manual => unreachable!("Manual handled before reporter_credential"),
-	}
-}
-
-fn report_finding_from_row(
-	state: &AppState, row: findings::FindingRow,
-) -> anyhow::Result<reporters::ReportFinding> {
-	let id = row.id;
-	let job_id = row.job_id;
-	let finding = row.into_finding();
-	let reviewed_revision =
-		state.db.with_conn(|c| Ok(jobs::get(c, job_id)?))?.and_then(|j| j.head_sha);
-	Ok(reporters::ReportFinding { id, finding, reviewed_revision })
-}
-
-fn mark_reported(state: &AppState, ids: &[i64], now: i64) -> anyhow::Result<usize> {
-	let n = state.db.with_conn(|c| Ok(findings::mark_reported(c, ids, now)?))?;
-	Ok(n)
-}
+#[cfg(test)]
+#[path = "report_delivery_tests.rs"]
+mod report_delivery_tests;
 
 #[cfg(test)]
 mod storage_error_tests {

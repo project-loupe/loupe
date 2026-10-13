@@ -31,11 +31,61 @@ fn recipe() -> BoundedJson<Payload, loupe_provenance::Agent> {
 	.unwrap()
 }
 
+#[test]
+fn survey_recipe_sql_bytes_and_typed_digest_match_the_historical_schema() {
+	for (recipe, expected) in [
+		(SurveyRecipe::Bootstrap, "bootstrap"),
+		(SurveyRecipe::Incremental, "incremental"),
+		(SurveyRecipe::Reconciliation, "reconciliation"),
+		(SurveyRecipe::Coverage, "coverage"),
+	] {
+		let db = fixture();
+		db.with_conn(|conn| {
+			transaction::immediate(conn, |tx| {
+				let submitted = self::recipe();
+				let mut new = survey(&submitted);
+				new.recipe = PhaseRecipeInput::Survey(recipe);
+				let id = enqueue_phase(&crate::test_support::scope(tx, 1), &new, 0)?;
+				let job = jobs::get_raw(tx, id)?.unwrap();
+				let expected = format!(
+					r#"{{"assignment_key":"ordinary","phase":"survey","recipe":"{expected}","version":1}}"#
+				);
+				let stored = job.recipe.as_ref().expect("survey recipe");
+				assert_eq!(stored.expose(), expected);
+				assert_eq!(*stored.digest(), loupe_core::canonical::digest(expected.as_bytes()));
+				let raw: String =
+					tx.query_row("SELECT recipe FROM jobs WHERE id=?1", [id], |row| row.get(0))?;
+				assert_eq!(raw, expected);
+				Ok(())
+			})
+		})
+		.unwrap();
+	}
+}
+
+#[test]
+fn scope_safety_expiry_retry_rechecks_the_actual_lease_deadline() {
+	let db = fixture();
+	db.with_conn(|conn| {
+		transaction::immediate(conn, |tx| {
+			tx.execute("UPDATE jobs SET state='leased',lease_expires_at=1000 WHERE id=101", [])?;
+			let result =
+				retry_or_fail(tx, 101, 2, FailureReason::<loupe_provenance::Db>::LeaseExpired);
+			assert!(
+				matches!(result, Err(Error::Conflict(Conflict::JobState))),
+				"an earlier reaper selection must not revoke a renewed lease"
+			);
+			assert_eq!(jobs::get_raw(tx, 101)?.unwrap().state, JobState::Leased);
+			Ok(())
+		})
+	})
+	.unwrap();
+}
+
 fn survey(
 	recipe: &BoundedJson<Payload, loupe_provenance::Agent>,
 ) -> NewPhaseJob<'_, loupe_provenance::Agent> {
 	NewPhaseJob {
-		repo_id: 1,
 		kind: JobKind::<loupe_provenance::Agent>::Survey,
 		campaign_id: 1,
 		generation_id: Some(11),
@@ -65,29 +115,38 @@ fn phase_enqueue_checks_shape_ownership_and_round_trips_columns() {
 				),
 			] {
 				new.kind = kind;
-				assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+				assert!(matches!(
+					enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+					Err(Error::Validation(_))
+				));
 			}
 			new.kind = JobKind::<loupe_provenance::Agent>::Drilldown;
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.assigned_lead_id = Some(12);
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Ownership(Ownership::JobLead))
 			));
 			new.assigned_lead_id = Some(21);
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Ownership(Ownership::JobLead))
 			));
 			new.assigned_lead_id = Some(11);
 			new.generation_id = Some(12);
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.generation_id = Some(11);
 			new.effective_priority = 2000;
 			new.token_budget = Some(100);
 			new.eligible_at = 20;
-			let id = enqueue_phase(tx, &new, 1)?;
-			let row = jobs::get(tx, id)?.unwrap();
+			let id = enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1)?;
+			let row = jobs::get_raw(tx, id)?.unwrap();
 			assert_eq!(row.campaign_id, Some(1));
 			assert_eq!(row.generation_id, Some(11));
 			assert_eq!(row.assigned_lead_id, Some(11));
@@ -98,35 +157,50 @@ fn phase_enqueue_checks_shape_ownership_and_round_trips_columns() {
 			assert_eq!(row.recipe.as_ref().map(BoundedJson::expose), Some(recipe.expose()));
 			assert_eq!(row.workflow_contract_version, Some(WORKFLOW_CONTRACT_VERSION));
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Conflict(Conflict::ActiveDrilldown))
 			));
 			new.kind = JobKind::<loupe_provenance::Agent>::Verify;
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.assigned_lead_id = None;
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.target_finding_id = Some(21);
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Ownership(Ownership::JobFinding))
 			));
 			new.target_finding_id = Some(11);
-			enqueue_phase(tx, &new, 1)?;
+			enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1)?;
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Conflict(Conflict::ActiveVerify))
 			));
 			new = survey(&recipe);
 			new.assigned_lead_id = Some(11);
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.assigned_lead_id = None;
 			new.target_finding_id = Some(11);
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.target_finding_id = None;
 			new.generation_id = None;
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			tx.execute("UPDATE review_campaigns SET generation_id=NULL WHERE campaign_id=1", [])?;
-			enqueue_phase(tx, &new, 1)?;
+			enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1)?;
 			Ok(())
 		})
 	})
@@ -142,46 +216,52 @@ fn phase_enqueue_rejects_campaign_and_continuation_mismatches() {
 			let mut new = survey(&recipe);
 			new.campaign_id = 2;
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Conflict(Conflict::CampaignState))
 			));
 			new.campaign_id = 1;
 			for state in ["cancelled", "finished"] {
 				tx.execute("UPDATE review_campaigns SET state=?1 WHERE campaign_id=1", [state])?;
 				assert!(matches!(
-					enqueue_phase(tx, &new, 1),
+					enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 					Err(Error::Conflict(Conflict::CampaignState))
 				));
 			}
 			tx.execute("UPDATE review_campaigns SET state='active' WHERE campaign_id=1", [])?;
 			assert!(matches!(
-				enqueue_phase(tx, &new, 10000),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 10000),
 				Err(Error::Conflict(Conflict::CampaignState))
 			));
 			new.token_budget = Some(0);
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.token_budget = Some(u64::MAX);
-			assert!(matches!(enqueue_phase(tx, &new, 1), Err(Error::Validation(_))));
+			assert!(matches!(
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
+				Err(Error::Validation(_))
+			));
 			new.token_budget = None;
 			new.continuation_of_job_id = Some(201);
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Ownership(Ownership::JobContinuation))
 			));
 			new.continuation_of_job_id = Some(101);
 			tx.execute("UPDATE jobs SET state='leased' WHERE id=101", [])?;
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Ownership(Ownership::JobContinuation))
 			));
 			tx.execute("UPDATE jobs SET state='succeeded',kind='verify' WHERE id=101", [])?;
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Ownership(Ownership::JobContinuation))
 			));
 			tx.execute("UPDATE jobs SET kind='survey' WHERE id=101", [])?;
-			let id = enqueue_phase(tx, &new, 1)?;
-			assert_eq!(jobs::get(tx, id)?.unwrap().continuation_of_job_id, Some(101));
+			let id = enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1)?;
+			assert_eq!(jobs::get_raw(tx, id)?.unwrap().continuation_of_job_id, Some(101));
 			Ok(())
 		})
 	})
@@ -206,20 +286,20 @@ fn campaign_budget_reserves_handoffs_and_counts_terminal_jobs() {
 			)?;
 			let recipe = recipe();
 			let mut new = survey(&recipe);
-			enqueue_phase(tx, &new, 1)?; // Two terminal jobs already count against the budget.
+			enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1)?; // Two terminal jobs already count against the budget.
 			new.handoff = true;
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Conflict(Conflict::CampaignBudget))
 			));
 			new.kind = JobKind::<loupe_provenance::Agent>::Drilldown;
 			new.assigned_lead_id = Some(11);
-			enqueue_phase(tx, &new, 1)?;
+			enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1)?;
 			new.kind = JobKind::<loupe_provenance::Agent>::Verify;
 			new.assigned_lead_id = None;
 			new.target_finding_id = Some(11);
 			assert!(matches!(
-				enqueue_phase(tx, &new, 1),
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 1),
 				Err(Error::Conflict(Conflict::CampaignBudget))
 			));
 			Ok(())
@@ -263,7 +343,7 @@ fn retries_use_snapshot_limits_and_preserve_assignments() {
 		INSERT INTO job_assigned_review_units VALUES (101,1,0,0);")?;
 		let error = crate::test_support::text::<Reason>("execution failure")?;
 		assert_eq!(retry_or_fail(tx, 101, 100, FailureReason::Submitted(&error))?, RetryOutcome::Requeued { eligible_at: 580 });
-		let job = jobs::get(tx, 101)?.unwrap();
+		let job = jobs::get_raw(tx, 101)?.unwrap();
 		assert_eq!(job.state, JobState::Queued);
 		assert_eq!(job.eligible_at, Some(580));
 		assert_eq!(job.hard_deadline_at, None);
@@ -272,7 +352,7 @@ fn retries_use_snapshot_limits_and_preserve_assignments() {
 		assert_eq!(tx.query_row("SELECT COUNT(*) FROM job_assigned_review_units WHERE job_id=101", [], |r|r.get::<_,i64>(0))?, 1);
 		tx.execute("UPDATE jobs SET state='leased',attempts=5 WHERE id=101", [])?;
 		assert_eq!(retry_or_fail(tx, 101, 1000, FailureReason::Submitted(&error))?, RetryOutcome::Failed);
-		assert_eq!(jobs::get(tx, 101)?.unwrap().error.as_ref().map(loupe_core::text::BoundedText::expose), Some("execution failure"));
+		assert_eq!(jobs::get_raw(tx, 101)?.unwrap().error.as_ref().map(loupe_core::text::BoundedText::expose), Some("execution failure"));
 		assert!(retry_or_fail(tx, 101, 1001, FailureReason::Submitted(&error)).is_err(), "terminal jobs must not be retried");
 		Ok(())
 	})).unwrap();
@@ -283,10 +363,10 @@ fn queued_cancellation_leaves_leased_jobs_alone() {
 	let db = fixture();
 	db.with_conn(|conn| transaction::immediate(conn, |tx| {
 		tx.execute_batch("UPDATE jobs SET state='queued' WHERE id=101; UPDATE jobs SET state='leased' WHERE id=102;")?;
-		assert_eq!(cancel_queued_children(tx, 1, 100, &crate::test_support::text("campaign deadline")?)?, 1);
-		assert_eq!(jobs::get(tx, 101)?.unwrap().state, JobState::Cancelled);
-		assert_eq!(jobs::get(tx, 101)?.unwrap().finished_at, Some(100));
-		assert_eq!(jobs::get(tx, 102)?.unwrap().state, JobState::Leased);
+		assert_eq!(cancel_queued_children(&crate::test_support::scope(tx, 1), 1, 100, &crate::test_support::text("campaign deadline")?)?, 1);
+		assert_eq!(jobs::get_raw(tx, 101)?.unwrap().state, JobState::Cancelled);
+		assert_eq!(jobs::get_raw(tx, 101)?.unwrap().finished_at, Some(100));
+		assert_eq!(jobs::get_raw(tx, 102)?.unwrap().state, JobState::Leased);
 		Ok(())
 	})).unwrap();
 }
@@ -302,9 +382,9 @@ fn reaper_uses_campaign_attempts_without_changing_legacy_limits() {
 		INSERT INTO jobs (repo_id,kind,state,lease_expires_at,attempts,enqueued_at) VALUES (1,'scan','leased',100,3,0);")?;
 		let legacy = conn.last_insert_rowid();
 		assert_eq!(jobs::reap_stale_leases(conn, 101)?, 2);
-		assert_eq!(jobs::get(conn, 101)?.unwrap().state, JobState::Queued);
-		assert_eq!(jobs::get(conn, 101)?.unwrap().eligible_at, Some(341));
-		assert_eq!(jobs::get(conn, legacy)?.unwrap().state, JobState::Failed);
+		assert_eq!(jobs::get_raw(conn, 101)?.unwrap().state, JobState::Queued);
+		assert_eq!(jobs::get_raw(conn, 101)?.unwrap().eligible_at, Some(341));
+		assert_eq!(jobs::get_raw(conn, legacy)?.unwrap().state, JobState::Failed);
 		Ok(())
 	}).unwrap();
 }
@@ -316,11 +396,11 @@ fn inactive_drilldown_reaping_releases_assignment_for_next_campaign() {
 		conn.execute_batch("UPDATE jobs SET kind='drilldown',assigned_lead_id=11,state='leased',lease_expires_at=100,attempts=1 WHERE id=101;
 		UPDATE review_campaigns SET state='cancelled' WHERE campaign_id=1;")?;
 		assert_eq!(jobs::reap_stale_leases(conn, 101)?, 1);
-		assert_eq!(jobs::get(conn, 101)?.unwrap().state, JobState::Failed);
+		assert_eq!(jobs::get_raw(conn, 101)?.unwrap().state, JobState::Failed);
 		transaction::immediate(conn, |tx| {
 			let snapshot = crate::test_support::json::<Payload>(&serde_json::to_string(&CampaignPolicy::default()).unwrap())?;
-			let campaign = crate::campaigns::create(tx, &crate::campaigns::NewCampaign {
-				repo_id: 1, recipe: crate::campaigns::Recipe::Incremental, trigger: crate::campaigns::Trigger::Manual,
+			let campaign = crate::campaigns::create(&crate::test_support::scope(tx, 1), &crate::campaigns::NewCampaign {
+				 recipe: crate::campaigns::Recipe::Incremental, trigger: crate::campaigns::Trigger::Manual,
 				requested_base_sha: None, target_commit_sha: &crate::test_support::db_text("base").unwrap(), generation_id: Some(11), effective_policy: crate::campaigns::CampaignPolicyInput::Submitted(&snapshot),
 				deadline_at: None, root_campaign_id: None, continuation_of_campaign_id: None,
 			}, 102)?;
@@ -329,7 +409,7 @@ fn inactive_drilldown_reaping_releases_assignment_for_next_campaign() {
 			new.campaign_id = campaign;
 			new.kind = JobKind::<loupe_provenance::Agent>::Drilldown;
 			new.assigned_lead_id = Some(11);
-			enqueue_phase(tx, &new, 102)?;
+			enqueue_phase(&crate::test_support::scope(tx, 1), &new, 102)?;
 			Ok(())
 		})
 	}).unwrap();
@@ -348,11 +428,11 @@ fn reaper_never_requeues_children_of_inactive_campaigns() {
 		let legacy = conn.last_insert_rowid();
 		assert_eq!(jobs::reap_stale_leases(conn, 101)?, 2);
 		assert_eq!(
-			jobs::get(conn, 101)?.unwrap().state,
+			jobs::get_raw(conn, 101)?.unwrap().state,
 			loupe_core::JobState::Failed,
 			"an inactive campaign child must fail instead of becoming a queued orphan"
 		);
-		assert_eq!(jobs::get(conn, legacy)?.unwrap().state, loupe_core::JobState::Queued);
+		assert_eq!(jobs::get_raw(conn, legacy)?.unwrap().state, loupe_core::JobState::Queued);
 		let eligible: Option<i64> =
 			conn.query_row("SELECT eligible_at FROM jobs WHERE id=?1", [legacy], |r| r.get(0))?;
 		assert_eq!(eligible, None, "legacy requeues must not acquire campaign backoff");
@@ -419,8 +499,8 @@ fn an_unreadable_campaign_snapshot_never_blocks_legacy_reaping() {
 		// The reaper must keep reclaiming legacy leases and must leave a
 		// durable trace on the campaign job it could not decide about.
 		assert_eq!(jobs::reap_stale_leases(conn, 101)?, 2);
-		assert_eq!(jobs::get(conn, legacy)?.unwrap().state, JobState::Queued);
-		let stuck = jobs::get(conn, 101)?.unwrap();
+		assert_eq!(jobs::get_raw(conn, legacy)?.unwrap().state, JobState::Queued);
+		let stuck = jobs::get_raw(conn, 101)?.unwrap();
 		assert_eq!(stuck.state, JobState::Failed);
 		assert!(stuck.error.as_ref().map(loupe_core::text::BoundedText::expose).is_some_and(|e| e.contains("CampaignPolicy")), "{:?}", stuck.error);
 		assert_eq!(jobs::reap_stale_leases(conn, 102)?, 0);

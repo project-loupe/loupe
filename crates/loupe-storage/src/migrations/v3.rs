@@ -15,6 +15,7 @@ const LEGACY_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha,
     head_sha, parent_job_id, target_finding_id, worker_id, lease_expires_at, attempts,
     enqueued_at, started_at, finished_at, error, job_capability_hash";
 
+// debug-ok: migration steps are closed host operation names without stored row content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
 	PreCheck,

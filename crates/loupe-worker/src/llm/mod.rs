@@ -1,11 +1,10 @@
 //! LLM backend abstraction.
 //!
 //! A `LlmBackend` is one provider of agentic completions: it receives a
-//! prompt and a read-only working directory, manages its own internal
-//! tool loop (the `claude` CLI does this for us; an HTTP backend would
-//! manage one explicitly), and returns the model's final text response.
+//! prompt and a read-only working directory, manages its internal tool
+//! loop through the agent CLI, and returns the model's final text response.
 //!
-//! Two concrete impls today:
+//! Concrete implementations:
 //!
 //! - [`ClaudeCliBackend`] shells out to Anthropic's `claude` CLI.
 //!   Carries optional MCP context so each invocation can call back
@@ -44,30 +43,38 @@ use model_broker::{CredentialKind, ModelBrokerContext, ModelBrokerLimits, ModelC
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::{SandboxNetworkConfig, SandboxNetworkMode};
+use crate::config::{SandboxAgentConfig, SandboxLaunchConfig, SandboxNetworkPolicy};
+#[cfg(test)]
+use crate::sandbox::SandboxNetworkConfig;
+use crate::sandbox::SandboxNetworkMode;
 
 const ANTHROPIC_UPSTREAM_URL: &str = "https://api.anthropic.com";
 const OPENAI_UPSTREAM_URL: &str = "https://api.openai.com";
 
+// debug-ok: Every content field uses the redacted ConfiguredText formatter.
 #[derive(Debug, Clone)]
 pub struct CliModelConfig {
 	pub model: crate::config::ConfiguredText,
 	pub effort: crate::config::ConfiguredText,
 }
 
+// debug-ok: Nested network, launch and model configurations redact all content owners.
 #[derive(Debug, Clone, Default)]
 pub struct BackendRuntimeConfig {
-	pub network: SandboxNetworkConfig,
+	pub network: SandboxNetworkPolicy,
+	pub launch: SandboxLaunchConfig,
 	pub log_agent_output: bool,
 	pub model_broker: Option<ModelBrokerRuntimeConfig>,
 }
 
+// debug-ok: The worker binary path is opaque and broker limits are numeric.
 #[derive(Debug, Clone)]
 pub struct ModelBrokerRuntimeConfig {
-	pub worker_binary: PathBuf,
+	pub worker_binary: crate::sandbox::SandboxPath,
 	pub limits: ModelBrokerLimits,
 }
 
+// debug-ok: Closed fieldless variants; no dynamic content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobAgent {
@@ -104,12 +111,14 @@ pub async fn fuzz_collect_cli_output(
 	Ok((output.fixture_bytes(), output.truncated))
 }
 
+#[cfg(test)]
 const CLI_STREAM_OMISSION: &str = " ... ";
 
 /// Collapse a CLI output stream into a single log-line snippet while
 /// preserving both the beginning and the end. Agent CLIs often print a
 /// long startup banner first and the actionable error last; head-only
 /// truncation hides the part an operator needs.
+#[cfg(test)]
 pub(crate) fn summarize_cli_stream_for_error(s: &str, max_chars: usize) -> String {
 	let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
 	let len = collapsed.chars().count();
@@ -133,13 +142,8 @@ pub(crate) fn summarize_cli_stream_for_error(s: &str, max_chars: usize) -> Strin
 /// fit comfortably within this; if they don't, the call is aborted and
 /// the file is treated as having produced no findings (logged warning).
 ///
-/// 30 minutes is generous; the goal is to be the *fallback* ceiling,
-/// not the operative deadline. Auditing a 1–2k-line source file
-/// end-to-end (several MCP round-trips for prior-finding dedup, a PoC
-/// regression-test diff, validation) routinely takes 1–3 minutes
-/// against real-world Rust repos, and the previous 180s default was
-/// killing roughly 4 in 5 sessions before the agent could submit.
-/// Operators can still tighten via the per-repo `scanner_config` JSON
+/// The 30-minute fallback allows multiple MCP round-trips for finding dedup,
+/// PoC generation and validation. Operators can tighten it through `scanner_config`
 /// (`per_request_timeout_seconds`).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 
@@ -184,8 +188,10 @@ pub fn extract_json_object(text: &str) -> Option<String> {
 	None
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmRequest {
+	pub sandbox_workdir: crate::sandbox::SandboxPath,
+	pub security: Arc<crate::canary::JobSecurity>,
 	pub tool_boundary: prompt::JobToolBoundary,
 	pub prompt: prompts::Prompt,
 	/// Read-only working directory the backend may inspect (e.g. the
@@ -214,7 +220,13 @@ pub struct LlmRequest {
 	/// advertised instead. `None` keeps the discovery-mode catalog.
 	pub finding_id: Option<i64>,
 }
+impl std::fmt::Debug for LlmRequest {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("LlmRequest([redacted])")
+	}
+}
 
+// debug-ok: CLI text has an opaque Debug formatter; backend ID is a host static identifier.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "test-support"), doc = include_str!("../../tests/ui/raw_stub.md"))]
 pub struct LlmResponse {
@@ -224,6 +236,10 @@ pub struct LlmResponse {
 
 #[async_trait::async_trait]
 pub trait LlmBackend: Send + Sync {
+	/// Opaque watch of the credential already selected for this backend.
+	fn credential_watch(&self) -> Option<model_broker::CredentialWatch> {
+		None
+	}
 	/// Stable identifier — appears in logs and in `Finding.scanner_id`
 	/// when the backend is the source of truth for a finding.
 	fn id(&self) -> &'static str;
@@ -239,6 +255,10 @@ pub trait LlmBackend: Send + Sync {
 /// selection to decide whether Claude-backed scan or verify work can
 /// be registered.
 pub fn claude_available() -> bool {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Startup availability probe runs the fixed Claude version command with output discarded."
+	)]
 	std::process::Command::new("claude")
 		.arg("--version")
 		.stdout(Stdio::null())
@@ -255,7 +275,7 @@ pub fn claude_available() -> bool {
 /// `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Subscription
 /// login state under `~/.claude` is deliberately not mounted, and its
 /// OAuth refresh needs to write — which the read-only sandbox forbids
-/// — so a bare `~/.claude.json` no longer counts as usable auth.
+/// — so a bare `~/.claude.json` does not count as usable auth.
 pub fn claude_auth_available() -> bool {
 	env_present("ANTHROPIC_API_KEY") || env_present("CLAUDE_CODE_OAUTH_TOKEN")
 }
@@ -268,6 +288,10 @@ fn claude_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<Mode
 	} else {
 		anyhow::bail!("Claude model broker requires ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN");
 	};
+	#[allow(
+		clippy::expect_used,
+		reason = "The upstream URL is a fixed HTTPS literal checked by runtime tests."
+	)]
 	Ok(ModelBrokerContext::new(
 		runtime.worker_binary,
 		ANTHROPIC_UPSTREAM_URL.parse().expect("static Anthropic upstream URL is valid"),
@@ -289,24 +313,8 @@ fn claude_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<Mode
 ///
 /// Install via `cargo install bkb-mcp`; the worker config controls
 /// the `BKB_API_URL` passed to the child.
-pub fn bkb_mcp_available() -> Option<PathBuf> {
-	let path = std::env::var_os("PATH")?;
-	for dir in std::env::split_paths(&path) {
-		let candidate = dir.join("bkb-mcp");
-		if candidate.is_file() {
-			let ok = std::process::Command::new(&candidate)
-				.arg("--help")
-				.stdout(Stdio::null())
-				.stderr(Stdio::null())
-				.status()
-				.map(|s| s.success())
-				.unwrap_or(false);
-			if ok {
-				return Some(candidate);
-			}
-		}
-	}
-	None
+pub fn bkb_mcp_available(config: &SandboxLaunchConfig) -> Option<crate::sandbox::SandboxPath> {
+	crate::sandbox::SandboxBinary::bkb_mcp(config.path())
 }
 
 /// Probe PATH for `codex --version`. Returns `true` only if the
@@ -317,6 +325,10 @@ pub fn bkb_mcp_available() -> Option<PathBuf> {
 /// selection to decide whether Codex-backed scan or verify work can
 /// be registered.
 pub fn codex_available() -> bool {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Startup availability probe runs the fixed Codex version command with output discarded."
+	)]
 	std::process::Command::new("codex")
 		.arg("--version")
 		.stdout(Stdio::null())
@@ -340,6 +352,10 @@ fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<Model
 	} else {
 		anyhow::bail!("Codex model broker requires CODEX_API_KEY or OPENAI_API_KEY");
 	};
+	#[allow(
+		clippy::expect_used,
+		reason = "The upstream URL is a fixed HTTPS literal checked by runtime tests."
+	)]
 	Ok(ModelBrokerContext::new(
 		runtime.worker_binary,
 		OPENAI_UPSTREAM_URL.parse().expect("static OpenAI upstream URL is valid"),
@@ -348,22 +364,17 @@ fn codex_model_broker_context(runtime: ModelBrokerRuntimeConfig) -> Result<Model
 	))
 }
 
-pub(crate) fn required_network_hosts(bkb_api_url: Option<&str>) -> Result<Vec<String>> {
-	let mut hosts = Vec::new();
-	if let Some(bkb_api_url) = bkb_api_url {
-		let url = reqwest::Url::parse(bkb_api_url)?;
-		let host =
-			url.host_str().ok_or_else(|| anyhow::anyhow!("configured BKB API URL has no host"))?;
-		hosts.push(host.to_owned());
-	}
-	Ok(hosts)
+pub(crate) fn required_network_hosts(
+	bkb_api_url: Option<&crate::config::ConfigNonSecret>,
+) -> Result<crate::config::SandboxRequiredHosts> {
+	crate::config::SandboxRequiredHosts::for_bkb(bkb_api_url)
 }
 
 pub(crate) fn sandbox_requires_egress_setup(
-	network: &SandboxNetworkConfig, required_hosts: &[String],
+	network: &SandboxNetworkPolicy, required_hosts: &crate::config::SandboxRequiredHosts,
 ) -> bool {
-	network.mode == SandboxNetworkMode::Public
-		|| !network.allowlist.is_empty()
+	network.mode() == SandboxNetworkMode::Public
+		|| !network.allowlist().is_empty()
 		|| !required_hosts.is_empty()
 }
 
@@ -406,27 +417,25 @@ fn utf8_env_value(name: &str) -> Result<Option<Secret<String>>> {
 }
 
 /// Build the scan [`LlmBackend`] according to the configured agent
-/// selection. `auto` preserves the historical behaviour: Claude owns
+/// selection. `auto` selects Claude for
 /// LLM discovery when ready; Codex-only workers advertise verify-only
 /// unless the operator explicitly selects Codex for scan jobs.
 pub fn build_scan_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: CliModelConfig, claude_agent: CliModelConfig, runtime: BackendRuntimeConfig,
+	codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,
+	runtime: BackendRuntimeConfig,
 ) -> Result<Option<Arc<dyn LlmBackend>>> {
-	let BackendRuntimeConfig { network, log_agent_output, model_broker } = runtime;
+	let BackendRuntimeConfig { network, launch, log_agent_output, model_broker } = runtime;
 	match selection {
 		JobAgent::Auto if claude_ready => {
-			tracing::info!(
-				model = %claude_agent.model.for_operation(),
-				effort = %claude_agent.effort.for_operation(),
-				"scan backend: claude (auto)"
-			);
+			tracing::info!("scan backend: claude (auto)");
 			Ok(Some(build_claude_backend(
 				mcp,
 				claude_agent,
 				network,
 				log_agent_output,
 				model_broker,
+				launch,
 			)?))
 		},
 		JobAgent::Auto => {
@@ -437,39 +446,32 @@ pub fn build_scan_backend(
 		},
 		JobAgent::Claude => {
 			require_agent_ready("scan", JobAgent::Claude, claude_ready)?;
-			tracing::info!(
-				model = %claude_agent.model.for_operation(),
-				effort = %claude_agent.effort.for_operation(),
-				"scan backend: claude (configured)"
-			);
+			tracing::info!("scan backend: claude (configured)");
 			Ok(Some(build_claude_backend(
 				mcp,
 				claude_agent,
 				network,
 				log_agent_output,
 				model_broker,
+				launch,
 			)?))
 		},
 		JobAgent::Codex => {
 			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
-			tracing::info!(
-				model = %codex_agent.model.for_operation(),
-				effort = %codex_agent.effort.for_operation(),
-				"scan backend: codex (configured)"
-			);
+			tracing::info!("scan backend: codex (configured)");
 			Ok(Some(build_codex_backend(
 				mcp,
 				codex_agent,
 				network,
 				log_agent_output,
 				model_broker,
+				launch,
 			)?))
 		},
 	}
 }
 
-/// Build the verifier's [`LlmBackend`]. `auto` preserves the
-/// historical verifier behaviour: prefer Codex, falling back to
+/// Build the verifier's [`LlmBackend`]. `auto` prefers Codex, falling back to
 /// Claude when Codex is unavailable.
 ///
 /// `mcp` (optional) attaches the loupe MCP server to the backend's
@@ -484,44 +486,57 @@ pub fn build_scan_backend(
 /// is actually verifying without having to inspect process listings.
 pub fn build_verifier_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: CliModelConfig, claude_agent: CliModelConfig, runtime: BackendRuntimeConfig,
+	codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,
+	runtime: BackendRuntimeConfig,
 ) -> Result<Arc<dyn LlmBackend>> {
-	let BackendRuntimeConfig { network, log_agent_output, model_broker } = runtime;
+	let BackendRuntimeConfig { network, launch, log_agent_output, model_broker } = runtime;
 	match selection {
 		JobAgent::Auto if codex_ready => {
-			tracing::info!(
-				model = %codex_agent.model.for_operation(),
-				effort = %codex_agent.effort.for_operation(),
-				"verifier backend: codex (auto)"
-			);
-			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
+			tracing::info!("verifier backend: codex (auto)");
+			Ok(build_codex_backend(
+				mcp,
+				codex_agent,
+				network,
+				log_agent_output,
+				model_broker,
+				launch,
+			)?)
 		},
 		JobAgent::Auto if claude_ready => {
-			tracing::info!(
-				model = %claude_agent.model.for_operation(),
-				effort = %claude_agent.effort.for_operation(),
-				"verifier backend: claude (auto, codex unavailable)"
-			);
-			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker)?)
+			tracing::info!("verifier backend: claude (auto, codex unavailable)");
+			Ok(build_claude_backend(
+				mcp,
+				claude_agent,
+				network,
+				log_agent_output,
+				model_broker,
+				launch,
+			)?)
 		},
 		JobAgent::Auto => anyhow::bail!("no authenticated verifier backend available"),
 		JobAgent::Claude => {
 			require_agent_ready("verify", JobAgent::Claude, claude_ready)?;
-			tracing::info!(
-				model = %claude_agent.model.for_operation(),
-				effort = %claude_agent.effort.for_operation(),
-				"verifier backend: claude (configured)"
-			);
-			Ok(build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker)?)
+			tracing::info!("verifier backend: claude (configured)");
+			Ok(build_claude_backend(
+				mcp,
+				claude_agent,
+				network,
+				log_agent_output,
+				model_broker,
+				launch,
+			)?)
 		},
 		JobAgent::Codex => {
 			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
-			tracing::info!(
-				model = %codex_agent.model.for_operation(),
-				effort = %codex_agent.effort.for_operation(),
-				"verifier backend: codex (configured)"
-			);
-			Ok(build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker)?)
+			tracing::info!("verifier backend: codex (configured)");
+			Ok(build_codex_backend(
+				mcp,
+				codex_agent,
+				network,
+				log_agent_output,
+				model_broker,
+				launch,
+			)?)
 		},
 	}
 }
@@ -537,11 +552,13 @@ fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<(
 }
 
 fn build_claude_backend(
-	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
+	mcp: Option<McpContext>, agent: SandboxAgentConfig, network: SandboxNetworkPolicy,
 	log_agent_output: bool, model_broker: Option<ModelBrokerRuntimeConfig>,
+	launch: SandboxLaunchConfig,
 ) -> Result<Arc<dyn LlmBackend>> {
 	let mut backend = ClaudeCliBackend::new()
 		.with_agent_config(agent)
+		.with_launch_config(launch)
 		.with_network_config(network)
 		.with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
@@ -554,11 +571,13 @@ fn build_claude_backend(
 }
 
 fn build_codex_backend(
-	mcp: Option<McpContext>, agent: CliModelConfig, network: SandboxNetworkConfig,
+	mcp: Option<McpContext>, agent: SandboxAgentConfig, network: SandboxNetworkPolicy,
 	log_agent_output: bool, model_broker: Option<ModelBrokerRuntimeConfig>,
+	launch: SandboxLaunchConfig,
 ) -> Result<Arc<dyn LlmBackend>> {
 	let mut backend = CodexCliBackend::new()
 		.with_agent_config(agent)
+		.with_launch_config(launch)
 		.with_network_config(network)
 		.with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
@@ -572,6 +591,29 @@ fn build_codex_backend(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn request_debug_omits_workdir() {
+		let request = super::LlmRequest {
+			sandbox_workdir: crate::sandbox::SandboxPath::fixture(
+				"/tmp/private-request-workdir-sentinel".into(),
+			),
+			workdir: "/tmp/private-request-workdir-sentinel".into(),
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: super::prompt::JobToolBoundary::new().unwrap(),
+			prompt: super::prompt::Prompt::instruction("fixture").unwrap(),
+			timeout: std::time::Duration::from_secs(1),
+			cancel: tokio_util::sync::CancellationToken::new(),
+			repo_id: None,
+			job_id: None,
+			finding_id: None,
+			job_capability: None,
+		};
+		assert!(
+			!format!("{request:?}").contains("private-request-workdir-sentinel"),
+			"request Debug leaked the checkout path"
+		);
+	}
+
 	use super::*;
 	use crate::test_env::in_env;
 
@@ -610,10 +652,8 @@ mod tests {
 		let home = tempfile::tempdir().unwrap();
 		std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
 
-		// A leftover `~/.claude.json` carries no usable credential once
-		// `~/.claude` (with `.credentials.json`) is no longer mounted,
-		// and OAuth refresh cannot write into the read-only sandbox. It
-		// must not make the worker advertise Claude as ready.
+		// `~/.claude` is not mounted and OAuth refresh cannot write into the
+		// read-only sandbox. A config file alone cannot make Claude ready.
 		for (case, token) in [("stale-config", None), ("oauth-token", Some("oauth-token"))] {
 			if in_env(
 				"llm::tests::claude_auth_requires_env_token_not_a_stale_config_file",
@@ -663,43 +703,62 @@ mod tests {
 
 	#[test]
 	fn sandbox_network_only_includes_enabled_bkb() {
-		assert_eq!(required_network_hosts(None).unwrap(), Vec::<String>::new());
+		assert_eq!(required_network_hosts(None).unwrap().for_supervisor(), Vec::<String>::new());
+		let launch = SandboxLaunchConfig::default();
 		assert_eq!(
-			required_network_hosts(Some(mcp::DEFAULT_BKB_API_URL)).unwrap(),
+			required_network_hosts(Some(launch.bkb_api_url())).unwrap().for_supervisor(),
 			["bitcoinknowledge.dev"]
 		);
+		let mut config = crate::config::WorkerConfig::default();
+		config.bkb.api_url =
+			crate::test_support::config_text("https://knowledge.example.test:8443/api");
+		let launch = config.sandbox_launch_config().unwrap();
 		assert_eq!(
-			required_network_hosts(Some("https://knowledge.example.test:8443/api")).unwrap(),
+			required_network_hosts(Some(launch.bkb_api_url())).unwrap().for_supervisor(),
 			["knowledge.example.test"]
 		);
 	}
 
 	#[test]
 	fn empty_allowlist_uses_the_private_loopback_namespace() {
-		let model_only =
-			SandboxNetworkConfig { mode: SandboxNetworkMode::Allowlist, allowlist: Vec::new() };
-		assert!(!sandbox_requires_egress_setup(&model_only, &[]));
-		assert!(sandbox_requires_egress_setup(&model_only, &["bkb.example".into()]));
+		let model_only = crate::test_support::sandbox_network(SandboxNetworkConfig {
+			mode: SandboxNetworkMode::Allowlist,
+			allowlist: Vec::new(),
+		});
+		assert!(!sandbox_requires_egress_setup(&model_only, &Default::default()));
 		assert!(sandbox_requires_egress_setup(
-			&SandboxNetworkConfig {
+			&model_only,
+			&crate::config::SandboxRequiredHosts::fixture(vec!["bkb.example".into()])
+		));
+		assert!(sandbox_requires_egress_setup(
+			&crate::test_support::sandbox_network(SandboxNetworkConfig {
 				mode: SandboxNetworkMode::Allowlist,
 				allowlist: vec![crate::config::ConfiguredText::Builtin("docs.example")],
-			},
-			&[],
+			}),
+			&Default::default(),
 		));
-		assert!(sandbox_requires_egress_setup(&SandboxNetworkConfig::default(), &[]));
+		assert!(sandbox_requires_egress_setup(
+			&SandboxNetworkPolicy::default(),
+			&Default::default()
+		));
 	}
 
 	#[test]
 	fn scan_backend_auto_preserves_claude_only_discovery_default() {
-		let codex = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("gpt-test"),
-			effort: crate::config::ConfiguredText::Builtin("xhigh"),
-		};
-		let claude = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("claude-test"),
-			effort: crate::config::ConfiguredText::Builtin("max"),
-		};
+		let codex = crate::test_support::sandbox_agent(
+			true,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
+		);
+		let claude = crate::test_support::sandbox_agent(
+			false,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("max"),
+			},
+		);
 
 		let backend = build_scan_backend(
 			None,
@@ -732,14 +791,20 @@ mod tests {
 
 	#[test]
 	fn scan_backend_allows_explicit_codex_and_fails_when_unavailable() {
-		let codex = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("gpt-test"),
-			effort: crate::config::ConfiguredText::Builtin("xhigh"),
-		};
-		let claude = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("claude-test"),
-			effort: crate::config::ConfiguredText::Builtin("max"),
-		};
+		let codex = crate::test_support::sandbox_agent(
+			true,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
+		);
+		let claude = crate::test_support::sandbox_agent(
+			false,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("max"),
+			},
+		);
 
 		let backend = build_scan_backend(
 			None,
@@ -771,14 +836,20 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_auto_prefers_codex_then_claude() {
-		let codex = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("gpt-test"),
-			effort: crate::config::ConfiguredText::Builtin("xhigh"),
-		};
-		let claude = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("claude-test"),
-			effort: crate::config::ConfiguredText::Builtin("max"),
-		};
+		let codex = crate::test_support::sandbox_agent(
+			true,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
+		);
+		let claude = crate::test_support::sandbox_agent(
+			false,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("max"),
+			},
+		);
 		let backend = build_verifier_backend(
 			None,
 			JobAgent::Auto,
@@ -820,14 +891,20 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_honors_explicit_selection() {
-		let codex = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("gpt-test"),
-			effort: crate::config::ConfiguredText::Builtin("xhigh"),
-		};
-		let claude = CliModelConfig {
-			model: crate::config::ConfiguredText::Builtin("claude-test"),
-			effort: crate::config::ConfiguredText::Builtin("max"),
-		};
+		let codex = crate::test_support::sandbox_agent(
+			true,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
+		);
+		let claude = crate::test_support::sandbox_agent(
+			false,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("max"),
+			},
+		);
 
 		let backend = build_verifier_backend(
 			None,

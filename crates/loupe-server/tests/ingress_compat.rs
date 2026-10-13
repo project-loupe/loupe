@@ -1,6 +1,4 @@
-//! Compatibility controls for the authenticated router before the ingress migration.
-//! Initial controls preserve existing behavior. The later sentinel tests pin
-//! deliberate diagnostic hardening with separately recorded pre-change failures.
+//! Authenticated router compatibility and diagnostic redaction checks.
 
 mod common;
 use std::sync::Arc;
@@ -10,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use common::wire::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_server::{router, AppState, PeerCert};
 use loupe_storage::secrets::MasterKey;
-use loupe_storage::{repos, workers, Db};
+use loupe_storage::{registry, Db};
 use loupe_tls::{cert_fingerprint, Ca};
 use tower::ServiceExt;
 
@@ -27,26 +25,21 @@ fn fixture() -> Fixture {
 	let admin = PeerCert(vec![1, 2, 3].into());
 	let worker = PeerCert(vec![4, 5, 6].into());
 	let revoked = PeerCert(vec![7, 8, 9].into());
-	db.with_conn(|conn| {
-		for (name, cert, kind) in [
-			("admin", &admin, workers::WorkerKind::Admin),
-			("worker", &worker, workers::WorkerKind::Worker),
-			("revoked", &revoked, workers::WorkerKind::Worker),
-		] {
-			let id = workers::insert(
-				conn,
-				&common::marked::operator::text(name),
-				kind,
-				&cert_fingerprint(cert.0.as_ref()),
-				0,
-			)?;
-			if name == "revoked" {
-				assert!(workers::revoke(conn, id, 1)?);
-			}
+	registry::bootstrap_admin(&db, &cert_fingerprint(admin.0.as_ref()), 0).unwrap();
+	let operator = common::marked::operator_ingress();
+	for (name, cert) in [("worker", &worker), ("revoked", &revoked)] {
+		let id = registry::register_worker(
+			&db,
+			&operator,
+			&common::marked::operator::text(name),
+			&cert_fingerprint(cert.0.as_ref()),
+			0,
+		)
+		.unwrap();
+		if name == "revoked" {
+			assert!(registry::revoke_worker(&db, &operator, id, 1).unwrap());
 		}
-		Ok(())
-	})
-	.unwrap();
+	}
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(Ca::new("ingress compatibility").unwrap()),
@@ -113,10 +106,8 @@ async fn lease_overflow_number_keeps_syntax_category() {
 
 #[tokio::test]
 async fn malformed_field_containers_receive_syntax_rejection() {
-	// Accepted bounded compatibility exception: RawValue must finish scanning
-	// a token before type validation. Malformed containers are now syntax400,
-	// where the old String visitor could stop at their opening token with422.
-	// Original old422/candidate400 logs and test are retained separately.
+	// RawValue scans a complete token before type validation, so malformed
+	// containers yield syntax/400 rather than a wrong-type/422 response.
 	let f = fixture();
 	let malformed_object =
 		format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"capabilities":[{{"x":"#);
@@ -266,7 +257,7 @@ async fn json_media_types_and_unknown_fields_preserve_route_values() {
 		assert_eq!(status, StatusCode::CREATED, "{media_type}: {body}");
 		let reply: loupe_proto::RegisterRepoResponse = serde_json::from_str(&body).unwrap();
 		assert_eq!(reply.protocol_version, PROTOCOL_VERSION);
-		let row = f.db.with_conn(|conn| Ok(repos::get(conn, reply.repo_id)?)).unwrap().unwrap();
+		let row = common::repo(&f.db, reply.repo_id);
 		assert_eq!(row.clone_url.expose(), format!("https://github.com/acme/repo-{index}.git"));
 		assert_eq!(row.default_branch.as_ref().map(|v| v.expose()), Some(" Main-é "));
 		assert_eq!(row.reporting, loupe_core::ReportingDestination::Manual);
@@ -344,7 +335,10 @@ async fn json_media_syntax_data_and_duplicate_rejections_keep_their_categories()
 		assert_eq!(status, expected, "{label}: {body}");
 		assert!(body.contains(diagnostic), "{label}: {body}");
 	}
-	assert_eq!(f.db.with_conn(|conn| Ok(repos::list(conn, None)?.len())).unwrap(), 0);
+	assert_eq!(
+		registry::repositories(&f.db, &common::marked::operator_ingress(), None).unwrap().len(),
+		0
+	);
 }
 
 #[tokio::test]
@@ -456,7 +450,7 @@ async fn operator_json_body_cap_is_exactly_two_mib() {
 			send(&f, Some(&f.admin), post("/v1/repos", Some("application/json"), body)).await;
 		assert_eq!(status, expected, "{name}: {body}");
 	}
-	let rows = f.db.with_conn(|conn| Ok(repos::list(conn, None)?)).unwrap();
+	let rows = registry::repositories(&f.db, &common::marked::operator_ingress(), None).unwrap();
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].repo.expose(), "at-cap");
 }

@@ -1,7 +1,7 @@
 //! The Clap value-parser boundary receives original argv/environment OsStr
 //! values before their text, URL or native-path interpretation.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use clap::builder::{TypedValueParser, ValueParserFactory};
@@ -49,6 +49,37 @@ impl Validate<&OsStr, Config> for WorkerNativePathArgument {
 		Ok(ConfiguredPath::admitted(&mark, PathBuf::from(u.get())))
 	}
 }
+
+/// Original native command operand for the dedicated network supervisor.
+/// This role does not grant host mount or ordinary sandbox operand authority.
+#[derive(Clone)]
+pub struct SupervisorCommandArgument {
+	value: OsString,
+	source: std::marker::PhantomData<Config>,
+}
+impl std::fmt::Debug for SupervisorCommandArgument {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("SupervisorCommandArgument([redacted])")
+	}
+}
+impl SupervisorCommandArgument {
+	pub(crate) fn into_supervisor_operand(self) -> OsString {
+		self.value
+	}
+}
+struct SupervisorNativeArgument;
+impl Validate<&OsStr, Config> for SupervisorNativeArgument {
+	type Output = SupervisorCommandArgument;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, u: Unvalidated<'view, &OsStr>, _: Mark<'view, Config>,
+	) -> Result<Self::Output, Self::Error> {
+		Ok(SupervisorCommandArgument {
+			value: u.get().to_os_string(),
+			source: std::marker::PhantomData,
+		})
+	}
+}
 macro_rules! parser {
 	($name:ident, $output:ty, $validator:expr) => {
 		#[derive(Clone)]
@@ -75,3 +106,4 @@ macro_rules! parser {
 parser!(ConfiguredTextParser, ConfiguredText, WorkerTextArgument);
 parser!(ConfiguredUrlParser, ConfiguredUrl, WorkerUrlArgument);
 parser!(ConfiguredPathParser, ConfiguredPath, WorkerNativePathArgument);
+parser!(SupervisorCommandArgumentParser, SupervisorCommandArgument, SupervisorNativeArgument);

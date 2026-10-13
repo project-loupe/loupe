@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use crate::{FindingState, JobState};
 
+// debug-ok: private fields are static machine, state and transition names.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid {machine} transition {transition} from {state}")]
 pub struct StateTransitionError {
@@ -16,6 +17,7 @@ impl StateTransitionError {
 	}
 }
 
+// debug-ok: closed job transition unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobTransition {
 	Enqueue,
@@ -72,6 +74,7 @@ pub fn initial_job_state(transition: JobTransition) -> Result<JobState, StateTra
 	}
 }
 
+// debug-ok: closed finding transition unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FindingTransition {
 	ScanAccepted,
@@ -162,6 +165,7 @@ pub fn initial_finding_state(
 	}
 }
 
+// debug-ok: aggregate state contains only four booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VerdictRollup {
 	pub has_confirmed: bool,

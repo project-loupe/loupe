@@ -50,7 +50,7 @@ fn actual_finding_read_carries_live_whole_columns_and_keeps_audit_db() {
 			[id],
 		)?;
 		OBSERVATIONS.with_borrow_mut(|events| *events = Some(Vec::new()));
-		let read = crate::findings::get(conn, id)?.unwrap();
+		let read = crate::findings::get_raw(conn, id)?.unwrap();
 		let events = OBSERVATIONS.with_borrow_mut(Option::take).unwrap();
 		assert_eq!(read.into_finding(), finding);
 		let mut carries = 0;
@@ -97,7 +97,7 @@ fn original_db_metadata_and_agent_review_policy_outputs_keep_sources_and_normali
             assert_eq!(reason.expose(),"Café");
             Ok(())
         })?;
-        let read=crate::review_units::get(conn,31)?.unwrap();
+        let read=crate::review_units::get(&crate::test_support::scope(conn, 1),31)?.unwrap();
         assert_eq!(read.title.expose(),"Café");
         assert_eq!(read.stale_reason.unwrap().expose(),"Café");
         Ok(())
@@ -116,7 +116,7 @@ fn reporting_syntax_and_new_admission_remain_distinct_without_column_errors() {
 		] {
 			conn.execute("UPDATE registered_repos SET reporting=?1 WHERE id=1", [raw])?;
 			let rusqlite::Error::FromSqlConversionFailure(_, _, error) =
-				crate::repos::get(conn, 1).unwrap_err()
+				crate::repos::get_raw(conn, 1).unwrap_err()
 			else {
 				panic!("wrong conversion category")
 			};

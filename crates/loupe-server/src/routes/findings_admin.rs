@@ -20,14 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use loupe_core::{FindingState, JobKind, ReportingDestination};
+use loupe_core::{FindingState, ReportingDestination};
 use loupe_proto::{
 	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyResponse, PROTOCOL_VERSION,
 };
 use loupe_provenance::{Agent, Db};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
-use loupe_storage::jobs::NewJob;
-use loupe_storage::{jobs, repos};
+use loupe_storage::repos;
+use loupe_storage::scope::{self, OperatorTarget, RepoScope};
 use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
@@ -45,40 +45,78 @@ const SEARCH_DEFAULT_LIMIT: i64 = 20;
 /// downloading every finding on a repo.
 const SEARCH_MAX_LIMIT: i64 = 100;
 
-#[derive(Debug)]
-struct VerifyRetryCandidate {
-	finding_id: i64,
-	repo_id: i64,
-	parent_job_id: i64,
-}
-
 fn now_secs() -> i64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn authorize_prior_finding_repo(
-	state: &AppState, authed: &AuthedWorker, headers: &HeaderMap, repo_id: i64,
-) -> Result<(), (StatusCode, String)> {
-	if authed.is_admin() {
-		return Ok(());
+fn read_scope<T>(
+	state: &AppState, authed: &AuthedWorker, headers: &HeaderMap, target: OperatorTarget,
+	body: impl for<'tx> FnOnce(&RepoScope<'tx>) -> loupe_storage::Result<T>,
+) -> Result<T, (StatusCode, String)> {
+	if let Some(operator) = authed.operator_ingress() {
+		return scope::with_operator_repository(&state.db, &operator, target, body)
+			.map_err(read_error);
 	}
 	let now = now_secs();
-	let authorized = job_capability::authorize(state, authed, headers, now)?;
-	if authorized.row.repo_id == repo_id {
-		Ok(())
-	} else {
-		Err(job_capability::forbidden())
+	use loupe_core::security_event::{CapabilityDenial, Operation, RequestedTarget};
+	let (operation, requested) = match target {
+		OperatorTarget::Repository(id) => {
+			(Operation::SearchFindings, RequestedTarget::Repository(id))
+		},
+		OperatorTarget::Finding(id) => (Operation::ReadFinding, RequestedTarget::Finding(id)),
+		OperatorTarget::Job(id) => (Operation::ReadFinding, RequestedTarget::Job(id)),
+	};
+	let authorized = job_capability::authorize(state, authed, headers, now, operation, requested)?;
+	scope::with_active_lease(&state.db, authorized.active_lease(authed.id(), now), |scope| {
+		if let OperatorTarget::Repository(repo) = target
+			&& scope.repo().repository_id() != repo
+		{
+			job_capability::denied(
+				authed,
+				Some(&authorized.row),
+				operation,
+				requested,
+				CapabilityDenial::RepositoryMismatch,
+			);
+			return Err(loupe_storage::Error::ScopeDenied);
+		}
+		body(scope.repo())
+	})
+	.map_err(read_error)?
+	.ok_or_else(|| {
+		job_capability::denied(
+			authed,
+			Some(&authorized.row),
+			operation,
+			requested,
+			CapabilityDenial::LeaseInvalidated,
+		);
+		job_capability::forbidden()
+	})
+}
+
+fn read_error(error: loupe_storage::Error) -> (StatusCode, String) {
+	match error {
+		loupe_storage::Error::NotFound(loupe_storage::Entity::Finding, id) => {
+			(StatusCode::NOT_FOUND, format!("no finding with id {id}"))
+		},
+		loupe_storage::Error::ScopeDenied => job_capability::forbidden(),
+		other => (StatusCode::INTERNAL_SERVER_ERROR, format!("reading findings: {other}")),
 	}
 }
 
 pub async fn list_for_repo(
 	State(state): State<AppState>, Path(repo_id): Path<i64>, Query(qp): Query<ListQuery>,
+	Extension(authed): Extension<AuthedWorker>,
 ) -> Result<Json<ListFindingsResponse<Agent, Db>>, (StatusCode, String)> {
 	let limit = positive_limit(qp.limit)?.unwrap_or(LIST_DEFAULT_LIMIT);
-	let rows = state
-		.db
-		.with_conn(|c| Ok(findings::list_for_repo(c, repo_id, limit)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listing findings: {e}")))?;
+	let rows = read_scope(
+		&state,
+		&authed,
+		&HeaderMap::new(),
+		OperatorTarget::Repository(repo_id),
+		|scope| findings::list_for_repo(scope, limit),
+	)?;
 	Ok(Json(ListFindingsResponse {
 		protocol_version: PROTOCOL_VERSION,
 		findings: rows.into_iter().map(row_to_summary).collect(),
@@ -86,6 +124,7 @@ pub async fn list_for_repo(
 }
 
 /// Query string for `GET /v1/repos/:id/findings`.
+// debug-ok: this list query contains only an optional numeric limit.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
 	#[serde(default)]
@@ -112,21 +151,16 @@ pub async fn search(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>,
 	Path(repo_id): Path<i64>, qp: SearchQuery, headers: HeaderMap,
 ) -> Result<Json<ListFindingsResponse<Agent, Db>>, (StatusCode, String)> {
-	authorize_prior_finding_repo(&state, &authed, &headers, repo_id)?;
 	let limit = qp.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
 	let sanitized = qp.q;
-	if sanitized.is_empty() {
-		// No usable terms — return empty rather than running an
-		// invalid FTS5 query that errors out.
-		return Ok(Json(ListFindingsResponse {
-			protocol_version: PROTOCOL_VERSION,
-			findings: vec![],
-		}));
-	}
-	let rows = state
-		.db
-		.with_conn(|c| Ok(sanitized.search(c, repo_id, limit)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("searching findings: {e}")))?;
+	let rows =
+		read_scope(&state, &authed, &headers, OperatorTarget::Repository(repo_id), |scope| {
+			if sanitized.is_empty() {
+				Ok(Vec::new())
+			} else {
+				sanitized.search(scope, limit)
+			}
+		})?;
 	Ok(Json(ListFindingsResponse {
 		protocol_version: PROTOCOL_VERSION,
 		findings: rows.into_iter().map(row_to_summary).collect(),
@@ -137,22 +171,10 @@ pub async fn get(
 	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
 	headers: HeaderMap,
 ) -> Result<Json<FindingDetail<Agent, Db>>, (StatusCode, String)> {
-	let authorized_repo = if authed.is_admin() {
-		None
-	} else {
-		Some(job_capability::authorize(&state, &authed, &headers, now_secs())?.row.repo_id)
-	};
-	let row = state
-		.db
-		.with_conn(|c| Ok(findings::get(c, id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
-		.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
-	if authorized_repo.is_some_and(|repo_id| repo_id != row.repo_id) {
-		// Return the same 404 a nonexistent id yields so a leased
-		// worker cannot use the status code to probe which finding ids
-		// exist in a repository it does not hold a capability for.
-		return Err((StatusCode::NOT_FOUND, format!("no finding with id {id}")));
-	}
+	let row = read_scope(&state, &authed, &headers, OperatorTarget::Finding(id), |scope| {
+		findings::get(scope, id)
+	})?
+	.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
 	Ok(Json(row_to_detail(row)))
 }
 
@@ -175,7 +197,8 @@ pub async fn get(
 /// the reaper's system inconclusive marker (`job_id = NULL`) remains
 /// recoverable without that flag.
 pub async fn retry_verify(
-	State(state): State<AppState>, body: crate::ingress::OperatorJson,
+	State(state): State<AppState>, Extension(operator): Extension<AuthedWorker>,
+	body: crate::ingress::OperatorJson,
 ) -> Result<Json<RetryVerifyResponse>, (StatusCode, String)> {
 	let req = crate::ingress::registry::RetryVerifyDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
@@ -190,168 +213,32 @@ pub async fn retry_verify(
 		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
 	}
 	let now = now_secs();
-	let mut response = state
-		.db
-		.with_conn(|c| {
-			let tx = c.transaction()?;
-			let limit = req.limit.unwrap_or(-1);
-			let candidates = {
-				// Keep the three recovery modes in one query so the
-				// repo/limit ordering is global rather than per-arm.
-				// Active queued/leased verify jobs are counted later and
-				// not mutated, which prevents duplicate verifier work.
-				let mut stmt = tx.prepare(
-					"SELECT f.id, f.repo_id, f.job_id
-						   FROM findings f
-						  WHERE f.verification_required = 1
-						    AND (?1 IS NULL OR f.repo_id = ?1)
-						    AND (
-						      (
-						        f.state = 'dismissed'
-						        AND EXISTS (
-						          SELECT 1 FROM finding_verifications v
-						           WHERE v.finding_id = f.id
-						             AND v.job_id IS NULL
-						             AND v.verdict = 'inconclusive'
-						             AND v.notes = ?4
-						        )
-						      )
-						      OR (
-						        f.state = 'pending'
-						        AND EXISTS (
-						          SELECT 1 FROM jobs j
-						           WHERE j.id = f.job_id
-						             AND j.kind = 'scan'
-						             AND j.state IN ('succeeded', 'failed', 'cancelled')
-						             AND j.finished_at IS NOT NULL
-						        )
-						      )
-						      OR f.state = 'validating'
-						    )
-						    AND NOT EXISTS (
-						      SELECT 1 FROM finding_verifications v
-						       WHERE v.finding_id = f.id
-						         AND v.verdict IN ('confirmed', 'dismissed')
-						    )
-						    AND (
-						      ?3 = 1
-						      OR NOT EXISTS (
-						        SELECT 1 FROM finding_verifications v
-						         WHERE v.finding_id = f.id
-						           AND v.job_id IS NOT NULL
-						           AND v.verdict = 'inconclusive'
-						      )
-						    )
-						  ORDER BY COALESCE(f.validating_deadline, f.created_at), f.id
-						  LIMIT ?2",
-				)?;
-				let mut rows = stmt.query((
-					req.repo_id,
-					limit,
-					req.include_inconclusive as i64,
-					findings::VALIDATING_DEADLINE_EXPIRED_NOTE,
-				))?;
-				let mut out = Vec::new();
-				while let Some(r) = rows.next()? {
-					out.push(VerifyRetryCandidate {
-						finding_id: r.get(0)?,
-						repo_id: r.get(1)?,
-						parent_job_id: r.get(2)?,
-					});
-				}
-				out
-			};
-
-			let mut out = RetryVerifyResponse {
-				protocol_version: PROTOCOL_VERSION,
-				dry_run: req.dry_run,
-				matched: candidates.len() as u64,
-				revived: 0,
-				requeued_jobs: 0,
-				created_jobs: 0,
-				left_queued_or_leased: 0,
-			};
-
-			for candidate in candidates {
-				let active_verify: bool = tx.query_row(
-					"SELECT EXISTS(
-					   SELECT 1 FROM jobs
-					    WHERE kind = 'verify'
-					      AND target_finding_id = ?1
-					      AND state IN ('queued','leased')
-					)",
-					[candidate.finding_id],
-					|r| r.get(0),
-				)?;
-
-				if active_verify {
-					out.left_queued_or_leased += 1;
-					continue;
-				} else {
-					out.revived += 1;
-					let failed_job_id: Option<i64> = {
-						let mut stmt = tx.prepare(
-							"SELECT id FROM jobs
-							  WHERE kind = 'verify'
-							    AND target_finding_id = ?1
-							    AND state = 'failed'
-							  ORDER BY enqueued_at DESC, id DESC
-							  LIMIT 1",
-						)?;
-						let mut rows = stmt.query([candidate.finding_id])?;
-						match rows.next()? {
-							Some(r) => Some(r.get(0)?),
-							None => None,
-						}
-					};
-
-					if let Some(job_id) = failed_job_id {
-						out.requeued_jobs += 1;
-						if !req.dry_run {
-							jobs::requeue_failed(&tx, job_id, now)?;
-						}
-					} else {
-						out.created_jobs += 1;
-						if !req.dry_run {
-							jobs::enqueue(
-								&tx,
-								&NewJob {
-									repo_id: candidate.repo_id,
-									kind: JobKind::<Db>::Verify,
-									incremental: false,
-									since_sha: None,
-									parent_job_id: Some(candidate.parent_job_id),
-									target_finding_id: Some(candidate.finding_id),
-								},
-								now,
-							)?;
-						}
-					}
-				}
-
-				if !req.dry_run {
-					findings::retry_verification(
-						&tx,
-						candidate.finding_id,
-						now + super::jobs::DEFAULT_VALIDATING_BUDGET_SECS,
-					)?;
-				}
-			}
-
-			if req.dry_run {
-				tx.rollback()?;
-			} else {
-				tx.commit()?;
-			}
-			Ok(out)
-		})
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry verify: {e}")))?;
+	let response = loupe_storage::recovery::retry_verification_candidates(
+		&state.db,
+		&operator.require_operator()?,
+		&loupe_storage::recovery::RecoveryRequest {
+			repo_id: req.repo_id,
+			limit: req.limit,
+			include_inconclusive: req.include_inconclusive,
+			dry_run: req.dry_run,
+		},
+		now,
+		super::jobs::DEFAULT_VALIDATING_BUDGET_SECS,
+	)
+	.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry verify: {e}")))?;
 
 	if !response.dry_run && response.requeued_jobs + response.created_jobs > 0 {
 		state.job_arrived.notify_waiters();
 	}
-	response.protocol_version = PROTOCOL_VERSION;
-	Ok(Json(response))
+	Ok(Json(RetryVerifyResponse {
+		protocol_version: PROTOCOL_VERSION,
+		dry_run: response.dry_run,
+		matched: response.matched,
+		revived: response.revived,
+		requeued_jobs: response.requeued_jobs,
+		created_jobs: response.created_jobs,
+		left_queued_or_leased: response.left_queued_or_leased,
+	}))
 }
 
 /// `POST /v1/findings/:id/approve` — admin only. Transitions a
@@ -366,13 +253,30 @@ pub async fn approve(
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 	let cn = authed.name().to_owned();
-	let outcome = state
-		.db
-		.with_conn(|c| Ok(findings::approve(c, id, &cn, now)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("approve finding: {e}")))?;
+	let ingress =
+		authed.operator_ingress().ok_or((StatusCode::FORBIDDEN, "admin required".into()))?;
+	let (outcome, preparation) = loupe_storage::scope::with_operator_repository(
+		&state.db,
+		&ingress,
+		loupe_storage::scope::OperatorTarget::Finding(id),
+		|scope| loupe_storage::reports::approve(scope, id, &cn, now),
+	)
+	.map_err(|e| match e {
+		loupe_storage::Error::NotFound(loupe_storage::Entity::Finding, _) => {
+			(StatusCode::NOT_FOUND, format!("no finding with id {id}"))
+		},
+		error => (StatusCode::INTERNAL_SERVER_ERROR, format!("approve finding: {error}")),
+	})?;
 	match outcome {
 		ApprovalOutcome::Applied => {
-			if let Err(e) = super::jobs::dispatch_finding(&state, id, now).await {
+			if let Err(e) = super::jobs::dispatch_prepared(
+				&state,
+				preparation,
+				super::jobs::DispatchScope::Finding(id),
+				now,
+			)
+			.await
+			{
 				tracing::warn!(
 					finding_id = id,
 					error = %super::jobs::format_error_chain(&e),
@@ -394,34 +298,49 @@ pub async fn approve(
 /// reporting for a finding that is already `confirmed`. Already
 /// `reported` findings are idempotent no-ops.
 pub async fn retry_report(
-	State(state): State<AppState>, Path(id): Path<i64>,
+	State(state): State<AppState>, Extension(authed): Extension<AuthedWorker>, Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let now = now_secs();
-	let row = state
-		.db
-		.with_conn(|c| Ok(findings::get(c, id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get finding: {e}")))?
-		.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
-
-	match row.state {
-		FindingState::Reported => return Ok(StatusCode::NO_CONTENT),
-		FindingState::Confirmed => {},
-		_ => return Err((StatusCode::CONFLICT, format!("finding {id} is not confirmed"))),
-	}
-
-	let repo = state
-		.db
-		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
-		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "finding repo is missing".to_owned()))?;
-	if matches!(repo.reporting, ReportingDestination::Manual) {
-		return Err((
-			StatusCode::CONFLICT,
-			format!("repo {} does not have reporting configured", repo.id),
-		));
-	}
-
-	match super::jobs::dispatch_finding(&state, id, now).await {
+	let ingress =
+		authed.operator_ingress().ok_or((StatusCode::FORBIDDEN, "admin required".into()))?;
+	let preparation = loupe_storage::scope::with_operator_repository(
+		&state.db,
+		&ingress,
+		loupe_storage::scope::OperatorTarget::Finding(id),
+		|scope| {
+			let row = findings::get(scope, id)?
+				.ok_or(loupe_storage::Error::NotFound(loupe_storage::Entity::Finding, id))?;
+			match row.state {
+				FindingState::Reported => {
+					return Ok(Ok(loupe_storage::reports::Preparation::NoReport))
+				},
+				FindingState::Confirmed => {},
+				_ => {
+					return Ok(Err((
+						StatusCode::CONFLICT,
+						format!("finding {id} is not confirmed"),
+					)))
+				},
+			}
+			let repo = repos::get(scope)?.ok_or(loupe_storage::Error::ScopeDenied)?;
+			if matches!(repo.reporting, ReportingDestination::Manual) {
+				return Ok(Err((
+					StatusCode::CONFLICT,
+					format!("repo {} does not have reporting configured", repo.id),
+				)));
+			}
+			Ok(Ok(loupe_storage::reports::prepare_operator(scope, id)?))
+		},
+	)
+	.map_err(read_error)??;
+	match super::jobs::dispatch_prepared(
+		&state,
+		preparation,
+		super::jobs::DispatchScope::Finding(id),
+		now,
+	)
+	.await
+	{
 		Ok(()) => Ok(StatusCode::NO_CONTENT),
 		Err(e) => {
 			let error = super::jobs::format_error_chain(&e);
@@ -441,10 +360,13 @@ pub async fn reject(
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 	let cn = authed.name().to_owned();
-	let outcome = state
-		.db
-		.with_conn(|c| Ok(findings::reject(c, id, &cn, now)?))
-		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("reject finding: {e}")))?;
+	let outcome = scope::with_operator_repository(
+		&state.db,
+		&authed.require_operator()?,
+		OperatorTarget::Finding(id),
+		|scope| findings::reject(scope, id, &cn, now),
+	)
+	.map_err(read_error)?;
 	match outcome {
 		ApprovalOutcome::Applied => Ok(StatusCode::NO_CONTENT),
 		ApprovalOutcome::NotPending => {

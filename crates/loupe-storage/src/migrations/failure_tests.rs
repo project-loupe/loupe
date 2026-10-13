@@ -82,7 +82,7 @@ fn v3_exact_copy_check_detects_equal_length_corruption() {
 		let error = run_with_probe(&mut conn, &mut |step, conn| {
 			if step == Step::VerifyCopy {
 				conn.execute_batch(sql)?;
-				// These are exactly the aggregates the earlier plan proposed.
+				// Aggregate equality alone must not hide changes to individual rows.
 				for column in ["since_sha", "head_sha", "job_capability_hash"] {
 					assert_eq!(rows(conn, &format!("SELECT COUNT(*), COUNT({column}), TOTAL(LENGTH({column})) FROM jobs")),
 						rows(conn, &format!("SELECT COUNT(*), COUNT({column}), TOTAL(LENGTH({column})) FROM jobs_new")));

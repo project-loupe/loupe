@@ -1,3 +1,17 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 #![deny(unsafe_code)]
 //! `loupectl` — operator CLI for loupe-server.
 //!
@@ -23,6 +37,7 @@ mod config_input;
 mod credential_request;
 mod ingress;
 
+// debug-ok: command/configuration children redact text, paths and credentials.
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe operator CLI")]
 struct Cli {
@@ -32,6 +47,7 @@ struct Cli {
 	cmd: Cmd,
 }
 
+// debug-ok: all connection values delegate to redacted Config owners.
 #[derive(Debug, Args)]
 struct ConnArgs {
 	#[arg(long, env = "LOUPE_SERVER_URL", value_parser = config_input::UrlArgument)]
@@ -56,6 +72,7 @@ struct ConnArgs {
 	admin_key_pem_b64: Option<config_input::ConfiguredPem>,
 }
 
+// debug-ok: command variants contain reviewed argument owners and numeric IDs.
 #[derive(Debug, Subcommand)]
 enum Cmd {
 	#[command(subcommand)]
@@ -73,6 +90,7 @@ enum Cmd {
 	GithubApp(GithubAppCmd),
 }
 
+// debug-ok: app arguments redact credentials; other variants are fieldless.
 #[derive(Debug, Subcommand)]
 enum GithubAppCmd {
 	/// Store (or replace) the GitHub App credential. The server verifies
@@ -84,6 +102,7 @@ enum GithubAppCmd {
 	Clear,
 }
 
+// debug-ok: app ID is numeric; key paths and PEM inputs redact their content.
 #[derive(Debug, Args)]
 struct GithubAppSetArgs {
 	/// Numeric App ID from the app's settings page on GitHub.
@@ -101,6 +120,7 @@ struct GithubAppSetArgs {
 	private_key_pem_b64: Option<config_input::ConfiguredPem>,
 }
 
+// debug-ok: repo arguments redact content; remaining fields are IDs/flags.
 #[derive(Debug, Subcommand)]
 enum RepoCmd {
 	/// Register a new repo for scanning.
@@ -125,6 +145,7 @@ enum RepoCmd {
 	},
 }
 
+// debug-ok: PAT is redacted; repository ID is numeric.
 #[derive(Debug, Args)]
 struct RepoRotatePatArgs {
 	id: i64,
@@ -134,6 +155,7 @@ struct RepoRotatePatArgs {
 	pat: config_input::PatInput,
 }
 
+// debug-ok: target text and optional PAT redact content; ID is numeric.
 #[derive(Debug, Args)]
 struct RepoSetGithubReportingArgs {
 	id: i64,
@@ -149,6 +171,7 @@ struct RepoSetGithubReportingArgs {
 	pat: Option<config_input::PatInput>,
 }
 
+// debug-ok: update arguments contain only booleans and numeric ID/interval.
 #[derive(Debug, Args)]
 struct RepoUpdateArgs {
 	id: i64,
@@ -184,6 +207,7 @@ struct RepoUpdateArgs {
 	inherit_approval: bool,
 }
 
+// debug-ok: all text and PAT values redact; remaining fields are counts/flags.
 #[derive(Debug, Args)]
 struct RepoAddArgs {
 	#[arg(long, value_parser = config_input::CloneUrlArgument)]
@@ -237,6 +261,7 @@ struct RepoAddArgs {
 	no_require_approval: bool,
 }
 
+// debug-ok: registration arguments redact content; removal carries an ID.
 #[derive(Debug, Subcommand)]
 enum WorkerCmd {
 	/// Mint a new worker cert. Saves the bundle to `--out` (or stdout).
@@ -245,6 +270,7 @@ enum WorkerCmd {
 	Rm { id: i64 },
 }
 
+// debug-ok: name and output path redact; output mode is a boolean.
 #[derive(Debug, Args)]
 struct WorkerRegisterArgs {
 	#[arg(long, value_parser = config_input::WorkerNameArgument)]
@@ -256,6 +282,7 @@ struct WorkerRegisterArgs {
 	emit_env: bool,
 }
 
+// debug-ok: job operations contain only numeric IDs and listing limit.
 #[derive(Debug, Subcommand)]
 enum JobCmd {
 	/// List jobs with the newest row printed last.
@@ -273,6 +300,7 @@ enum JobCmd {
 	},
 }
 
+// debug-ok: search query redacts; other arguments are numeric IDs/limits/flags.
 #[derive(Debug, Subcommand)]
 enum FindingCmd {
 	/// List recent findings for a repo (recent page, newest row printed last).
@@ -313,6 +341,7 @@ enum FindingCmd {
 	Reject { id: i64 },
 }
 
+// debug-ok: listing argument is only an optional numeric limit.
 #[derive(Debug, Args)]
 struct ListArgs {
 	/// Number of rows to return.
@@ -320,6 +349,7 @@ struct ListArgs {
 	limit: Option<i64>,
 }
 
+// debug-ok: repository listing contains only numeric limit and output flag.
 #[derive(Debug, Args)]
 struct RepoListArgs {
 	/// Number of rows to return.
@@ -330,6 +360,7 @@ struct RepoListArgs {
 	json: bool,
 }
 
+// debug-ok: finding listing contains only numeric repository ID and limit.
 #[derive(Debug, Args)]
 struct FindingListArgs {
 	repo_id: i64,
@@ -346,6 +377,7 @@ fn parse_positive_i64(raw: &str) -> Result<i64, String> {
 	Ok(value)
 }
 
+// debug-ok: retry arguments contain only booleans and numeric ID/limit.
 #[derive(Debug, Args)]
 struct RetryVerifyArgs {
 	/// Return counts without changing findings or jobs.
@@ -364,12 +396,14 @@ struct RetryVerifyArgs {
 	limit: Option<i64>,
 }
 
+// debug-ok: certificate argument owner redacts names, paths and PEM inputs.
 #[derive(Debug, Subcommand)]
 enum CertCmd {
 	/// Mint a replacement server certificate signed by the existing CA.
 	MintServer(CertMintServerArgs),
 }
 
+// debug-ok: certificate names, paths and PEM inputs redact; mode is boolean.
 #[derive(Debug, Args)]
 struct CertMintServerArgs {
 	/// DNS name to include in the server certificate SAN. Repeat for
@@ -520,8 +554,12 @@ async fn github_app_set(
 		a.private_key_file.as_ref(),
 		"GitHub App private key missing — pass --private-key-file or set LOUPE_GITHUB_APP_KEY_PEM / LOUPE_GITHUB_APP_KEY_PEM_B64",
 	)?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = credential_request::with_body(
-		client.put(url(base, "/v1/github-app")),
+		client.put(url(base, "/v1/github-app")?),
 		private_key_pem.app_credential_json(a.app_id)?,
 	)
 	.send()
@@ -532,7 +570,11 @@ async fn github_app_set(
 }
 
 async fn github_app_show(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
-	let resp = client.get(url(base, "/v1/github-app")).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.get(url(base, "/v1/github-app")?).send().await?;
 	let body: GithubAppResponse<Server> =
 		ingress::show_github_app(server_response(resp, "show GitHub App").await?)?;
 	match body.app {
@@ -543,7 +585,11 @@ async fn github_app_show(client: &reqwest::Client, base: &reqwest::Url) -> Resul
 }
 
 async fn github_app_clear(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
-	let resp = client.delete(url(base, "/v1/github-app")).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.delete(url(base, "/v1/github-app")?).send().await?;
 	ingress::discard(server_response(resp, "clear GitHub App").await?)?;
 	println!("github app cleared");
 	Ok(())
@@ -585,7 +631,15 @@ fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
 		"admin key missing — set LOUPE_ADMIN_KEY_PEM, LOUPE_ADMIN_KEY_PEM_B64, or LOUPE_ADMIN_KEY",
 	)?;
 	let tls = loupe_tls::reqwest_client_config(cert.for_tls(), key.for_tls(), ca.for_tls())?;
-	reqwest::Client::builder().use_preconfigured_tls(tls).build().context("building reqwest client")
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI transport owns the configured mTLS client for the fixed server API"
+	)]
+	let client = reqwest::Client::builder()
+		.use_preconfigured_tls(tls)
+		.build()
+		.context("building reqwest client");
+	client
 }
 
 fn pem_from_env_or_file(
@@ -603,8 +657,8 @@ fn pem_from_env_or_file(
 	config_input::read_pem(path).with_context(|| format!("reading {label} at {}", path.display()))
 }
 
-fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
-	base.join(path).expect("path is always valid")
+fn url(base: &reqwest::Url, path: &str) -> Result<reqwest::Url> {
+	base.join(path).context("building server request URL")
 }
 
 fn register_repo_request(a: RepoAddArgs) -> RegisterRepoRequest<Config> {
@@ -621,11 +675,19 @@ fn register_repo_request(a: RepoAddArgs) -> RegisterRepoRequest<Config> {
 	let reporting = if a.no_reporting {
 		ReportingSetup::Manual
 	} else {
+		#[expect(
+			clippy::expect_used,
+			reason = "the only production caller passes clap's validated RepoAddArgs, which requires target_owner unless no_reporting is set"
+		)]
+		let target_owner = a.target_owner.expect("clap enforces target_owner");
+		#[expect(
+			clippy::expect_used,
+			reason = "the only production caller passes clap's validated RepoAddArgs, which requires target_repo unless no_reporting is set"
+		)]
+		let target_repo = a.target_repo.expect("clap enforces target_repo");
 		ReportingSetup::GithubIssue {
-			// `clap` enforces these are present unless --no-reporting is set,
-			// so the unwrap is structurally safe.
-			target_owner: a.target_owner.expect("clap enforces target_owner"),
-			target_repo: a.target_repo.expect("clap enforces target_repo"),
+			target_owner,
+			target_repo,
 			github_pat: a.pat.map(config_input::PatInput::into_pat),
 		}
 	};
@@ -643,8 +705,12 @@ fn register_repo_request(a: RepoAddArgs) -> RegisterRepoRequest<Config> {
 
 async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
 	let req = register_repo_request(a);
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI repository registration sends the guarded Config credential request to the fixed server endpoint"
+	)]
 	let resp =
-		credential_request::with_body(client.post(url(base, "/v1/repos")), req.credential_json()?)
+		credential_request::with_body(client.post(url(base, "/v1/repos")?), req.credential_json()?)
 			.send()
 			.await?;
 	let body: RegisterRepoResponse =
@@ -656,8 +722,16 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 async fn repo_list(
 	client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>, as_json: bool,
 ) -> Result<()> {
-	let req = client.get(url(base, "/v1/repos"));
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let req = client.get(url(base, "/v1/repos")?);
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = req.send().await?;
 	let body: ListReposResponse<Server> =
 		ingress::list_repos(server_response(resp, "list repos").await?)?;
@@ -713,7 +787,11 @@ fn reporting_label(reporting: Option<&ReportingSummary<Server>>) -> String {
 }
 
 async fn repo_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.delete(url(base, &format!("/v1/repos/{id}"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.delete(url(base, &format!("/v1/repos/{id}"))?).send().await?;
 	ingress::discard(server_response(resp, "remove repo").await?)?;
 	Ok(())
 }
@@ -744,7 +822,11 @@ async fn repo_update(
 		require_approval,
 		inherit_require_approval: a.inherit_approval,
 	};
-	let resp = client.patch(url(base, &format!("/v1/repos/{}", a.id))).json(&req).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.patch(url(base, &format!("/v1/repos/{}", a.id))?).json(&req).send().await?;
 	ingress::discard(server_response(resp, "update repo").await?)?;
 	Ok(())
 }
@@ -754,8 +836,12 @@ async fn repo_rotate_pat(
 ) -> Result<()> {
 	let req =
 		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: a.pat.into_pat() };
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = credential_request::with_body(
-		client.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id))),
+		client.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id))?),
 		req.credential_json()?,
 	)
 	.send()
@@ -769,8 +855,12 @@ async fn repo_set_github_reporting(
 ) -> Result<()> {
 	let id = a.id;
 	let req = set_reporting_request(a);
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = credential_request::with_body(
-		client.put(url(base, &format!("/v1/repos/{id}/reporting/github"))),
+		client.put(url(base, &format!("/v1/repos/{id}/reporting/github"))?),
 		req.credential_json()?,
 	)
 	.send()
@@ -791,8 +881,12 @@ fn set_reporting_request(a: RepoSetGithubReportingArgs) -> SetRepoGithubReportin
 async fn repo_scan(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64, incremental: bool,
 ) -> Result<()> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = client
-		.post(url(base, &format!("/v1/repos/{id}/scan")))
+		.post(url(base, &format!("/v1/repos/{id}/scan"))?)
 		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental })
 		.send()
 		.await?;
@@ -810,8 +904,15 @@ fn register_worker_request(
 async fn worker_register(
 	client: &reqwest::Client, base: &reqwest::Url, a: WorkerRegisterArgs,
 ) -> Result<()> {
-	let resp =
-		client.post(url(base, "/v1/workers")).json(&register_worker_request(a.name)).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client
+		.post(url(base, "/v1/workers")?)
+		.json(&register_worker_request(a.name))
+		.send()
+		.await?;
 	let bundle: RegisterWorkerResponse =
 		ingress::register_worker_bundle(server_response(resp, "register worker").await?)?;
 	if a.emit_env {
@@ -850,11 +951,19 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
 		options.mode(0o600);
 	}
 
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI credential export creates the operator-selected file exclusively with restrictive creation mode"
+	)]
 	let mut file =
 		options.open(path).with_context(|| format!("creating secret file {}", path.display()))?;
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::PermissionsExt;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "CLI credential export enforces owner-only permissions on the newly created file"
+		)]
 		file.set_permissions(std::fs::Permissions::from_mode(0o600))
 			.with_context(|| format!("setting permissions on {}", path.display()))?;
 	}
@@ -930,14 +1039,26 @@ fn server_cert_env_assignments(
 }
 
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.delete(url(base, &format!("/v1/workers/{id}"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.delete(url(base, &format!("/v1/workers/{id}"))?).send().await?;
 	ingress::discard(server_response(resp, "remove worker").await?)?;
 	Ok(())
 }
 
 async fn job_list(client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>) -> Result<()> {
-	let req = client.get(url(base, "/v1/jobs"));
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let req = client.get(url(base, "/v1/jobs")?);
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = req.send().await?;
 	let jobs: Vec<JobInfo<Server>> = ingress::list_jobs(server_response(resp, "list jobs").await?)?;
 	for j in jobs.into_iter().rev() {
@@ -955,21 +1076,33 @@ async fn job_list(client: &reqwest::Client, base: &reqwest::Url, limit: Option<i
 }
 
 async fn job_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.get(url(base, &format!("/v1/jobs/{id}"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.get(url(base, &format!("/v1/jobs/{id}"))?).send().await?;
 	let job: JobInfo<Server> = ingress::get_job(server_response(resp, "get job").await?)?;
 	println!("{}", serde_json::to_string_pretty(&job)?);
 	Ok(())
 }
 
 async fn job_retry(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.post(url(base, &format!("/v1/jobs/{id}/retry"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.post(url(base, &format!("/v1/jobs/{id}/retry"))?).send().await?;
 	let job: JobInfo<Server> = ingress::retry_job(server_response(resp, "retry job").await?)?;
 	println!("job_id={} state={:?} attempts={}", job.job_id, job.state, job.attempts);
 	Ok(())
 }
 
 async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.post(url(base, &format!("/v1/jobs/{id}/cancel"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.post(url(base, &format!("/v1/jobs/{id}/cancel"))?).send().await?;
 	let job: JobInfo<Server> = ingress::cancel_job(server_response(resp, "cancel job").await?)?;
 	println!("job_id={} state={:?} attempts={}", job.job_id, job.state, job.attempts);
 	Ok(())
@@ -978,8 +1111,16 @@ async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> R
 async fn finding_list(
 	client: &reqwest::Client, base: &reqwest::Url, repo_id: i64, limit: Option<i64>,
 ) -> Result<()> {
-	let req = client.get(url(base, &format!("/v1/repos/{repo_id}/findings")));
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let req = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))?);
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = req.send().await?;
 	let body: ListFindingsResponse<Agent, Server> =
 		ingress::list_findings(server_response(resp, "list findings").await?)?;
@@ -993,7 +1134,11 @@ async fn finding_search(
 	client: &reqwest::Client, base: &reqwest::Url, repo_id: i64,
 	query: &BoundedText<config_input::SearchQuery, Config>, limit: i64,
 ) -> Result<()> {
-	let url = url(base, &format!("/v1/repos/{repo_id}/findings/search"));
+	let url = url(base, &format!("/v1/repos/{repo_id}/findings/search"))?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
 	let resp = client
 		.get(url)
 		.query(&[("q", query.expose()), ("limit", &limit.to_string())])
@@ -1014,7 +1159,11 @@ async fn finding_search(
 async fn finding_show(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64, as_json: bool,
 ) -> Result<()> {
-	let resp = client.get(url(base, &format!("/v1/findings/{id}"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.get(url(base, &format!("/v1/findings/{id}"))?).send().await?;
 	let detail: FindingDetail<Agent, Server> =
 		ingress::get_finding(server_response(resp, "get finding").await?)?;
 	if as_json {
@@ -1026,7 +1175,11 @@ async fn finding_show(
 }
 
 async fn finding_approve(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.post(url(base, &format!("/v1/findings/{id}/approve"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/approve"))?).send().await?;
 	ingress::discard(server_response(resp, "approve finding").await?)?;
 	Ok(())
 }
@@ -1034,7 +1187,11 @@ async fn finding_approve(client: &reqwest::Client, base: &reqwest::Url, id: i64)
 async fn finding_retry_report(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64,
 ) -> Result<()> {
-	let resp = client.post(url(base, &format!("/v1/findings/{id}/retry-report"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/retry-report"))?).send().await?;
 	ingress::discard(server_response(resp, "retry report").await?)?;
 	Ok(())
 }
@@ -1049,7 +1206,11 @@ async fn finding_retry_verify(
 		repo_id: args.repo_id,
 		limit: args.limit,
 	};
-	let resp = client.post(url(base, "/v1/findings/retry-verify")).json(&req).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.post(url(base, "/v1/findings/retry-verify")?).json(&req).send().await?;
 	let body: RetryVerifyResponse =
 		ingress::retry_verification(server_response(resp, "retry verify").await?)?;
 	let label = if body.dry_run { "would_revive" } else { "revived" };
@@ -1067,7 +1228,11 @@ async fn finding_retry_verify(
 }
 
 async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
-	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))).send().await?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "CLI API egress uses the configured server and the operation-specific endpoint and admitted request fields"
+	)]
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))?).send().await?;
 	ingress::discard(server_response(resp, "reject finding").await?)?;
 	Ok(())
 }
@@ -1113,6 +1278,25 @@ mod tests {
 		GithubReportingAuth, ListReposResponse, RepoSummary, ReportingSummary,
 	};
 	use super::{config_fixtures, *};
+
+	#[tokio::test]
+	async fn non_base_server_url_returns_a_request_error() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"mailto:untrusted-url-sentinel@example.test",
+			"github-app",
+			"show",
+		])
+		.unwrap();
+		let base = cli.conn.server_url.as_ref().unwrap().for_request();
+		let error = github_app_show(&reqwest::Client::new(), base).await.unwrap_err();
+		assert_eq!(
+			error.to_string(),
+			"building server request URL",
+			"invalid base must fail without a panic"
+		);
+	}
 
 	#[test]
 	fn selected_pem_retains_config_until_concrete_operation() {

@@ -137,5 +137,9 @@ async fn revision_checkout_rejects_a_branch_name_that_latest_checkout_accepts() 
 	assert_eq!(observed.expose(), commit);
 	assert_eq!(std::fs::read(workdir.path().join("file.txt")).unwrap(), b"original\n");
 	let error = checkout_revision(&bare, "base").await.unwrap_err();
-	assert_eq!(error.to_string(), "parsing reviewed revision base");
+	assert!(matches!(
+		error.downcast_ref::<CheckoutFailure>(),
+		Some(CheckoutFailure::ParseRevision)
+	));
+	assert_eq!(error.to_string(), "parsing reviewed revision");
 }

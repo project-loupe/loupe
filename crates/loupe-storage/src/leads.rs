@@ -2,10 +2,10 @@
 use loupe_core::text::policy::{Payload, Reason, RevisionText};
 use loupe_core::text::{BoundedJson, BoundedText};
 use loupe_provenance::{Agent, Db, Source};
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::identity::Identity;
-use crate::review::{changed, is_unique, optional, parsed, standalone, string_enum};
+use crate::review::{changed, is_unique, optional, parsed, string_enum};
 use crate::review_units::Priority;
 use crate::{lead_observations, ownership, Conflict, Entity, Error, Ownership, Result};
 string_enum!(Status { Open=>"open", Deferred=>"deferred", Closed=>"closed" });
@@ -21,6 +21,7 @@ pub struct NewLead<'a, RevisionS: Source> {
 	pub supersedes: Option<i64>,
 	pub created_by_job: Option<i64>,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone)]
 pub struct Lead {
 	pub lead_id: i64,
@@ -45,6 +46,7 @@ pub struct Lead {
 	pub created_at: i64,
 	pub closed_at: Option<i64>,
 }
+// debug-ok: submission outcomes contain integer IDs and closed lead states/dispositions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Submitted {
 	Created(i64),
@@ -59,9 +61,11 @@ pub enum Closure {
 	Stale,
 }
 pub fn submit<RevisionS: Source>(
-	tx: &Transaction<'_>, new: &NewLead<'_, RevisionS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewLead<'_, RevisionS>, now: i64,
 ) -> Result<Submitted> {
-	ownership::generation_repo(tx, new.generation_id)?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	ownership::generation(tx, scope.repo_id, new.generation_id, Ownership::LeadUnit)?;
 	if let Some(unit) = new.unit_id {
 		ownership::unit_in_generation(tx, unit, new.generation_id, Ownership::LeadUnit)?;
 	}
@@ -73,8 +77,8 @@ pub fn submit<RevisionS: Source>(
 		// Superseding records a stale-closed identity being resubmitted; any
 		// other lead state would fabricate that history.
 		let stale: bool = tx.query_row(
-			"SELECT EXISTS(SELECT 1 FROM leads WHERE lead_id=?1 AND status='closed' AND disposition='stale')",
-			[parent],
+			"SELECT EXISTS(SELECT 1 FROM leads WHERE lead_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2) AND status='closed' AND disposition='stale')",
+			params![parent,scope.repo_id],
 			|r| r.get(0),
 		)?;
 		if !stale {
@@ -84,16 +88,16 @@ pub fn submit<RevisionS: Source>(
 	let fingerprint = new.identity.fingerprint();
 	let supersedes=match new.supersedes{
   Some(id)=>Some(id),
-  None=>tx.query_row("SELECT lead_id FROM leads WHERE generation_id=?1 AND identity_fingerprint=?2 AND status='closed' AND disposition='stale' ORDER BY lead_id DESC LIMIT 1",params![new.generation_id,fingerprint.as_slice()],|r|r.get(0)).optional()?
+  None=>tx.query_row("SELECT lead_id FROM leads WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?3) AND identity_fingerprint=?2 AND status='closed' AND disposition='stale' ORDER BY lead_id DESC LIMIT 1",params![new.generation_id,fingerprint.as_slice(),scope.repo_id],|r|r.get(0)).optional()?
  };
 	let result=tx.execute("INSERT INTO leads (generation_id,review_unit_id,priority_band,priority_proposal,identity_family,identity_anchor,identity_instance_key,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,supersedes_lead_id,created_by_job_id,created_at)
- VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![new.generation_id,new.unit_id,new.priority.as_str(),new.priority_proposal.map(BoundedJson::expose),new.identity.family.expose(),new.identity.anchor.expose(),new.identity.instance.as_ref().map(|v|v.expose()),fingerprint.as_slice(),new.payload.expose(),new.payload.digest().as_slice(),new.commit_sha.expose(),supersedes,new.created_by_job,now]);
+ SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14 WHERE EXISTS(SELECT 1 FROM review_generations WHERE generation_id=?1 AND repo_id=?15)",params![new.generation_id,new.unit_id,new.priority.as_str(),new.priority_proposal.map(BoundedJson::expose),new.identity.family.expose(),new.identity.anchor.expose(),new.identity.instance.as_ref().map(|v|v.expose()),fingerprint.as_slice(),new.payload.expose(),new.payload.digest().as_slice(),new.commit_sha.expose(),supersedes,new.created_by_job,now,scope.repo_id]);
 	match result {
 		Ok(_) => Ok(Submitted::Created(tx.last_insert_rowid())),
 		Err(error) if is_unique(&error, "leads.generation_id, leads.identity_fingerprint") => {
-			let existing=tx.query_row(&format!("SELECT {COLUMNS} FROM leads WHERE generation_id=?1 AND identity_fingerprint=?2 AND (status<>'closed' OR disposition<>'stale')"),params![new.generation_id,fingerprint.as_slice()],row)?;
+			let existing=tx.query_row(&format!("SELECT {COLUMNS} FROM leads WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?3) AND identity_fingerprint=?2 AND (status<>'closed' OR disposition<>'stale')"),params![new.generation_id,fingerprint.as_slice(),scope.repo_id],row)?;
 			lead_observations::insert(
-				tx,
+				scope,
 				&lead_observations::NewObservation {
 					lead_id: existing.lead_id,
 					submitted_by_job: new.created_by_job,
@@ -165,20 +169,26 @@ pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
 		|_| Ok::<_, rusqlite::Error>(()),
 	)
 }
-pub fn get(conn: &Connection, id: i64) -> Result<Option<Lead>> {
-	Ok(conn
-		.query_row(&format!("SELECT {COLUMNS} FROM leads WHERE lead_id=?1"), [id], row)
+pub fn get(scope: &crate::scope::RepoScope<'_>, id: i64) -> Result<Option<Lead>> {
+	let tx = scope.conn;
+	Ok(tx
+		.query_row(&format!("SELECT {COLUMNS} FROM leads WHERE lead_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2)"), params![id,scope.repo_id], row)
 		.optional()?)
 }
-pub fn list(conn: &Connection, generation: i64) -> Result<Vec<Lead>> {
-	Ok(conn
-		.prepare(&format!("SELECT {COLUMNS} FROM leads WHERE generation_id=?1 ORDER BY lead_id"))?
-		.query_map([generation], row)?
+pub fn list(scope: &crate::scope::RepoScope<'_>, generation: i64) -> Result<Vec<Lead>> {
+	let tx = scope.conn;
+	Ok(tx
+		.prepare(&format!("SELECT {COLUMNS} FROM leads WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2) ORDER BY lead_id"))?
+		.query_map(params![generation,scope.repo_id], row)?
 		.collect::<rusqlite::Result<_>>()?)
 }
-pub fn close(tx: &Transaction<'_>, id: i64, closure: &Closure, now: i64) -> Result<()> {
-	let lead = get(tx, id)?.ok_or(Error::NotFound(Entity::Lead, id))?;
-	let repo = ownership::generation_repo(tx, lead.generation_id)?;
+pub fn close(
+	scope: &crate::scope::RepoScope<'_>, id: i64, closure: &Closure, now: i64,
+) -> Result<()> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	get(scope, id)?.ok_or(Error::NotFound(Entity::Lead, id))?;
+	let repo = scope.repo_id;
 	let (disposition, duplicate_lead, duplicate_finding, promoted_finding) = match closure {
 		Closure::Promoted { finding } => {
 			ownership::finding(tx, *finding, repo, Ownership::PromotedFinding)?;
@@ -200,20 +210,23 @@ pub fn close(tx: &Transaction<'_>, id: i64, closure: &Closure, now: i64) -> Resu
 		Closure::Hardening => (Disposition::Hardening, None, None, None),
 		Closure::Stale => (Disposition::Stale, None, None, None),
 	};
-	changed(tx.execute("UPDATE leads SET status='closed',disposition=?2,duplicate_of_lead_id=?3,duplicate_of_finding_id=?4,promoted_finding_id=?5,closed_at=?6 WHERE lead_id=?1 AND status IN ('open','deferred') AND (?2<>'stale' OR NOT EXISTS(SELECT 1 FROM jobs WHERE assigned_lead_id=?1 AND state IN ('queued','leased')))",params![id,disposition.as_str(),duplicate_lead,duplicate_finding,promoted_finding,now])?,Conflict::LeadState)
+	changed(tx.execute("UPDATE leads SET status='closed',disposition=?2,duplicate_of_lead_id=?3,duplicate_of_finding_id=?4,promoted_finding_id=?5,closed_at=?6 WHERE lead_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?7) AND status IN ('open','deferred') AND (?2<>'stale' OR NOT EXISTS(SELECT 1 FROM jobs WHERE assigned_lead_id=?1 AND state IN ('queued','leased')))",params![id,disposition.as_str(),duplicate_lead,duplicate_finding,promoted_finding,now,scope.repo_id])?,Conflict::LeadState)
 }
 pub fn defer<S: Source>(
-	tx: &Transaction<'_>, id: i64, reason: &BoundedText<Reason, S>,
+	scope: &crate::scope::RepoScope<'_>, id: i64, reason: &BoundedText<Reason, S>,
 	retry: Option<&BoundedText<Reason, S>>,
 ) -> Result<()> {
-	changed(tx.execute("UPDATE leads SET status='deferred',defer_reason=?2,retry_condition=?3 WHERE lead_id=?1 AND status='open'",params![id,reason.expose(),retry.map(BoundedText::expose)])?,Conflict::LeadState)
+	scope.require_operator()?;
+	let tx = scope.conn;
+	changed(tx.execute("UPDATE leads SET status='deferred',defer_reason=?2,retry_condition=?3 WHERE lead_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?4) AND status='open'",params![id,reason.expose(),retry.map(BoundedText::expose),scope.repo_id])?,Conflict::LeadState)
 }
-pub fn reopen(tx: &Transaction<'_>, id: i64) -> Result<()> {
-	changed(tx.execute("UPDATE leads SET status='open',defer_reason=NULL,retry_condition=NULL WHERE lead_id=?1 AND status='deferred'",[id])?,Conflict::LeadState)
+pub fn reopen(scope: &crate::scope::RepoScope<'_>, id: i64) -> Result<()> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	changed(tx.execute("UPDATE leads SET status='open',defer_reason=NULL,retry_condition=NULL WHERE lead_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2) AND status='deferred'",params![id,scope.repo_id])?,Conflict::LeadState)
 }
-pub fn mark_needs_revalidation(tx: &Transaction<'_>, id: i64) -> Result<()> {
-	changed(tx.execute("UPDATE leads SET needs_revalidation=1 WHERE lead_id=?1 AND status IN ('open','deferred')",[id])?,Conflict::LeadState)
+pub fn mark_needs_revalidation(scope: &crate::scope::RepoScope<'_>, id: i64) -> Result<()> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	changed(tx.execute("UPDATE leads SET needs_revalidation=1 WHERE lead_id=?1 AND status IN ('open','deferred') AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=leads.generation_id AND g.repo_id=?2)",params![id,scope.repo_id])?,Conflict::LeadState)
 }
-standalone! {submit<RevisionS>(new:&NewLead<'_, RevisionS>,now:i64)->Submitted;close(id:i64,closure:&Closure,now:i64)->();
-defer<S>(id:i64,reason:&BoundedText<Reason, S>,retry:Option<&BoundedText<Reason, S>>)->();
-reopen(id:i64)->();mark_needs_revalidation(id:i64)->();}

@@ -32,15 +32,21 @@ impl UpstreamRequest {
 	}
 	/// The sole original/repaired request-byte egress to the configured provider.
 	pub(super) async fn send(
-		self, request: reqwest::RequestBuilder,
-	) -> reqwest::Result<reqwest::Response> {
-		request.body(self.0).send().await
+		self, request: reqwest::RequestBuilder, security: &crate::canary::JobSecurity,
+	) -> anyhow::Result<reqwest::Response> {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The guarded request owner sends only after raw and lexical canary admission and policy rewriting."
+		)]
+		security
+			.run(loupe_core::security_event::Operation::ModelRequest, request.body(self.0).send())
+			.await
 	}
 }
 
 /// An initially empty capture receives bytes only from `ToSandbox`'s Provider
-/// mark scope. It retains the same output-budget accounting and allocation as
-/// the existing capture, and exposes only the concrete usage interpretation.
+/// mark scope. The capture is bounded by the output budget and exposes only
+/// the concrete usage interpretation.
 #[derive(Default)]
 pub(super) struct ProviderCapture(Vec<u8>);
 impl ProviderCapture {

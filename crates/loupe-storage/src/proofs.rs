@@ -3,15 +3,16 @@ use loupe_core::text::policy::{Label, Payload, RevisionText};
 pub use loupe_core::text::policy::{MediaType, OriginalName};
 use loupe_core::text::{BoundedJson, BoundedText, Identifier, RepoPath};
 use loupe_provenance::{Mark, Source};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::review::{is_unique, standalone, string_enum};
+use crate::review::{is_unique, string_enum};
 use crate::scope::{Assignment, Scope, Subject, SubjectKind};
 use crate::{ownership, Ownership, Result};
 string_enum!(Role { ReproducerSource=>"reproducer_source", CraftedInput=>"crafted_input", TestPatch=>"test_patch", CommandStdout=>"command_stdout", CommandStderr=>"command_stderr", ExecutionTrace=>"execution_trace" });
 string_enum!(Rung { L3=>"L3", L4=>"L4" });
 string_enum!(NetworkPolicy { Isolated=>"isolated" });
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug)]
 pub enum WorkingDirectory<S: Source> {
 	Root,
@@ -44,7 +45,6 @@ impl<S: Source> WorkingDirectory<S> {
 	}
 }
 pub struct NewArtifact<'a, MetadataS: Source> {
-	pub repo_id: i64,
 	pub blob_id: i64,
 	pub role: Role,
 	pub media_type: &'a BoundedText<MediaType, MetadataS>,
@@ -53,7 +53,6 @@ pub struct NewArtifact<'a, MetadataS: Source> {
 	pub produced_by_job: Option<i64>,
 }
 pub struct NewStagedArtifact<'a, MetadataS: Source> {
-	pub repo_id: i64,
 	pub job_id: i64,
 	pub blob_id: i64,
 	pub role: Role,
@@ -62,7 +61,6 @@ pub struct NewStagedArtifact<'a, MetadataS: Source> {
 	pub original_name: &'a BoundedText<OriginalName, MetadataS>,
 }
 pub struct NewExecution<'a, RevisionS: Source, RequestS: Source, PolicyS: Source> {
-	pub repo_id: i64,
 	pub produced_by_job: i64,
 	pub target_commit_sha: &'a BoundedText<RevisionText, RevisionS>,
 	pub clean_tree: bool,
@@ -82,7 +80,6 @@ pub struct NewExecution<'a, RevisionS: Source, RequestS: Source, PolicyS: Source
 	pub output_truncated: bool,
 }
 pub struct NewProof<'a, RevisionS: Source, ManifestS: Source> {
-	pub repo_id: i64,
 	pub finding_id: i64,
 	pub verification_id: i64,
 	pub rung: Rung,
@@ -101,8 +98,11 @@ impl<'a, S: Source> ArtifactBytes<'a, S> {
 	}
 }
 pub fn insert_blob<S: Source>(
-	tx: &Transaction<'_>, repo: i64, content: &ArtifactBytes<'_, S>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, content: &ArtifactBytes<'_, S>, now: i64,
 ) -> Result<i64> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
 	let content = content.bytes;
 	let hash: [u8; 32] = Sha256::digest(content).into();
 	let len = i64::try_from(content.len()).map_err(|_| {
@@ -114,7 +114,7 @@ pub fn insert_blob<S: Source>(
   Err(error)=>Err(error.into())
  }
 }
-fn blob(tx: &Transaction<'_>, repo: i64, id: i64) -> Result<()> {
+fn blob(tx: &Connection, repo: i64, id: i64) -> Result<()> {
 	ownership::require(
 		tx,
 		"SELECT repo_id FROM proof_artifact_blobs WHERE proof_artifact_blob_id=?1",
@@ -124,7 +124,7 @@ fn blob(tx: &Transaction<'_>, repo: i64, id: i64) -> Result<()> {
 		ownership::repository_row,
 	)
 }
-fn job(tx: &Transaction<'_>, repo: i64, id: i64, relation: Ownership) -> Result<()> {
+fn job(tx: &Connection, repo: i64, id: i64, relation: Ownership) -> Result<()> {
 	ownership::require(
 		tx,
 		"SELECT repo_id FROM jobs WHERE id=?1",
@@ -135,61 +135,77 @@ fn job(tx: &Transaction<'_>, repo: i64, id: i64, relation: Ownership) -> Result<
 	)
 }
 pub fn insert_artifact<MetadataS: Source>(
-	tx: &Transaction<'_>, new: &NewArtifact<'_, MetadataS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewArtifact<'_, MetadataS>, now: i64,
 ) -> Result<i64> {
-	blob(tx, new.repo_id, new.blob_id)?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
+	blob(tx, repo, new.blob_id)?;
 	if let Some(id) = new.produced_by_job {
-		job(tx, new.repo_id, id, Ownership::ArtifactJob)?;
+		job(tx, repo, id, Ownership::ArtifactJob)?;
 	}
 	tx.execute("INSERT INTO proof_artifacts (repo_id,proof_artifact_blob_id,artifact_role,media_type,label,original_name,sha256,byte_len,produced_by_job_id,created_at,source)
- SELECT ?1,?2,?3,?4,?5,?6,sha256,byte_len,?7,?8,?9 FROM proof_artifact_blobs WHERE repo_id=?1 AND proof_artifact_blob_id=?2",params![new.repo_id,new.blob_id,new.role.as_str(),new.media_type.expose(),new.label.map(Identifier::expose),new.original_name.expose(),new.produced_by_job,now,MetadataS::NAME])?;
+ SELECT ?1,?2,?3,?4,?5,?6,sha256,byte_len,?7,?8,?9 FROM proof_artifact_blobs WHERE repo_id=?1 AND proof_artifact_blob_id=?2",params![repo,new.blob_id,new.role.as_str(),new.media_type.expose(),new.label.map(Identifier::expose),new.original_name.expose(),new.produced_by_job,now,MetadataS::NAME])?;
 	Ok(tx.last_insert_rowid())
 }
 pub fn insert_staged_artifact<MetadataS: Source>(
-	tx: &Transaction<'_>, new: &NewStagedArtifact<'_, MetadataS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewStagedArtifact<'_, MetadataS>, now: i64,
 ) -> Result<i64> {
-	blob(tx, new.repo_id, new.blob_id)?;
-	job(tx, new.repo_id, new.job_id, Ownership::ArtifactJob)?;
-	tx.execute("INSERT INTO staged_proof_artifacts (job_id,repo_id,proof_artifact_blob_id,artifact_role,media_type,label,original_name,created_at,source) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![new.job_id,new.repo_id,new.blob_id,new.role.as_str(),new.media_type.expose(),new.label.map(Identifier::expose),new.original_name.expose(),now,MetadataS::NAME])?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
+	blob(tx, repo, new.blob_id)?;
+	job(tx, repo, new.job_id, Ownership::ArtifactJob)?;
+	tx.execute("INSERT INTO staged_proof_artifacts (job_id,repo_id,proof_artifact_blob_id,artifact_role,media_type,label,original_name,created_at,source) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![new.job_id,repo,new.blob_id,new.role.as_str(),new.media_type.expose(),new.label.map(Identifier::expose),new.original_name.expose(),now,MetadataS::NAME])?;
 	Ok(tx.last_insert_rowid())
 }
 pub fn insert_execution<RevisionS: Source, RequestS: Source, PolicyS: Source>(
-	tx: &Transaction<'_>, new: &NewExecution<'_, RevisionS, RequestS, PolicyS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewExecution<'_, RevisionS, RequestS, PolicyS>,
+	now: i64,
 ) -> Result<i64> {
-	job(tx, new.repo_id, new.produced_by_job, Ownership::ExecutionJob)?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
+	job(tx, repo, new.produced_by_job, Ownership::ExecutionJob)?;
 	for id in [new.stdout_artifact, new.stderr_artifact].into_iter().flatten() {
 		ownership::require(
 			tx,
 			"SELECT repo_id FROM proof_artifacts WHERE proof_artifact_id=?1",
 			[id],
-			Scope::repository(new.repo_id),
+			Scope::repository(repo),
 			Ownership::ExecutionArtifact,
 			ownership::repository_row,
 		)?;
 	}
 	if let Some(fixtures) = new.fixture_artifact_ids {
-		check_fixtures(tx, new.repo_id, new.produced_by_job, fixtures)?;
+		check_fixtures(tx, repo, new.produced_by_job, fixtures)?;
 	}
 	tx.execute("INSERT INTO proof_executions (repo_id,produced_by_job_id,target_commit_sha,clean_tree,argv,working_dir,env_names,fixture_artifact_ids,network_policy,limits,timeout_seconds,started_at,duration_ms,exit_status,term_signal,stdout_artifact_id,stderr_artifact_id,output_truncated,created_at,source)
- VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",params![new.repo_id,new.produced_by_job,new.target_commit_sha.expose(),new.clean_tree,new.argv.expose(),new.working_dir.expose(),new.env_names.expose(),new.fixture_artifact_ids.map(BoundedJson::expose),new.network_policy.as_str(),new.limits.expose(),new.timeout_seconds,new.started_at,new.duration_ms,new.exit_status,new.term_signal,new.stdout_artifact,new.stderr_artifact,new.output_truncated,now,RequestS::NAME])?;
+ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",params![repo,new.produced_by_job,new.target_commit_sha.expose(),new.clean_tree,new.argv.expose(),new.working_dir.expose(),new.env_names.expose(),new.fixture_artifact_ids.map(BoundedJson::expose),new.network_policy.as_str(),new.limits.expose(),new.timeout_seconds,new.started_at,new.duration_ms,new.exit_status,new.term_signal,new.stdout_artifact,new.stderr_artifact,new.output_truncated,now,RequestS::NAME])?;
 	Ok(tx.last_insert_rowid())
 }
 pub fn insert_proof<RevisionS: Source, ManifestS: Source>(
-	tx: &Transaction<'_>, new: &NewProof<'_, RevisionS, ManifestS>, now: i64,
+	scope: &crate::scope::RepoScope<'_>, new: &NewProof<'_, RevisionS, ManifestS>, now: i64,
 ) -> Result<i64> {
-	ownership::finding(tx, new.finding_id, new.repo_id, Ownership::ProofFinding)?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
+	ownership::finding(tx, new.finding_id, repo, Ownership::ProofFinding)?;
 	ownership::require(
 		tx,
 		"SELECT f.repo_id,v.finding_id FROM finding_verifications v JOIN findings f ON f.id=v.finding_id WHERE v.id=?1",
 		[new.verification_id],
-		Scope { assignment: Some(Assignment::Finding(new.finding_id)), ..Scope::repository(new.repo_id) },
+		Scope { assignment: Some(Assignment::Finding(new.finding_id)), ..Scope::repository(repo) },
 		Ownership::ProofVerification,
 		|r| Ok(Subject { kind: SubjectKind::Assigned(Assignment::Finding(r.get(1)?)), ..Subject::repository(r.get(0)?) }),
 	)?;
-	tx.execute("INSERT INTO verification_proofs (finding_id,verification_id,repo_id,rung,pinned_commit_sha,manifest,manifest_digest,created_at,source) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![new.finding_id,new.verification_id,new.repo_id,new.rung.as_str(),new.pinned_commit_sha.expose(),new.manifest.expose(),new.manifest.digest().as_slice(),now,ManifestS::NAME])?;
+	tx.execute("INSERT INTO verification_proofs (finding_id,verification_id,repo_id,rung,pinned_commit_sha,manifest,manifest_digest,created_at,source) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![new.finding_id,new.verification_id,repo,new.rung.as_str(),new.pinned_commit_sha.expose(),new.manifest.expose(),new.manifest.digest().as_slice(),now,ManifestS::NAME])?;
 	Ok(tx.last_insert_rowid())
 }
-pub fn link_artifact(tx: &Transaction<'_>, repo: i64, proof: i64, artifact: i64) -> Result<()> {
+pub fn link_artifact(scope: &crate::scope::RepoScope<'_>, proof: i64, artifact: i64) -> Result<()> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
 	ownership::require(
 		tx,
 		"SELECT repo_id FROM verification_proofs WHERE verification_proof_id=?1",
@@ -209,7 +225,12 @@ pub fn link_artifact(tx: &Transaction<'_>, repo: i64, proof: i64, artifact: i64)
 	tx.execute("INSERT INTO verification_proof_artifacts (repo_id,verification_proof_id,proof_artifact_id) VALUES (?1,?2,?3)",params![repo,proof,artifact])?;
 	Ok(())
 }
-pub fn link_execution(tx: &Transaction<'_>, repo: i64, proof: i64, execution: i64) -> Result<()> {
+pub fn link_execution(
+	scope: &crate::scope::RepoScope<'_>, proof: i64, execution: i64,
+) -> Result<()> {
+	scope.require_operator()?;
+	let tx = scope.conn;
+	let repo = scope.repo_id;
 	ownership::require(
 		tx,
 		"SELECT repo_id FROM verification_proofs WHERE verification_proof_id=?1",
@@ -229,9 +250,6 @@ pub fn link_execution(tx: &Transaction<'_>, repo: i64, proof: i64, execution: i6
 	tx.execute("INSERT INTO verification_proof_executions (repo_id,verification_proof_id,proof_execution_id) VALUES (?1,?2,?3)",params![repo,proof,execution])?;
 	Ok(())
 }
-standalone! {insert_blob<S>(repo:i64,content:&ArtifactBytes<'_, S>,now:i64)->i64;insert_artifact<MetadataS>(new:&NewArtifact<'_, MetadataS>,now:i64)->i64;
-insert_staged_artifact<MetadataS>(new:&NewStagedArtifact<'_, MetadataS>,now:i64)->i64;insert_execution<RevisionS, RequestS, PolicyS>(new:&NewExecution<'_, RevisionS, RequestS, PolicyS>,now:i64)->i64;
-insert_proof<RevisionS, ManifestS>(new:&NewProof<'_, RevisionS, ManifestS>,now:i64)->i64;link_artifact(repo:i64,proof:i64,artifact:i64)->();link_execution(repo:i64,proof:i64,execution:i64)->();}
 
 fn check_fixtures<S: Source>(
 	conn: &Connection, repo: i64, job: i64, fixtures: &BoundedJson<Payload, S>,

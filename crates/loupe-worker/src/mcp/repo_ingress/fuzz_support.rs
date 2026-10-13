@@ -9,6 +9,7 @@ pub enum RepoCase<'a> {
 	Fingerprint { bytes: &'a [u8], file: &'a str, start: u32, end: u32 },
 	GitOutput(std::process::Output),
 }
+// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RepoObservation {
 	Membership { native: PathBuf, relative: Option<String> },

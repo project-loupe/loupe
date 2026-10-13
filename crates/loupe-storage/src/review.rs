@@ -4,6 +4,7 @@ use std::str::FromStr;
 use rusqlite::types::Type;
 use rusqlite::Row;
 
+// debug-ok: entity kinds are closed schema vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entity {
 	Campaign,
@@ -20,6 +21,7 @@ pub enum Entity {
 	Execution,
 	Proof,
 }
+// debug-ok: conflicts retain only a closed category and an optional integer finding ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conflict {
 	ActiveCampaign,
@@ -49,6 +51,7 @@ pub enum Conflict {
 	AttemptDetails,
 	ArtifactIdentity,
 }
+// debug-ok: ownership relations are closed schema vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
 	CampaignRoot,
@@ -146,6 +149,7 @@ pub(crate) fn changed(count: usize, conflict: Conflict) -> crate::Result<()> {
 
 macro_rules! string_enum {
 	($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+		// debug-ok: generated enums have only closed unit variants, never their input strings.
 		#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum $name { $($variant),+ }
         impl crate::review::ClosedSqlEnum for $name {}
 		impl $name { pub fn as_str(self) -> &'static str { match self { $(Self::$variant => $value),+ } } }
@@ -158,15 +162,3 @@ macro_rules! string_enum {
 	};
 }
 pub(crate) use string_enum;
-
-macro_rules! standalone {
-	($($name:ident $(<$($source:ident),+>)? ($($arg:ident : $ty:ty),* $(,)?) -> $result:ty;)+) => {
-		/// Convenience entry points that own an IMMEDIATE transaction.
-		pub mod standalone { use super::*; $(
-			pub fn $name $(<$($source: loupe_provenance::Source),+>)? (conn: &mut rusqlite::Connection, $($arg: $ty),*) -> crate::Result<$result> {
-				crate::transaction::immediate(conn, |tx| super::$name(tx, $($arg),*))
-			}
-		)+ }
-	};
-}
-pub(crate) use standalone;

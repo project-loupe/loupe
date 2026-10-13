@@ -174,6 +174,10 @@ pub async fn fetch_app(
 ) -> Result<GithubAppInfo> {
 	let jwt = key.sign_jwt(now_unix())?;
 	let url = api_base.join("/app").map_err(|e| anyhow!("building app URL: {e}"))?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "GitHub credential owner verifies the admitted App key at the fixed app endpoint"
+	)]
 	let resp = github_request(http.get(url), jwt.expose())
 		.send()
 		.await
@@ -312,6 +316,10 @@ async fn lookup_installation(
 	let url = api_base
 		.join(&format!("/repos/{owner}/{repo}/installation"))
 		.map_err(|e| anyhow!("building installation URL: {e}"))?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "GitHub credential owner resolves installation for the selected repository destination"
+	)]
 	let resp = github_request(http.get(url), jwt.expose())
 		.send()
 		.await
@@ -350,6 +358,10 @@ async fn mint_token(
 	let url = api_base
 		.join(&format!("/app/installations/{installation_id}/access_tokens"))
 		.map_err(|e| anyhow!("building access token URL: {e}"))?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "GitHub credential owner requests an issues-write token restricted to the selected repository"
+	)]
 	let resp = github_request(http.post(url), jwt.expose())
 		.json(&AccessTokenRequest {
 			repositories: [repo],

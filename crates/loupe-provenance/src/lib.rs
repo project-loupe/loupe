@@ -1,3 +1,17 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 //! Provenance labels: where a value came from, and whether it is a
 //! secret, enforced by the type system.
 //!
@@ -19,16 +33,14 @@
 //!   `Drop` zeroises the bytes through volatile writes.
 //!
 //! `no_std` plus `alloc`, no dependencies. This crate never touches a
-//! socket, file, clock or process. Nothing in it panics. The trust
-//! model it encodes is `SECURITY-FIRST-REFACTOR.md` section 2; the
-//! practices the implementation commits to, and the one `unsafe`
-//! exception, are in `PRACTICES.md` beside this crate.
+//! socket, file, clock or process. Nothing in it panics. Source labels
+//! and their trust assumptions are defined in [`Source`]; the crate's
+//! security contracts are documented in `PRACTICES.md`.
 #![no_std]
 // `unsafe_code` is denied by the workspace lints. One module,
-// `volatile`, allows it for the zeroising writes; see that file and
-// PRACTICES.md, practice P9.
+// `volatile`, allows it for zeroising writes.
 #![deny(missing_docs)]
-// Not a parser crate, but it promises never to panic (practice P6), so
+// Not a parser crate, but it promises never to panic, so
 // it opts into the parser lint block to hold that for every input size,
 // not only the Kani bounds.
 #![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::panic)]

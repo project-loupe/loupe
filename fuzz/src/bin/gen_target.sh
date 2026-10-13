@@ -37,6 +37,7 @@ GEN_TEST server_request_parsers
 GEN_TEST smoke
 GEN_TEST storage_identity
 GEN_TEST storage_policy_snapshot
+GEN_TEST storage_scope_sequence
 GEN_TEST storage_source_refs
 GEN_TEST tls_fingerprint
 GEN_TEST tls_input
@@ -45,6 +46,8 @@ GEN_TEST web_api
 GEN_TEST web_server_response
 GEN_TEST worker_broker_policy
 GEN_TEST worker_broker_usage
+GEN_TEST worker_canary_observe
+GEN_TEST worker_citation
 GEN_TEST worker_client_ingress
 GEN_TEST worker_config
 GEN_TEST worker_extract_json

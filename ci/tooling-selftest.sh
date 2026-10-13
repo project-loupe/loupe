@@ -33,6 +33,7 @@ fixture() {
 	# The real compiler bypass probes run separately in ci/gate-selftest.sh.
 	# shellcheck disable=SC2016 # The generated script expands its own FIXTURE.
 	printf '#!/bin/sh\n: > "$FIXTURE/state/minting-selftest"\n' > "$CASE/repo/ci/gate-selftest.sh"
+	printf '#!/bin/sh\nexit 0\n' > "$CASE/repo/ci/production-lint-selftest.sh"
 	printf '# No unsafe files in this fixture.\n' > "$CASE/repo/ci/unsafe-allow.txt"
 	printf '# No build scripts in this fixture.\n' > "$CASE/repo/ci/build-scripts.txt"
 	printf '# No no-verdict harnesses in this fixture.\n' > "$CASE/repo/ci/kani-no-verdict.txt"
@@ -238,6 +239,16 @@ metadata_tools)
 		grep -q "a product crate depends on a tool crate:.*$tool" "$CASE/output" || fail 'tool dependency failed for an unrelated reason'
 	done
 	;;
+production_lints)
+	fixture production_lints
+	"$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1 || fail 'production lint fixture rejected'
+	production=$(grep '^clippy --workspace --lib --bins --all-features -- ' "$CASE/state/cargo-args" || true)
+	[[ -n $production ]] || fail 'production lint pass is missing'
+	for lint in unwrap_used expect_used string_slice mem_forget dbg_macro todo unimplemented disallowed_methods; do
+		[[ $production == *"-D clippy::$lint"* ]] || fail "production pass omitted $lint"
+	done
+	grep -q '^clippy --workspace --all-targets --all-features -- -D warnings$' "$CASE/state/cargo-args" || fail 'test lint policy changed'
+	;;
 minting_default)
 	fixture minting_default
 	unset LOUPE_GATE_UNSAFE
@@ -256,6 +267,91 @@ minting_default)
 	rm "$CASE/repo/crates/loupe-worker/src/unlisted.rs"
 	"$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1 || fail 'clean fixture rejected with legacy opt-out'
 	[[ -f $CASE/state/minting-selftest ]] || fail 'compiler bypass self-tests were omitted'
+	;;
+debug_default)
+	fixture debug_default
+	unset LOUPE_DEBUG_GATE_CRATES
+	"$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1 || fail 'clean debug fixture rejected'
+	printf '#[derive(Debug)]\nstruct Payload(String);\n' > "$CASE/repo/crates/loupe-worker/src/lib.rs"
+	for setting in unset empty unrelated; do
+		case "$setting" in
+		empty) export LOUPE_DEBUG_GATE_CRATES='' ;;
+		unrelated) export LOUPE_DEBUG_GATE_CRATES=loupe-core ;;
+		esac
+		if "$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1; then
+			fail "default gate accepted unreviewed derived Debug ($setting)"
+		fi
+		grep -q 'derived Debug without a debug-ok reason' "$CASE/output" || {
+			cat "$CASE/output"
+			fail 'derived Debug gate failed for an unrelated reason'
+		}
+	done
+	;;
+debug_raw_comment_position|debug_block_comment_position)
+	fixture "$1"
+	case "$1" in
+	debug_raw_comment_position)
+		cat > "$CASE/repo/crates/loupe-worker/src/lib.rs" <<'RUST'
+const TEXT: &str = r#"
+// debug-ok: this is still raw-string content"#; // unrelated real comment
+#[derive(Debug)]
+pub struct Payload(String);
+RUST
+		;;
+	debug_block_comment_position)
+		cat > "$CASE/repo/crates/loupe-worker/src/lib.rs" <<'RUST'
+/*
+// debug-ok: this is still a block comment */ // unrelated real comment
+#[derive(Debug)]
+pub struct Payload(String);
+RUST
+		;;
+	esac
+	if "$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1; then
+		fail "gate accepted literal Debug reason with unrelated trailing comment ($1)"
+	fi
+	grep -q 'derived Debug without a debug-ok reason' "$CASE/output" || {
+		cat "$CASE/output"
+		fail 'derived Debug gate failed for an unrelated reason'
+	}
+	;;
+debug_multiline)
+	fixture debug_multiline
+	export LOUPE_DEBUG_GATE_CRATES=loupe-worker
+	for form in plain multiline empty_reason string_reason block_reason raw_reason; do
+		case "$form" in
+		plain) code='#[derive(Debug)]\nstruct Payload(String);' ;;
+		multiline) code='#[derive(\n    Clone,\n    Debug,\n)]\nstruct Payload(String);' ;;
+		empty_reason) code='// debug-ok:   \n#[derive(Debug)]\nstruct Payload(String);' ;;
+		string_reason) code='const TEXT: &str = "// debug-ok: this is not a comment";\n#[derive(Debug)]\nstruct Payload(String);' ;;
+		raw_reason) code='const TEXT: &str = r#"\n// debug-ok: this is raw string content"#;\n#[derive(Debug)]\nstruct Payload(String);' ;;
+		block_reason) code='/*\n// debug-ok: this is a block comment, not the required line comment */\n#[derive(Debug)]\nstruct Payload(String);' ;;
+		esac
+		printf '%b\n' "$code" > "$CASE/repo/crates/loupe-worker/src/lib.rs"
+		if "$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1; then
+			fail "gate accepted unreviewed derived Debug ($form)"
+		fi
+		grep -q 'derived Debug without a debug-ok reason' "$CASE/output" || {
+			cat "$CASE/output"
+			fail 'derived Debug gate failed for an unrelated reason'
+		}
+	done
+	cat > "$CASE/repo/crates/loupe-worker/src/lib.rs" <<'RUST'
+// A comment mentioning #[derive(Debug)] is not an attribute.
+const TEXT: &str = "#[derive(Debug)]";
+// debug-ok: a scalar counter contains no input content.
+#[derive(
+    Clone,
+    Debug,
+)]
+struct Count(u64);
+#[derive(Debug)] // debug-ok: closed unit variants contain no input content.
+enum Category { One, Two }
+RUST
+	"$CASE/repo/ci/check.sh" > "$CASE/output" 2>&1 || {
+		cat "$CASE/output"
+		fail 'reviewed scalars or non-code Debug mentions were rejected'
+	}
 	;;
 forward_env)
 	fixture forward_env
@@ -536,7 +632,7 @@ kani_cleanup_stubborn)
 	done
 	;;
 all)
-	for name in env metadata metadata_error metadata_uncached metadata_dependency_error metadata_tools minting_default forward_env generated_staged generated_changes generated_ci short_lock kill_after target_dir default_targets empty_targets singleton cleanup failure find timeout kani kani_failure kani_cleanup kani_singleton kani_slots kani_slot_cap kani_memory_cap kani_memory_arg_cap kani_required kani_lower_limits kani_stubbing kani_verdict kani_harness_cleanup kani_cleanup_stubborn; do
+	for name in env metadata metadata_error metadata_uncached metadata_dependency_error metadata_tools production_lints minting_default debug_default debug_multiline debug_raw_comment_position debug_block_comment_position forward_env generated_staged generated_changes generated_ci short_lock kill_after target_dir default_targets empty_targets singleton cleanup failure find timeout kani kani_failure kani_cleanup kani_singleton kani_slots kani_slot_cap kani_memory_cap kani_memory_arg_cap kani_required kani_lower_limits kani_stubbing kani_verdict kani_harness_cleanup kani_cleanup_stubborn; do
 		"$SCRIPT_DIR/tooling-selftest.sh" "$name"
 	done
 	;;

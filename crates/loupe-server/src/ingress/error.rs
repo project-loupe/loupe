@@ -3,6 +3,7 @@ use std::fmt::{self, Write};
 use axum::http::StatusCode;
 
 /// Closed parser metadata. Never retains a serde error, input bytes or cause.
+// debug-ok: parser categories are fixed literals and policy errors contain no input bytes or causes.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DecodeError {
 	#[error("invalid JSON syntax")]

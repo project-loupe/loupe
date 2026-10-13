@@ -39,7 +39,12 @@ impl CheckedJson {
 		Ok(Self { value, canonical, digest })
 	}
 	pub(crate) fn expose(&self) -> &str {
-		std::str::from_utf8(&self.canonical).expect("canonical JSON is UTF-8")
+		#[expect(
+			clippy::expect_used,
+			reason = "the private canonical buffer is created only by JSON serialization, whose output is UTF-8"
+		)]
+		let text = std::str::from_utf8(&self.canonical).expect("canonical JSON is UTF-8");
+		text
 	}
 	pub(crate) fn canonical(&self) -> &[u8] {
 		&self.canonical
@@ -54,9 +59,8 @@ impl Serialize for CheckedJson {
 	}
 }
 
-// Exercise the parser's actual serde visitor paths without restoring a public
-// Deserialize implementation for a source-bearing value. The final raw entry
-// point additionally checks the original document cap before this traversal.
+// Exercise the serde visitor without constructing a source-bearing value.
+// The production entry point also checks the document cap before traversal.
 #[cfg(test)]
 pub(super) fn visitor_fixture<'de, P: JsonPolicy, D: serde::Deserializer<'de>>(
 	deserializer: D,

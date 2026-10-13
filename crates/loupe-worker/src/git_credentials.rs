@@ -60,6 +60,10 @@ impl Destination {
 		if path.is_empty() || path.split('/').any(|part| matches!(part, "." | "..")) {
 			bail!("invalid Git repository path");
 		}
+		#[allow(
+			clippy::unwrap_used,
+			reason = "The host was checked above; this HTTPS branch always has the standard port when omitted."
+		)]
 		let destination = is_https.then(|| Self {
 			host: url.host_str().unwrap().to_owned(),
 			port: url.port_or_known_default().unwrap(),
@@ -239,9 +243,17 @@ impl Session {
 		// bind, repository, or the persistent cache. Sandboxes get fresh /tmp.
 		let dir =
 			tempfile::Builder::new().prefix("loupe-git-").rand_bytes(22).tempdir_in("/tmp")?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The credential owner restricts its fresh private temporary directory to the owner."
+		)]
 		std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
 		let socket = dir.path().join("credential.sock");
 		let listener = UnixListener::bind(&socket)?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The credential owner restricts its freshly bound local socket to the owner."
+		)]
 		std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 		listener.set_nonblocking(true)?;
 		let stop = Arc::new(AtomicBool::new(false));
@@ -258,8 +270,8 @@ impl Session {
 							let accepted = WireBuffer::read(&stream, deadline, false)
 								.is_ok_and(|request| destination.matches(request.expose()));
 							if accepted {
-								// Reviewed authentication handoff. No intermediate String
-								// or encoded URL owns a second copy of this PAT.
+								// Borrow the PAT directly into the authentication pipe;
+								// no intermediate String or encoded URL owns another copy.
 								let _ =
 									write(&stream, b"username=x-access-token\npassword=", deadline)
 										.and_then(|()| {
@@ -323,6 +335,10 @@ impl GitCredentialOperation {
 	}
 
 	pub(crate) fn command(&self) -> Command {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "GitCredentialOperation owns the fixed Git command and clears inherited credential configuration."
+		)]
 		let mut command = Command::new("git");
 		command.env_clear();
 		// Preserve ordinary Git transport/config discovery explicitly. In
@@ -372,7 +388,15 @@ impl GitCredentialOperation {
 
 	fn install_helper(&self, command: &mut Command) {
 		if let (Some(session), Some(helper)) = (&self.session, &self.helper) {
+			#[allow(
+				clippy::expect_used,
+				reason = "The selected helper path was explicitly validated as UTF-8 during operation construction."
+			)]
 			let helper = shell_quote(helper.to_str().expect("validated helper"));
+			#[allow(
+				clippy::expect_used,
+				reason = "The socket path is created under literal /tmp with an ASCII random basename."
+			)]
 			let socket = shell_quote(session.socket.to_str().expect("private ASCII socket path"));
 			command.args([
 				"-c",
@@ -416,6 +440,10 @@ impl GitCredentialOperation {
 			return Ok((command, self.url.clone()));
 		};
 		let effective = self.effective_url(directory)?;
+		#[allow(
+			clippy::unwrap_used,
+			reason = "The private tempfile directory created by Session always has its generated basename."
+		)]
 		let alias = format!(
 			"loupe-git://{}/repository",
 			session._dir.path().file_name().unwrap().to_string_lossy()
@@ -435,12 +463,20 @@ impl GitCredentialOperation {
 		if let Some(directory) = directory {
 			command.current_dir(directory);
 		}
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Local Git URL projection uses the credential owner's cleared environment and bounded stdout reader."
+		)]
 		let mut child = command
 			.args(["ls-remote", "--get-url", "--", &self.url])
 			.stdout(Stdio::piped())
 			.spawn()
 			.context("starting Git URL projection")?;
 		let deadline = Instant::now() + IO_DEADLINE;
+		#[allow(
+			clippy::expect_used,
+			reason = "This newly spawned projection command explicitly pipes stdout and has not taken it."
+		)]
 		let output =
 			WireBuffer::read(child.stdout.as_ref().expect("piped Git output"), deadline, true);
 		if output.is_err() {
@@ -464,6 +500,10 @@ impl GitCredentialOperation {
 		if !status.success() {
 			bail!("Git URL projection failed ({status})");
 		}
+		#[allow(
+			clippy::expect_used,
+			reason = "The error branch above returns after killing and reaping the child."
+		)]
 		let output = output.expect("checked projection output");
 		let raw = std::str::from_utf8(output.expose())
 			.ok()
@@ -541,6 +581,10 @@ fn validate_projection(raw: &str) -> Result<()> {
 		// A slash before the first colon denotes a local path. Local and
 		// SCP paths are never percent-decoded by Git's transport parser.
 		if !prefix.contains('/') {
+			#[allow(
+				clippy::string_slice,
+				reason = "The closing bracket is an ASCII byte found by str::find, so its end is a UTF-8 boundary."
+			)]
 			let host_end = if raw.starts_with('[') {
 				let close = raw.find(']').context("invalid Git URL projection authority")?;
 				close
@@ -549,6 +593,10 @@ fn validate_projection(raw: &str) -> Result<()> {
 			} else {
 				prefix.len()
 			};
+			#[allow(
+				clippy::string_slice,
+				reason = "The endpoint is an ASCII delimiter position returned by str::find or split_once."
+			)]
 			if raw[..host_end].contains('@') || raw.contains("@[") {
 				bail!("Git URL projection contains userinfo");
 			}
@@ -595,7 +643,7 @@ pub fn run_git_credential_helper(socket: &Path, operation: &str) {
 				let stream = connect(socket, deadline)?;
 				write(&stream, request.expose(), deadline)?;
 				let response = WireBuffer::read(&stream, deadline, false)?;
-				// Reviewed handoff into Git's credential pipe. This allocation
+				// Handoff into Git's credential pipe. This allocation
 				// is wiped after the direct write, including error exits.
 				write(&io::stdout(), response.expose(), deadline)
 			},

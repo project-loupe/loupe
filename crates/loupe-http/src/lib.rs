@@ -1,3 +1,17 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 #![forbid(unsafe_code)]
 //! Shared response transport budget for worker, CLI, and web clients.
 //!
@@ -13,12 +27,29 @@ use loupe_provenance::Zeroise;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A response could not be collected within the transport budget.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ResponseBodyError {
 	#[error("response body exceeds {MAX_RESPONSE_BYTES} bytes")]
 	TooLarge,
-	#[error("reading response body: {0}")]
-	Transport(#[from] reqwest::Error),
+	#[error("reading response body failed")]
+	Transport(reqwest::Error),
+}
+
+impl std::fmt::Debug for ResponseBodyError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			Self::TooLarge => "TooLarge",
+			Self::Transport(_) => "Transport([redacted])",
+		})
+	}
+}
+
+impl From<reqwest::Error> for ResponseBodyError {
+	fn from(error: reqwest::Error) -> Self {
+		// Keep the transport category inspectable without exposing request
+		// URLs or dependency diagnostics through a printable source chain.
+		Self::Transport(error)
+	}
 }
 
 // This private construction/transport owner has mutable storage only while

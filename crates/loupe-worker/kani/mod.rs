@@ -1,8 +1,8 @@
 //! Bounded proofs for the production broker and sandbox decisions.
 //! Run only through ci/kani.sh; host discovery and JSON wire parsing remain
-//! exercised by their integration tests and S1 fuzz targets.
+//! exercised by their integration tests and fuzz targets.
 
-// invariant: I4, I6. Proves the actual byte-level candidate selector over two
+// Proves the actual byte-level candidate selector over two
 // original payloads of 0..=40 bytes and all three full 128-bit draws. Each
 // payload can contain an entire 32-byte hex boundary. Tags/Marked/JSON join
 // this core through unit and fuzz checks; no claim about model obedience.
@@ -140,9 +140,8 @@ use serde_json::{Map, Value};
 use crate::llm::model_broker::{
 	apply_request_policy, strip_request_header_name, ModelBrokerBackend,
 };
-use crate::sandbox::{SandboxBuilder, SandboxHostFacts, SandboxNetworkConfig};
+use crate::sandbox::{SandboxBuilder, SandboxHostFacts};
 
-// invariant: I3, I10
 // All fixed denied names (including those longer than 12 bytes), plus an
 // arbitrary byte prefix of length 0..=12. This covers proxy- plus six bytes;
 // the pure core is checked even for bytes HeaderName itself would reject.
@@ -209,19 +208,27 @@ const ENV_NAMES: [&str; 8] = [
 fn sandbox_fixture(
 	network: bool, supervisor: bool, bind: bool, explicit: Option<usize>,
 ) -> (SandboxBuilder, SandboxHostFacts) {
-	let mut builder = SandboxBuilder::new("/repo");
+	let mut builder = SandboxBuilder::fixture("/repo");
 	if network {
-		builder = builder.with_network(SandboxNetworkConfig::default(), vec!["api.test".into()]);
+		builder = builder.with_network(
+			Default::default(),
+			crate::config::SandboxRequiredHosts::fixture(vec!["api.test".into()]),
+		);
 	}
 	if supervisor {
-		builder = builder.with_network_supervisor("/pinned-worker");
+		builder = builder
+			.with_network_supervisor(crate::sandbox::SandboxPath::fixture("/pinned-worker".into()));
 	}
 	if bind {
 		// A flag-looking operand must never be mistaken for an option.
-		builder = builder.bind_ro("--cap-add", "/home/scanner/config");
+		builder = builder.bind_ro(
+			crate::sandbox::SandboxPath::fixture("--cap-add".into()),
+			"/home/scanner/config",
+		);
 	}
 	if let Some(index) = explicit {
-		builder = builder.set_env(ENV_NAMES[index], "--share-net");
+		builder = builder
+			.set_env(ENV_NAMES[index], crate::sandbox::SandboxValue::r#static("--share-net"));
 	}
 	let host = SandboxHostFacts {
 		launcher: PathBuf::from(if !network {
@@ -313,7 +320,6 @@ fn check_sandbox_argv(
 	std::mem::forget(expected);
 }
 
-// invariant: I9
 // Symbolic network/supervisor/bind choices, with one system directory, one
 // public system file and at most one extra bind. Repeating a bind cannot add
 // a new flag kind. Partition the eight boolean combinations before allocating
@@ -343,7 +349,7 @@ fn argv_never_contains_a_forbidden_flag() {
 fn check_sandbox_case(network: bool, supervisor: bool, bind: bool, explicit: Option<usize>) {
 	let (builder, host) = sandbox_fixture(network, supervisor, bind, explicit);
 	let args = [OsString::from("--cap-add"), OsString::from("--")];
-	let argv = builder.argv("/bin/true", &args, &host);
+	let argv = builder.argv(std::ffi::OsStr::new("/bin/true"), &args, &host);
 	assert_eq!(argv[0], host.launcher.as_os_str());
 	check_sandbox_argv(&argv, network, supervisor, bind, explicit);
 	#[cfg(kani)]
@@ -354,7 +360,6 @@ fn check_sandbox_case(network: bool, supervisor: bool, bind: bool, explicit: Opt
 	}
 }
 
-// invariant: I3, I9
 // Eight names cover ordinary/fixed names and every secret denylist entry.
 // Zero or one explicit entry suffices for the per-entry name property; the
 // production loop appends each additional entry by the same projection.
@@ -408,10 +413,9 @@ fn small_value(choice: u8, tool: u8) -> Value {
 	}
 }
 
-// invariant: I10
 // Up to three symbolic keys from six names; seven shapes include malformed
 // configs, empty/nonempty server lists and all provider-side tool classes.
-// The real inner object policy is called; S1 covers wire parsing/serialization.
+// The real inner object policy is called; fuzzing covers wire parsing/serialization.
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(20)]

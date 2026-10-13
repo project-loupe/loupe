@@ -1,7 +1,6 @@
-//! Schema v3 DDL, mapped to SPEC-01 sections (planning commit 720fc9c).
+//! Schema v3 DDL for campaign-based review state.
 //! Published migrations are immutable; later changes require a new version.
 
-/// SPEC-01 §1.
 pub(super) const JOB_KINDS: &str = r#"
 CREATE TABLE job_kinds (
     -- NOT NULL is explicit: SQLite admits NULL in a non-INTEGER PRIMARY KEY.
@@ -12,7 +11,7 @@ INSERT INTO job_kinds (kind, legacy) VALUES
     ('scan', 1), ('verify', 0), ('survey', 0), ('drilldown', 0);
 "#;
 
-/// SPEC-01 §2: replacement table, populated only through the legacy projection.
+/// Replacement jobs table, populated only through the legacy projection.
 pub(super) const JOBS_NEW: &str = r#"
 CREATE TABLE jobs_new (
     id                  INTEGER PRIMARY KEY,
@@ -52,7 +51,6 @@ CREATE TABLE jobs_new (
 );
 "#;
 
-/// SPEC-01 §3.
 pub(super) const REVIEW_CAMPAIGNS: &str = r#"
 CREATE TABLE review_campaigns (
     campaign_id          INTEGER PRIMARY KEY,
@@ -80,7 +78,6 @@ CREATE UNIQUE INDEX idx_campaigns_one_active
     ON review_campaigns(repo_id) WHERE state = 'active';
 "#;
 
-/// SPEC-01 §4.
 pub(super) const REVIEW_GENERATIONS: &str = r#"
 CREATE TABLE review_generations (
     generation_id         INTEGER PRIMARY KEY,
@@ -108,7 +105,6 @@ CREATE UNIQUE INDEX idx_generations_one_active
 CREATE INDEX idx_generations_repo ON review_generations(repo_id, created_at DESC);
 "#;
 
-/// SPEC-01 §5.
 pub(super) const GENERATION_INVENTORY: &str = r#"
 CREATE TABLE generation_inventory (
     inventory_entry_id INTEGER PRIMARY KEY,
@@ -125,7 +121,6 @@ CREATE TABLE generation_inventory (
 );
 "#;
 
-/// SPEC-01 §6.
 pub(super) const REVIEW_UNITS: &str = r#"
 CREATE TABLE review_units (
     review_unit_id     INTEGER PRIMARY KEY,
@@ -163,7 +158,6 @@ CREATE TABLE job_assigned_review_units (
 );
 "#;
 
-/// SPEC-01 §7.
 pub(super) const REVIEW_UNIT_RESULTS: &str = r#"
 CREATE TABLE review_unit_results (
     review_unit_result_id INTEGER PRIMARY KEY,
@@ -191,7 +185,6 @@ CREATE TABLE review_unit_results (
 CREATE INDEX idx_unit_results_unit ON review_unit_results(review_unit_id, created_at DESC);
 "#;
 
-/// SPEC-01 §8.
 pub(super) const LEADS: &str = r#"
 CREATE TABLE leads (
     lead_id            INTEGER PRIMARY KEY,
@@ -241,9 +234,8 @@ CREATE TABLE lead_observations (
 );
 "#;
 
-/// SPEC-01 §9.
 pub(super) const JOB_RECEIPTS: &str = r#"
--- [transient-ish: retained for replay, GC'd with the job's retry grace]
+-- Replay receipts are deleted with their job through the foreign-key cascade.
 CREATE TABLE job_checkpoints (
     job_checkpoint_id INTEGER PRIMARY KEY,
     job_id           INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -273,7 +265,6 @@ CREATE TABLE job_terminal_receipts (
 );
 "#;
 
-/// SPEC-01 §10.
 pub(super) const FINDING_EXTENSIONS: &str = r#"
 CREATE TABLE finding_review_details (
     finding_id         INTEGER PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
@@ -316,7 +307,6 @@ CREATE TABLE verification_attempt_details (
 );
 "#;
 
-/// SPEC-01 §11.
 pub(super) const PROOF_STORAGE: &str = r#"
 CREATE TABLE proof_artifact_blobs (
     proof_artifact_blob_id INTEGER PRIMARY KEY,
@@ -374,7 +364,7 @@ CREATE TABLE proof_executions (
     working_dir        TEXT    NOT NULL,   -- logical, relative
     env_names          TEXT    NOT NULL,   -- JSON: allowlisted names + non-secret values
     fixture_artifact_ids TEXT,             -- JSON: staged fixture references
-    network_policy     TEXT    NOT NULL,   -- 'isolated' (only value until networked-e2e ships)
+    network_policy     TEXT    NOT NULL,   -- 'isolated'
     limits             TEXT    NOT NULL,   -- JSON: cpu/mem/pids/file/time/output
     timeout_seconds    INTEGER NOT NULL,
     started_at         INTEGER NOT NULL,

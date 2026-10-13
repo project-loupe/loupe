@@ -4,7 +4,7 @@ use loupe_proto::{JobCapability, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_worker::ServerClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// Kept literal so this regression also compiles against the pre-budget client.
+// Independent expectation: changing the production limit must not change this assertion.
 const BUDGET: usize = 16 * 1024 * 1024;
 
 async fn chunked_response(status: &str, prefix: &[u8], length: usize) -> reqwest::Url {
@@ -108,7 +108,7 @@ async fn conservative_escaped_finding_fixture_fits_budget() {
 		"verification_required": true, "created_at": 42,
 	}))
 	.unwrap();
-	// Preserve the original six-byte escaping stress while using admitted text.
+	// Six-byte escapes stress wire size while the decoded text stays valid.
 	// serde_json would otherwise serialize these letters as one byte each.
 	body = body.replace(&format!("\"{diff}\""), &format!("\"{}\"", "\\u0061".repeat(diff.len())));
 	body = body.replace(
@@ -135,6 +135,8 @@ async fn all_worker_response_paths_reject_malformed_dtos() {
 			// The query owner is admitted from the original MCP request. The
 			// same client search response decoder must still reject this DTO.
 			let context = loupe_worker::mcp::McpSessionContext {
+				security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new())
+					.unwrap(),
 				tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 				client: std::sync::Arc::new(client),
 				job_capability: capability.clone(),

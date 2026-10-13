@@ -11,7 +11,12 @@ BEGIN { st = "code"; depth = 0; hashes = 0 }
 	while (i <= n) {
 		c = substr(line, i, 1); d = substr(line, i + 1, 1)
 		if (st == "code") {
-			if (c == "/" && d == "/") { st = "line"; break }
+			if (c == "/" && d == "/") {
+				# Optional line/column output identifies the actual // token;
+				# an earlier literal marker on this line is not that comment.
+				if (line_comments != "") print FNR, i > line_comments
+				st = "line"; break
+			}
 			if (c == "/" && d == "*") { st = "block"; depth = 1; i += 2; continue }
 			# r"..." raw string, br"..." raw byte string, cr"..." raw C string:
 			# the prefix starts a token, so the octet before it is not part

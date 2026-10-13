@@ -1,8 +1,9 @@
 //! Header injection checks for validated operator fields and arbitrary findings.
-use loupe_server::reporters::{email, ReportFinding};
+use loupe_server::reporters::email;
 use serde::Deserialize;
 
 use crate::server_common;
+use crate::server_report_github::reference_field;
 use crate::utils::test_logger;
 
 #[derive(Deserialize)]
@@ -20,7 +21,8 @@ pub fn do_test(data: &[u8]) {
 		.into_iter()
 		.chain(input.to.iter().map(|value| ("To", value)))
 	{
-		let valid = !value.contains(['\r', '\n']);
+		let valid =
+			value.chars().all(|ch| crate::cli_common::exact(ch.encode_utf8(&mut [0; 4]), false));
 		assert_eq!(
 			email::validate_header_value(name, value).is_ok(),
 			valid,
@@ -31,31 +33,60 @@ pub fn do_test(data: &[u8]) {
 	if !accepted {
 		return;
 	}
-	let repo = server_common::repo_with_reporting(serde_json::json!({
-		"kind":"email", "from":input.from, "to":input.to, "subject_prefix":input.subject
-	}));
+	let bytes =
+		serde_json::to_vec(&input.finding).unwrap_or_else(|e| panic!("finding fixture: {e}"));
+	let Some(finding) = server_common::finding(&bytes) else { return };
+	let prepared = server_common::prepared_report(
+		serde_json::json!({
+			"kind":"email", "from":input.from, "to":input.to, "subject_prefix":input.subject
+		}),
+		&finding,
+		false,
+	);
 	let admitted = [&input.from, &input.subject]
 		.into_iter()
 		.chain(input.to.iter())
 		.all(|value| crate::cli_common::exact(value, false));
-	assert_eq!(repo.is_ok(), admitted, "stored header admission differs");
-	let Ok(repo) = repo else { return };
-	let bytes =
-		serde_json::to_vec(&input.finding).unwrap_or_else(|e| panic!("finding fixture: {e}"));
-	let Some(finding) = server_common::finding(&bytes) else { return };
+	assert_eq!(prepared.is_ok(), admitted, "stored header admission differs");
+	let Ok((_db, batch)) = prepared else { return };
 	let subject = format!("{} 1 {} finding(s) in example/repo", input.subject, finding.severity);
-	let report = ReportFinding { id: 1, finding, reviewed_revision: None };
-	let message = email::fuzz_render_message(&repo, &[report])
-		.unwrap_or_else(|e| panic!("admitted email renderer: {e}"));
+	let expected = format!("From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8",
+		input.from, input.to.join(", "), subject);
+	let mut content = String::from("loupe has finished a scan\n\n");
+	for (label, value) in [
+		("repository owner", "example"),
+		("repository", "repo"),
+		("clone URL", "https://github.com/example/repo.git"),
+	] {
+		content.push_str(&reference_field(label, value, ""));
+	}
+	content
+		.push_str(&format!("Findings: 1\n\nFinding LUP-1\n\n- severity: {}\n", finding.severity));
+	content.push_str(&reference_field("title", finding.title.expose(), ""));
+	content.push_str(&reference_field("reviewed revision", "reviewed-sha", ""));
+	if let Some(path) = &finding.file_path {
+		let path = match finding.line_start {
+			Some(line) => format!("{}:{line}", path.expose()),
+			None => path.expose().to_owned(),
+		};
+		content.push_str(&reference_field("file", &path, ""));
+	}
+	if let Some(cwe) = &finding.cwe {
+		content.push_str(&reference_field("cwe", cwe.expose(), ""));
+	}
+	content.push_str(&reference_field("description", finding.description.expose(), ""));
+	let message = email::fuzz_render_message(&batch);
+	let within_budget = expected.split("\r\n").all(|line| line.len() + 2 <= 8192)
+		&& expected.len() + 2 <= 65_536
+		&& expected.len() + 4 + content.len() <= 16 * 1024 * 1024;
+	assert_eq!(message.is_ok(), within_budget, "assembled email budget differs");
+	let Ok(message) = message else { return };
 	let Some((headers, body)) = message.split_once("\r\n\r\n") else {
 		panic!("email header boundary missing")
 	};
-	let expected = format!("From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8",
-		input.from, input.to.join(", "), subject);
 	assert_eq!(headers, expected, "finding content escaped into email headers");
-	// Main has no body cap. Keep a known oversize seed for S3 rather than
-	// introducing a cap or dynamically modifying committed test cases here.
-	std::hint::black_box(body.len() > 65_536);
+	assert_eq!(body, content, "original finding bytes must survive inside literal fields");
+	assert!(message.len() <= 16 * 1024 * 1024);
 }
 
 pub fn server_report_email_test<Out: test_logger::Output>(data: &[u8], _out: Out) {
@@ -96,12 +127,15 @@ mod tests {
 			serde_json::to_vec(&input.finding).unwrap_or_else(|e| panic!("admitted finding: {e}"));
 		let finding = server_common::finding(&finding_bytes)
 			.unwrap_or_else(|| panic!("companion must reach the real email renderer"));
-		let repo = server_common::repo_with_reporting(serde_json::json!({
-			"kind":"email", "from":input.from, "to":input.to, "subject_prefix":input.subject
-		}))
+		let (_db, batch) = server_common::prepared_report(
+			serde_json::json!({
+				"kind":"email", "from":input.from, "to":input.to, "subject_prefix":input.subject
+			}),
+			&finding,
+			false,
+		)
 		.unwrap_or_else(|e| panic!("admitted email fixture: {e}"));
-		let report = ReportFinding { id: 1, finding, reviewed_revision: None };
-		let message = email::fuzz_render_message(&repo, &[report])
+		let message = email::fuzz_render_message(&batch)
 			.unwrap_or_else(|e| panic!("actual email renderer: {e}"));
 		let (_, body) = message
 			.split_once("\r\n\r\n")

@@ -107,12 +107,14 @@ macro_rules! owner {
 					self.observe(None);
 				}
 				let body = self.0.encode().map_err(|error| Box::new(error.into_response()))?;
-				request
+				#[allow(clippy::disallowed_methods, reason = "dashboard egress sends the original admitted Browser body through its closed operation-specific owner")]
+				let response = request
 					.header(reqwest::header::CONTENT_TYPE, "application/json")
 					.body(body)
 					.send()
 					.await
-					.map_err(|_| Box::new(super::server::Failure::Transport.into_response()))
+					.map_err(|_| Box::new(super::server::Failure::Transport.into_response()));
+				response
 			}
 		}
 	};

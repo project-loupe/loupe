@@ -19,11 +19,25 @@ use clap::ValueEnum;
 use serde::Deserialize;
 use tokio::process::Command;
 
+mod binary;
+mod command;
+mod path;
+#[cfg(fuzzing)]
+mod projection;
+mod value;
+pub use binary::SandboxBinary;
+pub use command::{PreparedChild, PreparedCommand};
+pub use path::SandboxPath;
+pub use value::SandboxValue;
+
 /// Path to the bwrap binary. Resolved once and cached.
 const BWRAP_BIN: &str = "bwrap";
 
 #[cfg(fuzzing)]
 pub mod fuzzing {
+	pub use super::projection::{
+		observe, ProjectionInput, ProjectionObservation, ProjectionRejection,
+	};
 	pub use crate::sandbox_network::fuzzing::{
 		bwrap_pid, connected_routes, host_addresses, network_policy, uid_map, valid_network,
 	};
@@ -42,6 +56,7 @@ const SANDBOX_SYSTEM_FILES: &[&str] =
 const SANDBOX_NETWORK_FILES: &[&str] = &["/etc/hosts"];
 pub(crate) const SANDBOX_RESOLV_CONF_PLACEHOLDER: &str = "@LOUPE_RESOLV_CONF@";
 
+// debug-ok: Closed fieldless variants; no dynamic content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxNetworkMode {
@@ -65,6 +80,7 @@ impl std::fmt::Display for SandboxNetworkMode {
 	}
 }
 
+// debug-ok: Closed network mode and redacted configured host values.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxNetworkConfig {
 	pub mode: SandboxNetworkMode,
@@ -92,10 +108,11 @@ pub fn validate_network_host(host: &str) -> Result<()> {
 	Ok(())
 }
 
+// debug-ok: Both typed configuration owners redact their content.
 #[derive(Debug, Clone)]
 struct SandboxNetworkLaunch {
-	config: SandboxNetworkConfig,
-	required_hosts: Vec<String>,
+	config: crate::config::SandboxNetworkPolicy,
+	required_hosts: crate::config::SandboxRequiredHosts,
 }
 
 /// Public CA locations used by the major Linux distribution families.
@@ -131,6 +148,10 @@ fn ensure_sandbox_enabled(disabled: bool) -> Result<()> {
 /// means the sandbox is available.
 pub fn probe_at_startup(disabled_by_config: bool) -> Result<()> {
 	ensure_sandbox_enabled(disabled_by_config || sandbox_disabled())?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Startup probes fixed bubblewrap version with output discarded."
+	)]
 	let status = std::process::Command::new(BWRAP_BIN)
 		.arg("--version")
 		.stdout(Stdio::null())
@@ -150,10 +171,16 @@ pub fn probe_at_startup(disabled_by_config: bool) -> Result<()> {
 
 #[doc(hidden)]
 pub fn run_networked_sandbox(
-	mode: SandboxNetworkMode, required_hosts: Vec<String>, allow_hosts: Vec<String>,
-	command: Vec<OsString>,
+	mode: SandboxNetworkMode, required_hosts: Vec<crate::config::ConfiguredText>,
+	allow_hosts: Vec<crate::config::ConfiguredText>,
+	command: Vec<crate::config_value_parsers::SupervisorCommandArgument>,
 ) -> Result<ExitStatus> {
-	crate::sandbox_network::run_networked_sandbox(mode, required_hosts, allow_hosts, command)
+	crate::sandbox_network::run_networked_sandbox(
+		mode,
+		required_hosts.into_iter().map(|host| host.for_operation().to_owned()).collect(),
+		allow_hosts.into_iter().map(|host| host.for_operation().to_owned()).collect(),
+		command.into_iter().map(|argument| argument.into_supervisor_operand()).collect(),
+	)
 }
 
 /// Builder for a sandboxed `tokio::process::Command`. Default posture:
@@ -161,19 +188,29 @@ pub fn run_networked_sandbox(
 /// `$HOME`, private user/process/network namespaces, `--die-with-parent`,
 /// and a working directory set to neutral `/home/scanner`. The worktree remains readable at
 /// `/workdir` without becoming the instruction-discovery root.
+#[doc = include_str!("../tests/ui/typed_sandbox.md")]
 pub struct SandboxBuilder {
-	workdir: PathBuf,
+	workdir: SandboxPath,
+	launch_path: crate::config::ConfigNonSecret,
+	canary: Option<SandboxPath>,
 	network: Option<SandboxNetworkLaunch>,
-	network_supervisor: Option<PathBuf>,
+	network_supervisor: Option<SandboxPath>,
 	disabled: bool,
 	/// Caller-supplied read-only bind mounts (host path, sandbox
 	/// path). Populated by [`bind_ro`] and [`allow_binary`].
-	extra_ro_binds: Vec<(PathBuf, PathBuf)>,
-	/// Env vars to forward into the sandbox by name (the value is
-	/// looked up from the worker's own env at `build()` time).
+	extra_ro_binds: Vec<(SandboxPath, BindDestination)>,
+	/// Test-only env forwarding; values are looked up at `build()` time.
+	#[cfg(test)]
 	forward_env: Vec<&'static str>,
 	/// Env vars to set to caller-provided values.
-	set_env: Vec<(&'static str, OsString)>,
+	set_env: Vec<(&'static str, SandboxValue)>,
+}
+
+enum BindDestination {
+	Static(&'static str),
+	SameAsSource,
+	#[cfg(fuzzing)]
+	Fixture(OsString),
 }
 
 /// Facts discovered on the trusted host before projecting sandbox arguments.
@@ -193,13 +230,19 @@ impl SandboxBuilder {
 	/// Always wraps. `LOUPE_DISABLE_SANDBOX` is rejected at startup by
 	/// [`probe_at_startup`], so consulting it again here would only
 	/// add a second, quieter way to lose isolation.
-	pub fn new(workdir: impl Into<PathBuf>) -> Self {
+	pub fn new(workdir: SandboxPath, config: &crate::config::SandboxLaunchConfig) -> Self {
+		Self::with_launch_path(workdir, config.path().clone())
+	}
+	fn with_launch_path(workdir: SandboxPath, launch_path: crate::config::ConfigNonSecret) -> Self {
 		Self {
-			workdir: workdir.into(),
+			workdir,
+			launch_path,
+			canary: None,
 			network: None,
 			network_supervisor: None,
 			disabled: false,
 			extra_ro_binds: Vec::new(),
+			#[cfg(test)]
 			forward_env: Vec::new(),
 			set_env: Vec::new(),
 		}
@@ -207,22 +250,29 @@ impl SandboxBuilder {
 
 	#[cfg(test)]
 	pub(crate) fn disabled_for_tests(workdir: impl Into<PathBuf>) -> Self {
-		Self {
-			workdir: workdir.into(),
-			network: None,
-			network_supervisor: None,
-			disabled: true,
-			extra_ro_binds: Vec::new(),
-			forward_env: Vec::new(),
-			set_env: Vec::new(),
-		}
+		let mut builder = Self::fixture(workdir);
+		builder.disabled = true;
+		builder
+	}
+	#[cfg(any(test, kani))]
+	pub(crate) fn fixture(workdir: impl Into<PathBuf>) -> Self {
+		#[cfg(kani)]
+		let path = crate::config::ConfigNonSecret::proof_launch_path();
+		#[cfg(not(kani))]
+		let path = crate::config::SandboxLaunchConfig::default().path().clone();
+		Self::with_launch_path(SandboxPath::fixture(workdir.into()), path)
+	}
+	#[cfg(test)]
+	pub(crate) fn build_fixture(&self, program: &str) -> PreparedCommand {
+		self.build(SandboxValue::fixture(program), &[])
 	}
 
 	/// Attach isolated outbound networking. The required hosts are
 	/// backend-owned destinations such as the provider API and cannot
 	/// be removed by operator configuration.
 	pub fn with_network(
-		mut self, config: SandboxNetworkConfig, required_hosts: Vec<String>,
+		mut self, config: crate::config::SandboxNetworkPolicy,
+		required_hosts: crate::config::SandboxRequiredHosts,
 	) -> Self {
 		self.network = Some(SandboxNetworkLaunch { config, required_hosts });
 		self
@@ -232,22 +282,29 @@ impl SandboxBuilder {
 	/// sandbox. Production normally defaults to the current executable;
 	/// callers that already pin a worker binary for a broker mount should
 	/// use the same path here.
-	pub fn with_network_supervisor(mut self, worker_binary: impl Into<PathBuf>) -> Self {
-		self.network_supervisor = Some(worker_binary.into());
+	pub fn with_network_supervisor(mut self, worker_binary: SandboxPath) -> Self {
+		self.network_supervisor = Some(worker_binary);
 		self
 	}
 
 	/// Bind-mount `src` (a path on the host) read-only at `dst` (a path
 	/// inside the sandbox). The two can be equal — that's the common
 	/// case when surfacing a host install directly.
-	pub fn bind_ro(mut self, src: impl Into<PathBuf>, dst: impl Into<PathBuf>) -> Self {
-		self.extra_ro_binds.push((src.into(), dst.into()));
+	pub fn bind_ro(mut self, src: SandboxPath, dst: &'static str) -> Self {
+		self.extra_ro_binds.push((src, BindDestination::Static(dst)));
 		self
 	}
 
-	/// Forward a non-secret env var into the sandbox. The value is looked up
-	/// from the worker's own environment at `build()` time. Provider credentials
-	/// must remain in a host-side broker and must never use this path.
+	pub(crate) fn with_canary(
+		mut self, security: std::sync::Arc<crate::canary::JobSecurity>,
+	) -> Self {
+		self.canary = Some(SandboxPath::canary(&security));
+		self
+	}
+
+	/// Forward a non-secret env var for unit fixtures only. Production has no
+	/// ambient environment forwarding; credentials stay in the host broker.
+	#[cfg(test)]
 	pub fn forward_env(mut self, name: &'static str) -> Self {
 		self.forward_env.push(name);
 		self
@@ -256,8 +313,8 @@ impl SandboxBuilder {
 	/// Set an env var to a caller-provided value inside the sandbox.
 	/// This is useful when a backend accepts one env name but Loupe
 	/// supports a compatibility alias at the worker boundary.
-	pub fn set_env(mut self, name: &'static str, value: impl Into<OsString>) -> Self {
-		self.set_env.push((name, value.into()));
+	pub fn set_env(mut self, name: &'static str, value: SandboxValue) -> Self {
+		self.set_env.push((name, value));
 		self
 	}
 
@@ -285,59 +342,57 @@ impl SandboxBuilder {
 	/// Depending on the package manager, those deps can be nested under
 	/// the wrapper package or installed as siblings under the global
 	/// `node_modules` root. Codex is the canonical example.
-	pub fn allow_binary(self, name: &str) -> Result<Self> {
-		let original =
-			locate_on_path(name).ok_or_else(|| anyhow::anyhow!("`{name}` not found on PATH"))?;
-		let canonical = std::fs::canonicalize(&original)
-			.with_context(|| format!("canonicalizing {}", original.display()))?;
-
-		let entrypoint_bind = entrypoint_bind_source(&original)?;
-		let mut this = self.bind_ro(entrypoint_bind.clone(), entrypoint_bind);
-		// Decide what to mount alongside the entry point.
-		// Priority: directory canonical → that dir; npm package
-		// detected → the node_modules root; else canonical's parent.
-		let install_dir = if canonical.is_dir() {
-			canonical
-		} else if let Some(node_modules_root) = npm_node_modules_root(&canonical) {
-			node_modules_root
-		} else {
-			canonical
-				.parent()
-				.ok_or_else(|| anyhow::anyhow!("canonical path has no parent"))?
-				.to_path_buf()
-		};
-		this = this.bind_ro(install_dir.clone(), install_dir);
-		Ok(this)
+	pub fn allow_binary(mut self, binary: &SandboxBinary) -> Self {
+		self.extra_ro_binds.extend(
+			binary.binds().iter().cloned().map(|path| (path, BindDestination::SameAsSource)),
+		);
+		self
 	}
 
-	/// Build a `Command` for `program`. The command runs inside the
-	/// sandbox; its `args()` should be appended by the caller as normal.
-	/// Test-only disabled builders return a bare command rooted at the
-	/// worktree.
-	pub fn build(&self, program: &str) -> Command {
+	/// Finalize every operand before constructing the process command.
+	pub fn build(&self, program: SandboxValue, args: &[SandboxValue]) -> PreparedCommand {
+		let mut owners = Vec::new();
+		owners.extend(self.workdir.owner());
+		owners.extend(self.extra_ro_binds.iter().filter_map(|(source, _)| source.owner()));
+		owners.extend(self.network_supervisor.as_ref().and_then(SandboxPath::owner));
+		owners.extend(self.canary.as_ref().and_then(SandboxPath::owner));
+		owners.extend(program.owner());
+		owners.extend(args.iter().filter_map(SandboxValue::owner));
+		owners.extend(self.set_env.iter().filter_map(|(_, value)| value.owner()));
+		let program = program.operand();
+		let args: Vec<_> = args.iter().map(SandboxValue::operand).collect();
 		if self.disabled {
-			let mut cmd = Command::new(program);
-			cmd.current_dir(&self.workdir);
+			#[allow(
+				clippy::disallowed_methods,
+				reason = "Disabled test mode constructs the same typed program operands without bubblewrap wrapping."
+			)]
+			let mut cmd = Command::new(&program);
+			cmd.args(&args);
+			cmd.current_dir(self.workdir.native());
 			for (name, value) in &self.set_env {
-				cmd.env(name, value);
+				cmd.env(name, value.operand());
 			}
-			return cmd;
+			return PreparedCommand::new(cmd, owners);
 		}
 
 		let host = self.host_facts();
-		let argv = self.argv(program, &[], &host);
+		let argv = self.argv(&program, &args, &host);
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "SandboxBuilder is the sole finalizer of typed program, argument, environment and mount operands."
+		)]
 		let mut cmd = Command::new(&argv[0]);
 		cmd.args(&argv[1..]);
 		cmd.env_clear();
 		cmd.env("PATH", &host.path);
-		cmd
+		PreparedCommand::new(cmd, owners)
 	}
 
 	fn host_facts(&self) -> SandboxHostFacts {
 		let launcher = if self.network.is_some() {
-			self.network_supervisor.clone().unwrap_or_else(|| {
-				std::env::current_exe().unwrap_or_else(|_| PathBuf::from("loupe-worker"))
-			})
+			self.network_supervisor.as_ref().map(|path| path.native().to_owned()).unwrap_or_else(
+				|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("loupe-worker")),
+			)
 		} else {
 			PathBuf::from(BWRAP_BIN)
 		};
@@ -353,37 +408,45 @@ impl SandboxBuilder {
 					.filter_map(|path| canonical_ro_bind(path)),
 			);
 		}
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "SandboxBuilder checks only fixed public system directories before read-only binding."
+		)]
+		let system_dirs = ["/usr", "/lib", "/lib64", "/bin", "/sbin"]
+			.into_iter()
+			.filter(|path| Path::new(path).exists())
+			.collect();
 		SandboxHostFacts {
 			launcher,
-			path: sandbox_path(),
-			system_dirs: ["/usr", "/lib", "/lib64", "/bin", "/sbin"]
-				.into_iter()
-				.filter(|path| Path::new(path).exists())
-				.collect(),
+			path: self.launch_path.for_sandbox().to_owned(),
+			system_dirs,
 			system_binds,
+			#[cfg(test)]
 			forwarded_env: self
 				.forward_env
 				.iter()
 				.filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
 				.collect(),
+			#[cfg(not(test))]
+			forwarded_env: Vec::new(),
 		}
 	}
 
 	/// Pure projection, including the executable and both supervisor/program
 	/// separators. Only build's test-only disabled path bypasses this policy.
 	pub(crate) fn argv(
-		&self, program: &str, args: &[OsString], host: &SandboxHostFacts,
+		&self, program: &OsStr, args: &[OsString], host: &SandboxHostFacts,
 	) -> Vec<OsString> {
 		let mut argv = vec![host.launcher.as_os_str().to_owned()];
 		if let Some(network) = &self.network {
 			argv.extend(
-				["sandbox-exec", "--network", network.config.mode.as_str()].map(OsString::from),
+				["sandbox-exec", "--network", network.config.mode().as_str()].map(OsString::from),
 			);
-			for host in &network.required_hosts {
+			for host in network.required_hosts.for_supervisor() {
 				argv.extend([OsString::from("--required-host"), OsString::from(host)]);
 			}
-			for host in &network.config.allowlist {
-				argv.extend([OsString::from("--allow-host"), OsString::from(host.for_operation())]);
+			for host in network.config.allowlist() {
+				argv.extend([OsString::from("--allow-host"), OsString::from(host.for_sandbox())]);
 			}
 			argv.extend(["--", BWRAP_BIN].map(OsString::from));
 		}
@@ -435,55 +498,55 @@ impl SandboxBuilder {
 		// Fresh tmpfs for /tmp and a new $HOME. *Must* come before
 		// any extra_ro_binds that target paths inside /home/scanner —
 		// bwrap processes args in order and a tmpfs mounted on top of
-		// a prior bind hides it. Putting the tmpfs first lets caller
-		// binds (e.g. ~/.claude.json → /home/scanner/.claude.json)
-		// overlay the tmpfs and stay visible.
+		// a prior bind hides it.
 		argv.extend(["--tmpfs", "/tmp", "--tmpfs", "/home/scanner"].map(OsString::from));
 		argv.extend(
 			["--setenv", "HOME", "/home/scanner", "--setenv", "TMPDIR", "/tmp"].map(OsString::from),
 		);
 		argv.extend(["--setenv", "PATH", &host.path].map(OsString::from));
 
-		// Caller-supplied read-only binds (binary install dirs, agent
-		// config dirs, etc.). Use `--ro-bind-try` so a missing src
-		// path is a no-op rather than a fatal — handy when binding an
-		// optional auth dir that may or may not exist on every host.
+		// `--ro-bind-try` skips missing optional runtime paths. Mount authority
+		// comes from the typed owner retained with the prepared command.
 		for (src, dst) in &self.extra_ro_binds {
+			let destination = match dst {
+				BindDestination::Static(path) => OsString::from(path),
+				BindDestination::SameAsSource => src.native().as_os_str().to_owned(),
+				#[cfg(fuzzing)]
+				BindDestination::Fixture(path) => path.clone(),
+			};
 			argv.extend([
 				OsString::from("--ro-bind-try"),
-				src.as_os_str().to_owned(),
-				dst.as_os_str().to_owned(),
+				src.native().as_os_str().to_owned(),
+				destination,
 			]);
 		}
 
-		// Worktree: read-only.
+		if let Some(canary) = &self.canary {
+			argv.extend([
+				OsString::from("--ro-bind"),
+				canary.native().as_os_str().to_owned(),
+				OsString::from(crate::canary::SANDBOX_CANARY_FILE),
+			]);
+		}
+
 		argv.extend([
 			OsString::from("--ro-bind"),
-			self.workdir.as_os_str().to_owned(),
+			self.workdir.native().as_os_str().to_owned(),
 			OsString::from("/workdir"),
 		]);
 		argv.extend(["--chdir", "/home/scanner"].map(OsString::from));
 
 		// Forwarded env vars. Skip those that aren't set on the host.
-		for (name, value) in host.forwarded_env.iter().chain(&self.set_env) {
+		for (name, value) in &host.forwarded_env {
 			argv.extend([OsString::from("--setenv"), OsString::from(name), value.clone()]);
 		}
+		for (name, value) in &self.set_env {
+			argv.extend([OsString::from("--setenv"), OsString::from(name), value.operand()]);
+		}
 
-		argv.extend(["--", program].map(OsString::from));
+		argv.extend([OsString::from("--"), program.to_owned()]);
 		argv.extend_from_slice(args);
 		argv
-	}
-
-	/// Convenience: build with full args + stdio piped, returning the
-	/// fully prepared command for the caller to spawn.
-	pub fn build_with_args<'a>(
-		&self, program: &str, args: impl IntoIterator<Item = &'a str>,
-	) -> Command {
-		let mut cmd = self.build(program);
-		for a in args {
-			cmd.arg(a);
-		}
-		cmd
 	}
 }
 
@@ -502,12 +565,11 @@ fn sandbox_disabled_value(value: Option<&OsStr>) -> bool {
 	})
 }
 
-fn sandbox_path() -> String {
-	std::env::var("PATH")
-		.unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into())
-}
-
 fn canonical_ro_bind(destination: &str) -> Option<(PathBuf, &str)> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The mount resolver canonicalizes the selected typed binary to retain its real install tree."
+	)]
 	let source = std::fs::canonicalize(destination).ok()?;
 	// Resolve symlinks on the trusted side, then mount only the resolved
 	// file or directory at its conventional sandbox path. This keeps a
@@ -546,6 +608,10 @@ fn npm_node_modules_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn entrypoint_bind_source(original: &Path) -> Result<PathBuf> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Binary discovery inspects only selected Config PATH candidates without following unrelated inputs."
+	)]
 	if std::fs::symlink_metadata(original).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
 		original
 			.parent()
@@ -556,55 +622,103 @@ fn entrypoint_bind_source(original: &Path) -> Result<PathBuf> {
 	}
 }
 
-/// PATH walk: return the first existing executable file matching
-/// `name`. Mirrors what `execvp` would do — used by
-/// [`SandboxBuilder::allow_binary`] to discover the host install of
-/// an agent CLI without pulling in a `which`-style dep.
-fn locate_on_path(name: &str) -> Option<PathBuf> {
-	let path = std::env::var_os("PATH")?;
-	for dir in std::env::split_paths(&path) {
-		let candidate = dir.join(name);
-		if candidate.is_file() {
-			return Some(candidate);
-		}
-	}
-	None
-}
-
 /// Validate that the host can run `bwrap` *with its full mount layout*,
 /// not just `--version`. Useful in tests and as a smoke check before
 /// the worker runs its first scan. Many container hosts have `bwrap`
 /// installed but disable user namespaces, which makes any real
 /// invocation fail; calling this once at startup surfaces that early
 /// rather than mid-job.
-pub fn smoketest(workdir: &Path, network: SandboxNetworkConfig) -> Result<()> {
-	smoketest_with_builder(SandboxBuilder::new(workdir).with_network(network, Vec::new()))
+pub fn smoketest(config: &crate::config::SandboxLaunchConfig) -> Result<()> {
+	smoketest_with_supervisor(config, SandboxBinary::current_worker()?)
 }
 
 #[doc(hidden)]
 pub fn smoketest_with_supervisor(
-	workdir: &Path, network: SandboxNetworkConfig, worker_binary: impl Into<PathBuf>,
+	config: &crate::config::SandboxLaunchConfig, worker_binary: SandboxPath,
 ) -> Result<()> {
+	let directory =
+		std::sync::Arc::new(tempfile::tempdir().context("creating sandbox probe directory")?);
 	smoketest_with_builder(
-		SandboxBuilder::new(workdir)
-			.with_network(network, Vec::new())
+		SandboxBuilder::new(SandboxPath::smoke_test(directory), config)
+			.with_network(config.network().clone(), Default::default())
 			.with_network_supervisor(worker_binary),
 	)
 }
 
 fn smoketest_with_builder(builder: SandboxBuilder) -> Result<()> {
-	let mut cmd = builder.build("/bin/true");
+	let mut cmd = builder.build(SandboxValue::r#static("/bin/true"), &[]);
 	cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-	let output = cmd.as_std_mut().output().context("running bwrap smoketest")?;
+	let output = cmd.blocking_output().context("running bwrap smoketest")?;
 	if !output.status.success() {
-		let stderr = String::from_utf8_lossy(&output.stderr);
-		anyhow::bail!("bwrap smoketest failed: {} ({stderr})", output.status);
+		anyhow::bail!("bwrap smoketest failed: {}", output.status);
 	}
 	Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn sandbox_smoketest_diagnostics_omit_child_stderr() {
+		use std::os::unix::fs::PermissionsExt;
+		let directory = tempfile::tempdir().unwrap();
+		let binary = directory.path().join("bwrap");
+		std::fs::write(&binary, "#!/bin/sh\necho private-smoketest-stderr-sentinel >&2\nexit 1\n")
+			.unwrap();
+		std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+		let path = directory.path().as_os_str();
+		if !in_env(
+			"sandbox::tests::sandbox_smoketest_diagnostics_omit_child_stderr",
+			"smoke-i8",
+			&[("PATH", Some(path))],
+		) {
+			return;
+		}
+		let builder = SandboxBuilder::new(
+			SandboxPath::fixture("/tmp".into()),
+			&crate::config::SandboxLaunchConfig::default(),
+		);
+		let error = smoketest_with_builder(builder).unwrap_err();
+		assert!(
+			error.to_string().contains("bwrap smoketest failed"),
+			"the fake child must reach the failure path"
+		);
+		assert!(
+			!format!("{error:#}").contains("private-smoketest-stderr-sentinel"),
+			"sandbox child stderr leaked through smoketest error"
+		);
+	}
+
+	#[tokio::test]
+	async fn prepared_child_retains_its_canary_mount_owner() {
+		let job = crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap();
+		let path = job.canary_mount_path();
+		let builder = job.mount(SandboxBuilder::disabled_for_tests("/tmp"));
+		let mut command = builder.build_fixture("/bin/sleep");
+		command.arg("30");
+		let mut child = command.spawn().unwrap();
+		drop(command);
+		drop(builder);
+		drop(job);
+		let retained = path.exists();
+		child.kill().await.unwrap();
+		child.wait().await.unwrap();
+		drop(child);
+		assert!(retained, "a spawned child must retain its canary mount owner");
+		assert!(!path.exists(), "the last child owner must release the fake file");
+	}
+
+	#[test]
+	fn s3_sandbox_typed_operands_preserve_exact_arguments() {
+		let builder = super::SandboxBuilder::fixture("/tmp")
+			.bind_ro(SandboxPath::fixture("/tmp/raw".into()), "/sandbox/raw")
+			.set_env("PUBLIC_NAME", SandboxValue::r#static("arbitrary bytes"));
+		let command = builder.build(
+			SandboxValue::r#static("/bin/true"),
+			&[SandboxValue::r#static("arbitrary argument")],
+		);
+		assert!(command.as_std().get_args().any(|arg| arg == "arbitrary argument"));
+	}
+
 	#[test]
 	fn network_hosts_enforce_rfc1123_label_boundaries() {
 		for host in ["API.Example-2.test", "2.example", "192.0.2.1", " api.example "] {
@@ -712,7 +826,7 @@ mod tests {
 			return;
 		}
 		let tmp = tempfile::tempdir().unwrap();
-		let mut cmd = SandboxBuilder::new(tmp.path()).build("/bin/sh");
+		let mut cmd = SandboxBuilder::fixture(tmp.path()).build_fixture("/bin/sh");
 		let out =
 			cmd.arg("-c").arg("echo hello && pwd").output().await.expect("bwrap smoketest spawned");
 		assert!(
@@ -736,12 +850,11 @@ mod tests {
 			return;
 		}
 		let tmp = tempfile::tempdir().unwrap();
-		// Plant a file the test can try to overwrite.
 		let mut f = std::fs::File::create(tmp.path().join("readme")).unwrap();
 		f.write_all(b"original").unwrap();
 
-		let out = SandboxBuilder::new(tmp.path())
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(tmp.path())
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("echo overwrite > /workdir/readme && echo OK || echo DENIED")
 			.output()
@@ -750,7 +863,6 @@ mod tests {
 		let stdout = String::from_utf8_lossy(&out.stdout);
 		// The command itself must report DENIED — read-only mount.
 		assert!(stdout.contains("DENIED"), "stdout: {stdout}");
-		// And the original file on disk is unchanged.
 		let after = std::fs::read_to_string(tmp.path().join("readme")).unwrap();
 		assert_eq!(after, "original");
 	}
@@ -763,8 +875,8 @@ mod tests {
 		}
 		let tmp = tempfile::tempdir().unwrap();
 		// First run: drop a marker into /tmp.
-		let out = SandboxBuilder::new(tmp.path())
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(tmp.path())
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("echo marker > /tmp/m && cat /tmp/m")
 			.output()
@@ -774,8 +886,8 @@ mod tests {
 		assert!(String::from_utf8_lossy(&out.stdout).contains("marker"));
 
 		// Second run: marker must be gone — /tmp is a fresh tmpfs.
-		let out = SandboxBuilder::new(tmp.path())
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(tmp.path())
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("test -f /tmp/m && echo LEAK || echo CLEAN")
 			.output()
@@ -793,8 +905,8 @@ mod tests {
 		}
 		let tmp = tempfile::tempdir().unwrap();
 		// `getent hosts` should fail without --share-net (no DNS).
-		let out = SandboxBuilder::new(tmp.path())
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(tmp.path())
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("getent hosts example.com >/dev/null 2>&1 && echo ALLOWED || echo BLOCKED")
 			.output()
@@ -808,9 +920,9 @@ mod tests {
 	fn disabled_sandbox_returns_bare_command() {
 		// Force the test-only unwrapped path; no environment variable
 		// can reach it.
-		let mut b = SandboxBuilder::new("/tmp");
+		let mut b = SandboxBuilder::fixture("/tmp");
 		b.disabled = true;
-		let cmd = b.build("/bin/echo");
+		let cmd = b.build_fixture("/bin/echo");
 		assert_eq!(cmd.as_std().get_program(), "/bin/echo");
 	}
 
@@ -864,7 +976,7 @@ mod tests {
 			return;
 		}
 
-		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp").build_fixture("/bin/true");
 		let program = cmd.as_std().get_program().to_string_lossy().into_owned();
 
 		assert_eq!(
@@ -875,7 +987,7 @@ mod tests {
 
 	#[test]
 	fn agent_starts_outside_the_untrusted_repository() {
-		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp").build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
 		assert!(
@@ -886,7 +998,7 @@ mod tests {
 
 	#[test]
 	fn sandbox_does_not_bind_the_host_etc_tree() {
-		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp").build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
 
@@ -906,8 +1018,8 @@ mod tests {
 			return;
 		}
 		let workdir = tempfile::tempdir().unwrap();
-		let out = SandboxBuilder::new(workdir.path())
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(workdir.path())
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("test ! -e /etc/machine-id")
 			.output()
@@ -951,9 +1063,9 @@ mod tests {
 		let marker_path = marker_dir.path().join("creds");
 		std::fs::write(&marker_path, b"hello-from-host").unwrap();
 
-		let out = SandboxBuilder::new(workdir.path())
-			.bind_ro(marker_path, "/home/scanner/creds")
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(workdir.path())
+			.bind_ro(SandboxPath::fixture(marker_path), "/home/scanner/creds")
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("cat /home/scanner/creds")
 			.output()
@@ -971,9 +1083,9 @@ mod tests {
 
 	#[test]
 	fn network_enabled_commands_use_a_private_namespace() {
-		let cmd = SandboxBuilder::new("/tmp")
-			.with_network(SandboxNetworkConfig::default(), Vec::new())
-			.build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp")
+			.with_network(Default::default(), Default::default())
+			.build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
 		assert!(args.iter().any(|a| a == "sandbox-exec"), "args: {args:?}");
@@ -998,9 +1110,9 @@ mod tests {
 
 	#[test]
 	fn network_enabled_commands_take_their_resolver_from_the_supervisor() {
-		let cmd = SandboxBuilder::new("/tmp")
-			.with_network(SandboxNetworkConfig::default(), Vec::new())
-			.build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp")
+			.with_network(Default::default(), Default::default())
+			.build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
 
@@ -1030,7 +1142,7 @@ mod tests {
 			return;
 		}
 
-		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp").build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
 
@@ -1058,8 +1170,8 @@ mod tests {
 		}
 
 		let tmp = tempfile::tempdir().unwrap();
-		let out = SandboxBuilder::new(tmp.path())
-			.build("/bin/sh")
+		let out = SandboxBuilder::fixture(tmp.path())
+			.build_fixture("/bin/sh")
 			.arg("-c")
 			.arg("grep -aFq do-not-leak-through-bwrap /proc/1/environ && echo LEAK || echo CLEAN")
 			.output()
@@ -1075,7 +1187,7 @@ mod tests {
 
 	#[test]
 	fn wrapped_command_isolates_controlling_terminal() {
-		let cmd = SandboxBuilder::new("/tmp").build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp").build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
 
@@ -1087,7 +1199,7 @@ mod tests {
 
 	#[test]
 	fn wrapped_command_unshares_every_namespace_explicitly() {
-		let command = SandboxBuilder::new("/tmp").build("/bin/true");
+		let command = SandboxBuilder::fixture("/tmp").build_fixture("/bin/true");
 		let namespaces: Vec<_> = command
 			.as_std()
 			.get_args()
@@ -1109,8 +1221,9 @@ mod tests {
 			return;
 		}
 
-		let cmd =
-			SandboxBuilder::new("/tmp").forward_env("LOUPE_SANDBOX_TEST_SECRET").build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp")
+			.forward_env("LOUPE_SANDBOX_TEST_SECRET")
+			.build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
 
@@ -1126,9 +1239,9 @@ mod tests {
 
 	#[test]
 	fn set_env_passes_caller_provided_values() {
-		let cmd = SandboxBuilder::new("/tmp")
-			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", "explicit-value")
-			.build("/bin/true");
+		let cmd = SandboxBuilder::fixture("/tmp")
+			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", SandboxValue::r#static("explicit-value"))
+			.build_fixture("/bin/true");
 		let args: Vec<String> =
 			cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
 
@@ -1145,8 +1258,8 @@ mod tests {
 	#[test]
 	fn disabled_sandbox_sets_caller_provided_values() {
 		let cmd = SandboxBuilder::disabled_for_tests("/tmp")
-			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", "explicit-value")
-			.build("/bin/true");
+			.set_env("LOUPE_SANDBOX_TEST_EXPLICIT", SandboxValue::r#static("explicit-value"))
+			.build_fixture("/bin/true");
 
 		assert!(cmd.as_std().get_envs().any(|(key, value)| {
 			key == "LOUPE_SANDBOX_TEST_EXPLICIT" && value.is_some_and(|v| v == "explicit-value")

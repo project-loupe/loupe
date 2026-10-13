@@ -1,8 +1,7 @@
 //! `Scanner` trait — the extension point for security checks.
 //!
 //! Built-in scanners cover regex-based secret discovery, LLM discovery,
-//! and LLM verification. Future scanner families plug into this same
-//! trait.
+//! and LLM verification.
 
 use std::path::PathBuf;
 
@@ -18,10 +17,9 @@ use tokio_util::sync::CancellationToken;
 /// verifier scanner can hand a verdict back to the runner:
 ///
 /// - `Verdict(v)` — scanner ran in-process and returns the verdict
-///   for the runner to POST. The original (regex / stdout-JSON-LLM)
-///   shape; the runner does the network hop.
+///   for the runner to POST.
 /// - `Submitted` — scanner already POSTed the verdict via an
-///   out-of-band channel (today: the MCP server in verify mode
+///   out-of-band channel (the MCP server in verify mode
 ///   flushes a `VerdictSubmission` at session end). The runner
 ///   must NOT POST again or the server will see two verification
 ///   rows for one verify job.
@@ -45,6 +43,8 @@ pub trait Scanner: Send + Sync {
 }
 
 pub struct ScanContext {
+	pub sandbox_workdir: crate::sandbox::SandboxPath,
+	pub security: std::sync::Arc<crate::canary::JobSecurity>,
 	pub tool_boundary: crate::llm::prompt::JobToolBoundary,
 	pub workdir: PathBuf,
 	pub repo: RepoSpec<Server>,
@@ -54,8 +54,7 @@ pub struct ScanContext {
 	pub repo_id: i64,
 	/// Server-side job id from the lease envelope. The agent's MCP
 	/// `submit_finding` tool uses it to POST findings to
-	/// `/v1/jobs/{job_id}/llm-findings` through the trusted broker —
-	/// submission no longer goes through the runner's batch call.
+	/// `/v1/jobs/{job_id}/llm-findings` through the trusted broker.
 	pub job_id: i64,
 	pub job_capability: JobCapability,
 	pub head_sha: BoundedText<RevisionText, Repo>,
@@ -65,6 +64,8 @@ pub struct ScanContext {
 }
 
 pub struct VerifyContext {
+	pub sandbox_workdir: crate::sandbox::SandboxPath,
+	pub security: std::sync::Arc<crate::canary::JobSecurity>,
 	pub tool_boundary: crate::llm::prompt::JobToolBoundary,
 	pub workdir: PathBuf,
 	pub repo: RepoSpec<Server>,

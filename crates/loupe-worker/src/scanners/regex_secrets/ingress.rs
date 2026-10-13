@@ -39,6 +39,10 @@ impl Validate<RepoFileInput, Repo> for RegexSecretFindings<'_> {
 		};
 		let mut findings = Vec::new();
 		for found in self.regex.find_iter(text) {
+			#[allow(
+				clippy::string_slice,
+				reason = "Regex match offsets on a UTF-8 str always fall on scalar boundaries."
+			)]
 			let line_start = 1 + text[..found.start()].matches('\n').count() as u32;
 			// Stable across line shifts and revisions; preserve legacy framing.
 			let fingerprint =
@@ -76,6 +80,7 @@ pub(super) mod observe {
 	use std::cell::RefCell;
 
 	use super::*;
+	// debug-ok: Cfg-only synthetic observation; raw values support independent source and compatibility assertions.
 	#[derive(Debug, PartialEq, Eq)]
 	pub struct RepoFindingObservation {
 		pub scanner: String,

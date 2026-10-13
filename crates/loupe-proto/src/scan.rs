@@ -5,6 +5,7 @@ use loupe_provenance::Source;
 use serde::{Deserialize, Serialize};
 
 /// Body of `POST /v1/repos/:id/scan` (admin).
+// debug-ok: scan request contains only protocol and incremental flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanRequest {
 	pub protocol_version: u16,
@@ -12,6 +13,7 @@ pub struct ScanRequest {
 	pub incremental: bool,
 }
 
+// debug-ok: scan response contains only numeric protocol and job ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanResponse {
 	pub protocol_version: u16,
@@ -20,11 +22,9 @@ pub struct ScanResponse {
 
 /// Listing entry for `GET /v1/jobs` and `GET /v1/jobs/:id`.
 ///
-/// The lease/timing/error block below is additive: every field is
-/// `Option` with `skip_serializing_if`, so a client built against this
-/// protocol still reads responses from a server that predates them. They
-/// exist so an operator surface can answer "how long did this take, who
-/// ran it, and why did it fail" without a second round-trip.
+/// Lease, timing and error fields are optional for wire compatibility.
+/// They let operators inspect duration, worker ownership and failure reasons
+/// without a second round-trip.
 #[derive(Serialize)]
 #[serde(bound(serialize = ""))]
 pub struct JobInfo<S: Source> {
@@ -166,7 +166,7 @@ mod tests {
 
 	#[test]
 	fn job_info_without_lease_detail_matches_the_legacy_wire_shape() {
-		// Missing-field input admission moves to the CLI's named JobInfo decoder.
+		// The CLI's named JobInfo decoder checks missing-field input admission.
 		let s = r#"{"job_id":1,"repo_id":2,"kind":"scan","state":"queued",
 			"incremental":false,"attempts":0,"enqueued_at":1700000000}"#;
 		assert_eq!(

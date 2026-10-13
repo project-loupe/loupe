@@ -149,9 +149,10 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 		.build()
 		.unwrap();
 
-	let resp = admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
+	let repo_id = common::register_local_repo(
+		&db,
+		&clone_url,
+		RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
 			branch: None,
@@ -164,21 +165,8 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval: None,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-	db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(&clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
+		},
+	);
 
 	let resp = admin
 		.post("https://loupe-server/v1/workers")
@@ -259,20 +247,15 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 
 	// Server-side: the job is succeeded, exactly one finding landed,
 	// and it carries our PoC.
-	let finding_count: i64 = db
-		.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
-		.unwrap();
-	assert_eq!(finding_count, 1);
-
-	let (poc, scanner_id, severity, finding_id): (Option<String>, String, String, i64) = db
-		.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT poc_unified, scanner_id, severity, id FROM findings LIMIT 1",
-				[],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-			)?)
-		})
-		.unwrap();
+	let findings = common::findings(&db, repo_id);
+	assert_eq!(findings.len(), 1);
+	let stored = &findings[0];
+	let (poc, scanner_id, severity, finding_id) = (
+		stored.poc_unified.as_ref().map(|poc| poc.expose()),
+		stored.scanner_id.expose(),
+		stored.severity.as_str(),
+		stored.id,
+	);
 	assert_eq!(scanner_id, "llm-code-review");
 	assert_eq!(severity, "high");
 	let poc = poc.expect("poc_unified must be populated");

@@ -26,6 +26,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use loupe_core::security_event::{Broker, Operation};
 use loupe_provenance::{Ingress, Provider, Sandbox, Secret, Untrusted};
 use tokio::net::UnixListener;
 use tokio::task::{JoinHandle, JoinSet};
@@ -48,6 +49,7 @@ type UpstreamByteStream =
 	Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>;
 
 /// Provider protocol plus the model policy fixed for one job.
+// debug-ok: Closed provider choice with redacted configured model and effort.
 #[derive(Clone, Debug)]
 pub enum ModelBrokerBackend {
 	Claude { model: crate::config::ConfiguredText, effort: crate::config::ConfiguredText },
@@ -75,6 +77,7 @@ impl ModelBrokerBackend {
 	}
 }
 
+// debug-ok: Closed fieldless variants; no dynamic content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelProvider {
 	Claude,
@@ -101,6 +104,23 @@ pub(super) enum CredentialKind {
 pub struct ModelCredential {
 	kind: CredentialKind,
 	secret: Arc<Secret<String>>,
+}
+
+/// Read-only watch sharing the selected credential's existing erased owner.
+/// It exposes neither plaintext nor a callback into the secret owner.
+#[derive(Clone)]
+pub struct CredentialWatch(ModelCredential);
+
+impl std::fmt::Debug for CredentialWatch {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("CredentialWatch([redacted])")
+	}
+}
+
+impl CredentialWatch {
+	pub(crate) fn matches(&self, candidate: &[u8]) -> bool {
+		crate::canary::contains_bytes(candidate, self.0.secret.expose().as_bytes())
+	}
 }
 
 impl Clone for ModelCredential {
@@ -146,7 +166,7 @@ struct ModelAuthHeader {
 /// each invocation of one backend.
 #[derive(Clone)]
 pub struct ModelBrokerContext {
-	worker_binary: PathBuf,
+	worker_binary: crate::sandbox::SandboxPath,
 	upstream: reqwest::Url,
 	credential: ModelCredential,
 	limits: ModelBrokerLimits,
@@ -154,24 +174,31 @@ pub struct ModelBrokerContext {
 
 impl ModelBrokerContext {
 	pub fn new(
-		worker_binary: PathBuf, upstream: reqwest::Url, credential: ModelCredential,
-		limits: ModelBrokerLimits,
+		worker_binary: crate::sandbox::SandboxPath, upstream: reqwest::Url,
+		credential: ModelCredential, limits: ModelBrokerLimits,
 	) -> Self {
 		Self { worker_binary, upstream, credential, limits }
 	}
 
-	pub async fn start_session(&self, backend: ModelBrokerBackend) -> Result<ModelBrokerSession> {
-		ModelBrokerSession::start(
+	pub fn credential_watch(&self) -> CredentialWatch {
+		self.credential.watch()
+	}
+
+	pub async fn start_session(
+		&self, backend: ModelBrokerBackend, security: Arc<crate::canary::JobSecurity>,
+	) -> Result<ModelBrokerSession> {
+		ModelBrokerSession::start_for_job(
 			backend,
 			self.upstream.clone(),
 			self.credential.clone(),
 			self.limits,
+			security,
 		)
 		.await
 	}
 
-	pub fn worker_binary(&self) -> &Path {
-		&self.worker_binary
+	pub fn worker_binary(&self) -> crate::sandbox::SandboxPath {
+		self.worker_binary.clone()
 	}
 }
 
@@ -180,10 +207,14 @@ pub fn bind_model_into_sandbox(
 ) -> SandboxBuilder {
 	sandbox
 		.bind_ro(context.worker_binary.clone(), super::mcp::SANDBOX_LOUPE_BIN)
-		.bind_ro(session.host_dir(), SANDBOX_MODEL_DIR)
+		.bind_ro(crate::sandbox::SandboxPath::model_broker(session), SANDBOX_MODEL_DIR)
 }
 
 impl ModelCredential {
+	pub fn watch(&self) -> CredentialWatch {
+		CredentialWatch(self.clone())
+	}
+
 	pub fn anthropic_api_key(secret: impl Into<String>) -> Self {
 		Self::from_secret(CredentialKind::AnthropicApiKey, Secret::new(secret.into()))
 	}
@@ -234,6 +265,7 @@ impl ModelCredential {
 	}
 }
 
+// debug-ok: Numeric ceilings and counters only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelBrokerLimits {
 	pub request_ceiling: u64,
@@ -262,6 +294,7 @@ impl Default for ModelBrokerLimits {
 	}
 }
 
+// debug-ok: Numeric ceilings and counters only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModelBrokerUsage {
 	pub requests: u64,
@@ -362,6 +395,7 @@ impl LimitKind {
 }
 
 struct BrokerState {
+	security: Arc<crate::canary::JobSecurity>,
 	backend: ModelBrokerBackend,
 	upstream: reqwest::Url,
 	auth: ModelAuthHeader,
@@ -373,7 +407,7 @@ struct BrokerState {
 
 /// Trusted authority for one job's model traffic.
 pub struct ModelBrokerSession {
-	dir: tempfile::TempDir,
+	dir: Arc<tempfile::TempDir>,
 	socket_path: PathBuf,
 	usage: Arc<UsageCounters>,
 	shutdown: CancellationToken,
@@ -381,9 +415,19 @@ pub struct ModelBrokerSession {
 }
 
 impl ModelBrokerSession {
+	/// Explicit standalone diagnostic invocation; production jobs use start_for_job.
 	pub async fn start(
 		backend: ModelBrokerBackend, upstream: reqwest::Url, credential: ModelCredential,
 		limits: ModelBrokerLimits,
+	) -> Result<Self> {
+		let security =
+			crate::canary::JobSecurity::new(Default::default(), vec![credential.watch()])?;
+		Self::start_for_job(backend, upstream, credential, limits, security).await
+	}
+
+	pub async fn start_for_job(
+		backend: ModelBrokerBackend, upstream: reqwest::Url, credential: ModelCredential,
+		limits: ModelBrokerLimits, security: Arc<crate::canary::JobSecurity>,
 	) -> Result<Self> {
 		limits.validate()?;
 		let auth = credential.prepare_for(backend.provider())?;
@@ -405,11 +449,16 @@ impl ModelBrokerSession {
 		let listener = UnixListener::bind(&socket_path)
 			.with_context(|| format!("binding model broker socket at {}", socket_path.display()))?;
 		let usage = Arc::new(UsageCounters::default());
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The model broker owns its selected provider transport with redirects disabled."
+		)]
 		let http = reqwest::Client::builder()
 			.redirect(reqwest::redirect::Policy::none())
 			.build()
 			.context("building model broker HTTP client")?;
 		let state = Arc::new(BrokerState {
+			security,
 			backend,
 			upstream,
 			auth,
@@ -422,7 +471,7 @@ impl ModelBrokerSession {
 		let task_shutdown = shutdown.clone();
 		let task = tokio::spawn(serve_session(listener, state, task_shutdown));
 
-		Ok(Self { dir, socket_path, usage, shutdown, task: Some(task) })
+		Ok(Self { dir: Arc::new(dir), socket_path, usage, shutdown, task: Some(task) })
 	}
 
 	pub fn socket_path(&self) -> &Path {
@@ -432,6 +481,9 @@ impl ModelBrokerSession {
 	pub fn host_dir(&self) -> &Path {
 		self.dir.path()
 	}
+	pub(crate) fn mount_owner(&self) -> Arc<tempfile::TempDir> {
+		self.dir.clone()
+	}
 
 	pub fn usage(&self) -> ModelBrokerUsage {
 		self.usage.snapshot()
@@ -440,6 +492,10 @@ impl ModelBrokerSession {
 	/// Revoke the socket and any in-flight response stream.
 	pub async fn finish(mut self) -> Result<ModelBrokerUsage> {
 		self.shutdown.cancel();
+		#[allow(
+			clippy::expect_used,
+			reason = "Consuming finish owns the sole task slot; only finish or Drop can take it."
+		)]
 		let mut task = self.task.take().expect("broker task is present until finish");
 		match tokio::time::timeout(BROKER_SHUTDOWN_TIMEOUT, &mut task).await {
 			Ok(result) => result.context("model broker task panicked")??,
@@ -513,7 +569,10 @@ async fn proxy_request(
 	request: Request<Incoming>, state: Arc<BrokerState>,
 ) -> std::result::Result<Response<BrokerBody>, Infallible> {
 	let response = handle_request(request, state).await.unwrap_or_else(|error| {
-		tracing::warn!(error = %error, "model broker rejected an internal proxy failure");
+		if error.is::<crate::canary::JobQuarantined>() {
+			return quarantined_response();
+		}
+		tracing::warn!("model broker rejected an internal proxy failure");
 		local_error(StatusCode::BAD_GATEWAY, "upstream_error", "model upstream request failed")
 	});
 	Ok(response)
@@ -522,6 +581,7 @@ async fn proxy_request(
 async fn handle_request(
 	request: Request<Incoming>, state: Arc<BrokerState>,
 ) -> Result<Response<BrokerBody>> {
+	state.security.admit(Operation::ModelRequest)?;
 	if state.backend.provider() == ModelProvider::Claude
 		&& request.method() == Method::HEAD
 		&& request.uri().path() == "/api/hello"
@@ -549,11 +609,18 @@ async fn handle_request(
 	let query = query.map(str::to_owned);
 
 	let headers = sanitize_request_headers(request.headers(), &state.auth);
-	let body = match Limited::new(request.into_body(), state.ingress_limits.model_request_bytes)
-		.collect()
+	let body = match state
+		.security
+		.run(Operation::ModelRequest, async {
+			Limited::new(request.into_body(), state.ingress_limits.model_request_bytes)
+				.collect()
+				.await
+				.map_err(|_| anyhow::anyhow!("model request collection failed"))
+		})
 		.await
 	{
 		Ok(body) => body.to_bytes(),
+		Err(error) if error.is::<crate::canary::JobQuarantined>() => return Err(error),
 		Err(_) => {
 			return Ok(local_error(
 				StatusCode::PAYLOAD_TOO_LARGE,
@@ -562,6 +629,8 @@ async fn handle_request(
 			));
 		},
 	};
+	state.security.observe(&body, Broker::Model);
+	state.security.admit(Operation::ModelRequest)?;
 	// SAFETY: this body was just read from the session's sandbox Unix socket
 	// through the existing finite HTTP body collector.
 	#[allow(unsafe_code)]
@@ -595,8 +664,12 @@ async fn handle_request(
 	upstream.set_path(endpoint);
 	upstream.set_query(query.as_deref());
 	upstream.set_fragment(None);
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The broker constructs an HTTP request only for its selected provider endpoint and opaque credential."
+	)]
 	let response = body
-		.send(state.http.post(upstream).headers(headers))
+		.send(state.http.post(upstream).headers(headers), &state.security)
 		.await
 		.context("sending model request to configured upstream")?;
 	if response.status().is_redirection() {
@@ -607,6 +680,10 @@ async fn handle_request(
 		));
 	}
 	Ok(stream_upstream_response(response, state))
+}
+
+fn quarantined_response() -> Response<BrokerBody> {
+	local_error(StatusCode::FORBIDDEN, "job_quarantined", "job_quarantined")
 }
 
 fn sanitize_request_headers(headers: &HeaderMap, auth: &ModelAuthHeader) -> HeaderMap {
@@ -745,6 +822,10 @@ pub(crate) fn apply_request_policy(
 	if !effort_config.is_object() {
 		*effort_config = serde_json::Value::Object(serde_json::Map::new());
 	}
+	#[allow(
+		clippy::expect_used,
+		reason = "The preceding branch replaces every non-object with an object before this access."
+	)]
 	effort_config
 		.as_object_mut()
 		.expect("effort config was made an object")
@@ -768,6 +849,7 @@ fn stream_upstream_response(
 	let status = upstream.status();
 	let headers = sanitize_response_headers(upstream.headers());
 	let stream_state = OutputStreamState {
+		security: state.security.clone(),
 		upstream: Box::pin(upstream.bytes_stream()),
 		usage: state.usage.clone(),
 		output_ceiling: state.limits.output_ceiling_bytes,
@@ -776,7 +858,7 @@ fn stream_upstream_response(
 		terminal: false,
 	};
 	let output = stream::unfold(stream_state, |mut state| async move {
-		if state.terminal {
+		if state.terminal || state.security.is_quarantined() {
 			return None;
 		}
 		if state.overflowed {
@@ -788,7 +870,16 @@ fn stream_upstream_response(
 			);
 			return Some((Ok(Frame::trailers(trailers)), state));
 		}
-		match state.upstream.next().await {
+		let cancel = state.security.cancellation();
+		let next = tokio::select! {
+			biased;
+			_ = cancel.cancelled() => return None,
+			next = state.upstream.next() => next,
+		};
+		if state.security.is_quarantined() {
+			return None;
+		}
+		match next {
 			Some(Ok(chunk)) => {
 				// SAFETY: this chunk came directly from the configured provider's
 				// response stream, before interpretation or sandbox forwarding.
@@ -835,6 +926,7 @@ fn stream_upstream_response(
 }
 
 struct OutputStreamState {
+	security: Arc<crate::canary::JobSecurity>,
 	upstream: UpstreamByteStream,
 	usage: Arc<UsageCounters>,
 	output_ceiling: u64,
@@ -911,6 +1003,10 @@ impl ParsedTokenUsage {
 fn local_error(
 	status: StatusCode, code: &'static str, message: &'static str,
 ) -> Response<BrokerBody> {
+	#[allow(
+		clippy::expect_used,
+		reason = "The local error contains only fixed string keys and values, which JSON serialization cannot reject."
+	)]
 	let body = serde_json::to_vec(&serde_json::json!({
 		"error": { "type": "loupe_model_broker", "code": code, "message": message }
 	}))
@@ -935,6 +1031,7 @@ fn empty_response(status: StatusCode) -> Response<BrokerBody> {
 #[cfg(fuzzing)]
 pub mod fuzzing {
 	use super::*;
+	// debug-ok: Closed fieldless variants; no dynamic content.
 	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 	pub enum PolicyError {
 		InvalidJson,
@@ -965,6 +1062,7 @@ pub mod fuzzing {
 				},
 			})
 	}
+	// debug-ok: Cfg(fuzzing) synthetic observation only; raw values support independent oracle comparisons.
 	#[derive(Debug)]
 	pub struct ProviderObservation {
 		pub forwarded: Vec<u8>,
@@ -1052,6 +1150,8 @@ mod tests {
 
 	use super::*;
 
+	#[path = "quarantine_tests.rs"]
+	mod quarantine_tests;
 	#[path = "security_log_tests.rs"]
 	mod security_log_tests;
 
@@ -1065,8 +1165,6 @@ mod tests {
 		Ok(sanitize_request_headers(headers, &credential.prepare_for(provider)?))
 	}
 
-	// Runtime ownership/header regressions and environment compatibility.
-	// These formatter/owner APIs are new acceptance checks, not old leak claims.
 	#[test]
 	fn model_credential_formatting_is_exactly_redacted() {
 		let credential = ModelCredential::openai_api_key("format-canary");
@@ -1111,14 +1209,24 @@ mod tests {
 		let credential = ModelCredential::anthropic_api_key("session-owner");
 		let weak = Arc::downgrade(&credential.secret);
 		let context = ModelBrokerContext::new(
-			"unused-worker".into(),
+			crate::sandbox::SandboxPath::fixture("unused-worker".into()),
 			"http://127.0.0.1:1".parse().unwrap(),
 			credential,
 			limits(),
 		);
 		let cloned = context.clone();
 		assert!(Arc::ptr_eq(&context.credential.secret, &cloned.credential.secret));
-		let session = cloned.start_session(claude_backend()).await.unwrap();
+		let session = cloned
+			.start_session(
+				claude_backend(),
+				crate::canary::JobSecurity::new(
+					Default::default(),
+					vec![cloned.credential_watch()],
+				)
+				.unwrap(),
+			)
+			.await
+			.unwrap();
 		drop(context);
 		drop(cloned);
 		assert!(weak.upgrade().is_some());
@@ -1241,7 +1349,7 @@ mod tests {
 					continue;
 				}
 				let runtime = super::super::ModelBrokerRuntimeConfig {
-					worker_binary: "unused-worker".into(),
+					worker_binary: crate::sandbox::SandboxPath::fixture("unused-worker".into()),
 					limits: ModelBrokerLimits::default(),
 				};
 				let (available, result) = if provider == "claude" {
@@ -1283,6 +1391,7 @@ mod tests {
 		}
 	}
 
+	// debug-ok: Private cfg(test) synthetic protocol fixture; exact fixture values are assertion diagnostics only.
 	#[derive(Clone, Debug)]
 	struct CapturedRequest {
 		path: String,
@@ -1467,15 +1576,15 @@ mod tests {
 
 		let workdir = tempfile::tempdir().unwrap();
 		let context = ModelBrokerContext::new(
-			"/bin/true".into(),
+			crate::sandbox::SandboxPath::fixture("/bin/true".into()),
 			upstream.url,
 			ModelCredential::anthropic_api_key("unused-host-secret"),
 			limits(),
 		);
 		let sandbox =
-			bind_model_into_sandbox(SandboxBuilder::new(workdir.path()), &context, &session_a);
+			bind_model_into_sandbox(SandboxBuilder::fixture(workdir.path()), &context, &session_a);
 		let output = sandbox
-			.build("/bin/sh")
+			.build_fixture("/bin/sh")
 			.args([
 				"-c",
 				"test -S /loupe/model/session.sock && test ! -e \"$1\"",

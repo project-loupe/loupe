@@ -4,9 +4,23 @@ Run `ci/check.sh` before committing. `ci/check.sh --full` also runs
 `sh fuzz/test-harness.sh`, committed corpus replay, generator checks,
 available Kani proofs and ignored integration tests. The Rust checks need
 stable and nightly toolchains. Workspace enumeration requires `jq`.
+Sandbox integration tests require Bubblewrap (`bwrap`), `curl`, `mawk`,
+and permission to create unprivileged user namespaces. On Ubuntu, install
+the test dependencies with `sudo apt-get install bubblewrap curl jq mawk`.
+These sandbox tests are mandatory and use scripted clients and local servers.
+The CI runner grants `/usr/bin/bwrap` user namespace access through its
+AppArmor profile and checks sandbox startup before compiling the workspace.
 Generator checks compare files before and after regeneration, so correct
 staged additions pass locally. With `CI=true`, generated files must also
 match `HEAD` and have no untracked additions.
+
+The existing `test (stable)` CI job invokes the same normal gate, including
+production lint and boundary self-tests, per-crate checks and nightly negative
+API doctests. Its stable toolchain remains the default; nightly is selected
+explicitly for formatting and doctests. The separate fuzz-replay job checks
+saved inputs and generated runners. Scheduled Kani runs retain their bounded
+wrapper and selected fast harnesses. Full local verification additionally
+requires the worker image's toolchains for the five ignored build checks.
 
 Campaign scripts require Bash, GNU coreutils (`timeout`, `nice`, `date`),
 and util-linux (`flock`, `setsid`, `taskset`). Fuzzing needs `cargo-fuzz`
@@ -19,6 +33,25 @@ inheritance, visible Rust sources and build scripts, and the absence of fuzz
 dependencies in product crates. `ci/gate-selftest.sh` exercises real compiler
 bypass attempts on each run. These checks are mandatory; the former
 `LOUPE_GATE_UNSAFE` opt-in no longer controls them.
+The derived-`Debug` gate covers every product crate by default. A derive needs
+an adjacent `// debug-ok: <reason>` explaining its closed/scalar fields or
+redacted children. The scanner recognizes multiline attributes and accepts
+reasons only from actual Rust line comments; literal text cannot grant an
+exception. `LOUPE_DEBUG_GATE_CRATES` no longer narrows the checked crates.
+
+Production Clippy runs separately on every workspace library and binary,
+denying `unwrap_used`, `expect_used`, `string_slice`, `mem_forget`, `dbg_macro`,
+`todo`, `unimplemented` and `disallowed_methods`. Crate-root attributes also
+apply those denials outside test builds. The dedicated invocation covers
+future members even if their root omits the attributes. The existing
+all-target pass keeps the deferred test lint policy; the workspace baseline
+allows `disallowed_methods` because its configured method list would otherwise
+warn in test targets too. Production attributes and command-line denials
+override that baseline. `ci/production-lint-selftest.sh` compiles all eight
+violation classes, aliases and UFCS against the real policy, and checks a
+reviewed call, an adjacent unreviewed call, and deferred test fixtures.
+See [BOUNDARIES.md](BOUNDARIES.md) for the API list's scope and reviewed owners.
+
 The normal gate also rejects production calls or qualified references to
 `forward_env` until sandbox values carry provenance. It strips Rust comments
 and literals and skips explicitly `#[cfg(test)]`-gated items; calls after a

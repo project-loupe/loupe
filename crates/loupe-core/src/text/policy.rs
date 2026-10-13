@@ -1,13 +1,14 @@
 //! Field policies shared by domain validation and DAO parameter types.
 use super::{AnchorPolicy, IdentPolicy, JsonPolicy, Normalization, TextPolicy, Whitespace};
 
-/// New compatibility ceiling for previously unbounded legacy strings.
+/// Byte ceiling for exact-text domain fields.
 /// Route/destination limits still apply, including the smaller LLM PoC cap.
 pub const LEGACY_TEXT_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 macro_rules! exact_texts {
 	($( $name:ident, $field:literal, $multi:literal; )*) => { $(
 		/// Preserves admitted decoded UTF-8, including significant whitespace.
+		// debug-ok: generated field policy markers have no fields or payload.
 		#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 		pub struct $name;
 		impl TextPolicy for $name {
@@ -54,6 +55,7 @@ exact_texts! {
 
 macro_rules! texts {
 	($( $name:ident, $field:literal, $chars:literal, $multi:literal; )*) => { $(
+		// debug-ok: generated field policy markers have no fields or payload.
 		#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct $name;
 		impl TextPolicy for $name {
 			const FIELD: &'static str = $field;
@@ -74,6 +76,7 @@ texts! {
 	AnchorText, "identity_anchor", 300, false;
 	InstanceKey, "identity_instance_key", 200, false;
 }
+// debug-ok: JSON leaf policy is a fieldless marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonLeaf;
 impl TextPolicy for JsonLeaf {
@@ -88,6 +91,7 @@ impl AnchorPolicy for InstanceKey {}
 
 macro_rules! ident {
 	($name:ident, $field:literal, $max:literal, $predicate:expr) => {
+		// debug-ok: generated identifier policy markers contain no identifiers.
 		#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 		pub struct $name;
 		impl IdentPolicy for $name {
@@ -114,6 +118,7 @@ ident!(JsonKey, "json_key", 64, |s: &str| s
 	.is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
 	&& s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
 
+// debug-ok: JSON payload policy is a fieldless marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Payload;
 impl JsonPolicy for Payload {

@@ -151,7 +151,12 @@ impl BrowserJobs {
 		if let Some(kind) = self.kind.as_ref().filter(|s| !s.expose().is_empty()) {
 			request = request.query(&[("kind", kind.expose())]);
 		}
-		request.send().await
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "dashboard jobs query egress sends only the fields admitted by BrowserJobs"
+		)]
+		let response = request.send().await;
+		response
 	}
 }
 pub(crate) struct BrowserSearch {
@@ -185,7 +190,12 @@ impl BrowserSearch {
 		if let Some(limit) = self.limit {
 			request = request.query(&[("limit", limit)]);
 		}
-		request.send().await
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "dashboard search egress sends only the bounded Browser search query and numeric limit"
+		)]
+		let response = request.send().await;
+		response
 	}
 }
 macro_rules! extractor {

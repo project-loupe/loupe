@@ -7,6 +7,7 @@ use clap::builder::TypedValueParser;
 use loupe_provenance::{Config, Ingress, Mark, Secret, Untrusted, Unvalidated, Validate};
 use loupe_tls::PemInput;
 
+// debug-ok: closed failure unit variants contain no rejected input.
 #[derive(Debug)]
 pub(super) enum Failure {
 	Url,
@@ -73,7 +74,12 @@ impl ConfigUrl {
 		&self, http: &reqwest::Client, method: reqwest::Method, path: &str,
 	) -> Result<reqwest::RequestBuilder, crate::ingress::server::Failure> {
 		let url = self.0.join(path).map_err(|_| crate::ingress::server::Failure::Url)?;
-		Ok(http.request(method, url))
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "dashboard Config URL builds requests only for the closed AdminRequest endpoint selection"
+		)]
+		let request = http.request(method, url);
+		Ok(request)
 	}
 	pub(crate) fn report_startup(
 		&self, health: crate::client::UpstreamResult<crate::client::HealthResponse>,
@@ -205,7 +211,15 @@ pub(super) fn tls_client(
 ) -> anyhow::Result<reqwest::Client> {
 	use anyhow::Context;
 	let tls = loupe_tls::reqwest_client_config(cert.0.expose(), key.0.expose(), ca.0.expose())?;
-	reqwest::Client::builder().use_preconfigured_tls(tls).build().context("building reqwest client")
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "dashboard configuration owns the mTLS client for its configured Loupe server"
+	)]
+	let client = reqwest::Client::builder()
+		.use_preconfigured_tls(tls)
+		.build()
+		.context("building reqwest client");
+	client
 }
 pub(super) fn selected(
 	pem: &Option<ConfigPem>, pem_b64: &Option<ConfigPem>, path: Option<&ConfigPath>,

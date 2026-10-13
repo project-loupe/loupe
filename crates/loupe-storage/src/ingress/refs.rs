@@ -190,7 +190,7 @@ impl Validate<&[u8], Agent> for AgentRefSymbol {
 		self, u: Unvalidated<'view, &[u8]>, mark: Mark<'view, Agent>,
 	) -> Result<Self::Output, Error> {
 		let raw = std::str::from_utf8(u.get()).map_err(|_| invalid())?;
-		// Existing prose bound applies to decoded raw text, before normalization.
+		// The prose bound applies to decoded raw text, before normalization.
 		let raw_bound = policy::Symbol::MAX_BYTES * 4;
 		let decoded = decode_json_string_bounded(raw, "symbol", raw_bound, raw_bound)?;
 		Ok((BoundedText::new(&mark, &decoded)?, raw.as_ptr() as usize))
@@ -222,7 +222,7 @@ mod tests {
                 assert_eq!(unit_refs(row,0)?.expose(),canonical);
                 Ok(())
             })?;
-            assert_eq!(crate::review_units::get(conn,31)?.unwrap().source_refs.as_slice().len(),2);
+            assert_eq!(crate::review_units::get(&crate::test_support::scope(conn, 1),31)?.unwrap().source_refs.as_slice().len(),2);
             Ok(())
         }).unwrap();
 	}

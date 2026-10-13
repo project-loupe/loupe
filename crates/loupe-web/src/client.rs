@@ -206,7 +206,14 @@ impl AdminClient {
 			ListRepos(query) | ListFindings(_, query) => {
 				query.send(request).await.map_err(|_| Failure::Transport.into_response())
 			},
-			_ => request.send().await.map_err(|_| Failure::Transport.into_response()),
+			_ => {
+				#[allow(
+					clippy::disallowed_methods,
+					reason = "dashboard egress sends an already selected closed AdminRequest without a browser body"
+				)]
+				let response = request.send().await.map_err(|_| Failure::Transport.into_response());
+				response
+			},
 		};
 		match response {
 			Ok(response) => match server::receive(response).await {
@@ -218,6 +225,10 @@ impl AdminClient {
 	}
 	/// Fixed startup liveness probe; no generic Server JSON projection exists.
 	pub async fn health(&self) -> UpstreamResult<HealthResponse> {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "dashboard startup owns the fixed server health request"
+		)]
 		let response = self
 			.request(&AdminRequest::Health)
 			.map_err(Failure::into_error)?

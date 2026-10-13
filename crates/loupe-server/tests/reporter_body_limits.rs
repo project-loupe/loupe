@@ -7,11 +7,8 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Router;
-use loupe_core::{Finding, Severity};
-use loupe_provenance::Secret;
 use loupe_server::reporters::github_app::GithubAppKey;
-use loupe_server::reporters::{GithubReporter, ReportFinding, Reporter, ReporterCredential};
-use loupe_storage::repos::RepoRow;
+use loupe_server::reporters::{GithubReporter, Reporter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LIMIT: usize = 16 * 1024 * 1024;
@@ -39,7 +36,7 @@ impl Stage {
 			Self::Metadata => br#"{"id":1,"slug":"boundary-app"}"#,
 			Self::Installation => br#"{"id":1}"#,
 			Self::Issue => br#"{"number":7}"#,
-			// Retain the existing non-JSON, lossy-UTF8 substring admission.
+			// Substring admission also accepts non-JSON and lossy UTF-8 input.
 			Self::Label => b"\xff malformed already_exists response",
 		};
 		let mut payload = prefix.to_vec();
@@ -57,30 +54,6 @@ enum Wire {
 fn key() -> GithubAppKey {
 	GithubAppKey::from_pem(1, loupe_server::reporters::github_app::testing::APP_PRIVATE_KEY_PEM)
 		.unwrap()
-}
-
-fn repo() -> RepoRow {
-	common::reporter_repo()
-}
-
-fn finding() -> ReportFinding {
-	ReportFinding {
-		id: 1,
-		reviewed_revision: None,
-		finding: Finding {
-			scanner_id: common::marked::agent::text("fixture"),
-			severity: Severity::High,
-			title: common::marked::agent::text("title"),
-			description: common::marked::agent::text("description"),
-			file_path: None,
-			line_start: None,
-			line_end: None,
-			cwe: None,
-			patch_unified: None,
-			poc_unified: None,
-			fingerprint: common::marked::agent::text("fixture"),
-		},
-	}
 }
 
 async fn response_for(stage: Stage, wire: Wire, payload: Vec<u8>) -> anyhow::Result<String> {
@@ -135,12 +108,8 @@ async fn response_for(stage: Stage, wire: Wire, payload: Vec<u8>) -> anyhow::Res
 	let result = if matches!(stage, Stage::Metadata) {
 		reporter.verify_app(&key()).await.map(|app| format!("{}:{}", app.id, app.slug.expose()))
 	} else {
-		let credential = if matches!(stage, Stage::Installation) {
-			ReporterCredential::GithubApp(Box::new(key()))
-		} else {
-			ReporterCredential::GithubPat(Secret::new(b"fake-test-pat".to_vec()))
-		};
-		reporter.dispatch(&repo(), &[finding()], &credential).await.map(|receipt| {
+		let batch = common::prepared_report(matches!(stage, Stage::Installation));
+		reporter.dispatch(&batch).await.map(|receipt| {
 			assert_eq!(receipt.kind, "github_issue");
 			receipt.external_id.expect("the issue response has a numeric receipt")
 		})

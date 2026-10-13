@@ -5,7 +5,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{Method, Request};
 use futures_util::{stream, StreamExt};
 use loupe_proto::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
-use loupe_storage::{workers, Db};
+use loupe_storage::{registry, Db};
 use loupe_tls::{cert_fingerprint, Ca};
 use tower::ServiceExt;
 
@@ -63,42 +63,51 @@ fn identities() -> &'static Identities {
 	})
 }
 
+#[allow(unsafe_code)]
+fn fixture_operator() -> loupe_provenance::Ingress<loupe_provenance::Operator> {
+	// SAFETY: this cfg(fuzzing)-only owner labels fixed synthetic fixture authority.
+	unsafe { loupe_provenance::Ingress::new() }
+}
+
 fn fixture(bytes_capacity: u64) -> (Arc<Db>, AppState, i64) {
 	let ids = identities();
 	let db = Arc::new(
 		Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests()).expect("fixture DB"),
 	);
-	let worker_id = db
-		.with_conn(|conn| {
-			let mut worker_id = 0;
-			for (index, peer) in ids.peers.iter().enumerate() {
-				if index == 2 {
-					continue;
-				}
-				let kind = if index == 1 {
-					workers::WorkerKind::Admin
-				} else {
-					workers::WorkerKind::Worker
-				};
-				let body = format!(r#"{{"protocol_version":2,"name":"fixture-{index}"}}"#);
-				// SAFETY: this fixed synthetic Operator message registers the fixture actor.
-				#[allow(unsafe_code)]
-				let ingress =
-					unsafe { loupe_provenance::Ingress::<loupe_provenance::Operator>::new() };
-				let (_, name) = loupe_provenance::Untrusted::new(body.as_bytes(), ingress)
-					.validate(crate::ingress::registry::RegisterWorkerDecoder)
-					.expect("fixture worker name");
-				let id = workers::insert(conn, &name, kind, &cert_fingerprint(peer.0.as_ref()), 0)?;
-				if index == 0 {
-					worker_id = id;
-				}
-				if index == 3 {
-					assert!(workers::revoke(conn, id, 1)?);
-				}
+	let worker_id = {
+		let mut worker_id = 0;
+		for (index, peer) in ids.peers.iter().enumerate() {
+			if index == 2 {
+				continue;
 			}
-			Ok(worker_id)
-		})
-		.expect("fixture worker rows");
+			if index == 1 {
+				registry::bootstrap_admin(&db, &cert_fingerprint(peer.0.as_ref()), 0)
+					.expect("fixture operator");
+				continue;
+			}
+			let body = format!(r#"{{"protocol_version":2,"name":"fixture-{index}"}}"#);
+			let ingress = fixture_operator();
+			let (_, name) = loupe_provenance::Untrusted::new(body.as_bytes(), ingress)
+				.validate(crate::ingress::registry::RegisterWorkerDecoder)
+				.expect("fixture worker name");
+			let id = registry::register_worker(
+				&db,
+				&fixture_operator(),
+				&name,
+				&cert_fingerprint(peer.0.as_ref()),
+				0,
+			)
+			.expect("fixture worker");
+			if index == 0 {
+				worker_id = id;
+			}
+			if index == 3 {
+				assert!(registry::revoke_worker(&db, &fixture_operator(), id, 1)
+					.expect("fixture revocation"));
+			}
+		}
+		worker_id
+	};
 	let mut config = crate::request_budget::WorkerBudgetConfig::default();
 	config.bytes.capacity = bytes_capacity;
 	config.bytes.refill_per_second = 1;
@@ -201,9 +210,8 @@ pub async fn request_route(case: RequestCase) -> RequestObservation {
 	let worker_budget = budgets.observed_bytes(worker_id);
 	let byte_charges = budgets.observed_charges();
 	let polled_chunks = polled.lock().expect("poll observation").clone();
-	let repo_count = db
-		.with_conn(|conn| Ok(loupe_storage::repos::list(conn, None)?.len()))
-		.expect("fixture repos");
+	let repo_count =
+		registry::repositories(&db, &fixture_operator(), None).expect("fixture repos").len();
 	RequestObservation {
 		status,
 		protocol,

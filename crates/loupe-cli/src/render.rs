@@ -21,7 +21,7 @@ use loupe_provenance::{Agent, Server};
 type FindingDetail = loupe_proto::FindingDetail<Agent, Server>;
 type FindingSummary = loupe_proto::FindingSummary<Agent, Server>;
 
-/// Preserve the CLI's historical kind spelling at its explicit terminal sink.
+/// Escape unknown job-kind spellings at the terminal sink.
 pub fn job_kind(kind: &loupe_core::JobKind<Server>) -> String {
 	match kind {
 		loupe_core::JobKind::Scan => "Scan".into(),
@@ -35,6 +35,7 @@ pub fn job_kind(kind: &loupe_core::JobKind<Server>) -> String {
 /// Whether to emit ANSI escape sequences. Detected once per call by
 /// [`Style::detect`], threaded through the renderer so callers can
 /// force one mode or the other (e.g. in unit tests).
+// debug-ok: terminal styling is a closed enum of unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
 	Plain,
@@ -456,19 +457,15 @@ mod tests {
 		assert!(out.contains("Proof of concept"));
 		assert!(out.contains("fn no_aws_keys()"));
 		assert!(out.contains("awaiting_approval"));
-		// Plain rendering must contain no ANSI escapes.
 		assert!(!out.contains('\x1b'), "plain rendering must be ANSI-free, got: {out:?}");
 	}
 
 	#[test]
 	fn color_render_emits_ansi_for_severity_and_diff_lines() {
 		let out = render(&sample(), Style::Color).unwrap();
-		// Header severity tag is colored.
 		assert!(out.contains("\x1b[31m[high]\x1b[0m"), "expected red severity in: {out:?}");
-		// `+` lines green, `-` lines red.
 		assert!(out.contains("\x1b[32m+#[test]\x1b[0m"), "expected green addition: {out:?}");
 		assert!(out.contains("\x1b[31m-unrelated\x1b[0m"), "expected red removal: {out:?}");
-		// Hunk header cyan.
 		assert!(out.contains("\x1b[36m@@ "));
 	}
 
@@ -494,7 +491,6 @@ mod tests {
 	fn format_unix_known_timestamps() {
 		// 1_756_000_000 = 2025-08-24 01:46:40 UTC.
 		assert_eq!(format_unix(1_756_000_000), "2025-08-24 01:46:40 UTC");
-		// Epoch.
 		assert_eq!(format_unix(0), "1970-01-01 00:00:00 UTC");
 		// One second before epoch — exercises the negative-days branch.
 		assert_eq!(format_unix(-1), "1969-12-31 23:59:59 UTC");

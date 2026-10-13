@@ -2,10 +2,10 @@
 use loupe_core::text::policy::{Reason, RevisionText};
 use loupe_core::text::{BoundedText, RepoPath, SourceRef};
 use loupe_provenance::{Agent, Db, Mark, Repo, Source};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
 pub use crate::ingress::InventoryRendering;
-use crate::review::{is_unique, parsed, standalone, string_enum};
+use crate::review::{is_unique, parsed, string_enum};
 use crate::{ownership, Conflict, Error, Ownership, Result};
 string_enum!(EntryKind { Tracked => "tracked", Submodule => "submodule" });
 string_enum!(Disposition { Mapped => "mapped", Context => "context", Excluded => "excluded", Unresolved => "unresolved" });
@@ -28,6 +28,10 @@ impl InventoryPath<Repo> {
 				rendering.push(byte as char);
 			} else {
 				use std::fmt::Write;
+				#[expect(
+					clippy::expect_used,
+					reason = "formatting one u8 into an owned String has no fallible writer or custom formatter"
+				)]
 				write!(&mut rendering, "%{byte:02X}").expect("writing a String");
 			}
 		}
@@ -71,6 +75,7 @@ pub struct NewEntry<'a, PathS: Source, RevisionS: Source, ReasonS: Source> {
 	pub reason: Option<&'a BoundedText<Reason, ReasonS>>,
 	pub highlighted: bool,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone)]
 pub struct Entry {
 	pub inventory_entry_id: i64,
@@ -82,6 +87,7 @@ pub struct Entry {
 	pub reason: Option<BoundedText<Reason, Db>>,
 	pub highlighted: bool,
 }
+// debug-ok: insertion outcomes contain only row counters, never inventory paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inserted {
 	/// Newly inserted physical rows (replacing a display alias adds no row).
@@ -91,6 +97,7 @@ pub struct Inserted {
 	/// including replacements of aliases from earlier batches.
 	pub skipped: usize,
 }
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownPaths(pub Vec<RepoPath<Agent>>);
 impl std::fmt::Display for UnknownPaths {
@@ -101,15 +108,17 @@ impl std::fmt::Display for UnknownPaths {
 impl std::error::Error for UnknownPaths {}
 
 pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
-	tx: &Transaction<'_>, repo: i64, generation: i64,
+	scope: &crate::scope::RepoScope<'_>, generation: i64,
 	entries: &[NewEntry<'_, PathS, RevisionS, ReasonS>], now: i64,
 ) -> Result<Inserted> {
-	ownership::generation(tx, repo, generation, Ownership::InventoryGeneration)?;
+	scope.require_operator()?;
+	let tx = scope.conn;
+	ownership::generation(tx, scope.repo_id, generation, Ownership::InventoryGeneration)?;
 	if entries.len() > MAX_ENTRIES {
 		return Err(Error::Conflict(Conflict::InventoryLimit));
 	}
 	let mut outcome = Inserted { inserted: 0, excluded: 0, skipped: 0 };
-	let mut insert = tx.prepare("INSERT INTO generation_inventory (generation_id,path,blob_sha,entry_kind,disposition,disposition_reason,highlighted,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+	let mut insert = tx.prepare("INSERT INTO generation_inventory (generation_id,path,blob_sha,entry_kind,disposition,disposition_reason,highlighted,created_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE EXISTS(SELECT 1 FROM review_generations WHERE generation_id=?1 AND repo_id=?9)")?;
 	// An earlier bulk batch may have reserved this display name for invalid
 	// Git bytes. Real paths win, unless evidence has already consumed that
 	// exclusion: never retarget evidence.
@@ -117,7 +126,7 @@ pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
 		"UPDATE generation_inventory
 		    SET blob_sha=?3, entry_kind=?4, disposition=?5,
 		        disposition_reason=?6, highlighted=?7, created_at=?8
-		  WHERE generation_id=?1 AND path=?2
+		  WHERE generation_id=?1 AND path=?2 AND EXISTS(SELECT 1 FROM review_generations WHERE generation_id=?1 AND repo_id=?9)
 		    AND disposition='excluded'
 		    AND disposition_reason='unrepresentable-path'
 		    AND NOT EXISTS (
@@ -129,7 +138,7 @@ pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
 	// duplicated upload) is a no-op; the same path with other content is not.
 	let mut identical = tx.prepare(
 		"SELECT EXISTS(SELECT 1 FROM generation_inventory
-		   WHERE generation_id=?1 AND path=?2 AND blob_sha IS ?3 AND entry_kind=?4
+		   WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations WHERE generation_id=?1 AND repo_id=?5) AND path=?2 AND blob_sha IS ?3 AND entry_kind=?4
 		     AND (disposition_reason IS NULL OR disposition_reason<>'unrepresentable-path'))",
 	)?;
 	// Reserve real names first so an encoded invalid name never shadows one.
@@ -167,7 +176,8 @@ pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
 			disposition.as_str(),
 			reason,
 			entry.highlighted,
-			now
+			now,
+			scope.repo_id
 		];
 		match insert.execute(row) {
 			Ok(_) => {
@@ -190,7 +200,8 @@ pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
 							generation,
 							entry.path.expose(),
 							entry.blob_sha.map(BoundedText::expose),
-							entry.kind.as_str()
+							entry.kind.as_str(),
+							scope.repo_id
 						],
 						|r| r.get::<_, bool>(0),
 					)? {
@@ -204,12 +215,13 @@ pub fn insert<PathS: Source, RevisionS: Source, ReasonS: Source>(
 	}
 	Ok(outcome)
 }
-pub fn list(conn: &Connection, generation: i64) -> Result<Vec<Entry>> {
-	Ok(conn
+pub fn list(scope: &crate::scope::RepoScope<'_>, generation: i64) -> Result<Vec<Entry>> {
+	let tx = scope.conn;
+	Ok(tx
 		.prepare(&format!(
-			"SELECT {COLUMNS} FROM generation_inventory WHERE generation_id=?1 ORDER BY path"
+			"SELECT {COLUMNS} FROM generation_inventory WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=generation_inventory.generation_id AND g.repo_id=?2) ORDER BY path"
 		))?
-		.query_map([generation], row)?
+		.query_map(params![generation,scope.repo_id], row)?
 		.collect::<rusqlite::Result<_>>()?)
 }
 const COLUMNS: &str = "inventory_entry_id,generation_id,path,blob_sha,entry_kind,disposition,disposition_reason,highlighted";
@@ -235,18 +247,21 @@ pub(crate) fn validate_stored_rows(conn: &Connection) -> Result<()> {
 		Ok::<_, rusqlite::Error>(())
 	})
 }
-pub fn verify_refs(tx: &Transaction<'_>, generation: i64, refs: &[SourceRef<Agent>]) -> Result<()> {
-	ownership::generation_repo(tx, generation)?;
-	let exists: bool = tx.query_row("SELECT inventory_digest IS NOT NULL OR EXISTS(SELECT 1 FROM generation_inventory WHERE generation_id=?1) FROM review_generations WHERE generation_id=?1",[generation],|r|r.get(0))?;
+pub fn verify_refs(
+	scope: &crate::scope::RepoScope<'_>, generation: i64, refs: &[SourceRef<Agent>],
+) -> Result<()> {
+	let tx = scope.conn;
+	ownership::generation(tx, scope.repo_id, generation, Ownership::InventoryGeneration)?;
+	let exists: bool = tx.query_row("SELECT inventory_digest IS NOT NULL OR EXISTS(SELECT 1 FROM generation_inventory WHERE generation_id=?1) FROM review_generations WHERE generation_id=?1 AND repo_id=?2",params![generation,scope.repo_id],|r|r.get(0))?;
 	if !exists {
 		return Ok(());
 	}
 	let mut unknown = Vec::new();
-	let mut statement = tx.prepare("SELECT EXISTS(SELECT 1 FROM generation_inventory WHERE generation_id=?1 AND path=?2 AND (disposition_reason IS NULL OR disposition_reason<>'unrepresentable-path'))")?;
+	let mut statement = tx.prepare("SELECT EXISTS(SELECT 1 FROM generation_inventory WHERE generation_id=?1 AND EXISTS(SELECT 1 FROM review_generations g WHERE g.generation_id=generation_inventory.generation_id AND g.repo_id=?3) AND path=?2 AND (disposition_reason IS NULL OR disposition_reason<>'unrepresentable-path'))")?;
 	for source in refs {
-		if !statement
-			.query_row(params![generation, source.path.expose()], |r| r.get::<_, bool>(0))?
-		{
+		if !statement.query_row(params![generation, source.path.expose(), scope.repo_id], |r| {
+			r.get::<_, bool>(0)
+		})? {
 			unknown.push(source.path.clone());
 		}
 	}
@@ -256,4 +271,3 @@ pub fn verify_refs(tx: &Transaction<'_>, generation: i64, refs: &[SourceRef<Agen
 		Err(Error::UnknownPaths(UnknownPaths(unknown)))
 	}
 }
-standalone! { insert<PathS, RevisionS, ReasonS>(repo: i64, generation: i64, entries: &[NewEntry<'_, PathS, RevisionS, ReasonS>], now: i64) -> Inserted; }

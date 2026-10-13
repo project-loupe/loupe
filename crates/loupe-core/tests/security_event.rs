@@ -1,5 +1,4 @@
-//! New schema/API evidence; there was no pre-existing event implementation.
-//! Direct emit capture is not evidence of any runtime producer integration.
+//! Closed event schema and emitter checks, independent of runtime producers.
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -255,6 +254,7 @@ fn allowed_budget_resource(value: BudgetResource) {
 		| BudgetResource::ModelTokens
 		| BudgetResource::ModelConnections
 		| BudgetResource::CampaignJobs => {},
+		BudgetResource::ReportOutput => {},
 	}
 }
 #[test]
@@ -270,6 +270,7 @@ fn budget_resource_spellings_are_closed_and_exhaustive() {
 		(BudgetResource::ModelTokens, "model_tokens"),
 		(BudgetResource::ModelConnections, "model_connections"),
 		(BudgetResource::CampaignJobs, "campaign_jobs"),
+		(BudgetResource::ReportOutput, "report_output"),
 	] {
 		allowed_budget_resource(value);
 		assert_eq!(value.as_str(), expected);

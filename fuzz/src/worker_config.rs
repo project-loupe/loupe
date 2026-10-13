@@ -243,6 +243,8 @@ fn allowed(config: &WorkerConfig) -> bool {
 	let bkb = url.as_ref().is_some_and(|url| {
 		["http", "https"].contains(&url.scheme())
 			&& url.host_str().is_some_and(crate::worker_network_host::allowed)
+			&& url.username().is_empty()
+			&& url.password().is_none()
 	});
 	!config.agents.claude.model.for_operation().trim().is_empty()
 		&& !config.agents.codex.model.for_operation().trim().is_empty()
@@ -284,6 +286,31 @@ pub unsafe extern "C" fn worker_config_run(data: *const u8, datalen: usize) {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn bkb_urls_reject_credentials_but_allow_public_paths() {
+		for (url, admitted) in [
+			("https:[::@i", false),
+			("https://user@example.com/api", false),
+			("https://user:password@example.com/api", false),
+			("https://:password@example.com/api", false),
+			("https://user:@example.com/api", false),
+			("https://%75ser@example.com/api", false),
+			("https://example.com/api/v2?format=json", true),
+			("https://example.com/@public?contact=user@example.com", true),
+			("https://@example.com/api", true),
+		] {
+			let mut config = super::WorkerConfig::default();
+			config.bkb.api_url = loupe_worker::config::ConfiguredText::Builtin(url);
+			assert_eq!(
+				super::fuzzing::validate(&config).is_ok(),
+				admitted,
+				"BKB URL policy: {url}"
+			);
+			assert_eq!(super::allowed(&config), admitted, "BKB URL oracle: {url}");
+			super::do_test(format!("[bkb]\napi_url={url:?}\n").as_bytes());
+		}
+	}
+
 	#[test]
 	fn config_file_schema_fields_and_closed_errors_are_independent() {
 		for document in [b"".as_slice(),b"[unknown]\nvalue='DO_NOT_ECHO_SENTINEL'",b"[logging]\nlevel='DO_NOT_ECHO_SENTINEL",b"[logging]\nlevel=17",b"[logging]\nlevel=\"bad\\u0001text\"",b"[server]\nurl='https://user:pat-sentinel@example.invalid/'\n[agents.claude]\nmodel='model'\neffort='high'",b"[tls]\nkey='native\tpath'",b"[sandbox]\nallowlist=['example.invalid']\nnetwork='allowlist'",b"\xff"] { super::do_test(document); }

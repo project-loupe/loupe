@@ -3,11 +3,11 @@
 
 use anyhow::{anyhow, Result};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
 
 use super::cli_output::{collect_cli_output, CapturedOutput};
 use super::prompt::Prompt;
+use crate::sandbox::PreparedChild;
 
 pub(crate) struct CliRun {
 	pub status: std::process::ExitStatus,
@@ -18,11 +18,12 @@ pub(crate) struct CliRun {
 }
 
 pub(crate) async fn drive(
-	child: &mut Child, prompt: &Prompt, cancel: CancellationToken,
+	child: &mut PreparedChild, prompt: &Prompt, cancel: CancellationToken,
+	quarantine: CancellationToken,
 ) -> Result<CliRun> {
-	let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("CLI stdin unavailable"))?;
-	let stdout = child.stdout.take().ok_or_else(|| anyhow!("CLI stdout unavailable"))?;
-	let stderr = child.stderr.take().ok_or_else(|| anyhow!("CLI stderr unavailable"))?;
+	let mut stdin = child.take_stdin().ok_or_else(|| anyhow!("CLI stdin unavailable"))?;
+	let stdout = child.take_stdout().ok_or_else(|| anyhow!("CLI stdout unavailable"))?;
+	let stderr = child.take_stderr().ok_or_else(|| anyhow!("CLI stderr unavailable"))?;
 	let wait_and_write = async {
 		let delivery = async move {
 			stdin.write_all(prompt.expose().as_bytes()).await?;
@@ -63,6 +64,7 @@ pub(crate) async fn drive(
 	};
 	tokio::select! {
 		biased;
+		_ = quarantine.cancelled() => Err(crate::canary::JobQuarantined.into()),
 		_ = cancel.cancelled() => Err(anyhow!("cancelled")),
 		result = operation => result.map_err(Into::into),
 	}

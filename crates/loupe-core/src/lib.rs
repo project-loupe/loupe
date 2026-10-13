@@ -1,3 +1,17 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg_attr(test, deny(unsafe_code))]
 //! Shared domain types for loupe.

@@ -6,6 +6,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: /tmp/cargo-target-loupe-ci
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
@@ -51,14 +55,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install nightly formatting and doctest tools
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y apparmor bubblewrap curl jq mawk
+      - name: Enable sandbox user namespaces
+        run: |
+          sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          bwrap --unshare-user --unshare-net --unshare-pid --ro-bind / / --dev /dev -- /bin/true
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-      - name: cargo test
-        run: cargo test --workspace --all-targets
+      - name: Check tests and security boundaries
+        run: ci/check.sh
 
   fuzz-replay:
     name: Fuzz corpus replay

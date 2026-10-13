@@ -33,6 +33,10 @@ impl RegexSecretsScanner {
 		// AWS access key id: 16-char base32-ish suffix after AKIA prefix.
 		// We only check the prefix shape; the dispatcher / verifier later
 		// confirms whether it's a live credential.
+		#[allow(
+			clippy::expect_used,
+			reason = "The compiled AWS access-key pattern is a fixed literal validated by scanner tests."
+		)]
 		let re = Regex::new(r"AKIA[0-9A-Z]{16}").expect("compile-time AKIA regex must be valid");
 		Self { re }
 	}
@@ -114,6 +118,10 @@ fn walk(
 		if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
 			continue;
 		}
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Regex scanner reads an admitted contained source file before the named Repo finding validator."
+		)]
 		let bytes = match fs::read(entry.path()) {
 			Ok(b) => b,
 			Err(_) => continue,

@@ -1,3 +1,17 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 #![deny(unsafe_code)]
 //! `loupe-web` — a local operator dashboard for `loupe-server`.
 //!
@@ -106,6 +120,7 @@ pub fn router(state: WebState) -> Router {
 }
 
 /// Handle for a running dashboard.
+// debug-ok: listener address and task handle contain no request/response data.
 #[derive(Debug)]
 pub struct ServeHandle {
 	pub local_addr: SocketAddr,

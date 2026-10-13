@@ -18,6 +18,7 @@ use crate::ingress_text::{json_text, token_range, DecodeError, DiscardContent};
 #[cfg(any(test, fuzzing))]
 pub(super) mod fuzz_support;
 
+// debug-ok: Closed syntax/policy categories, fixed field labels and numeric positions only.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RecordError {
 	#[error("MCP record is not UTF-8")]
@@ -78,6 +79,16 @@ pub(super) enum ToolName {
 	Unknown(String),
 }
 impl ToolName {
+	pub(super) fn operation(&self) -> loupe_core::security_event::Operation {
+		use loupe_core::security_event::Operation;
+		match self {
+			Self::Query => Operation::SearchFindings,
+			Self::Finding | Self::Poc => Operation::McpSubmitFinding,
+			Self::Verdict => Operation::McpSubmitVerdict,
+			Self::Patch | Self::ValidatePatch => Operation::McpSubmitPatch,
+			Self::Get | Self::Unknown(_) => Operation::ReadFinding,
+		}
+	}
 	pub(super) fn log_label(&self) -> &'static str {
 		match self {
 			Self::Query => "query_prior_findings",
@@ -326,6 +337,7 @@ fn arguments(
 	})
 }
 
+// debug-ok: Fieldless fixed error with no rejected input retained.
 #[derive(Debug, thiserror::Error)]
 #[error("unknown tool")]
 pub(super) struct UnknownTool;
@@ -352,8 +364,8 @@ struct RawRequest<'a> {
 	#[serde(borrow, default)]
 	params: Option<&'a RawValue>,
 }
-/// Only id and params were Value in the old envelope. Unknown top-level
-/// members remain IgnoredAny, so their numeric/Unicode semantics stay distinct.
+/// Only id and params receive Value-compatible numeric/Unicode validation.
+/// Unknown top-level members use IgnoredAny, which has different acceptance rules.
 #[derive(Deserialize)]
 struct EnvelopeContent {
 	#[serde(rename = "jsonrpc")]
@@ -365,9 +377,8 @@ struct EnvelopeContent {
 	#[serde(default, rename = "params")]
 	_params: Option<DiscardContent>,
 }
-/// A newly rejected field must not be decoded by the subsequent compatibility
-/// traversal. Its narrower rejection precedence is intentional: retain original
-/// id depth, skip the rejected params, then return the ordinary tool error.
+/// A rejected field must not be decoded by the subsequent content traversal.
+/// Retain original id depth, skip the rejected params, then return the tool error.
 #[derive(Deserialize)]
 struct RejectedParamsEnvelope {
 	#[serde(rename = "jsonrpc")]
@@ -385,8 +396,8 @@ fn new_field_policy_failure(result: &Result<Arguments>) -> bool {
 			Some(DecodeError::Policy(policy)) => Some(policy),
 			_ => error.downcast_ref::<loupe_core::text::Error>(),
 		};
-		// JSON syntax was already rejected by the legacy envelope parser.
-		// Only newly invalid field policy may skip the params content pass.
+		// Only field-policy errors may skip the params content pass; JSON syntax
+		// errors still require full envelope validation.
 		policy.is_some_and(|error| error.rule != loupe_core::text::Rule::JsonSyntax)
 	})
 }
@@ -446,10 +457,27 @@ impl ValidateCarrying<&[u8], Sandbox> for McpRequestDecoder {
 
 impl DecodedFindingArgs {
 	/// Retain the first owner's normalized Agent path and separate Repo membership.
+	#[cfg(any(test, fuzzing))]
 	pub(super) fn into_submission(self, workdir: &std::path::Path) -> Result<McpFindingSubmission> {
+		let mut submission = self.into_pending_submission(workdir)?;
+		submission.fingerprint = super::fingerprint_for(
+			workdir,
+			submission.file_path.expose(),
+			submission.line_start,
+			submission.line_end,
+		);
+		Ok(submission)
+	}
+
+	pub(super) fn into_pending_submission(
+		self, workdir: &std::path::Path,
+	) -> Result<McpFindingSubmission> {
 		let membership = super::check_submitted_membership(workdir, &self.file)?;
-		let fingerprint =
-			super::fingerprint_for(workdir, self.file.expose(), self.line_start, self.line_end);
+		let fingerprint = super::repo_ingress::ComputedFingerprint::line_range(
+			self.file.expose(),
+			self.line_start,
+			self.line_end,
+		);
 		Ok(McpFindingSubmission {
 			protocol_version: loupe_proto::PROTOCOL_VERSION,
 			severity: self.severity,

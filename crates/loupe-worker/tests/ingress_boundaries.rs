@@ -111,6 +111,7 @@ fn worker_file_config_rejects_new_text_cap() {
 
 fn context() -> McpSessionContext {
 	McpSessionContext {
+		security: loupe_worker::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
 		tool_boundary: loupe_worker::llm::prompt::JobToolBoundary::new().unwrap(),
 		client: Arc::new(ServerClient::from_parts(
 			reqwest::Client::new(),
@@ -192,7 +193,7 @@ async fn mcp_query_rejects_new_text_cap_before_http() {
 async fn mcp_over_limit_escaped_field_stops_before_params_content_pass() {
 	// RawValue locates this token without decoding it. The field preflight must
 	// reject before the legacy Value/content pass can allocate the escaped text
-	// or reach the later numeric overflow. The whole record remains under16MiB.
+	// or reach the later numeric overflow. The whole record remains under 16 MiB.
 	let notes = "\\u0061".repeat(2 * 1024 * 1024 + 1);
 	let record = format!(
 		r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"submit_verdict","arguments":{{"verdict":"confirmed","notes":"{notes}","later":1e400}}}}}}"#

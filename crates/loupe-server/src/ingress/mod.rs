@@ -136,12 +136,27 @@ impl<S: Send + Sync> FromRequest<S> for OperatorJson {
 	type Rejection = (StatusCode, String);
 	async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
 		json_media(&req)?;
+		let worker_id = req.extensions().get::<AuthedWorker>().map(AuthedWorker::id);
 		let token = req
 			.extensions()
 			.get::<AuthedWorker>()
 			.and_then(AuthedWorker::operator_ingress)
 			.ok_or_else(|| (StatusCode::FORBIDDEN, "operator role required".into()))?;
-		let bytes = collect_operator_body(req.into_body(), RequestBuffer::default()).await?;
+		let bytes = collect_operator_body(req.into_body(), RequestBuffer::default())
+			.await
+			.inspect_err(|error| {
+				if error.0 == StatusCode::PAYLOAD_TOO_LARGE {
+					use loupe_core::security_event::{
+						emit, BudgetResource, EventContext, SecurityEvent,
+					};
+					emit(SecurityEvent::BudgetExhausted {
+						context: EventContext { worker_id, ..Default::default() },
+						resource: BudgetResource::RequestBodyBytes,
+						used: None,
+						limit: Some(BODY_CAP as u64),
+					});
+				}
+			})?;
 		Ok(Self(Untrusted::new(bytes, token)))
 	}
 }

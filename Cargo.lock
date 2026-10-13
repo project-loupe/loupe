@@ -1085,6 +1085,7 @@ dependencies = [
  "loupe-server",
  "loupe-storage",
  "loupe-tls",
+ "loupe-worker",
  "rand_core 0.6.4",
  "regex",
  "reqwest",

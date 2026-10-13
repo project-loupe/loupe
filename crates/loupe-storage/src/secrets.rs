@@ -4,12 +4,6 @@
 //! `Db::open` for where that PRAGMA gets applied. Secrets therefore
 //! live as plaintext bytes inside an encrypted database file; this DAO
 //! is a thin store/fetch layer with no envelope of its own.
-//!
-//! Earlier milestones used a per-row `chacha20poly1305` envelope on
-//! the `ciphertext` column. That was removed when SQLCipher landed —
-//! the whole-file ciphertext supersedes the per-column ciphertext for
-//! the at-rest threat model, and keeping both was just doubled cost
-//! with no extra coverage we cared about.
 
 use loupe_provenance::{Secret, Zeroise};
 use rand_core::{OsRng, RngCore};
@@ -97,6 +91,7 @@ impl std::fmt::Display for MasterKey {
 	}
 }
 
+// debug-ok: secret kinds are closed discriminants, never credential bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
 	GithubPat,
@@ -116,7 +111,7 @@ impl SecretKind {
 /// Insert a secret. Returns the assigned id. The value column is
 /// stored as-is — SQLCipher seals the whole DB at the page level, so
 /// per-row encryption would be redundant work.
-pub fn insert(
+pub(crate) fn insert(
 	conn: &Connection, kind: SecretKind, label: &str, value: &[u8], now: i64,
 ) -> rusqlite::Result<i64> {
 	conn.execute(
@@ -128,7 +123,7 @@ pub fn insert(
 }
 
 /// Read a secret by id. Returns `Ok(None)` if no such row.
-pub fn read(conn: &Connection, id: i64) -> rusqlite::Result<Option<Secret<Vec<u8>>>> {
+pub(crate) fn read(conn: &Connection, id: i64) -> rusqlite::Result<Option<Secret<Vec<u8>>>> {
 	conn.query_row("SELECT value FROM secrets WHERE id = ?1", params![id], |r| {
 		r.get::<_, Vec<u8>>(0).map(Secret::new)
 	})
@@ -148,7 +143,7 @@ pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
 	})
 }
 
-pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+pub(crate) fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 	let n = conn.execute("DELETE FROM secrets WHERE id = ?1", params![id])?;
 	Ok(n > 0)
 }

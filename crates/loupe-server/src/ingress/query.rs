@@ -42,15 +42,16 @@ impl SearchTerms {
 		}
 	}
 	pub(crate) fn search(
-		&self, conn: &rusqlite::Connection, repo: i64, limit: i64,
-	) -> rusqlite::Result<Vec<loupe_storage::findings::FindingRow>> {
+		&self, scope: &loupe_storage::scope::RepoScope<'_>, limit: i64,
+	) -> loupe_storage::Result<Vec<loupe_storage::findings::FindingRow>> {
 		match self {
-			Self::Worker(q) => loupe_storage::findings::search(conn, repo, q, limit),
-			Self::Operator(q) => loupe_storage::findings::search(conn, repo, q, limit),
+			Self::Worker(q) => loupe_storage::findings::search(scope, q, limit),
+			Self::Operator(q) => loupe_storage::findings::search(scope, q, limit),
 		}
 	}
 }
 
+// debug-ok: shape and grammar diagnostics are fixed host phrases; text errors contain closed policy metadata.
 #[derive(Debug, thiserror::Error)]
 enum QueryError {
 	#[error("Failed to deserialize query string: invalid query")]

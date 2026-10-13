@@ -27,26 +27,31 @@ async fn review_scheduler_preserves_legacy_verify_first_through_http() {
 	let f = bring_up_with_repo_and_worker().await;
 	let first = enqueue_scan(&f, f.repo_id).await;
 	let second = enqueue_scan(&f, f.repo_id).await;
-	let verify = f.db.with_conn(|c| {
+	let finding = f.database.external_corruption(|c| {
 		c.execute("UPDATE jobs SET enqueued_at=1 WHERE id=?1",[first.job_id])?;
 		c.execute("UPDATE jobs SET enqueued_at=2 WHERE id=?1",[second.job_id])?;
 		c.execute("INSERT INTO findings(repo_id,job_id,scanner_id,severity,title,description,fingerprint,state,created_at,report_identity) VALUES(?1,?2,'test','high','t','d','scheduler-parity','validating',0,randomblob(16))",(f.repo_id,first.job_id))?;
-		let finding=c.last_insert_rowid();
-		loupe_storage::jobs::enqueue(c,&loupe_storage::jobs::NewJob{repo_id:f.repo_id,kind:loupe_core::JobKind::<loupe_provenance::Operator>::Verify,incremental:false,since_sha:None,parent_job_id:Some(first.job_id),target_finding_id:Some(finding)},3)
+		Ok(c.last_insert_rowid())
 	}).unwrap();
+	let verify = common::with_repo(&f.db, f.repo_id, |scope| {
+		loupe_storage::jobs::enqueue(
+			scope,
+			&loupe_storage::jobs::QueuedJob::<loupe_provenance::Operator> {
+				kind: loupe_core::JobKind::Verify,
+				incremental: false,
+				since_sha: None,
+				parent_job_id: Some(first.job_id),
+				target_finding_id: Some(finding),
+			},
+			3,
+		)
+	})
+	.unwrap();
 	assert_eq!(lease_verify_job(&f.worker).await.job_id, verify);
 	assert_eq!(lease_job(&f.worker).await.job_id, first.job_id);
 	assert_eq!(lease_job(&f.worker).await.job_id, second.job_id);
-	f.db.with_conn(|c| {
-		assert_eq!(
-			c.query_row("SELECT COUNT(*) FROM scheduler_repo_state", [], |r| r.get::<_, i64>(0))?,
-			0,
-			"legacy jobs must not alter campaign fairness"
-		);
-		assert_eq!(c.query_row("SELECT seq FROM scheduler_clock", [], |r| r.get::<_, i64>(0))?, 0);
-		Ok(())
-	})
-	.unwrap();
+	// Storage's legacy_verify_first_claims_leave_campaign_fairness_untouched
+	// checks both fairness TEMP tables on their actual owning connection.
 	f.handle.shutdown().await;
 }
 
@@ -69,6 +74,7 @@ struct Fixture {
 	worker: reqwest::Client,
 	repo_id: i64,
 	ca_cert_pem: String,
+	database: common::offline::OfflineDatabase,
 }
 
 async fn bring_up_with_repo_and_worker() -> Fixture {
@@ -89,16 +95,25 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
 	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
+	let mut database = common::offline::OfflineDatabase::new();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
-		db_path: init.layout.db_path.clone(),
+		db_path: common::config_path(database.path()),
 		server_cert_pem: common::config_pem(&server_cert_pem),
 		server_key_pem: common::config_pem(&server_key_pem),
 		ca_cert_pem: common::config_pem(&ca_cert_pem),
 		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
+	let db = database.open();
+	let admin_der =
+		rustls_pemfile::certs(&mut init.admin_bundle.cert_pem.as_bytes()).next().unwrap().unwrap();
+	loupe_storage::registry::bootstrap_admin(
+		&db,
+		&loupe_tls::cert_fingerprint(admin_der.as_ref()),
+		0,
+	)
+	.unwrap();
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),
@@ -143,7 +158,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 	let worker =
 		client(&ca_cert_pem, &bundle.client_cert_pem, bundle.client_key_pem.expose(), addr);
 
-	Fixture { handle, addr, db, admin, worker, repo_id, ca_cert_pem }
+	Fixture { handle, addr, db, admin, worker, repo_id, ca_cert_pem, database }
 }
 
 async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
@@ -444,13 +459,9 @@ async fn ingress_llm_length_checks_use_trimmed_views() {
 			.unwrap();
 		assert_eq!(response.status(), expected);
 	}
-	let (count, title, description): (i64, String, String) =
-		f.db.with_conn(|conn| {
-			Ok(conn.query_row("SELECT COUNT(*), title, description FROM findings", [], |row| {
-				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-			})?)
-		})
-		.unwrap();
+	let stored = common::findings(&f.db, f.repo_id);
+	let (count, title, description) =
+		(stored.len(), stored[0].title.expose(), stored[0].description.expose());
 	assert_eq!((count, title.len(), description.len()), (1, 8, 80));
 	f.handle.shutdown().await;
 }
@@ -471,13 +482,12 @@ async fn ingress_llm_route_retains_original_title_and_description() {
 		.await
 		.unwrap();
 	assert_eq!(response.status(), 204, "exact-content fixture must first be admitted");
-	let (id, stored_title, stored_description): (i64, String, String) =
-		f.db.with_conn(|conn| {
-			Ok(conn.query_row("SELECT id, title, description FROM findings", [], |row| {
-				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-			})?)
-		})
-		.unwrap();
+	let stored = common::findings(&f.db, f.repo_id);
+	let (id, stored_title, stored_description) = (
+		stored[0].id,
+		stored[0].title.expose().to_owned(),
+		stored[0].description.expose().to_owned(),
+	);
 	let response =
 		f.admin.get(format!("https://loupe-server/v1/findings/{id}")).send().await.unwrap();
 	assert_eq!(response.status(), 200);
@@ -495,7 +505,7 @@ async fn ingress_llm_route_retains_original_title_and_description() {
 	);
 }
 
-/// Passing pre-M compatibility: equal fields must remain distinct original
+/// Equal fields must remain distinct original
 /// tokens, and transport/storage/readback must retain final-newline variants.
 #[tokio::test]
 async fn atomic_m_batch_roundtrip_preserves_equal_fields_and_final_newlines() {
@@ -515,9 +525,19 @@ async fn atomic_m_batch_roundtrip_preserves_equal_fields_and_final_newlines() {
 			..finding(single, &format!("atomic-m-{index}"))
 		};
 		submit_finding(&f.worker, &lease, original.clone()).await;
-		let (id, scanner, title, description, patch, poc, path): (i64, String, String, String, String, String, String) = f.db.with_conn(|conn| {
-			Ok(conn.query_row("SELECT id,scanner_id,title,description,patch_unified,poc_unified,file_path FROM findings WHERE fingerprint=?1", [&original.fingerprint], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?)
-		}).unwrap();
+		let stored = common::findings(&f.db, f.repo_id)
+			.into_iter()
+			.find(|stored| stored.fingerprint.expose() == original.fingerprint)
+			.unwrap();
+		let (id, scanner, title, description, patch, poc, path) = (
+			stored.id,
+			stored.scanner_id.expose().to_owned(),
+			stored.title.expose().to_owned(),
+			stored.description.expose().to_owned(),
+			stored.patch_unified.as_ref().unwrap().expose().to_owned(),
+			stored.poc_unified.as_ref().unwrap().expose().to_owned(),
+			stored.file_path.as_ref().unwrap().expose().to_owned(),
+		);
 		assert_eq!(
 			(
 				scanner.as_str(),
@@ -844,9 +864,7 @@ async fn end_to_end_scan_lifecycle() {
 	assert_eq!(resp.status(), 204);
 
 	// Findings table has exactly one row (dedup worked).
-	let count: i64 =
-		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
-			.unwrap();
+	let count: i64 = i64::try_from(common::findings(&f.db, f.repo_id).len()).unwrap();
 	assert_eq!(count, 1);
 
 	// Job is succeeded; repo's last_scanned_sha is updated.
@@ -863,9 +881,12 @@ async fn end_to_end_scan_lifecycle() {
 	assert_eq!(job["head_sha"], "abc123");
 
 	// scan_history row was written.
-	let history_count: i64 =
-		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM scan_history", [], |r| r.get(0))?))
-			.unwrap();
+	let history_count: i64 = f
+		.database
+		.external_corruption(|c| {
+			Ok(c.query_row("SELECT COUNT(*) FROM scan_history", [], |r| r.get(0))?)
+		})
+		.unwrap();
 	assert_eq!(history_count, 1);
 
 	f.handle.shutdown().await;
@@ -954,13 +975,15 @@ async fn job_info_reports_lease_timing_and_failure_detail() {
 #[tokio::test]
 async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let failed_scan = enqueue_scan(&f, f.repo_id).await;
 	let failed_env = lease_job(&f.worker).await;
@@ -981,15 +1004,10 @@ async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let failed_job_findings: i64 =
-		f.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT COUNT(*) FROM findings WHERE job_id = ?1",
-				[failed_env.job_id],
-				|r| r.get(0),
-			)?)
-		})
-		.unwrap();
+	let failed_job_findings = common::findings(&f.db, f.repo_id)
+		.iter()
+		.filter(|finding| finding.job_id == failed_env.job_id)
+		.count();
 	assert_eq!(failed_job_findings, 0, "failed scans must not leave dedup-blocking findings");
 
 	let retried_scan = enqueue_scan(&f, f.repo_id).await;
@@ -1011,24 +1029,19 @@ async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let (finding_job_id, finding_state, verify_jobs): (i64, String, i64) =
-		f.db.with_conn(|c| {
-			let (finding_id, finding_job_id, finding_state): (i64, i64, String) = c.query_row(
-				"SELECT id, job_id, state FROM findings WHERE fingerprint = 'fp-retryable'",
-				[],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-			)?;
-			let verify_jobs = c.query_row(
-				"SELECT COUNT(*) FROM jobs
-				  WHERE kind = 'verify'
-				    AND parent_job_id = ?1
-				    AND target_finding_id = ?2",
-				(retried_env.job_id, finding_id),
-				|r| r.get(0),
-			)?;
-			Ok((finding_job_id, finding_state, verify_jobs))
-		})
+	let stored = common::findings(&f.db, f.repo_id)
+		.into_iter()
+		.find(|finding| finding.fingerprint.expose() == "fp-retryable")
 		.unwrap();
+	let (finding_job_id, finding_state) = (stored.job_id, stored.state.as_str());
+	let verify_jobs = common::jobs(&f.db, f.repo_id)
+		.iter()
+		.filter(|job| {
+			job.kind == loupe_core::JobKind::Verify
+				&& job.parent_job_id == Some(retried_env.job_id)
+				&& job.target_finding_id == Some(stored.id)
+		})
+		.count();
 	assert_eq!(finding_job_id, retried_env.job_id);
 	assert_eq!(finding_state, "validating");
 	assert_eq!(verify_jobs, 1);
@@ -1066,8 +1079,9 @@ async fn scan_success_without_head_sha_is_rejected_without_mutating_job() {
 		Option<i64>,
 		Option<i64>,
 		i64,
-	) =
-		f.db.with_conn(|c| {
+	) = f
+		.database
+		.external_corruption(|c| {
 			let (state, finished_at, lease_expires_at) = c.query_row(
 				"SELECT state, finished_at, lease_expires_at FROM jobs WHERE id = ?1",
 				[env.job_id],
@@ -1092,13 +1106,15 @@ async fn scan_success_without_head_sha_is_rejected_without_mutating_job() {
 #[tokio::test]
 async fn verify_success_without_verdict_is_rejected_without_mutating_job() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1142,8 +1158,9 @@ async fn verify_success_without_verdict_is_rejected_without_mutating_job() {
 	assert_eq!(status, 409, "{body}");
 	assert!(body.contains("verdict"), "response should explain missing verdict: {body}");
 
-	let (job_state, finding_state, verdict_count): (String, String, i64) =
-		f.db.with_conn(|c| {
+	let (job_state, finding_state, verdict_count): (String, String, i64) = f
+		.database
+		.external_corruption(|c| {
 			let job_state =
 				c.query_row("SELECT state FROM jobs WHERE id = ?1", [verify_env.job_id], |r| {
 					r.get(0)
@@ -1170,13 +1187,15 @@ async fn verify_success_without_verdict_is_rejected_without_mutating_job() {
 #[tokio::test]
 async fn verify_success_after_verdict_is_still_accepted() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1230,19 +1249,8 @@ async fn verify_success_after_verdict_is_still_accepted() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let (job_state, finding_state): (String, String) =
-		f.db.with_conn(|c| {
-			let job_state =
-				c.query_row("SELECT state FROM jobs WHERE id = ?1", [verify_env.job_id], |r| {
-					r.get(0)
-				})?;
-			let finding_state =
-				c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| {
-					r.get(0)
-				})?;
-			Ok((job_state, finding_state))
-		})
-		.unwrap();
+	let job_state = common::job(&f.db, f.repo_id, verify_env.job_id).state.as_str();
+	let finding_state = common::finding(&f.db, f.repo_id, finding_id).state.as_str();
 	assert_eq!(job_state, "succeeded");
 	assert_eq!(finding_state, "dismissed");
 
@@ -1334,13 +1342,10 @@ async fn cancel_leased_scan_discards_pending_findings_and_invalidates_worker() {
 		.unwrap();
 	assert_eq!(resp.status(), 403);
 
-	let pending_findings: i64 =
-		f.db.with_conn(|c| {
-			Ok(c.query_row("SELECT COUNT(*) FROM findings WHERE job_id = ?1", [env.job_id], |r| {
-				r.get(0)
-			})?)
-		})
-		.unwrap();
+	let pending_findings = common::findings(&f.db, f.repo_id)
+		.iter()
+		.filter(|finding| finding.job_id == env.job_id)
+		.count();
 	assert_eq!(pending_findings, 0);
 
 	f.handle.shutdown().await;
@@ -1349,13 +1354,15 @@ async fn cancel_leased_scan_discards_pending_findings_and_invalidates_worker() {
 #[tokio::test]
 async fn cancel_verify_job_leaves_target_finding_validating() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1389,19 +1396,8 @@ async fn cancel_verify_job_leaves_target_finding_validating() {
 		.unwrap();
 	assert_eq!(resp.status(), 200);
 
-	let (job_state, finding_state): (String, String) =
-		f.db.with_conn(|c| {
-			let job_state =
-				c.query_row("SELECT state FROM jobs WHERE id = ?1", [verify_env.job_id], |r| {
-					r.get(0)
-				})?;
-			let finding_state =
-				c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| {
-					r.get(0)
-				})?;
-			Ok((job_state, finding_state))
-		})
-		.unwrap();
+	let job_state = common::job(&f.db, f.repo_id, verify_env.job_id).state.as_str();
+	let finding_state = common::finding(&f.db, f.repo_id, finding_id).state.as_str();
 	assert_eq!(job_state, "cancelled");
 	assert_eq!(finding_state, "validating");
 
@@ -1443,13 +1439,15 @@ async fn cancel_rejects_terminal_jobs() {
 #[tokio::test]
 async fn admin_can_retry_failed_verify_job() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1480,8 +1478,9 @@ async fn admin_can_retry_failed_verify_job() {
 		other => panic!("expected verify payload, got {other:?}"),
 	};
 
-	let before_deadline: i64 =
-		f.db.with_conn(|c| {
+	let before_deadline: i64 = f
+		.database
+		.external_corruption(|c| {
 			Ok(c.query_row(
 				"SELECT validating_deadline FROM findings WHERE id = ?1",
 				[finding_id],
@@ -1520,8 +1519,9 @@ async fn admin_can_retry_failed_verify_job() {
 	assert_eq!(retried["state"], "queued");
 	assert_eq!(retried["attempts"], 0);
 
-	let (state, attempts, error, after_deadline): (String, i64, Option<String>, i64) =
-		f.db.with_conn(|c| {
+	let (state, attempts, error, after_deadline): (String, i64, Option<String>, i64) = f
+		.database
+		.external_corruption(|c| {
 			Ok(c.query_row(
 				"SELECT j.state, j.attempts, j.error, f.validating_deadline
 				   FROM jobs j
@@ -1546,13 +1546,15 @@ async fn admin_can_retry_failed_verify_job() {
 #[tokio::test]
 async fn terminal_inconclusive_verdict_dismisses_finding_immediately() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1599,8 +1601,9 @@ async fn terminal_inconclusive_verdict_dismisses_finding_immediately() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let (state, dismissed_at, verdict): (String, Option<i64>, String) =
-		f.db.with_conn(|c| {
+	let (state, dismissed_at, verdict): (String, Option<i64>, String) = f
+		.database
+		.external_corruption(|c| {
 			Ok(c.query_row(
 				"SELECT f.state, f.dismissed_at, v.verdict
 				   FROM findings f
@@ -1621,13 +1624,15 @@ async fn terminal_inconclusive_verdict_dismisses_finding_immediately() {
 #[tokio::test]
 async fn retry_revives_deadline_dismissed_verify_target() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1670,16 +1675,14 @@ async fn retry_revives_deadline_dismissed_verify_target() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	f.db.with_conn(|c| {
-		c.execute("UPDATE findings SET validating_deadline = 100 WHERE id = ?1", [finding_id])?;
-		Ok(loupe_storage::findings::reap_stale_validating(c, 200)?)
-	})
-	.unwrap();
-	let dismissed: String =
-		f.db.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| r.get(0))?)
+	f.database
+		.external_corruption(|c| {
+			c.execute("UPDATE findings SET validating_deadline = 100 WHERE id = ?1", [finding_id])?;
+			Ok(())
 		})
 		.unwrap();
+	loupe_storage::maintenance::reap_validating(&f.db, 200).unwrap();
+	let dismissed = common::finding(&f.db, f.repo_id, finding_id).state.as_str();
 	assert_eq!(dismissed, "dismissed");
 
 	let retried: serde_json::Value = f
@@ -1696,8 +1699,9 @@ async fn retry_revives_deadline_dismissed_verify_target() {
 	assert_eq!(retried["job_id"], verify_env.job_id);
 	assert_eq!(retried["state"], "queued");
 
-	let (state, dismissed_at): (String, Option<i64>) =
-		f.db.with_conn(|c| {
+	let (state, dismissed_at): (String, Option<i64>) = f
+		.database
+		.external_corruption(|c| {
 			Ok(c.query_row(
 				"SELECT state, dismissed_at FROM findings WHERE id = ?1",
 				[finding_id],
@@ -1714,13 +1718,15 @@ async fn retry_revives_deadline_dismissed_verify_target() {
 #[tokio::test]
 async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_findings() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1765,63 +1771,69 @@ async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_fin
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let queued_verify_job_id: i64 =
-		f.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT id FROM jobs
-				  WHERE kind = 'verify'
-				    AND state = 'queued'
-				    AND target_finding_id != ?1",
-				[failed_finding_id],
-				|r| r.get(0),
-			)?)
+	let queued_finding_id = common::findings(&f.db, f.repo_id)
+		.iter()
+		.find(|finding| finding.fingerprint.expose() == "fp-queued-verify")
+		.unwrap()
+		.id;
+	assert_ne!(queued_finding_id, failed_finding_id);
+	let queued_verify_job_id = common::jobs(&f.db, f.repo_id)
+		.iter()
+		.find(|job| {
+			job.kind == loupe_core::JobKind::Verify
+				&& job.state == JobState::Queued
+				&& job.target_finding_id == Some(queued_finding_id)
 		})
-		.unwrap();
+		.unwrap()
+		.id;
 
-	let (terminal_finding_id, terminal_verify_job_id): (i64, i64) =
-		f.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT f.id, j.id
-				   FROM findings f
-				   JOIN jobs j ON j.target_finding_id = f.id
-				  WHERE f.fingerprint = 'fp-verifier-dismissed'
-				    AND j.kind = 'verify'",
-				[],
-				|r| Ok((r.get(0)?, r.get(1)?)),
-			)?)
+	let terminal_finding_id = common::findings(&f.db, f.repo_id)
+		.iter()
+		.find(|finding| finding.fingerprint.expose() == "fp-verifier-dismissed")
+		.unwrap()
+		.id;
+	let terminal_verify_job_id = common::jobs(&f.db, f.repo_id)
+		.iter()
+		.find(|job| {
+			job.kind == loupe_core::JobKind::Verify
+				&& job.target_finding_id == Some(terminal_finding_id)
 		})
-		.unwrap();
+		.unwrap()
+		.id;
 
-	f.db.with_conn(|c| {
-		c.execute(
-			"INSERT INTO finding_verifications
+	f.database
+		.external_corruption(|c| {
+			c.execute(
+				"INSERT INTO finding_verifications
 			   (finding_id, job_id, verdict, notes, created_at)
 			 VALUES (?1, ?2, 'dismissed', 'verifier rejected it', 100)",
-			(terminal_finding_id, terminal_verify_job_id),
-		)?;
-		c.execute(
-			"UPDATE findings SET state = 'dismissed', dismissed_at = 100 WHERE id = ?1",
-			[terminal_finding_id],
-		)?;
-		c.execute(
-			"UPDATE jobs SET state = 'succeeded', finished_at = 100 WHERE id = ?1",
-			[terminal_verify_job_id],
-		)?;
-		Ok(())
-	})
-	.unwrap();
+				(terminal_finding_id, terminal_verify_job_id),
+			)?;
+			c.execute(
+				"UPDATE findings SET state = 'dismissed', dismissed_at = 100 WHERE id = ?1",
+				[terminal_finding_id],
+			)?;
+			c.execute(
+				"UPDATE jobs SET state = 'succeeded', finished_at = 100 WHERE id = ?1",
+				[terminal_verify_job_id],
+			)?;
+			Ok(())
+		})
+		.unwrap();
 
-	f.db.with_conn(|c| {
-		c.execute(
-			"UPDATE findings
+	f.database
+		.external_corruption(|c| {
+			c.execute(
+				"UPDATE findings
 			    SET validating_deadline = 100
 			  WHERE repo_id = ?1
 			    AND state = 'validating'",
-			[f.repo_id],
-		)?;
-		Ok(loupe_storage::findings::reap_stale_validating(c, 200)?)
-	})
-	.unwrap();
+				[f.repo_id],
+			)?;
+			Ok(())
+		})
+		.unwrap();
+	loupe_storage::maintenance::reap_validating(&f.db, 200).unwrap();
 
 	let dry_run: RetryVerifyResponse = f
 		.admin
@@ -1848,15 +1860,10 @@ async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_fin
 	assert_eq!(dry_run.created_jobs, 0);
 	assert_eq!(dry_run.left_queued_or_leased, 1);
 
-	let dismissed_count: i64 =
-		f.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT COUNT(*) FROM findings WHERE repo_id = ?1 AND state = 'dismissed'",
-				[f.repo_id],
-				|r| r.get(0),
-			)?)
-		})
-		.unwrap();
+	let dismissed_count = common::findings(&f.db, f.repo_id)
+		.iter()
+		.filter(|finding| finding.state == loupe_core::FindingState::Dismissed)
+		.count();
 	assert_eq!(dismissed_count, 3, "dry-run must not revive findings");
 
 	let applied: RetryVerifyResponse = f
@@ -1884,51 +1891,18 @@ async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_fin
 	assert_eq!(applied.created_jobs, 0);
 	assert_eq!(applied.left_queued_or_leased, 1);
 
-	let (failed_state, queued_state, terminal_state): (String, String, String) =
-		f.db.with_conn(|c| {
-			let failed_state = c.query_row(
-				"SELECT state FROM findings WHERE id = ?1",
-				[failed_finding_id],
-				|r| r.get(0),
-			)?;
-			let queued_state = c.query_row(
-				"SELECT f.state
-				   FROM findings f
-				   JOIN jobs j ON j.target_finding_id = f.id
-				  WHERE j.id = ?1",
-				[queued_verify_job_id],
-				|r| r.get(0),
-			)?;
-			let terminal_state = c.query_row(
-				"SELECT state FROM findings WHERE id = ?1",
-				[terminal_finding_id],
-				|r| r.get(0),
-			)?;
-			Ok((failed_state, queued_state, terminal_state))
-		})
-		.unwrap();
+	let failed_state = common::finding(&f.db, f.repo_id, failed_finding_id).state.as_str();
+	let queued_target =
+		common::job(&f.db, f.repo_id, queued_verify_job_id).target_finding_id.unwrap();
+	let queued_state = common::finding(&f.db, f.repo_id, queued_target).state.as_str();
+	let terminal_state = common::finding(&f.db, f.repo_id, terminal_finding_id).state.as_str();
 	assert_eq!(failed_state, "validating");
 	assert_eq!(queued_state, "dismissed", "active verify work must not be touched");
 	assert_eq!(terminal_state, "dismissed", "verifier-dismissed findings must stay terminal");
 
-	let (failed_job_state, queued_job_state, terminal_job_state): (String, String, String) =
-		f.db.with_conn(|c| {
-			let failed_state =
-				c.query_row("SELECT state FROM jobs WHERE id = ?1", [failed_env.job_id], |r| {
-					r.get(0)
-				})?;
-			let queued_state =
-				c.query_row("SELECT state FROM jobs WHERE id = ?1", [queued_verify_job_id], |r| {
-					r.get(0)
-				})?;
-			let terminal_state = c.query_row(
-				"SELECT state FROM jobs WHERE id = ?1",
-				[terminal_verify_job_id],
-				|r| r.get(0),
-			)?;
-			Ok((failed_state, queued_state, terminal_state))
-		})
-		.unwrap();
+	let failed_job_state = common::job(&f.db, f.repo_id, failed_env.job_id).state.as_str();
+	let queued_job_state = common::job(&f.db, f.repo_id, queued_verify_job_id).state.as_str();
+	let terminal_job_state = common::job(&f.db, f.repo_id, terminal_verify_job_id).state.as_str();
 	assert_eq!(failed_job_state, "queued");
 	assert_eq!(queued_job_state, "queued");
 	assert_eq!(terminal_job_state, "succeeded");
@@ -1939,13 +1913,15 @@ async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_fin
 #[tokio::test]
 async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let scan_env = lease_job(&f.worker).await;
@@ -1976,24 +1952,20 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let rows: Vec<(String, i64, i64)> =
-		f.db.with_conn(|c| {
-			let mut stmt = c.prepare(
-				"SELECT f.fingerprint, f.id, j.id
-				   FROM findings f
-				   JOIN jobs j ON j.target_finding_id = f.id
-				  WHERE f.repo_id = ?1
-				    AND j.kind = 'verify'",
-			)?;
-			let rows = stmt.query_map([f.repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-			Ok(rows.collect::<Result<Vec<_>, _>>()?)
-		})
-		.unwrap();
+	let findings = common::findings(&f.db, f.repo_id);
+	let jobs = common::jobs(&f.db, f.repo_id);
 	let ids = |fingerprint: &str| -> (i64, i64) {
-		rows.iter()
-			.find(|(fp, _, _)| fp == fingerprint)
-			.map(|(_, finding_id, job_id)| (*finding_id, *job_id))
-			.unwrap_or_else(|| panic!("missing finding/job for {fingerprint}"))
+		let finding = findings
+			.iter()
+			.find(|finding| finding.fingerprint.expose() == fingerprint)
+			.unwrap_or_else(|| panic!("missing finding for {fingerprint}"));
+		let job = jobs
+			.iter()
+			.find(|job| {
+				job.kind == loupe_core::JobKind::Verify && job.target_finding_id == Some(finding.id)
+			})
+			.unwrap_or_else(|| panic!("missing verify job for {fingerprint}"));
+		(finding.id, job.id)
 	};
 	let (failed_id, failed_job) = ids("fp-refresh-failed");
 	let (inconclusive_id, inconclusive_job) = ids("fp-refresh-inconclusive");
@@ -2003,78 +1975,79 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 	let (dismissed_id, dismissed_job) = ids("fp-refresh-dismissed");
 	let (reported_id, reported_job) = ids("fp-refresh-reported");
 
-	f.db.with_conn(|c| {
-		for finding_id in [
-			failed_id,
-			inconclusive_id,
-			queued_id,
-			leased_id,
-			confirmed_id,
-			dismissed_id,
-			reported_id,
-		] {
+	f.database
+		.external_corruption(|c| {
+			for finding_id in [
+				failed_id,
+				inconclusive_id,
+				queued_id,
+				leased_id,
+				confirmed_id,
+				dismissed_id,
+				reported_id,
+			] {
+				c.execute(
+					"UPDATE findings SET validating_deadline = 1000 WHERE id = ?1",
+					[finding_id],
+				)?;
+			}
 			c.execute(
-				"UPDATE findings SET validating_deadline = 1000 WHERE id = ?1",
-				[finding_id],
-			)?;
-		}
-		c.execute(
-			"UPDATE jobs
+				"UPDATE jobs
 			   SET state = 'failed', finished_at = 100, error = 'verifier failed'
 			 WHERE id = ?1",
-			[failed_job],
-		)?;
-		c.execute(
-			"UPDATE jobs
+				[failed_job],
+			)?;
+			c.execute(
+				"UPDATE jobs
 			   SET state = 'succeeded', finished_at = 100
 			 WHERE id = ?1",
-			[inconclusive_job],
-		)?;
-		c.execute(
-			"INSERT INTO finding_verifications
+				[inconclusive_job],
+			)?;
+			c.execute(
+				"INSERT INTO finding_verifications
 			   (finding_id, job_id, verdict, notes, created_at)
 			 VALUES (?1, ?2, 'inconclusive', ?3, ?4)",
-			(inconclusive_id, inconclusive_job, "verifier could not decide", 100_i64),
-		)?;
-		let worker_id: i64 =
-			c.query_row("SELECT id FROM workers WHERE name = 'w1'", [], |r| r.get(0))?;
-		c.execute(
-			"UPDATE jobs
+				(inconclusive_id, inconclusive_job, "verifier could not decide", 100_i64),
+			)?;
+			let worker_id: i64 =
+				c.query_row("SELECT id FROM workers WHERE name = 'w1'", [], |r| r.get(0))?;
+			c.execute(
+				"UPDATE jobs
 			   SET state = 'leased',
 			       worker_id = ?2,
 			       lease_expires_at = 9999999999,
 			       attempts = 1,
 			       started_at = 100
 			 WHERE id = ?1",
-			(leased_job, worker_id),
-		)?;
-		c.execute(
-			"UPDATE jobs
+				(leased_job, worker_id),
+			)?;
+			c.execute(
+				"UPDATE jobs
 			   SET state = 'failed', finished_at = 100, error = 'terminal finding'
 			 WHERE id IN (?1, ?2, ?3)",
-			(confirmed_job, dismissed_job, reported_job),
-		)?;
-		c.execute(
-			"UPDATE findings SET state = 'confirmed', confirmed_at = 100 WHERE id = ?1",
-			[confirmed_id],
-		)?;
-		c.execute(
-			"UPDATE findings SET state = 'dismissed', dismissed_at = 100 WHERE id = ?1",
-			[dismissed_id],
-		)?;
-		c.execute(
-			"INSERT INTO finding_verifications
+				(confirmed_job, dismissed_job, reported_job),
+			)?;
+			c.execute(
+				"UPDATE findings SET state = 'confirmed', confirmed_at = 100 WHERE id = ?1",
+				[confirmed_id],
+			)?;
+			c.execute(
+				"UPDATE findings SET state = 'dismissed', dismissed_at = 100 WHERE id = ?1",
+				[dismissed_id],
+			)?;
+			c.execute(
+				"INSERT INTO finding_verifications
 			   (finding_id, job_id, verdict, notes, created_at)
 			 VALUES (?1, ?2, 'dismissed', 'verifier rejected it', 100)",
-			(dismissed_id, dismissed_job),
-		)?;
-		c.execute(
-			"UPDATE findings SET state = 'reported', reported_at = 100 WHERE id = ?1",
-			[reported_id],
-		)?;
-		Ok(())
-	})
-	.unwrap();
+				(dismissed_id, dismissed_job),
+			)?;
+			c.execute(
+				"UPDATE findings SET state = 'reported', reported_at = 100 WHERE id = ?1",
+				[reported_id],
+			)?;
+			Ok(())
+		})
+		.unwrap();
 
 	let applied: RetryVerifyResponse = f
 		.admin
@@ -2106,9 +2079,7 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 		String,
 		i64,
 		i64,
-	) = f
-		.db
-		.with_conn(|c| {
+	) = f.database.external_corruption(|c| {
 			let failed_job_state =
 				c.query_row("SELECT state FROM jobs WHERE id = ?1", [failed_job], |r| r.get(0))?;
 			let inconclusive_queued = c.query_row(
@@ -2176,8 +2147,9 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 		String,
 		String,
 		i64,
-	) =
-		f.db.with_conn(|c| {
+	) = f
+		.database
+		.external_corruption(|c| {
 			let inconclusive_queued = c.query_row(
 				"SELECT COUNT(*) FROM jobs
 				  WHERE kind = 'verify'
@@ -2226,13 +2198,15 @@ async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs()
 #[tokio::test]
 async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		Ok(c.execute(
-			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
-			[f.repo_id],
-		)?)
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 
 	let scan = enqueue_scan(&f, f.repo_id).await;
 	let env = lease_job(&f.worker).await;
@@ -2253,8 +2227,9 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
-	let stranded_id: i64 =
-		f.db.with_conn(|c| {
+	let stranded_id: i64 = f
+		.database
+		.external_corruption(|c| {
 			let finding_id = c.query_row(
 				"SELECT id FROM findings WHERE fingerprint = 'fp-stranded'",
 				[],
@@ -2280,13 +2255,11 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 	assert_eq!(active_env.job_id, active_scan.job_id);
 	submit_finding(&f.worker, &active_env, finding("Still scanning", "fp-active")).await;
 
-	let active_id: i64 =
-		f.db.with_conn(|c| {
-			Ok(c.query_row("SELECT id FROM findings WHERE fingerprint = 'fp-active'", [], |r| {
-				r.get(0)
-			})?)
-		})
-		.unwrap();
+	let active_id = common::findings(&f.db, f.repo_id)
+		.iter()
+		.find(|finding| finding.fingerprint.expose() == "fp-active")
+		.unwrap()
+		.id;
 
 	let dry_run: RetryVerifyResponse = f
 		.admin
@@ -2313,24 +2286,15 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 	assert_eq!(dry_run.requeued_jobs, 0);
 	assert_eq!(dry_run.left_queued_or_leased, 0);
 
-	let (stranded_state, active_state, verify_jobs): (String, String, i64) =
-		f.db.with_conn(|c| {
-			let stranded_state =
-				c.query_row("SELECT state FROM findings WHERE id = ?1", [stranded_id], |r| {
-					r.get(0)
-				})?;
-			let active_state =
-				c.query_row("SELECT state FROM findings WHERE id = ?1", [active_id], |r| r.get(0))?;
-			let verify_jobs = c.query_row(
-				"SELECT COUNT(*) FROM jobs
-				  WHERE kind = 'verify'
-				    AND target_finding_id IN (?1, ?2)",
-				(stranded_id, active_id),
-				|r| r.get(0),
-			)?;
-			Ok((stranded_state, active_state, verify_jobs))
+	let stranded_state = common::finding(&f.db, f.repo_id, stranded_id).state.as_str();
+	let active_state = common::finding(&f.db, f.repo_id, active_id).state.as_str();
+	let verify_jobs = common::jobs(&f.db, f.repo_id)
+		.iter()
+		.filter(|job| {
+			job.kind == loupe_core::JobKind::Verify
+				&& job.target_finding_id.is_some_and(|id| [stranded_id, active_id].contains(&id))
 		})
-		.unwrap();
+		.count();
 	assert_eq!(stranded_state, "pending");
 	assert_eq!(active_state, "pending");
 	assert_eq!(verify_jobs, 0, "dry-run must not enqueue verification jobs");
@@ -2366,8 +2330,9 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 		String,
 		Option<i64>,
 		i64,
-	) =
-		f.db.with_conn(|c| {
+	) = f
+		.database
+		.external_corruption(|c| {
 			let (stranded_state, stranded_deadline) = c.query_row(
 				"SELECT state, validating_deadline FROM findings WHERE id = ?1",
 				[stranded_id],
@@ -2515,10 +2480,11 @@ async fn prior_finding_routes_require_active_lease_for_that_repo() {
 		.unwrap();
 	assert_eq!(resp.status(), 200, "admin review access should not require a worker lease");
 
-	f.db.with_conn(|c| {
-		Ok(c.execute("UPDATE jobs SET lease_expires_at = 0 WHERE id = ?1", [env_a.job_id])?)
-	})
-	.unwrap();
+	f.database
+		.external_corruption(|c| {
+			Ok(c.execute("UPDATE jobs SET lease_expires_at = 0 WHERE id = ?1", [env_a.job_id])?)
+		})
+		.unwrap();
 	let resp = f
 		.worker
 		.get(format!(
@@ -2737,9 +2703,7 @@ async fn oversized_llm_report_can_be_shortened_and_retried() {
 	assert_eq!(rejected.status(), 400, "oversized report must be rejected before storage");
 	let error = rejected.text().await.unwrap();
 	assert!(error.contains("60000") && error.contains("retry"), "actionable size error: {error}");
-	let count: i64 =
-		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
-			.unwrap();
+	let count: i64 = i64::try_from(common::findings(&f.db, f.repo_id).len()).unwrap();
 	assert_eq!(count, 0, "rejection must leave no dedup row");
 	submission["poc_unified"] = serde_json::json!(
 		"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n old\n+#[test] fn triggers_bug() {}\n"
@@ -2781,14 +2745,16 @@ async fn github_findings_batch_checks_the_rendered_body() {
 #[tokio::test]
 async fn oversized_verifier_patch_is_rejected_without_locking_the_verdict() {
 	let f = bring_up_with_repo_and_worker().await;
-	f.db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET verification_enabled=1, require_approval=1 WHERE id=?1",
-			[f.repo_id],
-		)?;
-		Ok(())
-	})
-	.unwrap();
+	assert!(common::with_repo(&f.db, f.repo_id, |scope| loupe_storage::repos::update(
+		scope,
+		&loupe_storage::repos::RepoUpdate {
+			verification_enabled: Some(true),
+			require_approval: Some(Some(true)),
+			..Default::default()
+		},
+		0
+	))
+	.unwrap());
 	enqueue_scan(&f, f.repo_id).await;
 	let scan = lease_job(&f.worker).await;
 	let mut report = finding("Large PoC", "patch-budget");
@@ -2831,8 +2797,9 @@ async fn oversized_verifier_patch_is_rejected_without_locking_the_verdict() {
 	assert_eq!(rejected.status(), 400, "patch must fit alongside the original report");
 	let error = rejected.text().await.unwrap();
 	assert!(error.contains("60000") && error.contains("retry"), "patch size error: {error}");
-	let count: i64 =
-		f.db.with_conn(|c| {
+	let count: i64 = f
+		.database
+		.external_corruption(|c| {
 			Ok(c.query_row("SELECT COUNT(*) FROM finding_verifications", [], |r| r.get(0))?)
 		})
 		.unwrap();
@@ -2892,11 +2859,8 @@ async fn strict_llm_endpoint_rejects_placeholders_and_sets_scanner_identity() {
 		.unwrap();
 	assert_eq!(accepted.status(), 204);
 
-	let scanner_id: String =
-		f.db.with_conn(|conn| {
-			Ok(conn.query_row("SELECT scanner_id FROM findings", [], |row| row.get(0))?)
-		})
-		.unwrap();
+	let stored = common::findings(&f.db, f.repo_id);
+	let scanner_id = stored[0].scanner_id.expose();
 	assert_eq!(scanner_id, "llm-code-review");
 	f.handle.shutdown().await;
 }
