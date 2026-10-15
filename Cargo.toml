@@ -3,7 +3,9 @@ resolver = "3"
 members = [
     "crates/loupe-cli",
     "crates/loupe-core",
+    "crates/loupe-http",
     "crates/loupe-proto",
+    "crates/loupe-provenance",
     "crates/loupe-server",
     "crates/loupe-storage",
     "crates/loupe-tls",
@@ -23,15 +25,18 @@ categories = ["development-tools"]
 publish = ["crates-io"]
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# Production crate roots and CI deny this. Independent test targets permit
+# direct I/O for fixture setup.
+disallowed_methods = "allow"
 
 [workspace.dependencies]
 # Every dep below sets `default-features = false` and lists exactly the
-# features we use. Two reasons: it documents our usage so a future
-# tightener can verify nothing's unused, and it keeps the dep tree
+# features we use to keep the dependency tree
 # small (most notably: keeps `aws-lc-rs` out of the rustls subtree —
 # default rustls pulls both ring AND aws-lc-rs, the latter is a
 # vendored LibCrypto fork worth tens of MB of build artefacts).
@@ -41,6 +46,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 bytes = { version = "1", default-features = false, features = ["std"] }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await", "std"] }
 http-body-util = { version = "0.1", default-features = false }
@@ -68,9 +74,11 @@ ring = { version = "0.17", default-features = false, features = ["std"] }
 rusqlite ={ version = "0.32", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
 rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
+pem = { version = "3", default-features = false, features = ["std"] }
+webpki-roots = { version = "1", default-features = false }
 rustix = { version = "1", default-features = false, features = ["std", "fs", "pipe", "process"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 tempfile = { version = "3", default-features = false }
 thiserror = { version = "2", default-features = false }

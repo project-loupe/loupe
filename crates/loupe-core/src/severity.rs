@@ -9,6 +9,7 @@ use crate::error::Error;
 ///
 /// Ordered from least to most severe so that `severity >= Severity::High`
 /// reads naturally in policy code.
+// debug-ok: severity is a closed enum of unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {

@@ -1,0 +1,3 @@
+# Build scripts allowed in product crates, one path per line with its reason.
+# A build script runs arbitrary code at build time and can generate code
+# the source checks never see, so each one is listed and reviewed.

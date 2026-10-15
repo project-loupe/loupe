@@ -15,6 +15,11 @@ publish.workspace = true
 name = "loupe-worker"
 path = "src/main.rs"
 
+[features]
+# Explicit synthetic Sandbox fixture authority for sibling integration tests.
+# Opting in is permitted outside tests too; keep it out of normal dependencies.
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -29,13 +34,16 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-http = { version = "0.1.0", path = "../loupe-http" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 regex = { workspace = true }
+rand_core = { workspace = true }
 reqwest = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["event", "net"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -46,7 +54,12 @@ tracing-subscriber = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+# Explicit fixture authority for this crate's integration tests only.
+loupe-worker = { path = ".", features = ["test-support"] }
 axum = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 # Keep this test dependency path-only: Cargo omits it on publication,
 # avoiding a server/worker cycle in the registry dependency graph.
 loupe-server = { path = "../loupe-server" }

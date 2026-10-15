@@ -1,3 +1,18 @@
+// Tests may unwrap fixture setup errors; production code must handle them.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
+#![deny(unsafe_code)]
 //! Entry point for the loupe scan/verify worker.
 //!
 //! Worker and internal helper modes are selected via subcommands:
@@ -11,14 +26,14 @@
 //!   supervises one sandboxed agent while provider authority stays in
 //!   the parent worker's per-job model broker.
 
+#[cfg(test)]
 use std::ffi::OsString;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
+use clap::{Parser, Subcommand};
+use loupe_worker::config::{LoggingConfig, WorkerConfig};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
 	claude_available, codex_auth_available, codex_available, BackendRuntimeConfig, JobAgent,
@@ -29,6 +44,17 @@ use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecr
 use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
+mod config_arguments;
+#[path = "sandbox/model_proxy_launcher.rs"]
+mod model_proxy_launcher;
+use config_arguments::WorkerOverridesDecoder;
+use config_value_parsers::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
+use loupe_worker::config_value_parsers;
+#[cfg(test)]
+use model_proxy_launcher::replace_model_base_url;
+use model_proxy_launcher::Args as ModelProxyArgs;
+
+// debug-ok: Nested argument types redact private inputs; other fields are closed modes, booleans and numeric limits.
 #[derive(Debug, Parser)]
 #[command(version, about = "loupe scan/verify worker")]
 struct Cli {
@@ -38,11 +64,11 @@ struct Cli {
 	run: RunArgs,
 }
 
+// debug-ok: Nested argument types redact private inputs; other fields are closed modes, booleans and numeric limits.
 #[derive(Debug, Subcommand)]
 enum Cmd {
 	/// Run the long-running scan/verify worker loop. Default when no
-	/// subcommand is given, so the existing
-	/// `loupe-worker --server-url ... ...` invocation keeps working.
+	/// subcommand is given: `loupe-worker --server-url ...` starts this mode.
 	Run(Box<RunArgs>),
 	/// Bridge MCP stdio to one host-side Unix socket. This subcommand
 	/// receives no server URL, mTLS credentials, job id, or capability.
@@ -53,46 +79,62 @@ enum Cmd {
 	/// Internal supervisor for one isolated sandbox network.
 	#[command(hide = true)]
 	SandboxExec(SandboxExecArgs),
+	/// Internal host-side Git credential pipe.
+	#[command(hide = true)]
+	GitCredential(GitCredentialArgs),
 }
 
+#[derive(Parser)]
+struct GitCredentialArgs {
+	#[arg(long)]
+	socket: PathBuf,
+	operation: String,
+}
+impl std::fmt::Debug for GitCredentialArgs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("GitCredentialArgs([redacted])")
+	}
+}
+
+// debug-ok: Nested argument types redact private inputs; other fields are closed modes, booleans and numeric limits.
 #[derive(Debug, Parser)]
 struct RunArgs {
 	/// Path to worker config TOML. CLI/env values override file settings.
 	#[arg(long, env = "LOUPE_WORKER_CONFIG")]
-	config: Option<PathBuf>,
+	config: Option<ConfiguredPath>,
 	/// Base URL of the loupe-server (e.g. https://loupe-server:8443).
 	#[arg(long, env = "LOUPE_SERVER_URL")]
-	server_url: Option<reqwest::Url>,
+	server_url: Option<ConfiguredUrl>,
 	/// Path to the CA cert (server-auth root).
 	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: Option<PathBuf>,
+	ca_cert: Option<ConfiguredPath>,
 	/// Path to this worker's client cert PEM.
 	#[arg(long, env = "LOUPE_WORKER_CERT")]
-	cert: Option<PathBuf>,
+	cert: Option<ConfiguredPath>,
 	/// Path to this worker's client private-key PEM.
 	#[arg(long, env = "LOUPE_WORKER_KEY")]
-	key: Option<PathBuf>,
+	key: Option<ConfiguredPath>,
 	/// CA cert PEM content. When set, this takes precedence over
 	/// --ca-cert / LOUPE_CA_CERT.
 	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM", hide_env_values = true)]
-	ca_cert_pem: Option<String>,
+	ca_cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_WORKER_CA_CERT_PEM_B64", hide_env_values = true)]
-	ca_cert_pem_b64: Option<String>,
+	ca_cert_pem_b64: Option<loupe_tls::PemInput>,
 	/// Worker client cert PEM content. When set, this takes precedence
 	/// over --cert / LOUPE_WORKER_CERT.
 	#[arg(long, env = "LOUPE_WORKER_CERT_PEM", hide_env_values = true)]
-	cert_pem: Option<String>,
+	cert_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_WORKER_CERT_PEM_B64", hide_env_values = true)]
-	cert_pem_b64: Option<String>,
+	cert_pem_b64: Option<loupe_tls::PemInput>,
 	/// Worker client private-key PEM content. When set, this takes
 	/// precedence over --key / LOUPE_WORKER_KEY.
 	#[arg(long, env = "LOUPE_WORKER_KEY_PEM", hide_env_values = true)]
-	key_pem: Option<String>,
+	key_pem: Option<loupe_tls::PemInput>,
 	#[arg(long, env = "LOUPE_WORKER_KEY_PEM_B64", hide_env_values = true)]
-	key_pem_b64: Option<String>,
+	key_pem_b64: Option<loupe_tls::PemInput>,
 	/// Where to keep cached bare clones.
 	#[arg(long, env = "LOUPE_CACHE_DIR")]
-	cache_dir: Option<PathBuf>,
+	cache_dir: Option<ConfiguredPath>,
 	/// Maximum cache size in GB before LRU eviction kicks in.
 	#[arg(long, env = "LOUPE_MAX_CACHE_GB")]
 	max_cache_gb: Option<u64>,
@@ -107,14 +149,14 @@ struct RunArgs {
 	sandbox_network: Option<SandboxNetworkMode>,
 	/// Comma-separated hostnames or IPv4 addresses added in allowlist mode.
 	#[arg(long, env = "LOUPE_SANDBOX_ALLOWLIST", value_delimiter = ',')]
-	sandbox_allowlist: Option<Vec<String>>,
+	sandbox_allowlist: Option<Vec<ConfiguredText>>,
 	/// Logging level: trace, debug, info, warn, or error.
 	#[arg(long, env = "LOUPE_LOG_LEVEL")]
-	log_level: Option<String>,
+	log_level: Option<ConfiguredText>,
 	/// Emit structured JSON logs.
 	#[arg(long, env = "LOUPE_LOG_JSON", value_parser = clap::builder::BoolishValueParser::new())]
 	log_json: Option<bool>,
-	/// Dump full successful agent stdout/stderr at info level.
+	/// Log successful agent output counts at info level; content stays private.
 	#[arg(long, env = "LOUPE_LOG_AGENT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
 	log_agent_output: Option<bool>,
 	/// Agent backend for LLM scan jobs: auto, claude, or codex.
@@ -125,16 +167,16 @@ struct RunArgs {
 	verify_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
 	#[arg(long, env = "LOUPE_CLAUDE_MODEL")]
-	claude_model: Option<String>,
+	claude_model: Option<ConfiguredText>,
 	/// Claude effort level: low, medium, high, xhigh, or max.
 	#[arg(long, env = "LOUPE_CLAUDE_EFFORT")]
-	claude_effort: Option<String>,
+	claude_effort: Option<ConfiguredText>,
 	/// Codex model for every Codex-backed invocation.
 	#[arg(long, env = "LOUPE_CODEX_MODEL")]
-	codex_model: Option<String>,
+	codex_model: Option<ConfiguredText>,
 	/// Codex reasoning effort: none, low, medium, high, or xhigh.
 	#[arg(long, env = "LOUPE_CODEX_EFFORT")]
-	codex_effort: Option<String>,
+	codex_effort: Option<ConfiguredText>,
 	/// Fleet-wide default for concurrent per-file LLM sessions.
 	#[arg(long, env = "LOUPE_MAX_CONCURRENT_FILES")]
 	max_concurrent_files: Option<usize>,
@@ -146,7 +188,7 @@ struct RunArgs {
 	per_request_timeout_seconds: Option<u64>,
 	/// BKB HTTP API URL for the optional bkb-mcp child.
 	#[arg(long, env = "LOUPE_BKB_API_URL")]
-	bkb_api_url: Option<String>,
+	bkb_api_url: Option<ConfiguredText>,
 	/// Maximum model API requests allowed in one broker session.
 	#[arg(long, env = "LOUPE_BROKER_REQUEST_CEILING")]
 	broker_request_ceiling: Option<u64>,
@@ -158,50 +200,49 @@ struct RunArgs {
 	broker_token_ceiling: Option<u64>,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 struct McpProxyArgs {
 	#[arg(long)]
 	socket: PathBuf,
 }
-
-#[derive(Debug, Parser)]
-struct ModelProxyArgs {
-	#[arg(long)]
-	socket: PathBuf,
-	#[arg(long, default_value = "127.0.0.1:0")]
-	listen: SocketAddr,
-	#[arg(long)]
-	port_file: PathBuf,
-	#[arg(long, value_enum, default_value = "claude")]
-	provider: ModelProxyProvider,
-	#[arg(last = true, required = true, allow_hyphen_values = true)]
-	command: Vec<OsString>,
+impl std::fmt::Debug for McpProxyArgs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("McpProxyArgs([redacted])")
+	}
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ModelProxyProvider {
-	Claude,
-	Codex,
-}
-
-const MODEL_BASE_URL_PLACEHOLDER: &str = "@LOUPE_MODEL_BASE_URL@";
-
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 struct SandboxExecArgs {
 	#[arg(long, value_enum)]
 	network: SandboxNetworkMode,
 	#[arg(long)]
-	required_host: Vec<String>,
+	required_host: Vec<ConfiguredText>,
 	#[arg(long)]
-	allow_host: Vec<String>,
+	allow_host: Vec<ConfiguredText>,
 	#[arg(last = true, required = true, allow_hyphen_values = true)]
-	command: Vec<OsString>,
+	command: Vec<config_value_parsers::SupervisorCommandArgument>,
+}
+impl std::fmt::Debug for SandboxExecArgs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("SandboxExecArgs([redacted])")
+	}
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	// Parse the private mode before RunArgs: unrelated worker environment
+	// must neither load credentials nor prevent Git authentication.
+	if std::env::args_os().nth(1).is_some_and(|arg| arg == "git-credential") {
+		let args = GitCredentialArgs::parse_from(std::env::args_os().skip(1));
+		loupe_worker::run_git_credential_helper(&args.socket, &args.operation);
+		return Ok(());
+	}
 	let cli = Cli::parse();
 	match cli.cmd {
+		Some(Cmd::GitCredential(args)) => {
+			loupe_worker::run_git_credential_helper(&args.socket, &args.operation);
+			Ok(())
+		},
 		Some(Cmd::Run(args)) => {
 			let cfg = load_worker_config(&args)?;
 			init_tracing(&cfg.logging);
@@ -213,7 +254,7 @@ async fn main() -> Result<()> {
 		},
 		Some(Cmd::ModelProxy(args)) => {
 			init_tracing_from_env();
-			let status = run_model_proxy(args).await?;
+			let status = model_proxy_launcher::run(args).await?;
 			std::process::exit(status.code().unwrap_or(1));
 		},
 		Some(Cmd::SandboxExec(args)) => {
@@ -225,8 +266,7 @@ async fn main() -> Result<()> {
 			)?;
 			std::process::exit(status.code().unwrap_or(1));
 		},
-		// Default subcommand for backwards compatibility with the
-		// existing `loupe-worker --server-url ...` invocation pattern.
+		// Top-level worker options select run mode without a subcommand.
 		None => {
 			let cfg = load_worker_config(&cli.run)?;
 			init_tracing(&cfg.logging);
@@ -254,21 +294,27 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	)?;
 
 	let client = Arc::new(ServerClient::new(
-		&tls.ca_cert_pem,
-		&tls.cert_pem,
-		&tls.key_pem,
-		server_url.clone(),
+		tls.ca_cert_pem.expose(),
+		tls.cert_pem.expose(),
+		tls.key_pem.expose(),
+		server_url.for_http().clone(),
 	)?);
-	let cache = Arc::new(RepoCache::new(cache_dir.clone(), cfg.cache.max_gb * 1_073_741_824)?);
+	// The persistent client owns its signer; retire controllable PEM now.
+	drop(tls);
+	let worker_binary =
+		std::env::current_exe().context("resolving the loupe-worker binary path")?;
+	let cache = Arc::new(RepoCache::new(
+		cache_dir.for_filesystem().to_path_buf(),
+		cfg.cache.max_gb * 1_073_741_824,
+		Some(worker_binary.clone()),
+	)?);
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 
 	// LLM scanners wire through worker-local job-agent policy:
 	//
-	// - [agents].scan = "auto" preserves the historical discovery
-	//   default: use claude when ready, otherwise advertise verify-only.
-	// - [agents].verify = "auto" preserves the historical verifier
-	//   default: prefer codex, falling back to claude.
+	// - [agents].scan = "auto": use claude when ready, otherwise verify-only.
+	// - [agents].verify = "auto": prefer codex, falling back to claude.
 	// - explicit claude/codex selections fail startup when unavailable.
 	// - no authenticated CLI still hard-fatals at startup. Docker
 	//   images can install both CLIs, but missing credentials should fail
@@ -302,8 +348,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// missing binary or attempted bypass is a startup error.
 	sandbox::probe_at_startup(cfg.runtime.disable_sandbox)
 		.context("LLM scanner requires bubblewrap")?;
-	sandbox::smoketest(&cache_dir, cfg.sandbox.clone())
-		.context("bubblewrap sandbox smoketest failed")?;
+	let launch = cfg.sandbox_launch_config()?;
+	let sandbox_worker = sandbox::SandboxBinary::current_worker()?;
+	sandbox::smoketest(&launch).context("bubblewrap sandbox smoketest failed")?;
 	tracing::info!(
 		network = %cfg.sandbox.mode,
 		allowlist_hosts = cfg.sandbox.allowlist.len(),
@@ -316,12 +363,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// historical-context lookups on bitcoin-shaped projects. The
 	// presence is a single PATH probe — no opt-in flag, no install at
 	// runtime; absence is silent.
-	let bkb_mcp_path = bkb_mcp_available();
-	if let Some(path) = &bkb_mcp_path {
-		tracing::info!(
-			path = %path.display(),
-			"bkb-mcp detected; attaching to discovery agent's MCP config"
-		);
+	let bkb_mcp_path = bkb_mcp_available(&launch);
+	if bkb_mcp_path.is_some() {
+		tracing::info!("bkb-mcp detected; attaching to discovery agent's MCP config");
 	} else {
 		tracing::info!(
 			"bkb-mcp not on PATH; discovery agent will run without Bitcoin-context tools \
@@ -332,31 +376,32 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// The agent gets only this binary's credential-free proxy mode and
 	// a per-invocation Unix socket. The authenticated client remains in
 	// the trusted parent process.
-	let worker_binary = std::env::current_exe()
-		.context("resolving the loupe-worker binary path for MCP bind-mount")?;
 	let mcp_ctx = McpContext {
-		worker_binary: worker_binary.clone(),
+		worker_binary: sandbox_worker.clone(),
 		client: client.clone(),
 		bkb_mcp_path: bkb_mcp_path.clone(),
-		bkb_api_url: cfg.bkb.api_url.clone(),
+		bkb_api_url: launch.bkb_api_url().clone(),
 	};
 
+	let mut credential_watches = Vec::new();
 	if let Some(backend) = build_scan_backend(
 		Some(mcp_ctx.clone()),
 		cfg.agents.scan,
 		claude,
 		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		launch.codex().clone(),
+		launch.claude().clone(),
 		BackendRuntimeConfig {
-			network: cfg.sandbox.clone(),
+			network: launch.network().clone(),
+			launch: launch.clone(),
 			log_agent_output: cfg.logging.agent_output,
 			model_broker: Some(ModelBrokerRuntimeConfig {
-				worker_binary: worker_binary.clone(),
+				worker_binary: sandbox_worker.clone(),
 				limits: cfg.broker,
 			}),
 		},
 	)? {
+		credential_watches.extend(backend.credential_watch());
 		scanners.push(Arc::new(
 			LlmCodeReviewScanner::new(backend)
 				.with_config(cfg.scanner_defaults.clone())
@@ -374,19 +419,25 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		cfg.agents.verify,
 		claude,
 		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		launch.codex().clone(),
+		launch.claude().clone(),
 		BackendRuntimeConfig {
-			network: cfg.sandbox.clone(),
+			network: launch.network().clone(),
+			launch,
 			log_agent_output: cfg.logging.agent_output,
-			model_broker: Some(ModelBrokerRuntimeConfig { worker_binary, limits: cfg.broker }),
+			model_broker: Some(ModelBrokerRuntimeConfig {
+				worker_binary: sandbox_worker,
+				limits: cfg.broker,
+			}),
 		},
 	)?;
+	credential_watches.extend(backend.credential_watch());
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
-	let runner =
-		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
+	let runner = Runner::new(client, cache, scanners)
+		.with_max_workdir_bytes(cfg.runtime.max_workdir_bytes)
+		.with_credential_watches(credential_watches);
 
 	let cancel = CancellationToken::new();
 	let cancel_for_signal = cancel.clone();
@@ -423,114 +474,25 @@ async fn run_mcp_proxy(args: McpProxyArgs) -> Result<()> {
 	Ok(())
 }
 
-async fn run_model_proxy(args: ModelProxyArgs) -> Result<std::process::ExitStatus> {
-	use loupe_worker::llm::model_proxy::ModelProxy;
-
-	let proxy = ModelProxy::bind(args.socket, args.listen, &args.port_file).await?;
-	let base_url = proxy.base_url();
-	let mut relay = tokio::spawn(proxy.relay());
-	let (program, command_args) = args.command.split_first().expect("clap requires a command");
-	let mut child = tokio::process::Command::new(program);
-	child.args(
-		command_args.iter().cloned().map(|argument| replace_model_base_url(argument, &base_url)),
-	);
-	// Fail closed even if this internal mode is invoked outside the
-	// normal Bubblewrap path: the supervised process sees only a fixed,
-	// non-secret gateway sentinel, never a host provider credential.
-	child.env_clear();
-	for name in ["PATH", "HOME", "TMPDIR"] {
-		if let Some(value) = std::env::var_os(name) {
-			child.env(name, value);
-		}
-	}
-	match args.provider {
-		ModelProxyProvider::Claude => {
-			child.env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered");
-			child.env("ANTHROPIC_BASE_URL", base_url);
-			child.env("DISABLE_AUTOUPDATER", "1");
-			child.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-			child.env("DISABLE_TELEMETRY", "1");
-			child.env("DISABLE_ERROR_REPORTING", "1");
-			child.env("DISABLE_BUG_COMMAND", "1");
-		},
-		ModelProxyProvider::Codex => {
-			child.env("CODEX_API_KEY", "loupe-brokered");
-		},
-	}
-	child.kill_on_drop(true);
-	let mut child = child.spawn().context("spawning model-proxied agent command")?;
-
-	tokio::select! {
-		biased;
-		status = child.wait() => {
-			relay.abort();
-			let _ = relay.await;
-			status.context("waiting for model-proxied agent command")
-		},
-		result = &mut relay => {
-			match result.context("model proxy relay task panicked")? {
-				Ok(()) => child.wait().await.context("waiting for model-proxied agent command"),
-				Err(error) => {
-					let _ = child.kill().await;
-					Err(error)
-				},
-			}
-		},
-	}
-}
-
-fn replace_model_base_url(argument: OsString, base_url: &str) -> OsString {
-	match argument.into_string() {
-		Ok(argument) => OsString::from(argument.replace(MODEL_BASE_URL_PLACEHOLDER, base_url)),
-		Err(argument) => argument,
-	}
-}
-
 fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 	WorkerConfig::load(
-		args.config.as_deref(),
-		WorkerConfigOverrides {
-			server_url: args.server_url.clone(),
-			ca_cert: args.ca_cert.clone(),
-			cert: args.cert.clone(),
-			key: args.key.clone(),
-			cache_dir: args.cache_dir.clone(),
-			max_cache_gb: args.max_cache_gb,
-			max_workdir_gb: args.max_workdir_gb,
-			disable_sandbox: args.disable_sandbox,
-			sandbox_network: args.sandbox_network,
-			sandbox_allowlist: args.sandbox_allowlist.clone(),
-			log_level: args.log_level.clone(),
-			log_json: args.log_json,
-			log_agent_output: args.log_agent_output,
-			scan_agent: args.scan_agent,
-			verify_agent: args.verify_agent,
-			claude_model: args.claude_model.clone(),
-			claude_effort: args.claude_effort.clone(),
-			codex_model: args.codex_model.clone(),
-			codex_effort: args.codex_effort.clone(),
-			max_concurrent_files: args.max_concurrent_files,
-			max_file_bytes: args.max_file_bytes,
-			per_request_timeout_seconds: args.per_request_timeout_seconds,
-			bkb_api_url: args.bkb_api_url.clone(),
-			broker_request_ceiling: args.broker_request_ceiling,
-			broker_output_ceiling_bytes: args.broker_output_ceiling_bytes,
-			broker_token_ceiling: args.broker_token_ceiling,
-		},
+		args.config.as_ref().map(ConfiguredPath::for_filesystem),
+		WorkerOverridesDecoder::decode(args),
 	)
 }
 
 struct WorkerTls {
-	ca_cert_pem: String,
-	cert_pem: String,
-	key_pem: String,
+	ca_cert_pem: loupe_provenance::Secret<String>,
+	cert_pem: loupe_provenance::Secret<String>,
+	key_pem: loupe_provenance::Secret<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn read_worker_tls(
-	ca_cert_pem: Option<String>, ca_cert_pem_b64: Option<String>, cert_pem: Option<String>,
-	cert_pem_b64: Option<String>, key_pem: Option<String>, key_pem_b64: Option<String>,
-	ca_cert: Option<PathBuf>, cert: Option<PathBuf>, key: Option<PathBuf>,
+	ca_cert_pem: Option<loupe_tls::PemInput>, ca_cert_pem_b64: Option<loupe_tls::PemInput>,
+	cert_pem: Option<loupe_tls::PemInput>, cert_pem_b64: Option<loupe_tls::PemInput>,
+	key_pem: Option<loupe_tls::PemInput>, key_pem_b64: Option<loupe_tls::PemInput>,
+	ca_cert: Option<ConfiguredPath>, cert: Option<ConfiguredPath>, key: Option<ConfiguredPath>,
 ) -> Result<WorkerTls> {
 	let env_pem_present = has_value(&ca_cert_pem)
 		|| has_value(&ca_cert_pem_b64)
@@ -567,37 +529,34 @@ fn read_worker_tls(
 		cert.context("--cert / LOUPE_WORKER_CERT is required unless LOUPE_WORKER_CERT_PEM is set")?;
 	let key =
 		key.context("--key / LOUPE_WORKER_KEY is required unless LOUPE_WORKER_KEY_PEM is set")?;
-	let ca_cert_pem = std::fs::read_to_string(&ca_cert)
-		.with_context(|| format!("reading CA cert at {}", ca_cert.display()))?;
-	let cert_pem = std::fs::read_to_string(&cert)
-		.with_context(|| format!("reading worker cert at {}", cert.display()))?;
-	let key_pem = std::fs::read_to_string(&key)
-		.with_context(|| format!("reading worker key at {}", key.display()))?;
+	let ca_cert_pem = loupe_tls::read_pem_file(ca_cert.for_filesystem())
+		.with_context(|| format!("reading CA cert at {}", ca_cert.for_filesystem().display()))?;
+	let cert_pem = loupe_tls::read_pem_file(cert.for_filesystem())
+		.with_context(|| format!("reading worker cert at {}", cert.for_filesystem().display()))?;
+	let key_pem = loupe_tls::read_pem_file(key.for_filesystem())
+		.with_context(|| format!("reading worker key at {}", key.for_filesystem().display()))?;
 	Ok(WorkerTls { ca_cert_pem, cert_pem, key_pem })
 }
 
-fn has_value(value: &Option<String>) -> bool {
-	value.as_deref().is_some_and(|s| !s.is_empty())
+fn has_value(value: &Option<loupe_tls::PemInput>) -> bool {
+	value.as_ref().is_some_and(|s| !s.expose().is_empty())
 }
 
 fn required_pem_env(
-	value: Option<String>, value_b64: Option<String>, name: &'static str, b64_name: &'static str,
-) -> Result<String> {
-	if let Some(value) = value.filter(|s| !s.is_empty()) {
-		return Ok(value);
+	value: Option<loupe_tls::PemInput>, value_b64: Option<loupe_tls::PemInput>, name: &'static str,
+	b64_name: &'static str,
+) -> Result<loupe_provenance::Secret<String>> {
+	if let Some(value) = value.filter(|s| !s.expose().is_empty()) {
+		return Ok(value.into_pem());
 	}
-	if let Some(value_b64) = value_b64.filter(|s| !s.is_empty()) {
-		return decode_pem_b64(b64_name, &value_b64);
+	if let Some(value_b64) = value_b64.filter(|s| !s.expose().is_empty()) {
+		return decode_pem_b64(b64_name, value_b64.expose());
 	}
 	anyhow::bail!("{name} or {b64_name} is required when any worker TLS PEM env var is set")
 }
 
-fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
-	use base64::Engine as _;
-	let bytes = base64::engine::general_purpose::STANDARD
-		.decode(pem_b64.trim())
-		.with_context(|| format!("decoding {label}"))?;
-	String::from_utf8(bytes).with_context(|| format!("{label} did not decode to valid UTF-8"))
+fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<loupe_provenance::Secret<String>> {
+	loupe_tls::decode_pem_base64(pem_b64.trim()).with_context(|| format!("decoding {label}"))
 }
 
 /// Initialise tracing. Defaults to the human-readable formatter; set
@@ -611,7 +570,7 @@ fn decode_pem_b64(label: &str, pem_b64: &str) -> Result<String> {
 /// (also stderr by `tracing_subscriber` default).
 fn init_tracing(logging: &LoggingConfig) {
 	let env_filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
-		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&logging.level));
+		.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(logging.level.for_operation()));
 	if logging.json {
 		tracing_subscriber::fmt()
 			.json()
@@ -625,7 +584,7 @@ fn init_tracing(logging: &LoggingConfig) {
 
 fn init_tracing_from_env() {
 	let logging = LoggingConfig {
-		level: "info".to_owned(),
+		level: loupe_worker::config::ConfiguredText::Builtin("info"),
 		json: bool_env("LOUPE_LOG_JSON").unwrap_or(false),
 		agent_output: false,
 	};
@@ -646,6 +605,9 @@ fn bool_env(name: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+mod test_env;
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 
@@ -662,31 +624,40 @@ mod tests {
 
 		let tls = read_worker_tls(
 			None,
-			Some(b64(ca)),
+			Some(b64(ca).into()),
 			None,
-			Some(b64(cert)),
+			Some(b64(cert).into()),
 			None,
-			Some(b64(key)),
+			Some(b64(key).into()),
 			None,
 			None,
 			None,
 		)
 		.unwrap();
 
-		assert_eq!(tls.ca_cert_pem, ca);
-		assert_eq!(tls.cert_pem, cert);
-		assert_eq!(tls.key_pem, key);
+		assert_eq!(tls.ca_cert_pem.expose(), ca);
+		assert_eq!(tls.cert_pem.expose(), cert);
+		assert_eq!(tls.key_pem.expose(), key);
 	}
 
 	#[test]
 	fn read_worker_tls_requires_complete_env_tuple() {
 		let ca = "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n";
 
-		let err =
-			match read_worker_tls(None, Some(b64(ca)), None, None, None, None, None, None, None) {
-				Ok(_) => panic!("partial env TLS should be rejected"),
-				Err(e) => e,
-			};
+		let err = match read_worker_tls(
+			None,
+			Some(b64(ca).into()),
+			None,
+			None,
+			None,
+			None,
+			None,
+			None,
+			None,
+		) {
+			Ok(_) => panic!("partial env TLS should be rejected"),
+			Err(e) => e,
+		};
 
 		assert!(err.to_string().contains("LOUPE_WORKER_CERT_PEM"));
 	}
@@ -703,7 +674,62 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(cli.run.sandbox_network, Some(SandboxNetworkMode::Allowlist));
-		assert_eq!(cli.run.sandbox_allowlist.unwrap(), ["example.com", "203.0.113.9"]);
+		assert_eq!(
+			cli.run
+				.sandbox_allowlist
+				.unwrap()
+				.iter()
+				.map(ConfiguredText::for_operation)
+				.collect::<Vec<_>>(),
+			["example.com", "203.0.113.9"]
+		);
+	}
+
+	#[test]
+	fn config_cli_flags_override_environment_then_file_values() {
+		use std::ffi::OsStr;
+
+		if !test_env::in_env(
+			"tests::config_cli_flags_override_environment_then_file_values",
+			"config-precedence",
+			&[
+				("LOUPE_CODEX_MODEL", Some(OsStr::new(" Env-Cafe\u{301} "))),
+				("LOUPE_MAX_FILE_BYTES", Some(OsStr::new("23"))),
+				("LOUPE_WORKER_CONFIG", None),
+			],
+		) {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(
+			&path,
+			"[agents.codex]\nmodel = 'File-Model'\n\
+			 [scanner_defaults]\nmax_file_bytes = 17\n",
+		)
+		.unwrap();
+		let cli = Cli::try_parse_from([
+			OsStr::new("loupe-worker"),
+			OsStr::new("--config"),
+			path.as_os_str(),
+		])
+		.unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.agents.codex.model.for_operation(), " Env-Cafe\u{301} ");
+		assert_eq!(cfg.scanner_defaults.max_file_bytes, 23);
+		let cli = Cli::try_parse_from([
+			OsStr::new("loupe-worker"),
+			OsStr::new("--config"),
+			path.as_os_str(),
+			OsStr::new("--codex-model"),
+			OsStr::new(" Flag-Cafe\u{301} "),
+			OsStr::new("--max-file-bytes"),
+			OsStr::new("31"),
+		])
+		.unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.agents.codex.model.for_operation(), " Flag-Cafe\u{301} ");
+		assert_eq!(cfg.scanner_defaults.max_file_bytes, 31);
 	}
 
 	#[test]
@@ -732,6 +758,34 @@ mod tests {
 	}
 
 	#[test]
+	fn internal_launcher_debug_omits_paths_commands_and_operation_tokens() {
+		let sentinel = "private-launch-sentinel";
+		let cases = [
+			vec!["loupe-worker", "git-credential", "--socket", sentinel, sentinel],
+			vec!["loupe-worker", "mcp-proxy", "--socket", sentinel],
+			vec![
+				"loupe-worker",
+				"model-proxy",
+				"--socket",
+				sentinel,
+				"--port-file",
+				sentinel,
+				"--",
+				sentinel,
+			],
+			vec!["loupe-worker", "sandbox-exec", "--network", "public", "--", sentinel],
+		];
+		let mut leaks = Vec::new();
+		for arguments in cases {
+			let cli = Cli::try_parse_from(&arguments).unwrap();
+			if format!("{cli:?}").contains(sentinel) {
+				leaks.push(arguments[1]);
+			}
+		}
+		assert!(leaks.is_empty(), "private launcher inputs leaked through Debug: {leaks:?}");
+	}
+
+	#[test]
 	fn model_proxy_replaces_only_the_fixed_base_url_placeholder() {
 		let argument =
 			OsString::from("model_providers.loupe.base_url=\"@LOUPE_MODEL_BASE_URL@/v1\"");
@@ -743,5 +797,189 @@ mod tests {
 			replace_model_base_url(OsString::from("unrelated"), "http://127.0.0.1:3210"),
 			OsString::from("unrelated"),
 		);
+	}
+}
+
+#[cfg(test)]
+mod tls_consumer_tests {
+	use base64::Engine as _;
+
+	use super::*;
+
+	#[test]
+	fn tls_consumer_worker_options_debug_redacts_raw_and_encoded_tls_inputs() {
+		let sentinel = "FAKE_WORKER_TLS_OPTION";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(sentinel);
+		let mut leaks = Vec::new();
+		for flag in [
+			"--ca-cert-pem",
+			"--cert-pem",
+			"--key-pem",
+			"--ca-cert-pem-b64",
+			"--cert-pem-b64",
+			"--key-pem-b64",
+		] {
+			let value = if flag.ends_with("-b64") { &encoded } else { sentinel };
+			let cli = Cli::try_parse_from(["loupe-worker", flag, value]).unwrap();
+			if [format!("{cli:?}"), format!("{cli:#?}")].iter().any(|text| text.contains(value)) {
+				leaks.push(flag);
+			}
+		}
+		assert!(leaks.is_empty(), "worker option Debug disclosed inputs at {leaks:?}");
+	}
+
+	#[test]
+	fn tls_consumer_worker_loaded_owners_redact_mixed_certificates_and_keys() {
+		let tls = read_worker_tls(
+			Some("FAKE_MIXED_CA_TLS".into()),
+			None,
+			Some("FAKE_MIXED_CERT_TLS".into()),
+			None,
+			Some("FAKE_WORKER_KEY_TLS".into()),
+			None,
+			None,
+			None,
+			None,
+		)
+		.unwrap();
+		for value in [&tls.ca_cert_pem, &tls.cert_pem, &tls.key_pem] {
+			for rendered in [
+				format!("{value:?}"),
+				format!("{value:#?}"),
+				format!("{value}"),
+				format!("{value:#}"),
+			] {
+				assert_eq!(rendered, "[redacted]", "loaded TLS owner must redact every formatter");
+			}
+		}
+	}
+
+	#[test]
+	fn tls_consumer_worker_invalid_utf8_error_does_not_retain_private_bytes() {
+		let bytes = b"FAKE_INVALID_WORKER_TLS\xff";
+		let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+		let error = decode_pem_b64("worker key", &encoded).unwrap_err();
+		let rendered: String = format!("{error:#?}").split_whitespace().collect();
+		let reflected: String = format!("bytes:{bytes:?}").split_whitespace().collect();
+		assert!(!rendered.contains(&reflected), "invalid UTF-8 error retained private input bytes");
+	}
+
+	#[test]
+	fn worker_tls_loader_preserves_complete_env_rule_and_file_fallback() {
+		let dir = tempfile::tempdir().unwrap();
+		let ca = dir.path().join("ca");
+		let cert = dir.path().join("cert");
+		let key = dir.path().join("key");
+		for (path, value) in [(&ca, "FILE_CA"), (&cert, "FILE_CERT"), (&key, "FILE_KEY")] {
+			std::fs::write(path, value).unwrap();
+		}
+		use clap::builder::TypedValueParser;
+		let command = clap::Command::new("worker-test");
+		let parse = |path: &std::path::Path| {
+			config_value_parsers::ConfiguredPathParser
+				.parse_ref(&command, None, path.as_os_str())
+				.unwrap()
+		};
+		let tls = read_worker_tls(
+			Some(String::new().into()),
+			None,
+			None,
+			Some(String::new().into()),
+			None,
+			None,
+			Some(parse(&ca)),
+			Some(parse(&cert)),
+			Some(parse(&key)),
+		)
+		.unwrap();
+		assert_eq!(
+			(tls.ca_cert_pem.expose(), tls.cert_pem.expose(), tls.key_pem.expose()),
+			(&"FILE_CA".to_owned(), &"FILE_CERT".to_owned(), &"FILE_KEY".to_owned())
+		);
+		assert!(
+			read_worker_tls(
+				Some("RAW_CA".into()),
+				None,
+				None,
+				None,
+				None,
+				None,
+				Some(parse(&ca)),
+				Some(parse(&cert)),
+				Some(parse(&key))
+			)
+			.is_err(),
+			"partial env must not mix with complete files"
+		);
+		let tls = read_worker_tls(
+			Some("RAW_CA".into()),
+			Some("invalid%%%".into()),
+			Some("RAW_CERT".into()),
+			Some("invalid%%%".into()),
+			Some("RAW_KEY".into()),
+			Some("invalid%%%".into()),
+			Some(parse(&ca)),
+			Some(parse(&cert)),
+			Some(parse(&key)),
+		)
+		.unwrap();
+		assert_eq!(
+			(tls.ca_cert_pem.expose(), tls.cert_pem.expose(), tls.key_pem.expose()),
+			(&"RAW_CA".to_owned(), &"RAW_CERT".to_owned(), &"RAW_KEY".to_owned())
+		);
+		std::fs::write(&key, b"invalid\xff").unwrap();
+		assert!(read_worker_tls(
+			None,
+			None,
+			None,
+			None,
+			None,
+			None,
+			Some(parse(&ca)),
+			Some(parse(&cert)),
+			Some(parse(&key))
+		)
+		.is_err());
+	}
+}
+
+#[cfg(test)]
+mod config_admission_tests {
+	use super::*;
+	#[test]
+	fn worker_cli_model_rejects_control_before_config_override() {
+		let result = Cli::try_parse_from(["loupe-worker", "--codex-model", "model\u{1}"]);
+		assert!(result.is_err(), "worker CLI model control bytes were accepted");
+	}
+	#[test]
+	fn worker_cli_model_rejects_text_over_two_mib() {
+		let model = "a".repeat(2 * 1024 * 1024 + 1);
+		let result = Cli::try_parse_from(["loupe-worker", "--codex-model", &model]);
+		assert!(result.is_err(), "worker CLI model above 2 MiB was accepted");
+	}
+	#[cfg(unix)]
+	#[test]
+	fn worker_cli_and_environment_keep_native_config_paths() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+		let native = OsString::from_vec(b"../operator-\xff-cache".to_vec());
+		if !test_env::in_env(
+			"config_admission_tests::worker_cli_and_environment_keep_native_config_paths",
+			"native-config-path",
+			&[("LOUPE_CACHE_DIR", Some(native.as_os_str()))],
+		) {
+			return;
+		}
+		let cli = Cli::try_parse_from(["loupe-worker"]).unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.cache.dir.for_filesystem().as_os_str().as_bytes(), native.as_bytes());
+		let flag = OsString::from_vec(b"../flag-\xfe-cache".to_vec());
+		let cli = Cli::try_parse_from([
+			OsString::from("loupe-worker"),
+			OsString::from("--cache-dir"),
+			flag.clone(),
+		])
+		.unwrap();
+		let cfg = load_worker_config(&cli.run).unwrap();
+		assert_eq!(cfg.cache.dir.for_filesystem().as_os_str().as_bytes(), flag.as_bytes());
 	}
 }

@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use crate::{FindingState, JobState};
 
+// debug-ok: private fields are static machine, state and transition names.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid {machine} transition {transition} from {state}")]
 pub struct StateTransitionError {
@@ -16,6 +17,7 @@ impl StateTransitionError {
 	}
 }
 
+// debug-ok: closed job transition unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobTransition {
 	Enqueue,
@@ -72,6 +74,7 @@ pub fn initial_job_state(transition: JobTransition) -> Result<JobState, StateTra
 	}
 }
 
+// debug-ok: closed finding transition unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FindingTransition {
 	ScanAccepted,
@@ -162,6 +165,7 @@ pub fn initial_finding_state(
 	}
 }
 
+// debug-ok: aggregate state contains only four booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VerdictRollup {
 	pub has_confirmed: bool,
@@ -237,6 +241,49 @@ mod tests {
 		FindingTransition::RetryVerification,
 		FindingTransition::MarkReported,
 	];
+
+	#[test]
+	fn transition_names_and_rejection_messages_are_exact() {
+		let jobs = [
+			(JobTransition::Enqueue, "enqueue"),
+			(JobTransition::Lease, "lease"),
+			(JobTransition::Heartbeat, "heartbeat"),
+			(JobTransition::CompleteSucceeded, "complete_succeeded"),
+			(JobTransition::CompleteFailed, "complete_failed"),
+			(JobTransition::Cancel, "cancel"),
+			(JobTransition::Retry, "retry"),
+			(JobTransition::ReapToQueued, "reap_to_queued"),
+			(JobTransition::ReapToFailed, "reap_to_failed"),
+		];
+		for (transition, label) in jobs {
+			assert_eq!(transition.as_str(), label);
+			assert_eq!(
+				JobState::Succeeded.apply(transition).unwrap_err().to_string(),
+				format!("invalid job transition {label} from succeeded")
+			);
+		}
+		let findings = [
+			(FindingTransition::ScanAccepted, "scan_accepted"),
+			(FindingTransition::ScanAutoConfirm, "scan_auto_confirm"),
+			(FindingTransition::ScanAwaitApproval, "scan_await_approval"),
+			(FindingTransition::ScanRequireVerification, "scan_require_verification"),
+			(FindingTransition::VerdictConfirm, "verdict_confirm"),
+			(FindingTransition::VerdictAwaitApproval, "verdict_await_approval"),
+			(FindingTransition::VerdictDismiss, "verdict_dismiss"),
+			(FindingTransition::DeadlineExpire, "deadline_expire"),
+			(FindingTransition::Approve, "approve"),
+			(FindingTransition::Reject, "reject"),
+			(FindingTransition::RetryVerification, "retry_verification"),
+			(FindingTransition::MarkReported, "mark_reported"),
+		];
+		for (transition, label) in findings {
+			assert_eq!(transition.as_str(), label);
+			assert_eq!(
+				FindingState::Reported.apply(transition).unwrap_err().to_string(),
+				format!("invalid finding transition {label} from reported")
+			);
+		}
+	}
 
 	#[test]
 	fn initial_job_state_is_only_enqueue() {

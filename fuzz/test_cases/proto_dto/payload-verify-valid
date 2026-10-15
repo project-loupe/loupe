@@ -1,0 +1,1 @@
+{"kind":"verify","finding_id":1,"finding":{"scanner_id":"scanner","severity":"high","title":"Finding title","description":"Longer description","fingerprint":"fp"},"reviewed_sha":"abc"}

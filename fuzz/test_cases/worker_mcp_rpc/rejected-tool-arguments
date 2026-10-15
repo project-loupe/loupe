@@ -1,0 +1,10 @@
+{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_finding_by_id","arguments":{}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"submit_finding","arguments":{}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"validate_poc","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"submit_verdict","arguments":{}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"submit_patch","arguments":{}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"validate_patch","arguments":{}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_finding_by_id","arguments":{"id":-1}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"get_finding_by_id","arguments":{"id":"LUP-+1"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{"query":"q","protocol_version":"1"}}}

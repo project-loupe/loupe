@@ -1,3 +1,18 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
+#![deny(unsafe_code)]
 //! `loupe-web` — a local operator dashboard for `loupe-server`.
 //!
 //! # Shape
@@ -26,10 +41,29 @@
 //!   in [`guard`] close that one.
 //!
 //! Exposed as a library so integration tests can drive the router.
+//!
+//! The actual Browser request context has no public construction path:
+//!
+//! ```compile_fail,E0603
+//! use loupe_web::ingress::BrowserRequest;
+//! ```
+//!
+//! Fuzz observations do not provide a normal-build decoder or mint API:
+//! ```compile_fail,E0432
+//! use loupe_web::fuzz_support;
+//! ```
+//!
+//! Browser query text has no ordinary public serde admission bypass:
+//! ```compile_fail,E0432
+//! use loupe_web::routes::api::{JobsQuery, SearchQuery, LimitQuery};
+//! ```
 
 pub mod client;
 pub mod config;
+#[cfg(fuzzing)]
+pub mod fuzz_support;
 pub mod guard;
+mod ingress;
 pub mod routes;
 pub mod state;
 pub mod token;
@@ -73,7 +107,8 @@ pub fn router(state: WebState) -> Router {
 		.route("/api/findings/{id}/approve", post(routes::api::approve_finding))
 		.route("/api/findings/{id}/reject", post(routes::api::reject_finding))
 		.route("/api/findings/{id}/retry-report", post(routes::api::retry_report_finding))
-		.route_layer(axum::middleware::from_fn_with_state(state.clone(), guard::require_token));
+		.route_layer(axum::middleware::from_fn_with_state(state.clone(), guard::require_token))
+		.layer(axum::middleware::map_response(routes::api::enclose_bad_request));
 
 	Router::new()
 		.route("/", get(routes::assets::index))
@@ -85,6 +120,7 @@ pub fn router(state: WebState) -> Router {
 }
 
 /// Handle for a running dashboard.
+// debug-ok: listener address and task handle contain no request/response data.
 #[derive(Debug)]
 pub struct ServeHandle {
 	pub local_addr: SocketAddr,
@@ -117,3 +153,6 @@ pub async fn serve(bind: SocketAddr, state: WebState) -> Result<ServeHandle> {
 	});
 	Ok(ServeHandle { local_addr, join })
 }
+
+#[cfg(test)]
+mod test_support;

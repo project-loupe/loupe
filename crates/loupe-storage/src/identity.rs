@@ -2,22 +2,41 @@
 
 use loupe_core::text::policy::{AnchorText, Family, InstanceKey};
 use loupe_core::text::{Anchor, Identifier};
+use loupe_provenance::Source;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity {
-	pub family: Identifier<Family>,
-	pub anchor: Anchor<AnchorText>,
-	pub instance: Option<Anchor<InstanceKey>>,
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
+#[derive(Debug)]
+pub struct Identity<S: Source> {
+	pub family: Identifier<Family, S>,
+	pub anchor: Anchor<AnchorText, S>,
+	pub instance: Option<Anchor<InstanceKey, S>>,
 }
-impl Identity {
+impl<S: Source> Clone for Identity<S> {
+	fn clone(&self) -> Self {
+		Self {
+			family: self.family.clone(),
+			anchor: self.anchor.clone(),
+			instance: self.instance.clone(),
+		}
+	}
+}
+impl<S: Source> PartialEq for Identity<S> {
+	fn eq(&self, other: &Self) -> bool {
+		self.family == other.family
+			&& self.anchor == other.anchor
+			&& self.instance == other.instance
+	}
+}
+impl<S: Source> Eq for Identity<S> {}
+impl<S: Source> Identity<S> {
 	pub fn fingerprint(&self) -> [u8; 32] {
 		fingerprint(&self.family, &self.anchor, self.instance.as_ref())
 	}
 }
 
-pub fn fingerprint(
-	family: &Identifier<Family>, anchor: &Anchor<AnchorText>,
-	instance: Option<&Anchor<InstanceKey>>,
+pub fn fingerprint<S: Source>(
+	family: &Identifier<Family, S>, anchor: &Anchor<AnchorText, S>,
+	instance: Option<&Anchor<InstanceKey, S>>,
 ) -> [u8; 32] {
 	let bytes = [
 		"lead-identity-v1\0",
@@ -37,8 +56,8 @@ mod tests {
 
 	#[test]
 	fn fingerprint_pins_the_versioned_identity_encoding() {
-		let family = Identifier::<Family>::new("auth-bypass").unwrap();
-		let anchor = Anchor::<AnchorText>::new("Token Refresh").unwrap();
+		let family = crate::test_support::identifier::<Family>("auth-bypass").unwrap();
+		let anchor = crate::test_support::anchor::<AnchorText>("Token Refresh").unwrap();
 		let expected = crate::canonical::digest(b"lead-identity-v1\0auth-bypass\0token refresh\0");
 		assert_eq!(
 			expected,
@@ -52,7 +71,7 @@ mod tests {
 			expected,
 			"identity framing must include its version and empty-instance separator"
 		);
-		let instance = Anchor::<InstanceKey>::new("admin endpoint").unwrap();
+		let instance = crate::test_support::anchor::<InstanceKey>("admin endpoint").unwrap();
 		assert_ne!(fingerprint(&family, &anchor, Some(&instance)), expected);
 		assert_eq!(
 			fingerprint(&family, &anchor, Some(&instance)),
@@ -64,21 +83,25 @@ mod tests {
 
 	#[test]
 	fn fingerprint_normalization_and_domain_separation() {
-		let family = Identifier::<Family>::new("auth-bypass").unwrap();
-		let expected = fingerprint(&family, &Anchor::new("café handler").unwrap(), None);
+		let family = crate::test_support::identifier::<Family>("auth-bypass").unwrap();
+		let expected =
+			fingerprint(&family, &crate::test_support::anchor("café handler").unwrap(), None);
 		for raw in [" CAFÉ   Handler ", "cafe\u{301} handler", "café\u{a0}handler"] {
-			assert_eq!(fingerprint(&family, &Anchor::new(raw).unwrap(), None), expected);
+			assert_eq!(
+				fingerprint(&family, &crate::test_support::anchor(raw).unwrap(), None),
+				expected
+			);
 		}
 		assert_ne!(
 			fingerprint(
-				&Identifier::new("other-family").unwrap(),
-				&Anchor::new("café handler").unwrap(),
+				&crate::test_support::identifier("other-family").unwrap(),
+				&crate::test_support::anchor("café handler").unwrap(),
 				None
 			),
 			expected
 		);
 		for bad in ["file.rs:123", "commit 79dec41", "job_9", "campaign 42"] {
-			assert!(Anchor::<AnchorText>::new(bad).is_err());
+			assert!(crate::test_support::anchor::<AnchorText>(bad).is_err());
 		}
 	}
 }

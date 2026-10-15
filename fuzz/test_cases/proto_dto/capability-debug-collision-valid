@@ -1,0 +1,1 @@
+{"protocol_version":2,"job_id":1,"job_capability":"LeaseEnvelope","repo_id":1,"repo":{"host":"example.test","owner":"owner","repo":"repo","clone_url":"https://example.test/owner/repo"},"head_branch":"LeaseEnvelope","lease_expires_at":42,"scanner_config":null,"payload":{"kind":"scan"},"github_pat":"LeaseEnvelope"}

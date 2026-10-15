@@ -1,0 +1,9 @@
+
+not JSON
+{"jsonrpc":"ignored-version","method":"ping"}
+{"jsonrpc":"2.0","id":1,"method":"unknown-method-private-012345678901234567890123456789"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"unknown-tool-private-012345678901234567890123456789"}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_finding_by_id","arguments":{"id":"LUP-01"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"submit_verdict","arguments":{"verdict":"private-invalid-verdict-012345678901234567890123456789","notes":"note"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{"query":"q","protocol_version":999}}}
+{"jsonrpc":"ignored-version","id":6,"method":"ping"}

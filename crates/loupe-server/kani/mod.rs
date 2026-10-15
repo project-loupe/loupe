@@ -1,0 +1,198 @@
+use axum::http::HeaderValue;
+use loupe_core::{JobKind, JobState};
+
+use crate::ingress::{request_body_next_len, BODY_CAP};
+use crate::job_capability::{capability_admits, legacy_kind, parse_capability_value, LeaseFacts};
+use crate::request_budget::Budget;
+use crate::routes::jobs::{route_admits_kind, Route};
+
+fn hash_stub(_: &[u8]) -> blake3::Hash {
+	[0x42; 32].into()
+}
+
+fn bounded_bytes_copy(data: &[u8]) -> axum::body::Bytes {
+	assert!(data.len() <= 44);
+	let mut copied = Box::new([0u8; 44]);
+	copied[..data.len()].copy_from_slice(data);
+	axum::body::Bytes::from_static(&Box::leak(copied)[..data.len()])
+}
+
+// Bound: All header byte strings of lengths 0..=44, including HTAB.
+// Hash cryptography is excluded: this proof checks acceptance and hash-result
+// propagation. HeaderMap lookup and real hashing remain in unit/fuzz checks.
+// Bytes copying uses a same-byte, fixed-size allocation model: real BytesMut
+// refcount/pointer machinery is outside this proof. HeaderValue's byte validation
+// and to_str remain real; allocator internals are covered by ordinary fuzzing.
+#[kani::proof]
+#[kani::unwind(46)]
+#[kani::stub(blake3::hash, hash_stub)]
+#[kani::stub(axum::body::Bytes::copy_from_slice, bounded_bytes_copy)]
+fn parse_capability_matches_header_text_length() {
+	let bytes: [u8; 44] = kani::any();
+	let len: usize = kani::any();
+	kani::assume(len <= 44);
+	let header = HeaderValue::from_bytes(&bytes[..len]);
+	if let Ok(header) = &header {
+		assert_eq!(header.as_bytes(), &bytes[..len]);
+	}
+	let accepted_text = header.as_ref().is_ok_and(|value| value.to_str().is_ok());
+	let parsed = parse_capability_value(header.as_ref().ok());
+	assert_eq!(parsed.is_some(), accepted_text && len == 43);
+	if let Some(hash) = parsed {
+		assert_eq!(hash, [0x42; 32]);
+	}
+	kani::cover!(parsed.is_some(), "accepted exact-length text");
+	kani::cover!(parsed.is_none(), "rejected header");
+	kani::cover!(parsed.is_some() && bytes[0] == b'\t', "horizontal tab accepted");
+}
+
+// Bound: Full i64 worker/time domain, all state variants and 32-byte
+// hashes. SQL tests separately establish that the returned row matches the
+// query hash; JobRow itself does not retain the stored capability hash.
+// ci: fast
+#[kani::proof]
+#[kani::unwind(34)]
+fn capability_admits_is_sound() {
+	let state: u8 = kani::any();
+	kani::assume(state < 5);
+	let state = match state {
+		0 => JobState::Queued,
+		1 => JobState::Leased,
+		2 => JobState::Succeeded,
+		3 => JobState::Failed,
+		_ => JobState::Cancelled,
+	};
+	let facts = LeaseFacts {
+		worker_id: kani::any(),
+		capability_hash: kani::any(),
+		lease_expires_at: kani::any(),
+		state,
+	};
+	let caller: i64 = kani::any();
+	let hash: [u8; 32] = kani::any();
+	let now: i64 = kani::any();
+	let admitted = capability_admits(&facts, caller, &hash, now);
+	let expected = facts.worker_id == Some(caller)
+		&& facts.capability_hash == hash
+		&& facts.state == JobState::Leased
+		&& facts.lease_expires_at.is_some_and(|expiry| expiry >= now);
+	assert_eq!(admitted, expected);
+	kani::cover!(admitted, "valid lease admitted");
+	kani::cover!(admitted && facts.lease_expires_at == Some(now), "inclusive expiry admitted");
+	kani::cover!(
+		!admitted
+			&& facts.worker_id == Some(caller)
+			&& facts.capability_hash == hash
+			&& facts.state == JobState::Leased
+			&& facts.lease_expires_at.and_then(|expiry| expiry.checked_add(1)) == Some(now),
+		"next instant refused"
+	);
+}
+
+// Bound: Every route-table row and every JobKind variant. The Unknown
+// payload deliberately spells a known kind: the variant, not text, grants access.
+// All fixture spellings are at most nine bytes; unwinding assertions check
+// that this finite bound suffices for their comparisons and validation.
+// ci: fast
+#[kani::proof]
+#[kani::unwind(16)]
+fn route_kind_check_is_exhaustive() {
+	let kind: u8 = kani::any();
+	kani::assume(kind < 5);
+	let kind = match kind {
+		0 => JobKind::Scan,
+		1 => JobKind::Verify,
+		2 => JobKind::Survey,
+		3 => JobKind::Drilldown,
+		_ => unknown_kind_fixture(),
+	};
+	let route: u8 = kani::any();
+	kani::assume(route < 3);
+	let selected = match route {
+		0 => Route::Findings,
+		1 => Route::LlmFinding,
+		_ => Route::Verdict,
+	};
+	let admitted = route_admits_kind(selected, &kind);
+	assert_eq!(admitted, if route == 2 { kind == JobKind::Verify } else { kind == JobKind::Scan });
+	assert_eq!(legacy_kind(&kind), matches!(kind, JobKind::Scan | JobKind::Verify));
+	kani::cover!(admitted && route == 0, "findings accepts scan");
+	kani::cover!(admitted && route == 1, "LLM findings accepts scan");
+	kani::cover!(admitted && route == 2, "verdict accepts verify");
+	kani::cover!(!admitted && kind == JobKind::Survey, "phase denied");
+	kani::cover!(!admitted && matches!(kind, JobKind::Unknown(_)), "unknown denied");
+}
+
+// Fixed synthetic Db content keeps the deliberate Unknown("scan") variant
+// control source-bearing without changing the normal production API. This is
+// fixture authority, not an actual SQLite read or proof of text validation.
+fn unknown_kind_fixture() -> JobKind<loupe_provenance::Db> {
+	use loupe_core::text::{BoundedText, Error};
+	use loupe_provenance::{Db, Ingress, Mark, Untrusted, Unvalidated, Validate};
+	struct Unknown;
+	impl Validate<&str, Db> for Unknown {
+		type Output = JobKind<Db>;
+		type Error = Error;
+		fn validate<'view>(
+			self, value: Unvalidated<'view, &str>, mark: Mark<'view, Db>,
+		) -> Result<Self::Output, Self::Error> {
+			BoundedText::new(&mark, value.get()).map(JobKind::Unknown)
+		}
+	}
+	// SAFETY: this proof owns its synthetic original "scan" bytes and fixes Db.
+	#[allow(unsafe_code)]
+	Untrusted::new("scan", unsafe { Ingress::<Db>::new() }).validate(Unknown).unwrap()
+}
+
+// Bound: One arbitrary transition over the full u64 domain. The
+// independent conservation oracle partitions exact arithmetic: overflow of
+// either checked operation means earned credit exceeds every u64 capacity.
+// This avoids the symbolic cost of a second 128-bit multiplier.
+// Composition follows by summing successful charges; time never moves back.
+#[kani::proof]
+fn request_budget_is_monotone() {
+	let capacity: u64 = kani::any();
+	let remaining: u64 = kani::any();
+	kani::assume(remaining <= capacity);
+	let rate: u64 = kani::any();
+	let last: u64 = kani::any();
+	let now: u64 = kani::any();
+	let cost: u64 = kani::any();
+	let mut budget = Budget { capacity, remaining, refill_per_second: rate, last };
+	let admitted = budget.admit(now, cost);
+	let elapsed = if now >= last { now - last } else { 0 };
+	let earned = elapsed.checked_mul(rate).and_then(|refill| remaining.checked_add(refill));
+	let available = earned.map_or(capacity, |earned| earned.min(capacity));
+	assert_eq!(admitted, cost <= available);
+	assert_eq!(budget.remaining, if admitted { available - cost } else { available });
+	assert!(budget.remaining <= capacity);
+	assert!(budget.last >= last && budget.last >= now);
+	if now < last {
+		assert!(budget.remaining <= remaining);
+	}
+	kani::cover!(admitted && cost > 0, "positive charge admitted");
+	kani::cover!(!admitted, "insufficient credit refused");
+	kani::cover!(now < last && admitted, "backward clock creates no credit");
+	kani::cover!(earned.is_none(), "refill overflow saturates");
+}
+
+// Bound: Full usize inputs on this 64-bit target, no assumptions or
+// stubs. Independent u128 arithmetic checks the production append admission.
+// This proves numeric limits only: actual collection, allocation, byte debt
+// and wipe-on-drop remain separate runtime and fuzz obligations.
+// ci: fast
+#[kani::proof]
+fn request_body_length_admission_is_exact() {
+	assert!(usize::BITS <= 64);
+	let used: usize = kani::any();
+	let incoming: usize = kani::any();
+	let admitted = request_body_next_len(used, incoming);
+	let sum = used as u128 + incoming as u128;
+	let expected = if sum <= BODY_CAP as u128 { Some(sum as usize) } else { None };
+	assert_eq!(admitted, expected);
+	kani::cover!(used == 0 && incoming == 0 && admitted == Some(0), "empty append admitted");
+	kani::cover!(sum == BODY_CAP as u128 && admitted.is_some(), "exact cap admitted");
+	kani::cover!(sum == BODY_CAP as u128 + 1 && admitted.is_none(), "first over-cap byte refused");
+	kani::cover!(sum > usize::MAX as u128 && admitted.is_none(), "arithmetic overflow refused");
+	kani::cover!(used > BODY_CAP && incoming == 0 && admitted.is_none(), "invalid start refused");
+}

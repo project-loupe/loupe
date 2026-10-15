@@ -13,9 +13,15 @@ publish.workspace = true
 
 [dependencies]
 loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 [lints]
 workspace = true

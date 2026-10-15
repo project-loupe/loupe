@@ -13,16 +13,26 @@
 //! `octocrab`: the integration is tiny and not worth a dependency.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use loupe_core::text::policy::GithubAppSlug;
+use loupe_core::text::BoundedText;
+use loupe_provenance::{
+	Ingress, Mark, Reporter as ReporterSource, Secret, Untrusted, Unvalidated, Validate,
+};
+use reqwest::header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION};
 use reqwest::{StatusCode, Url};
 use ring::rand::SystemRandom;
 use ring::signature::{self, RsaKeyPair};
 use rustls::pki_types::PrivateKeyDer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use zeroize::{Zeroize, Zeroizing};
 
 /// GitHub rejects JWTs whose `iat` is in the future relative to its own
 /// clock; backdating by a minute absorbs ordinary clock skew.
@@ -32,13 +42,26 @@ const JWT_LIFETIME_SECS: i64 = 540;
 /// Installation tokens live for an hour. Reusing one for fifty minutes
 /// leaves a comfortable margin before GitHub starts rejecting it.
 const TOKEN_CACHE_SECS: i64 = 50 * 60;
+const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
 const ACCEPT: &str = "application/vnd.github+json";
 const API_VERSION: &str = "2022-11-28";
 
-/// A GitHub App's identity plus its signing key.
+/// A GitHub App's identity plus its opaque ring signing state. Ring's
+/// inaccessible key allocations are outside our owned-buffer wipe guarantee.
 pub struct GithubAppKey {
 	app_id: u64,
 	key_pair: RsaKeyPair,
+}
+
+/// The parser's owned DER has a real Zeroize implementation but no Drop.
+/// Borrowing it here also permits safe observation after cleanup in tests.
+/// Parser scratch and ring's subsequently constructed key remain separate.
+struct PrivateDerGuard<'key>(&'key mut PrivateKeyDer<'static>);
+
+impl Drop for PrivateDerGuard<'_> {
+	fn drop(&mut self) {
+		self.0.zeroize();
+	}
 }
 
 impl std::fmt::Debug for GithubAppKey {
@@ -53,10 +76,11 @@ impl GithubAppKey {
 	/// PRIVATE KEY`) is accepted too for operators who re-encoded it.
 	pub fn from_pem(app_id: u64, pem: &str) -> Result<Self> {
 		let mut bytes = pem.as_bytes();
-		let key = rustls_pemfile::private_key(&mut bytes)
-			.context("reading GitHub App private key PEM")?
+		let mut key = rustls_pemfile::private_key(&mut bytes)
+			.map_err(|_| anyhow!("invalid GitHub App private key PEM"))?
 			.ok_or_else(|| anyhow!("GitHub App private key PEM contains no private key"))?;
-		let key_pair = match key {
+		let key = PrivateDerGuard(&mut key);
+		let key_pair = match &*key.0 {
 			PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
 			PrivateKeyDer::Pkcs8(der) => RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()),
 			PrivateKeyDer::Sec1(_) => {
@@ -74,7 +98,7 @@ impl GithubAppKey {
 
 	/// Sign a compact RS256 JWT that authenticates as the app itself.
 	/// `now_unix` is injected so tests can pin the claims.
-	pub fn sign_jwt(&self, now_unix: i64) -> Result<String> {
+	pub fn sign_jwt(&self, now_unix: i64) -> Result<Secret<String>> {
 		let header = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
 		let claims = serde_json::to_vec(&JwtClaims {
 			iat: now_unix - JWT_BACKDATE_SECS,
@@ -83,7 +107,15 @@ impl GithubAppKey {
 		})
 		.context("serialising GitHub App JWT claims")?;
 		let signing_input = format!("{header}.{}", b64url(&claims));
-		let mut sig = vec![0u8; self.key_pair.public().modulus_len()];
+		let signature_len = self.key_pair.public().modulus_len();
+		let encoded_len = base64::encoded_len(signature_len, false)
+			.ok_or_else(|| anyhow!("GitHub App JWT signature is too large"))?;
+		// Allocate the complete output before writing confidential bytes. These
+		// mutable construction guards wipe on both success and fallible exits;
+		// neither changes Secret's immutable exposure API.
+		let mut jwt = Zeroizing::new(vec![0u8; signing_input.len() + 1 + encoded_len]);
+		jwt[..signing_input.len()].copy_from_slice(signing_input.as_bytes());
+		let mut sig = Zeroizing::new(vec![0u8; signature_len]);
 		self.key_pair
 			.sign(
 				&signature::RSA_PKCS1_SHA256,
@@ -92,7 +124,19 @@ impl GithubAppKey {
 				&mut sig,
 			)
 			.map_err(|_| anyhow!("signing GitHub App JWT"))?;
-		Ok(format!("{signing_input}.{}", b64url(&sig)))
+		jwt[signing_input.len()] = b'.';
+		base64::engine::general_purpose::URL_SAFE_NO_PAD
+			.encode_slice(&sig, &mut jwt[signing_input.len() + 1..])
+			.map_err(|_| anyhow!("encoding GitHub App JWT signature"))?;
+		// Transfer the one allocation. ASCII header/claims/base64 are UTF-8;
+		// retain cleanup even if that invariant is broken by a later change.
+		match String::from_utf8(std::mem::take(&mut *jwt)) {
+			Ok(jwt) => Ok(Secret::new(jwt)),
+			Err(error) => {
+				let _rejected = Zeroizing::new(error.into_bytes());
+				bail!("GitHub App JWT encoding was not UTF-8")
+			},
+		}
 	}
 }
 
@@ -112,10 +156,15 @@ fn now_unix() -> i64 {
 }
 
 /// What `GET /app` reports about the app the key belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GithubAppInfo {
 	pub id: u64,
-	pub slug: String,
+	pub slug: BoundedText<GithubAppSlug, ReporterSource>,
+}
+impl std::fmt::Debug for GithubAppInfo {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("GithubAppInfo").field("id", &self.id).field("slug", &"[redacted]").finish()
+	}
 }
 
 /// Fetch the app's own metadata. Doubles as a credential check: a wrong
@@ -125,14 +174,29 @@ pub async fn fetch_app(
 ) -> Result<GithubAppInfo> {
 	let jwt = key.sign_jwt(now_unix())?;
 	let url = api_base.join("/app").map_err(|e| anyhow!("building app URL: {e}"))?;
-	let resp =
-		github_request(http.get(url), &jwt).send().await.context("fetching GitHub App metadata")?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "GitHub credential owner verifies the admitted App key at the fixed app endpoint"
+	)]
+	let resp = github_request(http.get(url), jwt.expose())
+		.send()
+		.await
+		.context("fetching GitHub App metadata")?;
 	let status = resp.status();
+	let body = super::ingress::read(resp).await?;
 	if !status.is_success() {
-		let body = resp.text().await.unwrap_or_default();
-		bail!("github returned {status} when fetching app {}: {body}", key.app_id());
+		bail!("github returned {status} when fetching app {}", key.app_id());
 	}
-	resp.json().await.context("parsing GitHub App metadata")
+	Ok(body.as_bytes().validate(super::ingress::AppMetadataDecoder)?)
+}
+
+/// Decode app metadata without reflecting response content into diagnostics.
+#[cfg(any(test, fuzzing))]
+pub fn parse_app_response(status: StatusCode, body: &[u8], app_id: u64) -> Result<GithubAppInfo> {
+	if !status.is_success() {
+		bail!("github returned {status} when fetching app {app_id}");
+	}
+	Ok(super::ingress::fixture_input(body).validate(super::ingress::AppMetadataDecoder)?)
 }
 
 /// Stamp the headers every GitHub API call carries. Shared with the
@@ -140,13 +204,45 @@ pub async fn fetch_app(
 pub(super) fn github_request(
 	req: reqwest::RequestBuilder, bearer: &str,
 ) -> reqwest::RequestBuilder {
-	req.bearer_auth(bearer).header("Accept", ACCEPT).header("X-GitHub-Api-Version", API_VERSION)
+	req.header(AUTHORIZATION, BearerHeader::new(bearer))
+		.header("Accept", ACCEPT)
+		.header("X-GitHub-Api-Version", API_VERSION)
+}
+
+/// Named HTTP credential sink. Bytes retains this actual guard through header
+/// clones, including the invalid-header path. HTTP/TLS encoding and kernel
+/// copies are outside this allocation's wipe guarantee.
+struct BearerHeader(Secret<Vec<u8>>);
+
+impl BearerHeader {
+	fn new(bearer: &str) -> Self {
+		let mut bytes = Vec::with_capacity(7 + bearer.len());
+		bytes.extend_from_slice(b"Bearer ");
+		bytes.extend_from_slice(bearer.as_bytes());
+		Self(Secret::new(bytes))
+	}
+}
+
+impl AsRef<[u8]> for BearerHeader {
+	fn as_ref(&self) -> &[u8] {
+		self.0.expose()
+	}
+}
+
+impl TryFrom<BearerHeader> for HeaderValue {
+	type Error = InvalidHeaderValue;
+
+	fn try_from(value: BearerHeader) -> Result<Self, Self::Error> {
+		let mut header = Self::from_maybe_shared(Bytes::from_owner(value))?;
+		header.set_sensitive(true);
+		Ok(header)
+	}
 }
 
 type TokenKey = (u64, String, String);
 
 struct CachedToken {
-	token: String,
+	token: Arc<Secret<String>>,
 	expires_at: i64,
 }
 
@@ -157,11 +253,6 @@ struct CachedToken {
 #[derive(Default)]
 pub struct InstallationTokens {
 	cache: Mutex<HashMap<TokenKey, CachedToken>>,
-}
-
-#[derive(Deserialize)]
-struct InstallationBody {
-	id: u64,
 }
 
 #[derive(Serialize)]
@@ -177,7 +268,14 @@ struct AccessTokenPermissions {
 
 #[derive(Deserialize)]
 struct AccessTokenBody {
-	token: String,
+	#[serde(deserialize_with = "deserialize_access_token")]
+	token: Secret<String>,
+}
+
+fn deserialize_access_token<'de, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> std::result::Result<Secret<String>, D::Error> {
+	String::deserialize(deserializer).map(Secret::new)
 }
 
 impl InstallationTokens {
@@ -185,7 +283,7 @@ impl InstallationTokens {
 	/// the cached token is missing or about to expire.
 	pub async fn token_for(
 		&self, http: &reqwest::Client, api_base: &Url, key: &GithubAppKey, owner: &str, repo: &str,
-	) -> Result<String> {
+	) -> Result<Arc<Secret<String>>> {
 		let now = now_unix();
 		let cache_key = (key.app_id(), owner.to_owned(), repo.to_owned());
 		let mut cache = self.cache.lock().await;
@@ -196,7 +294,7 @@ impl InstallationTokens {
 		}
 		let jwt = key.sign_jwt(now)?;
 		let installation_id = lookup_installation(http, api_base, &jwt, owner, repo).await?;
-		let token = mint_token(http, api_base, &jwt, installation_id, repo).await?;
+		let token = Arc::new(mint_token(http, api_base, &jwt, installation_id, repo).await?);
 		cache.insert(
 			cache_key,
 			CachedToken { token: token.clone(), expires_at: now + TOKEN_CACHE_SECS },
@@ -213,16 +311,35 @@ impl InstallationTokens {
 }
 
 async fn lookup_installation(
-	http: &reqwest::Client, api_base: &Url, jwt: &str, owner: &str, repo: &str,
+	http: &reqwest::Client, api_base: &Url, jwt: &Secret<String>, owner: &str, repo: &str,
 ) -> Result<u64> {
 	let url = api_base
 		.join(&format!("/repos/{owner}/{repo}/installation"))
 		.map_err(|e| anyhow!("building installation URL: {e}"))?;
-	let resp = github_request(http.get(url), jwt)
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "GitHub credential owner resolves installation for the selected repository destination"
+	)]
+	let resp = github_request(http.get(url), jwt.expose())
 		.send()
 		.await
 		.with_context(|| format!("looking up the GitHub App installation for {owner}/{repo}"))?;
 	let status = resp.status();
+	let body = super::ingress::read(resp).await?;
+	check_installation_status(status, owner, repo)?;
+	Ok(body.as_bytes().validate(super::ingress::InstallationDecoder)?)
+}
+
+/// Decode an installation lookup; owner/repo are configured request metadata.
+#[cfg(any(test, fuzzing))]
+pub fn parse_installation_response(
+	status: StatusCode, body: &[u8], owner: &str, repo: &str,
+) -> Result<u64> {
+	check_installation_status(status, owner, repo)?;
+	Ok(super::ingress::fixture_input(body).validate(super::ingress::InstallationDecoder)?)
+}
+
+fn check_installation_status(status: StatusCode, owner: &str, repo: &str) -> Result<()> {
 	if status == StatusCode::NOT_FOUND {
 		bail!(
 			"the GitHub App is not installed on {owner}/{repo}; add the repository to the \
@@ -230,22 +347,22 @@ async fn lookup_installation(
 		);
 	}
 	if !status.is_success() {
-		let body = resp.text().await.unwrap_or_default();
-		bail!(
-			"github returned {status} when looking up the installation for {owner}/{repo}: {body}"
-		);
+		bail!("github returned {status} when looking up the installation for {owner}/{repo}");
 	}
-	let body: InstallationBody = resp.json().await.context("parsing installation response")?;
-	Ok(body.id)
+	Ok(())
 }
 
 async fn mint_token(
-	http: &reqwest::Client, api_base: &Url, jwt: &str, installation_id: u64, repo: &str,
-) -> Result<String> {
+	http: &reqwest::Client, api_base: &Url, jwt: &Secret<String>, installation_id: u64, repo: &str,
+) -> Result<Secret<String>> {
 	let url = api_base
 		.join(&format!("/app/installations/{installation_id}/access_tokens"))
 		.map_err(|e| anyhow!("building access token URL: {e}"))?;
-	let resp = github_request(http.post(url), jwt)
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "GitHub credential owner requests an issues-write token restricted to the selected repository"
+	)]
+	let resp = github_request(http.post(url), jwt.expose())
 		.json(&AccessTokenRequest {
 			repositories: [repo],
 			permissions: AccessTokenPermissions { issues: "write" },
@@ -254,15 +371,77 @@ async fn mint_token(
 		.await
 		.context("minting GitHub App installation token")?;
 	let status = resp.status();
+	let body = read_token_response(resp).await?;
+	check_access_token_status(status, installation_id)?;
+	Ok(body.as_bytes().validate(AccessTokenDecoder)?)
+}
+
+/// Collect only the confidential token response. Reserve the approved limit
+/// once, then wipe the entire capacity on return, error, or cancellation.
+/// Upstream network chunks and serde scratch are owned by their libraries.
+async fn read_token_response(
+	resp: reqwest::Response,
+) -> Result<Untrusted<Zeroizing<Vec<u8>>, ReporterSource>> {
+	if resp.content_length().is_some_and(|len| len > MAX_TOKEN_RESPONSE_BYTES as u64) {
+		bail!("GitHub installation token response exceeds {MAX_TOKEN_RESPONSE_BYTES} bytes");
+	}
+	let mut body = Zeroizing::new(Vec::with_capacity(MAX_TOKEN_RESPONSE_BYTES));
+	let mut stream = resp.bytes_stream();
+	while let Some(chunk) = stream.next().await {
+		let chunk = chunk.map_err(|_| anyhow!("reading installation token response"))?;
+		if chunk.len() > MAX_TOKEN_RESPONSE_BYTES - body.len() {
+			bail!("GitHub installation token response exceeds {MAX_TOKEN_RESPONSE_BYTES} bytes");
+		}
+		body.extend_from_slice(&chunk);
+	}
+	// SAFETY: body is the actual token endpoint's guarded bounded HTTP read,
+	// captured here before any JSON parsing or token extraction.
+	#[allow(unsafe_code)]
+	let token = unsafe { Ingress::<ReporterSource>::new() };
+	Ok(Untrusted::new(body, token))
+}
+
+struct AccessTokenDecoder;
+impl Validate<&[u8], ReporterSource> for AccessTokenDecoder {
+	type Output = Secret<String>;
+	type Error = super::ingress::ReporterDecodeError;
+	fn validate<'view>(
+		self, input: Unvalidated<'view, &[u8]>, _: Mark<'view, ReporterSource>,
+	) -> std::result::Result<Self::Output, Self::Error> {
+		serde_json::from_slice::<AccessTokenBody>(input.get())
+			.map(|body| body.token)
+			.map_err(|_| super::ingress::ReporterDecodeError("parsing installation token"))
+	}
+}
+
+/// Fixed Reporter fixture for the actual confidential endpoint decoder.
+#[cfg(fuzzing)]
+pub fn fuzz_access_token(body: &[u8]) -> std::result::Result<Secret<String>, String> {
+	let token: Secret<String> = super::ingress::fuzz_support::original(body)
+		.validate(AccessTokenDecoder)
+		.map_err(super::ingress::fuzz_support::diagnostic)?;
+	assert_eq!(format!("{token:?}"), "[redacted]");
+	assert_eq!(format!("{token}"), "[redacted]");
+	Ok(token)
+}
+
+/// Decode an installation token; response bodies never become error text.
+#[cfg(any(test, fuzzing))]
+pub fn parse_access_token_response(
+	status: StatusCode, body: &[u8], installation_id: u64,
+) -> Result<Secret<String>> {
+	check_access_token_status(status, installation_id)?;
+	Ok(super::ingress::fixture_input(body).validate(AccessTokenDecoder)?)
+}
+
+fn check_access_token_status(status: StatusCode, installation_id: u64) -> Result<()> {
 	if !status.is_success() {
-		let body = resp.text().await.unwrap_or_default();
 		bail!(
 			"github returned {status} when minting an installation token for installation \
-			 {installation_id}: {body}"
+			 {installation_id}"
 		);
 	}
-	let body: AccessTokenBody = resp.json().await.context("parsing installation token")?;
-	Ok(body.token)
+	Ok(())
 }
 
 /// Throwaway RSA key for tests. Lives outside `#[cfg(test)]`, like
@@ -359,6 +538,178 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 	}
 
 	#[test]
+	fn secret_jwt_and_token_display_is_exactly_redacted() {
+		let key = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
+		assert_eq!(format!("{}", key.sign_jwt(1_000_000).unwrap()), "[redacted]");
+		let token = parse_access_token_response(
+			StatusCode::CREATED,
+			br#"{"token":"FAKE_DISPLAY_TOKEN"}"#,
+			777,
+		)
+		.unwrap();
+		assert_eq!(format!("{token}"), "[redacted]");
+	}
+
+	#[test]
+	fn private_der_guard_wipes_the_live_owner_on_drop() {
+		for mut key in [
+			PrivateKeyDer::Pkcs1(vec![7; 32].into()),
+			PrivateKeyDer::Pkcs8(vec![8; 32].into()),
+			PrivateKeyDer::Sec1(vec![9; 32].into()),
+		] {
+			assert_eq!(key.secret_der().len(), 32);
+			{
+				let guard = PrivateDerGuard(&mut key);
+				assert!(RsaKeyPair::from_der(guard.0.secret_der()).is_err());
+			}
+			assert!(key.secret_der().is_empty(), "drop must clear the actual owned DER");
+		}
+	}
+
+	#[test]
+	fn bearer_header_keeps_its_guarded_allocation_through_clones() {
+		let owner = BearerHeader::new("FAKE_RETAINED_BEARER");
+		let pointer = owner.0.expose().as_ptr();
+		let header = reqwest::header::HeaderValue::try_from(owner).unwrap();
+		assert_eq!(header.as_bytes().as_ptr(), pointer);
+		let retained = header.clone();
+		drop(header);
+		assert_eq!(retained.as_bytes().as_ptr(), pointer);
+		assert_eq!(retained.as_bytes(), b"Bearer FAKE_RETAINED_BEARER");
+		assert!(retained.is_sensitive());
+		let invalid = BearerHeader::new("FAKE_INVALID_BEARER\r\n");
+		assert!(reqwest::header::HeaderValue::try_from(invalid).is_err());
+	}
+
+	#[test]
+	fn github_secret_jwt_debug_is_redacted() {
+		let key = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
+		let jwt = key.sign_jwt(1_000_000).unwrap();
+		assert_eq!(format!("{jwt:?}"), "[redacted]", "JWT Debug must redact the bearer");
+		assert_eq!(format!("{jwt:#?}"), "[redacted]");
+	}
+
+	#[test]
+	fn github_secret_parsed_token_debug_is_redacted() {
+		let token = parse_access_token_response(
+			StatusCode::CREATED,
+			br#"{"token":"FAKE_INSTALLATION_TOKEN_SENTINEL"}"#,
+			777,
+		)
+		.unwrap();
+		assert_eq!(format!("{token:?}"), "[redacted]", "installation token Debug must be redacted");
+		assert_eq!(format!("{token:#?}"), "[redacted]");
+	}
+
+	#[test]
+	fn github_request_keeps_sensitive_bearer_bytes_and_metadata() {
+		let request = github_request(
+			reqwest::Client::new().get("http://example.invalid/app"),
+			"FAKE_HTTP_BEARER_SENTINEL",
+		)
+		.build()
+		.unwrap();
+		let header = request.headers().get(axum::http::header::AUTHORIZATION).unwrap();
+		assert_eq!(header.as_bytes(), b"Bearer FAKE_HTTP_BEARER_SENTINEL");
+		assert!(header.is_sensitive(), "Authorization must be marked sensitive");
+		assert!(!format!("{request:?}").contains("FAKE_HTTP_BEARER_SENTINEL"));
+		assert!(!format!("{header:?}").contains("FAKE_HTTP_BEARER_SENTINEL"));
+		assert_eq!(request.headers().get("Accept").unwrap(), ACCEPT);
+		assert_eq!(request.headers().get("X-GitHub-Api-Version").unwrap(), API_VERSION);
+		let retained = header.clone();
+		drop(request);
+		assert_eq!(retained.as_bytes(), b"Bearer FAKE_HTTP_BEARER_SENTINEL");
+		assert!(retained.is_sensitive());
+	}
+
+	const TOKEN_RESPONSE_TEST_LIMIT: usize = 256 * 1024;
+	const TOKEN_RESPONSE_LIMIT_ERROR: &str =
+		"GitHub installation token response exceeds 262144 bytes";
+
+	fn token_response_of_size(size: usize) -> Vec<u8> {
+		let mut body = br#"{"token":"FAKE_HTTP_TOKEN","ignored":""#.to_vec();
+		assert!(size >= body.len() + 2);
+		body.resize(size - 2, b'x');
+		body.extend_from_slice(b"\"}");
+		body
+	}
+
+	async fn mint_from_test_response(
+		body: axum::body::Body, declared_length: Option<usize>,
+	) -> Result<Secret<String>> {
+		let mut response = axum::response::Response::builder().status(StatusCode::CREATED);
+		if let Some(length) = declared_length {
+			response = response.header(axum::http::header::CONTENT_LENGTH, length);
+		}
+		let response = Arc::new(StdMutex::new(Some(response.body(body).unwrap())));
+		let app = Router::new().route(
+			"/app/installations/777/access_tokens",
+			post(move || {
+				let response = response.lock().unwrap().take().expect("one token mint request");
+				async move { response }
+			}),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		let http =
+			reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap();
+		let api_base: Url = format!("http://{addr}").parse().unwrap();
+		let jwt = Secret::new("FAKE_TEST_JWT".to_owned());
+		let result = mint_token(&http, &api_base, &jwt, 777, "tracker").await;
+		server.abort();
+		result
+	}
+
+	#[tokio::test]
+	async fn token_response_http_body_boundary_is_preserved() {
+		for size in [64, TOKEN_RESPONSE_TEST_LIMIT] {
+			let body = token_response_of_size(size);
+			let token =
+				mint_from_test_response(axum::body::Body::from(body), Some(size)).await.unwrap();
+			assert_eq!(token.expose(), "FAKE_HTTP_TOKEN", "valid token body of {size} bytes");
+		}
+	}
+
+	#[tokio::test]
+	async fn github_secret_oversize_token_response_with_length_is_rejected() {
+		let size = TOKEN_RESPONSE_TEST_LIMIT + 1;
+		let error = mint_from_test_response(
+			axum::body::Body::from(token_response_of_size(size)),
+			Some(size),
+		)
+		.await
+		.expect_err("oversize token response must be rejected");
+		assert_eq!(error.to_string(), TOKEN_RESPONSE_LIMIT_ERROR);
+	}
+
+	#[tokio::test]
+	async fn github_secret_oversize_streamed_token_response_is_rejected() {
+		let body = token_response_of_size(TOKEN_RESPONSE_TEST_LIMIT + 1);
+		let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+			body.chunks(8192).map(|chunk| Ok(chunk.to_vec())).collect();
+		let error = mint_from_test_response(
+			axum::body::Body::from_stream(futures_util::stream::iter(chunks)),
+			None,
+		)
+		.await
+		.expect_err("oversize streamed token response must be rejected");
+		assert_eq!(error.to_string(), TOKEN_RESPONSE_LIMIT_ERROR);
+	}
+
+	#[tokio::test]
+	async fn github_secret_oversize_declared_length_is_rejected_before_body() {
+		let pending = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+		let error = mint_from_test_response(
+			axum::body::Body::from_stream(pending),
+			Some(TOKEN_RESPONSE_TEST_LIMIT + 1),
+		)
+		.await
+		.expect_err("oversize declaration must be rejected without waiting for body bytes");
+		assert_eq!(error.to_string(), TOKEN_RESPONSE_LIMIT_ERROR);
+	}
+
+	#[test]
 	fn parses_pkcs1_and_pkcs8_encodings_of_the_same_key() {
 		let pkcs1 = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
 		let pkcs8 = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PKCS8_PEM).unwrap();
@@ -375,10 +726,22 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 	}
 
 	#[test]
+	fn credential_malformed_private_pem_errors_do_not_reflect_bytes() {
+		let pem = "-----BEGIN FAKE_PRIVATE_PEM_SENTINEL\n";
+		let error = GithubAppKey::from_pem(42, pem).unwrap_err();
+		for formatted in [format!("{error}"), format!("{error:#}"), format!("{error:?}")] {
+			assert!(
+				!formatted.contains("FAKE_PRIVATE_PEM_SENTINEL"),
+				"private-key parser errors must not reflect private PEM bytes"
+			);
+		}
+	}
+
+	#[test]
 	fn jwt_is_rs256_with_app_claims_and_verifies_against_the_public_key() {
 		let key = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
 		let jwt = key.sign_jwt(1_000_000).unwrap();
-		let parts: Vec<&str> = jwt.split('.').collect();
+		let parts: Vec<&str> = jwt.expose().split('.').collect();
 		assert_eq!(parts.len(), 3, "jwt: {jwt}");
 
 		let header: serde_json::Value = serde_json::from_slice(&b64url_decode(parts[0])).unwrap();
@@ -468,8 +831,8 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 
 		let first = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
 		let second = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
-		assert_eq!(first, "ghs_stub_777_1");
-		assert_eq!(second, first, "second call must come from the cache");
+		assert_eq!(first.expose(), "ghs_stub_777_1");
+		assert_eq!(second.expose(), first.expose(), "second call must come from the cache");
 
 		let lookups = stub.installation_lookups.lock().unwrap().clone();
 		assert_eq!(lookups.len(), 1, "lookups: {lookups:?}");
@@ -484,6 +847,62 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 			mints[0].2,
 			serde_json::json!({"repositories": ["tracker"], "permissions": {"issues": "write"}})
 		);
+	}
+
+	#[tokio::test]
+	async fn github_secret_concurrent_cache_hits_share_one_token_allocation() {
+		let (addr, stub) = spawn_stub().await;
+		stub.installed.lock().unwrap().insert("acme/tracker".into(), 777);
+		let api_base: Url = format!("http://{addr}").parse().unwrap();
+		let http = reqwest::Client::new();
+		let key = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
+		let tokens = InstallationTokens::default();
+		let (first, second) = tokio::join!(
+			tokens.token_for(&http, &api_base, &key, "acme", "tracker"),
+			tokens.token_for(&http, &api_base, &key, "acme", "tracker"),
+		);
+		let (first, second) = (first.unwrap(), second.unwrap());
+		assert_eq!(first.expose(), "ghs_stub_777_1");
+		assert_eq!(second.expose(), first.expose());
+		assert_eq!(stub.installation_lookups.lock().unwrap().len(), 1);
+		assert_eq!(stub.token_mints.lock().unwrap().len(), 1);
+		assert_eq!(
+			first.expose().as_ptr(),
+			second.expose().as_ptr(),
+			"concurrent cache hits must share the owned token allocation"
+		);
+		let cache = tokens.cache.lock().await;
+		let cached = cache.get(&(42, "acme".into(), "tracker".into())).unwrap();
+		assert_eq!(
+			first.expose().as_ptr(),
+			cached.token.expose().as_ptr(),
+			"cache must retain the same allocation"
+		);
+	}
+
+	#[tokio::test]
+	async fn token_cache_lifetime_and_expiry_preserve_inflight_token() {
+		let (addr, stub) = spawn_stub().await;
+		stub.installed.lock().unwrap().insert("acme/tracker".into(), 777);
+		let api_base: Url = format!("http://{addr}").parse().unwrap();
+		let http = reqwest::Client::new();
+		let key = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
+		let tokens = InstallationTokens::default();
+		let before = now_unix();
+		let first = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
+		let after = now_unix();
+		{
+			let mut cache = tokens.cache.lock().await;
+			let cached = cache.get_mut(&(42, "acme".into(), "tracker".into())).unwrap();
+			assert!(cached.expires_at >= before + 50 * 60);
+			assert!(cached.expires_at <= after + 50 * 60);
+			cached.expires_at = now_unix() - 1;
+		}
+		let fresh = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
+		assert_eq!(first.expose(), "ghs_stub_777_1", "in-flight owner remains usable after expiry");
+		assert_eq!(fresh.expose(), "ghs_stub_777_2");
+		assert_eq!(stub.installation_lookups.lock().unwrap().len(), 2);
+		assert_eq!(stub.token_mints.lock().unwrap().len(), 2);
 	}
 
 	#[tokio::test]
@@ -512,17 +931,23 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 		let tokens = InstallationTokens::default();
 
 		let first = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
-		assert_eq!(first, "ghs_stub_777_1");
+		assert_eq!(first.expose(), "ghs_stub_777_1");
 
 		// Dropping a token for another target must not touch this one.
 		tokens.invalidate(42, "acme", "elsewhere").await;
 		tokens.invalidate(7, "acme", "tracker").await;
 		let cached = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
-		assert_eq!(cached, first, "unrelated invalidations must keep the cached token");
+		assert_eq!(
+			cached.expose(),
+			first.expose(),
+			"unrelated invalidations must keep the cached token"
+		);
 
 		tokens.invalidate(42, "acme", "tracker").await;
 		let fresh = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
-		assert_eq!(fresh, "ghs_stub_777_2", "an invalidated token must be minted anew");
+		assert_eq!(fresh.expose(), "ghs_stub_777_2", "an invalidated token must be minted anew");
+		assert_eq!(first.expose(), "ghs_stub_777_1", "in-flight token survives cache invalidation");
+		assert_eq!(cached.expose(), "ghs_stub_777_1", "another in-flight token remains usable");
 		assert_eq!(stub.token_mints.lock().unwrap().len(), 2);
 	}
 }

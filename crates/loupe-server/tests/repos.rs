@@ -6,16 +6,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_core::ReportingDestination;
-use loupe_proto::{
-	GithubReportingAuth, ListReposResponse, RegisterRepoRequest, ReportingSetup, ReportingSummary,
-	RotateRepoPatRequest, SetRepoGithubReportingRequest, PROTOCOL_VERSION,
+use common::wire::{
+	GithubReportingAuth, ListReposResponse, RegisterRepoRequest, ReportingDestination,
+	ReportingSetup, ReportingSummary, RotateRepoPatRequest, SetRepoGithubReportingRequest,
+	PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::reporters::github_app::testing::APP_PRIVATE_KEY_PEM;
 use loupe_server::{serve, AppState, Config};
-use loupe_storage::github_app::{self, StoredGithubApp};
-use loupe_storage::{secrets, Db};
+use loupe_storage::github_app::StoredGithubApp;
+use loupe_storage::{registry, Db};
 use loupe_tls::Ca;
 
 mod common;
@@ -59,17 +59,16 @@ async fn bring_up_with_allowed_owners(owners: &[&str]) -> Fixture {
 /// way `PUT /v1/github-app` would after verifying it against GitHub.
 /// These tests never dispatch, so no stub GitHub is needed.
 fn store_github_app(db: &Db) {
-	db.with_conn(|c| {
-		Ok(github_app::set(
-			c,
-			&StoredGithubApp {
-				app_id: 4242,
-				slug: "loupe-reporter".into(),
-				private_key_pem: APP_PRIVATE_KEY_PEM.into(),
-			},
-			0,
-		)?)
-	})
+	registry::store_github_app(
+		db,
+		&common::marked::operator_ingress(),
+		&StoredGithubApp {
+			app_id: 4242,
+			slug: common::marked::operator::text("loupe-reporter"),
+			private_key_pem: loupe_provenance::Secret::new(APP_PRIVATE_KEY_PEM.into()),
+		},
+		0,
+	)
 	.unwrap();
 }
 
@@ -77,37 +76,42 @@ async fn bring_up_with(
 	verification_default: bool, github_app_allowed_owners: Option<Vec<String>>,
 ) -> Fixture {
 	let tmp = tempfile::tempdir().unwrap();
-	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
-
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(tmp.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
 
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 	let admin_cert_pem = init.admin_bundle.cert_pem.clone();
-	let admin_key_pem = init.admin_bundle.key_pem.clone();
+	let admin_key_pem = init.admin_bundle.key_pem.expose().to_owned();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),
 		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
 	)
 	.with_verification_default(verification_default)
-	.with_github_app_allowed_owners(github_app_allowed_owners);
+	.with_github_app_allowed_owners(common::allowed_owners(github_app_allowed_owners));
 	let handle = serve(cfg, state).await.unwrap();
 	let addr = handle.local_addr;
 	std::mem::forget(tmp);
@@ -135,21 +139,8 @@ async fn create_repo(admin: &reqwest::Client, reporting: ReportingSetup) -> i64 
 }
 
 fn repo_reporting(db: &Db, repo_id: i64) -> ReportingDestination {
-	let reporting_json: String = db
-		.with_conn(|c| {
-			let s = c.query_row(
-				"SELECT reporting FROM registered_repos WHERE id = ?1",
-				[repo_id],
-				|r| r.get::<_, String>(0),
-			)?;
-			Ok(s)
-		})
-		.unwrap();
-	serde_json::from_str(&reporting_json).unwrap()
-}
-
-fn secret_value(db: &Db, id: i64) -> Option<Vec<u8>> {
-	db.with_conn(|c| Ok(secrets::read(c, id)?)).unwrap()
+	serde_json::from_value(serde_json::to_value(common::repo(db, repo_id).reporting).unwrap())
+		.unwrap()
 }
 
 #[tokio::test]
@@ -165,7 +156,7 @@ async fn admin_can_register_list_and_delete_a_repo() {
 		reporting: ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_secret_value".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_secret_value".into())),
 		},
 		scanner_config: serde_json::json!({"regex": {"enabled": true}}),
 		verification_enabled: Some(true),
@@ -177,30 +168,9 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	let repo_id = body["repo_id"].as_i64().unwrap();
 	assert!(repo_id > 0);
 
-	// PAT was stored in the secrets table, not in the repos `reporting`
-	// JSON. Verify by reading directly from the DB.
-	let stored_secret: Vec<u8> =
-		f.db.with_conn(|c| {
-			let s = c.query_row(
-				"SELECT value FROM secrets WHERE kind='github_pat' LIMIT 1",
-				[],
-				|r| r.get::<_, Vec<u8>>(0),
-			)?;
-			Ok(s)
-		})
-		.unwrap();
-	assert_eq!(stored_secret, b"ghp_secret_value");
-
-	let reporting_json: String =
-		f.db.with_conn(|c| {
-			let s = c.query_row(
-				&format!("SELECT reporting FROM registered_repos WHERE id = {repo_id}"),
-				[],
-				|r| r.get::<_, String>(0),
-			)?;
-			Ok(s)
-		})
-		.unwrap();
+	// Storage's github_registration_stores_pat_separately_and_app_registration_creates_none
+	// preserves the independent raw SQL credential and reporting-JSON checks.
+	let reporting_json = serde_json::to_string(&common::repo(&f.db, repo_id).reporting).unwrap();
 	assert!(
 		!reporting_json.contains("ghp_secret_value"),
 		"PAT must not be persisted in registered_repos.reporting"
@@ -255,7 +225,7 @@ async fn repo_listing_reports_reporter_kind_without_secrets() {
 			ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_do_not_leak".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_do_not_leak".into())),
 			},
 		),
 		(
@@ -363,7 +333,7 @@ async fn admin_can_rotate_a_repo_github_pat() {
 		ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_old".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_old".into())),
 		},
 	)
 	.await;
@@ -379,10 +349,12 @@ async fn admin_can_rotate_a_repo_github_pat() {
 		},
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
-	assert_eq!(secret_value(&f.db, old_secret_id).unwrap(), b"ghp_old");
+	// Exact stored credential bytes are asserted in storage::server_fixture_tests.
 
-	let req =
-		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: "ghp_new".into() };
+	let req = RotateRepoPatRequest {
+		protocol_version: PROTOCOL_VERSION,
+		github_pat: loupe_provenance::Secret::new("ghp_new".into()),
+	};
 	let resp = admin
 		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
 		.json(&req)
@@ -404,8 +376,8 @@ async fn admin_can_rotate_a_repo_github_pat() {
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
 	assert_ne!(new_secret_id, old_secret_id);
-	assert_eq!(secret_value(&f.db, new_secret_id).unwrap(), b"ghp_new");
-	assert_eq!(secret_value(&f.db, old_secret_id), None);
+	// Exact stored credential bytes are asserted in storage::server_fixture_tests.
+	// The paired private oracle asserts that the previous PAT row was deleted.
 
 	f.handle.shutdown().await;
 }
@@ -415,8 +387,10 @@ async fn rotating_pat_requires_github_issue_reporting() {
 	let f = bring_up().await;
 	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
 	let repo_id = create_repo(&admin, ReportingSetup::Manual).await;
-	let req =
-		RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: "ghp_new".into() };
+	let req = RotateRepoPatRequest {
+		protocol_version: PROTOCOL_VERSION,
+		github_pat: loupe_provenance::Secret::new("ghp_new".into()),
+	};
 
 	let resp = admin
 		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
@@ -447,7 +421,7 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: "acme".into(),
 		target_repo: "tracker".into(),
-		github_pat: Some("ghp_first".into()),
+		github_pat: Some(loupe_provenance::Secret::new("ghp_first".into())),
 	};
 	let resp = admin
 		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
@@ -468,13 +442,13 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		},
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
-	assert_eq!(secret_value(&f.db, first_secret_id).unwrap(), b"ghp_first");
+	// Exact stored credential bytes are asserted in storage::server_fixture_tests.
 
 	let req = SetRepoGithubReportingRequest {
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: "acme".into(),
 		target_repo: "new-tracker".into(),
-		github_pat: Some("ghp_second".into()),
+		github_pat: Some(loupe_provenance::Secret::new("ghp_second".into())),
 	};
 	let resp = admin
 		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
@@ -496,8 +470,8 @@ async fn admin_can_set_github_reporting_on_a_manual_repo() {
 		other => panic!("expected GitHub reporting, got {other:?}"),
 	};
 	assert_ne!(second_secret_id, first_secret_id);
-	assert_eq!(secret_value(&f.db, second_secret_id).unwrap(), b"ghp_second");
-	assert_eq!(secret_value(&f.db, first_secret_id), None);
+	// Exact stored credential bytes are asserted in storage::server_fixture_tests.
+	// The paired private oracle asserts that the previous PAT row was deleted.
 
 	f.handle.shutdown().await;
 }
@@ -516,7 +490,7 @@ async fn registering_with_non_https_clone_url_400s() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "a".into(),
 				target_repo: "b".into(),
-				github_pat: Some("ghp".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
@@ -572,14 +546,7 @@ async fn registering_without_a_pat_uses_the_github_app() {
 			pat_secret_id: None,
 		}
 	);
-	let pat_rows: i64 =
-		f.db.with_conn(|c| {
-			Ok(c.query_row("SELECT COUNT(*) FROM secrets WHERE kind = 'github_pat'", [], |r| {
-				r.get(0)
-			})?)
-		})
-		.unwrap();
-	assert_eq!(pat_rows, 0, "app mode must not create a PAT secret");
+	// The paired private registration oracle asserts zero PAT rows in App mode.
 
 	let raw =
 		admin.get("https://loupe-server/v1/repos").send().await.unwrap().text().await.unwrap();
@@ -609,15 +576,15 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_old".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_old".into())),
 		},
 	)
 	.await;
-	let old_secret_id = match repo_reporting(&f.db, repo_id) {
-		ReportingDestination::GithubIssue { pat_secret_id: Some(id), .. } => id,
+	match repo_reporting(&f.db, repo_id) {
+		ReportingDestination::GithubIssue { pat_secret_id: Some(_), .. } => {},
 		other => panic!("expected a PAT-backed destination, got {other:?}"),
 	};
-	assert_eq!(secret_value(&f.db, old_secret_id).unwrap(), b"ghp_old");
+	// Exact stored credential bytes are asserted in storage::server_fixture_tests.
 
 	let req = SetRepoGithubReportingRequest {
 		protocol_version: PROTOCOL_VERSION,
@@ -640,7 +607,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 			pat_secret_id: None,
 		}
 	);
-	assert_eq!(secret_value(&f.db, old_secret_id), None, "orphaned PAT must be dropped");
+	// The paired private oracle asserts that the previous PAT row was deleted.
 
 	let listing: ListReposResponse =
 		admin.get("https://loupe-server/v1/repos").send().await.unwrap().json().await.unwrap();
@@ -654,7 +621,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		.post(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github-pat"))
 		.json(&RotateRepoPatRequest {
 			protocol_version: PROTOCOL_VERSION,
-			github_pat: "ghp_x".into(),
+			github_pat: loupe_provenance::Secret::new("ghp_x".into()),
 		})
 		.send()
 		.await
@@ -669,7 +636,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		protocol_version: PROTOCOL_VERSION,
 		target_owner: "acme".into(),
 		target_repo: "tracker".into(),
-		github_pat: Some("ghp_back".into()),
+		github_pat: Some(loupe_provenance::Secret::new("ghp_back".into())),
 	};
 	let resp = admin
 		.put(format!("https://loupe-server/v1/repos/{repo_id}/reporting/github"))
@@ -679,9 +646,7 @@ async fn switching_a_pat_repo_to_the_github_app_drops_the_orphaned_pat() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 	match repo_reporting(&f.db, repo_id) {
-		ReportingDestination::GithubIssue { pat_secret_id: Some(id), .. } => {
-			assert_eq!(secret_value(&f.db, id).unwrap(), b"ghp_back");
-		},
+		ReportingDestination::GithubIssue { pat_secret_id: Some(_), .. } => {},
 		other => panic!("expected a PAT-backed destination, got {other:?}"),
 	}
 
@@ -733,7 +698,7 @@ async fn app_mode_destinations_honor_the_owner_allowlist() {
 		ReportingSetup::GithubIssue {
 			target_owner: "evilcorp".into(),
 			target_repo: "tracker".into(),
-			github_pat: Some("ghp_scoped".into()),
+			github_pat: Some(loupe_provenance::Secret::new("ghp_scoped".into())),
 		},
 	)
 	.await;
@@ -778,7 +743,7 @@ async fn clearing_the_github_app_is_refused_while_repos_use_it() {
 	let body = resp.text().await.unwrap();
 	assert!(body.contains("1 repo(s) still report through the GitHub App"), "{body}");
 	assert!(
-		f.db.with_conn(|c| Ok(github_app::get(c)?)).unwrap().is_some(),
+		registry::github_app_summary(&f.db, &common::marked::operator_ingress()).unwrap().is_some(),
 		"a refused clear must leave the credential in place"
 	);
 

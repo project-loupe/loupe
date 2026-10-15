@@ -3,29 +3,71 @@
 //! over mTLS.
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use loupe_http::read_response_bytes;
 use loupe_proto::{
 	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
-	JobCapability, LeaseRequest, LeaseResponse, ListFindingsResponse, LlmFindingSubmission,
-	VerdictSubmission, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+	JobCapability, LeaseResponse, ListFindingsResponse, VerdictSubmission, JOB_CAPABILITY_HEADER,
+	PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
+use loupe_provenance::{Agent, Ingress, Repo, Server, Source, Untrusted};
+use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use reqwest::Url;
+
+mod ingress;
+#[cfg(fuzzing)]
+pub use ingress::fuzz_support;
+#[cfg(test)]
+pub(crate) use ingress::fuzz_support;
+#[cfg(test)]
+pub(crate) use ingress::fuzz_support::lease_fixture as test_lease;
+#[cfg(any(test, fuzzing))]
+pub(crate) use ingress::fuzz_support::scanner_patch_fixture as test_scanner_patch;
+
+/// Named authentication handoff: Bytes keeps this shared secret owner alive
+/// through header clones. HTTP/TLS encoding and kernel copies are not covered
+/// by the original Secret allocation's wipe-on-drop guarantee.
+struct CapabilityHeader(JobCapability);
+
+impl AsRef<[u8]> for CapabilityHeader {
+	fn as_ref(&self) -> &[u8] {
+		self.0.expose_secret().as_bytes()
+	}
+}
+
+impl TryFrom<CapabilityHeader> for HeaderValue {
+	type Error = InvalidHeaderValue;
+
+	fn try_from(value: CapabilityHeader) -> Result<Self, Self::Error> {
+		let mut header = Self::from_maybe_shared(Bytes::from_owner(value))?;
+		header.set_sensitive(true);
+		Ok(header)
+	}
+}
 
 pub struct ServerClient {
 	http: reqwest::Client,
 	base: Url,
 }
 
+pub(crate) struct LeaseReceipt {
+	pub(crate) response: LeaseResponse<Agent, Server>,
+	pub(crate) reviewed_revision: crate::host_outcome::ReviewedRevisionFact,
+	pub(crate) scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
+}
+
 impl ServerClient {
 	pub fn new(
 		server_cert_pem: &str, client_cert_pem: &str, client_key_pem: &str, base: Url,
 	) -> Result<Self> {
-		let identity = build_identity(client_cert_pem, client_key_pem)?;
-		let root = reqwest::Certificate::from_pem(server_cert_pem.as_bytes())
-			.context("parsing server CA PEM")?;
+		let tls =
+			loupe_tls::reqwest_client_config(client_cert_pem, client_key_pem, server_cert_pem)?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "ServerClient owns the configured mutual-TLS HTTP transport."
+		)]
 		let http = reqwest::Client::builder()
-			.add_root_certificate(root)
-			.identity(identity)
-			.use_rustls_tls()
+			.use_preconfigured_tls(tls)
 			.build()
 			.context("building reqwest client")?;
 		Ok(Self { http, base })
@@ -39,10 +81,27 @@ impl ServerClient {
 	}
 
 	pub async fn lease(
-		&self, capabilities: Vec<String>, wait_seconds: u32,
-	) -> Result<LeaseResponse> {
+		&self, capabilities: Vec<&'static str>, wait_seconds: u32,
+	) -> Result<LeaseResponse<Agent, Server>> {
+		Ok(self.lease_for_runner(capabilities, wait_seconds).await?.response)
+	}
+	pub(crate) async fn lease_for_runner(
+		&self, capabilities: Vec<&'static str>, wait_seconds: u32,
+	) -> Result<LeaseReceipt> {
 		let url = self.url("/v1/jobs/lease");
-		let req = LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
+		// Scanner capabilities are closed static declarations, not Config input.
+		#[derive(serde::Serialize)]
+		struct BuiltinLeaseRequest {
+			protocol_version: u16,
+			capabilities: Vec<&'static str>,
+			wait_seconds: u32,
+		}
+		let req =
+			BuiltinLeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Lease HTTP egress carries only the closed worker capability catalog to the configured server."
+		)]
 		let resp = self
 			.with_protocol(self.http.post(url))
 			.json(&req)
@@ -50,7 +109,7 @@ impl ServerClient {
 			.await
 			.context("lease request")?;
 		let resp = ensure_ok(resp).await?;
-		resp.json().await.context("decoding lease response")
+		ingress::lease(&resp).context("decoding lease response")
 	}
 
 	pub async fn heartbeat(
@@ -58,6 +117,10 @@ impl ServerClient {
 	) -> Result<HeartbeatResponse> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/heartbeat"));
 		let req = HeartbeatRequest { protocol_version: PROTOCOL_VERSION };
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Heartbeat HTTP egress is bound to the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(&req)
@@ -65,78 +128,136 @@ impl ServerClient {
 			.await
 			.context("heartbeat request")?;
 		let resp = ensure_ok(resp).await?;
-		resp.json().await.context("decoding heartbeat")
+		ingress::heartbeat(&resp).context("decoding heartbeat")
 	}
 
 	pub async fn submit_findings(
-		&self, job_id: i64, job_capability: &JobCapability, batch: &FindingsBatch,
+		&self, job_id: i64, job_capability: &JobCapability, batch: &FindingsBatch<Repo>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/findings"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Finding HTTP egress uses typed Repo findings and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(batch)
 			.send()
 			.await
 			.context("findings request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
-	pub async fn submit_llm_finding(
-		&self, job_id: i64, job_capability: &JobCapability, finding: &LlmFindingSubmission,
+	pub(crate) async fn submit_llm_finding(
+		&self, job_id: i64, job_capability: &JobCapability,
+		finding: &crate::mcp::McpFindingSubmission,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/llm-findings"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "LLM finding HTTP egress uses typed Agent fields and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(finding)
 			.send()
 			.await
 			.context("LLM finding request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
-	pub async fn complete(
-		&self, job_id: i64, job_capability: &JobCapability, req: &CompleteRequest,
+	pub async fn complete<RevisionS: Source, DiagnosticS: Source>(
+		&self, job_id: i64, job_capability: &JobCapability,
+		req: &CompleteRequest<RevisionS, DiagnosticS>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Completion HTTP egress retains source-typed revisions and diagnostics under the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
 			.send()
 			.await
 			.context("complete request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
 	pub async fn submit_verdict(
-		&self, job_id: i64, job_capability: &JobCapability, req: &VerdictSubmission,
+		&self, job_id: i64, job_capability: &JobCapability, req: &VerdictSubmission<Agent>,
 	) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Verdict HTTP egress uses typed Agent data and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.post(url), job_capability)
 			.json(req)
 			.send()
 			.await
 			.context("verdict request")?;
-		ensure_ok(resp).await.map(|_| ())
+		ensure_ok(resp).await.map(ingress::submission)
+	}
+
+	pub(crate) async fn complete_runner(
+		&self, job_id: i64, job_capability: &JobCapability, req: &crate::runner::RunnerCompletion,
+	) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Runner completion HTTP egress carries closed host outcomes under the active job capability."
+		)]
+		let resp = self
+			.with_job_capability(self.http.post(url), job_capability)
+			.json(req)
+			.send()
+			.await
+			.context("complete request")?;
+		ensure_ok(resp).await.map(ingress::submission)
+	}
+
+	pub(crate) async fn submit_host_verdict(
+		&self, job_id: i64, job_capability: &JobCapability,
+		reason: crate::host_outcome::HostVerifyReason,
+	) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Host verdict HTTP egress carries only a closed host outcome under the active job capability."
+		)]
+		let resp = self
+			.with_job_capability(self.http.post(url), job_capability)
+			.json(&reason.into_submission())
+			.send()
+			.await
+			.context("verdict request")?;
+		ensure_ok(resp).await.map(ingress::submission)
 	}
 
 	/// FTS keyword search over a repo's accumulated findings. The
 	/// MCP server's `query_prior_findings` tool calls this. `query`
 	/// is free-form keywords; the server sanitises them.
 	pub async fn search_findings(
-		&self, repo_id: i64, job_capability: &JobCapability, query: &str, limit: i64,
-	) -> Result<ListFindingsResponse> {
+		&self, repo_id: i64, job_capability: &JobCapability,
+		query: &loupe_core::text::BoundedText<crate::mcp::QueryText, Agent>, limit: i64,
+	) -> Result<ListFindingsResponse<Agent, Server>> {
 		let url = self.url(&format!("/v1/repos/{repo_id}/findings/search"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Finding query HTTP egress preserves repository scope and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(
-				self.http.get(url).query(&[("q", query), ("limit", &limit.to_string())]),
+				self.http.get(url).query(&[("q", query.expose()), ("limit", &limit.to_string())]),
 				job_capability,
 			)
 			.send()
 			.await
 			.context("search request")?;
 		let resp = ensure_ok(resp).await?;
-		resp.json().await.context("decoding search response")
+		ingress::search(&resp).context("decoding search response")
 	}
 
 	/// Fetch the full detail view for one finding by id. Used by the
@@ -145,18 +266,26 @@ impl ServerClient {
 	/// `query_prior_findings` (a summary-only listing) returned.
 	pub async fn get_finding(
 		&self, id: i64, job_capability: &JobCapability,
-	) -> Result<FindingDetail> {
+	) -> Result<FindingDetail<Agent, Server>> {
 		let url = self.url(&format!("/v1/findings/{id}"));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Finding lookup HTTP egress preserves finding ID and the active job capability."
+		)]
 		let resp = self
 			.with_job_capability(self.http.get(url), job_capability)
 			.send()
 			.await
 			.context("get_finding request")?;
 		let resp = ensure_ok(resp).await?;
-		resp.json().await.context("decoding finding detail")
+		ingress::detail(&resp).context("decoding finding detail")
 	}
 
 	fn url(&self, path: &str) -> Url {
+		#[allow(
+			clippy::expect_used,
+			reason = "The validated absolute base URL is joined only with static absolute API paths and numeric IDs."
+		)]
 		self.base.join(path).expect("path is always valid")
 	}
 
@@ -167,31 +296,46 @@ impl ServerClient {
 	fn with_job_capability(
 		&self, req: reqwest::RequestBuilder, job_capability: &JobCapability,
 	) -> reqwest::RequestBuilder {
-		self.with_protocol(req).header(JOB_CAPABILITY_HEADER, job_capability.expose_secret())
+		self.with_protocol(req)
+			.header(JOB_CAPABILITY_HEADER, CapabilityHeader(job_capability.clone()))
 	}
 }
 
-fn build_identity(cert_pem: &str, key_pem: &str) -> Result<reqwest::Identity> {
-	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
-	combined.push_str(cert_pem);
-	if !cert_pem.ends_with('\n') {
-		combined.push('\n');
-	}
-	combined.push_str(key_pem);
-	reqwest::Identity::from_pem(combined.as_bytes())
-		.map_err(|e| anyhow!("building reqwest identity from PEM: {e}"))
+#[allow(unsafe_code)]
+async fn read_server_response(
+	resp: reqwest::Response,
+) -> Result<Untrusted<Bytes, Server>, loupe_http::ResponseBodyError> {
+	let bytes = read_response_bytes(resp).await?;
+	// SAFETY: these owner-backed bytes came directly from this configured
+	// Server client's HTTP response, under the existing bounded body reader.
+	Ok(Untrusted::new(bytes, unsafe { Ingress::<Server>::new() }))
 }
 
-async fn ensure_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
+// debug-ok: HTTP status is numeric and ServerDiagnostic has an opaque Debug formatter.
+#[derive(Debug)]
+struct ServerResponseError {
+	status: reqwest::StatusCode,
+	body: ingress::ServerDiagnostic,
+}
+impl std::fmt::Display for ServerResponseError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "server returned {}", self.status)?;
+		let body = self.body.for_diagnostic();
+		if !body.is_empty() {
+			write!(f, ": {body}")?;
+		}
+		Ok(())
+	}
+}
+impl std::error::Error for ServerResponseError {}
+
+async fn ensure_ok(resp: reqwest::Response) -> Result<Untrusted<Bytes, Server>> {
 	if !resp.status().is_success() {
 		let status = resp.status();
-		let body =
-			resp.text().await.unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-		let body = body.trim();
-		if body.is_empty() {
-			return Err(anyhow!("server returned {status}"));
-		}
-		return Err(anyhow!("server returned {status}: {body}"));
+		let bytes = read_server_response(resp)
+			.await
+			.map_err(|error| anyhow!("server returned {status}: {error}"))?;
+		return Err(ServerResponseError { status, body: ingress::error(&bytes) }.into());
 	}
 	let header = resp
 		.headers()
@@ -207,7 +351,7 @@ async fn ensure_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
 			"server protocol mismatch: worker speaks {PROTOCOL_VERSION}, server sent {server_version}"
 		));
 	}
-	Ok(resp)
+	read_server_response(resp).await.map_err(|error| anyhow!("reading server response: {error}"))
 }
 
 #[cfg(test)]
@@ -217,6 +361,73 @@ mod tests {
 	use tokio::net::TcpListener;
 
 	use super::*;
+
+	const HEADER_CAPABILITY: &str = "worker-header-debug-sentinel-49f0b21";
+
+	fn request_with_capability() -> reqwest::Request {
+		let client =
+			ServerClient::from_parts(reqwest::Client::new(), "http://127.0.0.1/".parse().unwrap());
+		let capability = JobCapability::from_secret(HEADER_CAPABILITY);
+		client
+			.with_job_capability(client.http.post(client.url("/v1/jobs/17/heartbeat")), &capability)
+			.build()
+			.unwrap()
+	}
+
+	#[test]
+	fn capability_header_is_sensitive_and_preserves_wire_value() {
+		let request = request_with_capability();
+		let header = &request.headers()[JOB_CAPABILITY_HEADER];
+		assert_eq!(header.to_str().unwrap(), HEADER_CAPABILITY);
+		assert!(header.is_sensitive(), "job capability header must be marked sensitive");
+	}
+
+	#[test]
+	fn capability_header_debug_does_not_disclose_bearer() {
+		let request = request_with_capability();
+		assert!(
+			!format!("{:?}", request.headers()).contains(HEADER_CAPABILITY),
+			"worker request header Debug disclosed the job capability"
+		);
+		assert!(
+			!format!("{request:?}").contains(HEADER_CAPABILITY),
+			"worker request Debug disclosed the job capability"
+		);
+	}
+
+	#[test]
+	fn capability_header_retains_shared_storage_across_clones() {
+		let client =
+			ServerClient::from_parts(reqwest::Client::new(), "http://127.0.0.1/".parse().unwrap());
+		let capability = JobCapability::from_secret(HEADER_CAPABILITY);
+		let original_storage = capability.expose_secret().as_ptr();
+		let request = client
+			.with_job_capability(client.http.post(client.url("/v1/jobs/17/heartbeat")), &capability)
+			.build()
+			.unwrap();
+		let header = request.headers()[JOB_CAPABILITY_HEADER].clone();
+		assert_eq!(
+			header.as_bytes().as_ptr(),
+			original_storage,
+			"capability header must retain the original secret allocation"
+		);
+		drop(request);
+		drop(capability);
+		assert_eq!(header.to_str().unwrap(), HEADER_CAPABILITY);
+	}
+
+	#[test]
+	fn capability_header_rejects_invalid_bytes_without_disclosure() {
+		let client =
+			ServerClient::from_parts(reqwest::Client::new(), "http://127.0.0.1/".parse().unwrap());
+		let capability = JobCapability::from_secret(format!("{HEADER_CAPABILITY}\r\ninvalid"));
+		let error = client
+			.with_job_capability(client.http.post(client.url("/v1/jobs/17/heartbeat")), &capability)
+			.build()
+			.unwrap_err();
+		assert!(!format!("{error:?}").contains(HEADER_CAPABILITY));
+		assert!(!error.to_string().contains(HEADER_CAPABILITY));
+	}
 
 	#[tokio::test]
 	async fn server_error_includes_response_body() {
@@ -228,7 +439,7 @@ mod tests {
 			.complete(
 				1513,
 				&job_capability,
-				&CompleteRequest {
+				&CompleteRequest::<loupe_provenance::Repo, loupe_provenance::Server> {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Succeeded,
 					head_sha: None,
@@ -262,5 +473,123 @@ mod tests {
 			stream.write_all(response.as_bytes()).await.expect("write test response");
 		});
 		Url::parse(&format!("http://{addr}/")).expect("test server URL")
+	}
+}
+
+#[cfg(test)]
+mod tls_constructor_controls {
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use loupe_tls::Ca;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	use super::*;
+
+	fn application_client(ca: &str, cert: &str, key: &str) -> anyhow::Result<reqwest::Client> {
+		Ok(ServerClient::new(ca, cert, key, "https://localhost/".parse().unwrap())?.http)
+	}
+
+	async fn exchange(
+		http: reqwest::Client, mut config: rustls::ServerConfig,
+	) -> (bool, Option<(Vec<u8>, Vec<Vec<u8>>)>) {
+		config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let mut task = tokio::spawn(async move {
+			let (socket, _) = listener.accept().await.unwrap();
+			let Ok(mut tls) =
+				tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(socket).await
+			else {
+				return None;
+			};
+			let alpn = tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec();
+			let chain = tls
+				.get_ref()
+				.1
+				.peer_certificates()
+				.unwrap_or_default()
+				.iter()
+				.map(|cert| cert.to_vec())
+				.collect();
+			let mut request = Vec::new();
+			while !request.ends_with(b"\r\n\r\n") {
+				let mut byte = [0u8; 1];
+				if tls.read_exact(&mut byte).await.is_err() || request.len() == 16 * 1024 {
+					return None;
+				}
+				request.push(byte[0]);
+			}
+			if tls
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+				.await
+				.is_err()
+			{
+				return None;
+			}
+			let _ = tls.shutdown().await;
+			Some((alpn, chain))
+		});
+		let success = tokio::time::timeout(Duration::from_secs(5), async {
+			let response = http.get(format!("https://localhost:{port}/")).send().await?;
+			let body = response.bytes().await?;
+			Ok::<_, reqwest::Error>(body == b"ok".as_slice())
+		})
+		.await
+		.is_ok_and(|result| result.unwrap_or(false));
+		let peer = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+			Ok(result) => result.unwrap(),
+			Err(_) => {
+				task.abort();
+				let _ = task.await;
+				None
+			},
+		};
+		(success, peer)
+	}
+
+	#[tokio::test]
+	async fn actual_constructor_preserves_mtls_http11_chain_and_mixed_roots() {
+		let ca = Ca::new("throwaway-application-ca").unwrap();
+		let server = ca.mint_server("server", &["localhost".into()]).unwrap();
+		let client = ca.mint_client("client").unwrap();
+		let unused = ca.mint_client("unused").unwrap();
+		let roots = format!("{}{}", unused.key_pem.expose(), ca.cert_pem());
+		let chain = format!("{}{}", client.cert_pem, ca.cert_pem());
+		let expected: Vec<_> = rustls_pemfile::certs(&mut chain.as_bytes())
+			.map(|cert| cert.unwrap().to_vec())
+			.collect();
+		let http = application_client(&roots, &chain, client.key_pem.expose()).unwrap();
+		let config =
+			loupe_tls::server_config(&server.cert_pem, server.key_pem.expose(), ca.cert_pem())
+				.unwrap();
+		let (success, peer) = exchange(http, config).await;
+		assert!(success, "actual application client must complete mutual TLS");
+		let (alpn, observed) = peer.unwrap();
+		assert_eq!(alpn, b"http/1.1");
+		assert_eq!(observed, expected);
+	}
+
+	#[tokio::test]
+	async fn actual_constructor_rejects_wrong_ca_hostname_and_mismatched_key() {
+		let ca = Ca::new("throwaway-application-ca").unwrap();
+		let foreign = Ca::new("throwaway-foreign-ca").unwrap();
+		let client = ca.mint_client("client").unwrap();
+		let wrong = ca.mint_client("wrong-key").unwrap();
+		assert!(
+			application_client(ca.cert_pem(), &client.cert_pem, wrong.key_pem.expose()).is_err()
+		);
+		for (host, roots) in [("localhost", foreign.cert_pem()), ("wrong-host", ca.cert_pem())] {
+			let server = ca.mint_server("server", &[host.into()]).unwrap();
+			let http =
+				application_client(roots, &client.cert_pem, client.key_pem.expose()).unwrap();
+			let config =
+				loupe_tls::server_config(&server.cert_pem, server.key_pem.expose(), ca.cert_pem())
+					.unwrap();
+			assert!(
+				!exchange(http, config).await.0,
+				"verification must reject wrong trust or hostname"
+			);
+		}
 	}
 }

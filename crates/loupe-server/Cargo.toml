@@ -20,19 +20,24 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
+futures-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+mime = "0.3"
 tower = { workspace = true }
 loupe-core = { version = "0.1.0", path = "../loupe-core" }
+loupe-http = { version = "0.1.0", path = "../loupe-http" }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
 loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -44,13 +49,14 @@ tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 git2 = { workspace = true }
 loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 # Keep this test dependency path-only: Cargo omits it on publication,
 # avoiding a server/worker cycle in the registry dependency graph.
-loupe-worker = { path = "../loupe-worker" }
+loupe-worker = { path = "../loupe-worker", features = ["test-support"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 tempfile = { workspace = true }
 tokio-util = { workspace = true }

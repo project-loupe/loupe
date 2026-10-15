@@ -31,6 +31,20 @@ pub(super) fn rows(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
 		.unwrap()
 }
 
+/// Retain every column present before migration, excluding only later additions.
+pub(super) fn snapshot(conn: &Connection, table: &str) -> (String, Vec<Vec<Value>>) {
+	let columns: Vec<String> = conn
+		.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+		.unwrap()
+		.query_map([table], |row| row.get(0))
+		.unwrap()
+		.collect::<rusqlite::Result<_>>()
+		.unwrap();
+	let sql = format!("SELECT {} FROM {table} ORDER BY 1", columns.join(","));
+	let before = rows(conn, &sql);
+	(sql, before)
+}
+
 pub(super) fn schema(conn: &Connection) -> Vec<Vec<Value>> {
 	rows(conn, "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
 }
@@ -48,7 +62,7 @@ pub(super) fn fk_enabled(conn: &Connection) -> bool {
 
 pub(super) fn open(path: &Path) -> Connection {
 	let conn = Connection::open(path).unwrap();
-	conn.pragma_update(None, "key", format!("x'{}'", MasterKey::for_tests().to_hex())).unwrap();
+	conn.pragma_update(None, "key", MasterKey::for_tests().sqlcipher_key().expose()).unwrap();
 	conn.pragma_update(None, "journal_mode", "WAL").unwrap();
 	conn.pragma_update(None, "foreign_keys", true).unwrap();
 	conn

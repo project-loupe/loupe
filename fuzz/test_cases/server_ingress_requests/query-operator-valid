@@ -1,0 +1,1 @@
+/v1/findings/search?q=a+b%2Bc%0D%0A%09Cafe%CC%81&limit=7

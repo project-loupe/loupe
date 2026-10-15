@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 
 /// Lifecycle state of a finding in the server-side review/reporting pipeline.
+// debug-ok: closed lifecycle unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingState {

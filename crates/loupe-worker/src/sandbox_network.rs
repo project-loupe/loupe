@@ -39,12 +39,14 @@ const PUBLIC_DENYLIST: &[&str] = &[
 	"240.0.0.0/4",
 ];
 
+// debug-ok: The admitted helper observation contains only a numeric PID.
 #[derive(Debug, Deserialize)]
 struct BwrapInfo {
 	#[serde(rename = "child-pid")]
 	child_pid: u32,
 }
 
+// debug-ok: Selected Config helper executable paths only; no Repo, Agent, Sandbox or Secret values.
 #[derive(Debug)]
 struct NetworkTools {
 	slirp4netns: PathBuf,
@@ -67,6 +69,10 @@ impl NetworkTools {
 pub(crate) fn probe_network_helpers() -> Result<()> {
 	let tools = NetworkTools::discover()?;
 	probe_command(&tools.slirp4netns, &["--version"])?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Network helper discovery probes the selected nsenter binary with a fixed help argument."
+	)]
 	let nsenter_help = Command::new(&tools.nsenter)
 		.arg("--help")
 		.output()
@@ -83,6 +89,10 @@ pub(crate) fn probe_network_helpers() -> Result<()> {
 	}
 	probe_command(&tools.nft, &["--version"])?;
 	probe_command(&tools.ip, &["-Version"])?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Network setup checks the fixed host TUN device metadata."
+	)]
 	if !std::fs::metadata(TUN_DEVICE)
 		.map(|metadata| metadata.file_type().is_char_device())
 		.unwrap_or(false)
@@ -93,6 +103,10 @@ pub(crate) fn probe_network_helpers() -> Result<()> {
 }
 
 fn probe_command(program: &Path, args: &[&str]) -> Result<()> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Network helper discovery runs only selected helper paths and fixed version arguments."
+	)]
 	let status = Command::new(program)
 		.args(args)
 		.stdout(Stdio::null())
@@ -136,6 +150,10 @@ fn run_networked_sandbox_with_tools(
 
 	let tmp = tempfile::Builder::new().prefix("loupe-network-").tempdir()?;
 	let resolv_path = tmp.path().join("resolv.conf");
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The network supervisor writes a fixed DNS resolver file in its fresh owned scratch directory."
+	)]
 	std::fs::write(&resolv_path, format!("nameserver {SLIRP_DNS}\n"))?;
 	let policy_path = tmp.path().join("policy.nft");
 	let slirp_log_path = tmp.path().join("slirp4netns.log");
@@ -149,6 +167,10 @@ fn run_networked_sandbox_with_tools(
 		required_ipv4
 	};
 	let policy = build_network_policy(mode, &allowed_ipv4, tools)?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The network supervisor writes the generated policy from its closed mode and admitted address set."
+	)]
 	std::fs::write(&policy_path, policy)?;
 
 	let resolv_os = resolv_path.as_os_str();
@@ -165,6 +187,10 @@ fn run_networked_sandbox_with_tools(
 
 	let (info_read, info_write) = inheritable_pipe(true, InheritedEnd::Write)?;
 	let (block_read, block_write) = inheritable_pipe(false, InheritedEnd::Read)?;
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The private supervisor starts only the configured bubblewrap command received through typed CLI admission."
+	)]
 	let mut sandbox = Command::new(program);
 	sandbox
 		.args(["--info-fd", &info_write.as_raw_fd().to_string()])
@@ -173,6 +199,10 @@ fn run_networked_sandbox_with_tools(
 		.stdin(Stdio::inherit())
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit());
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The supervisor starts bubblewrap with private readiness pipes before releasing the child."
+	)]
 	let mut sandbox_child = sandbox.spawn().context("starting Bubblewrap network sandbox")?;
 	drop(info_write);
 	drop(block_read);
@@ -183,8 +213,16 @@ fn run_networked_sandbox_with_tools(
 
 		let (ready_read, ready_write) = inheritable_pipe(true, InheritedEnd::Write)?;
 		let (exit_read, exit_write) = inheritable_pipe(false, InheritedEnd::Read)?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The supervisor captures only the selected slirp helper diagnostic in its own scratch file."
+		)]
 		let slirp_log =
 			OpenOptions::new().create(true).truncate(true).write(true).open(&slirp_log_path)?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The supervisor enters the just-created child user namespace with the selected nsenter helper."
+		)]
 		let mut slirp = Command::new(&tools.nsenter);
 		slirp
 			.args(["--target", &child_pid.to_string()])
@@ -204,6 +242,10 @@ fn run_networked_sandbox_with_tools(
 			.arg("tap0")
 			.stdout(Stdio::from(slirp_log.try_clone()?))
 			.stderr(Stdio::from(slirp_log));
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The supervisor starts selected slirp with fixed policy arguments and private readiness and exit FDs."
+		)]
 		let mut slirp_child = slirp.spawn().context("starting slirp4netns")?;
 		drop(ready_write);
 		drop(exit_read);
@@ -214,6 +256,10 @@ fn run_networked_sandbox_with_tools(
 		}
 		drop(ready_read);
 
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The supervisor installs its generated nft policy in the numeric child namespace before release."
+		)]
 		let policy_status = Command::new(&tools.nsenter)
 			.args(["--target", &child_pid.to_string()])
 			.args(["--user", "--user-parent", "--preserve-credentials", "--keep-caps", "--"])
@@ -284,8 +330,8 @@ fn read_bwrap_pid(info: &OwnedFd, child: &mut Child) -> Result<u32> {
 			Ok(0) => {},
 			Ok(count) => {
 				bytes.extend_from_slice(&chunk[..count]);
-				if let Ok(info) = serde_json::from_slice::<BwrapInfo>(&bytes) {
-					return Ok(info.child_pid);
+				if let Ok(pid) = parse_bwrap_pid(&bytes) {
+					return Ok(pid);
 				}
 			},
 			Err(Errno::AGAIN) => {},
@@ -306,14 +352,11 @@ fn wait_for_userns_mapping(child_pid: u32, child: &mut Child, proc_root: &Path) 
 	let uid = rustix::process::geteuid().as_raw();
 	let path = proc_root.join(child_pid.to_string()).join("uid_map");
 	loop {
-		if std::fs::read_to_string(&path).ok().is_some_and(|map| {
-			map.lines().any(|line| {
-				let mut fields = line.split_whitespace();
-				let inside = fields.next().and_then(|value| value.parse::<u32>().ok());
-				let outside = fields.next().and_then(|value| value.parse::<u32>().ok());
-				inside == Some(uid) && outside == Some(uid)
-			})
-		}) {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The supervisor reads its own selected slirp helper diagnostic after failed startup."
+		)]
+		if std::fs::read_to_string(&path).ok().is_some_and(|map| uid_map_contains(&map, uid)) {
 			return Ok(());
 		}
 		if let Some(status) = child.try_wait()? {
@@ -351,6 +394,10 @@ fn terminate(child: &mut Child) {
 }
 
 fn slirp_diagnostic(path: &Path) -> String {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The supervisor reads only the numeric child PID uid_map in procfs before namespace setup."
+	)]
 	let text = std::fs::read_to_string(path).unwrap_or_default();
 	let excerpt = text.lines().take(20).collect::<Vec<_>>().join("\n");
 	if excerpt.is_empty() {
@@ -395,6 +442,18 @@ fn resolve_hosts(hosts: &[String]) -> Result<BTreeSet<Ipv4Addr>> {
 fn build_network_policy(
 	mode: SandboxNetworkMode, allowed: &BTreeSet<Ipv4Addr>, tools: &NetworkTools,
 ) -> Result<String> {
+	let (routes, addresses) = if mode == SandboxNetworkMode::Public {
+		(connected_ipv4_routes(&tools.ip)?, host_ipv4_addresses(&tools.ip)?)
+	} else {
+		(BTreeSet::new(), BTreeSet::new())
+	};
+	Ok(render_network_policy(mode, allowed, &routes, &addresses))
+}
+
+fn render_network_policy(
+	mode: SandboxNetworkMode, allowed: &BTreeSet<Ipv4Addr>, routes: &BTreeSet<String>,
+	addresses: &BTreeSet<Ipv4Addr>,
+) -> String {
 	let mut policy = String::new();
 	let default_policy = if mode == SandboxNetworkMode::Public { "accept" } else { "drop" };
 	policy.push_str("table inet loupe_sandbox {\n\tchain output {\n");
@@ -412,10 +471,10 @@ fn build_network_policy(
 		for route in PUBLIC_DENYLIST {
 			policy.push_str(&format!("\t\tip daddr {route} reject\n"));
 		}
-		for route in connected_ipv4_routes(&tools.ip)? {
+		for route in routes {
 			policy.push_str(&format!("\t\tip daddr {route} reject\n"));
 		}
-		for address in host_ipv4_addresses(&tools.ip)? {
+		for address in addresses {
 			policy.push_str(&format!("\t\tip daddr {address} reject\n"));
 		}
 		policy.push_str("\t\tip6 daddr ::/0 reject\n");
@@ -427,29 +486,78 @@ fn build_network_policy(
 		policy.push_str("\t\treject\n");
 	}
 	policy.push_str("\t}\n}\n");
-	Ok(policy)
+	policy
 }
 
 fn connected_ipv4_routes(ip: &Path) -> Result<BTreeSet<String>> {
 	let output = command_stdout(ip, &["-o", "-4", "route", "show", "scope", "link"])?;
-	Ok(output
+	Ok(parse_connected_ipv4_routes(&output))
+}
+
+fn parse_connected_ipv4_routes(output: &str) -> BTreeSet<String> {
+	output
 		.lines()
 		.filter_map(|line| line.split_whitespace().next())
 		.filter(|route| valid_ipv4_network(route))
 		.map(str::to_owned)
-		.collect())
+		.collect()
 }
 
 fn host_ipv4_addresses(ip: &Path) -> Result<BTreeSet<Ipv4Addr>> {
 	let output = command_stdout(ip, &["-o", "-4", "address", "show", "scope", "global"])?;
-	Ok(output
+	Ok(parse_host_ipv4_addresses(&output))
+}
+
+fn parse_host_ipv4_addresses(output: &str) -> BTreeSet<Ipv4Addr> {
+	output
 		.lines()
 		.filter_map(|line| {
 			let fields: Vec<&str> = line.split_whitespace().collect();
 			let inet = fields.iter().position(|field| *field == "inet")?;
 			fields.get(inet + 1)?.split('/').next()?.parse().ok()
 		})
-		.collect())
+		.collect()
+}
+
+fn parse_bwrap_pid(bytes: &[u8]) -> serde_json::Result<u32> {
+	serde_json::from_slice::<BwrapInfo>(bytes).map(|info| info.child_pid)
+}
+
+fn uid_map_contains(map: &str, uid: u32) -> bool {
+	map.lines().any(|line| {
+		let mut fields = line.split_whitespace();
+		let inside = fields.next().and_then(|value| value.parse::<u32>().ok());
+		let outside = fields.next().and_then(|value| value.parse::<u32>().ok());
+		inside == Some(uid) && outside == Some(uid)
+	})
+}
+
+/// Byte-only seams for fuzzing the parsers actually used by the supervisor.
+#[cfg(fuzzing)]
+pub(crate) mod fuzzing {
+	use super::*;
+
+	pub fn bwrap_pid(bytes: &[u8]) -> serde_json::Result<u32> {
+		parse_bwrap_pid(bytes)
+	}
+	pub fn uid_map(map: &str, uid: u32) -> bool {
+		uid_map_contains(map, uid)
+	}
+	pub fn connected_routes(output: &str) -> BTreeSet<String> {
+		parse_connected_ipv4_routes(output)
+	}
+	pub fn host_addresses(output: &str) -> BTreeSet<Ipv4Addr> {
+		parse_host_ipv4_addresses(output)
+	}
+	pub fn valid_network(value: &str) -> bool {
+		valid_ipv4_network(value)
+	}
+	pub fn network_policy(
+		mode: SandboxNetworkMode, allowed: &BTreeSet<Ipv4Addr>, routes: &BTreeSet<String>,
+		addresses: &BTreeSet<Ipv4Addr>,
+	) -> String {
+		render_network_policy(mode, allowed, routes, addresses)
+	}
 }
 
 fn valid_ipv4_network(value: &str) -> bool {
@@ -460,6 +568,10 @@ fn valid_ipv4_network(value: &str) -> bool {
 }
 
 fn command_stdout(program: &Path, args: &[&str]) -> Result<String> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Network policy discovery collects only fixed ip route and address queries from the selected helper."
+	)]
 	let output = Command::new(program)
 		.args(args)
 		.output()

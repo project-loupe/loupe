@@ -1,0 +1,3 @@
+[worker_budgets.bytes]
+capacity = 0
+refill_per_second = 1

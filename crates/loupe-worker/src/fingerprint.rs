@@ -116,7 +116,6 @@ mod tests {
 
 	#[test]
 	fn cosmetic_edits_do_not_shift_the_hash() {
-		// Same logical content, different formatting.
 		let a = "  let x = 1;\n  let y = 2;\n";
 		let b = "let x = 1;\nlet y = 2;\n"; // unindented
 		let c = "\nlet x = 1;\n\n\nlet y = 2;\n\n"; // extra blank lines
@@ -132,7 +131,6 @@ mod tests {
 
 	#[test]
 	fn touching_the_bug_body_changes_the_hash() {
-		// Substantive edit — different code, different fingerprint.
 		let original = "let x = unsafe { *raw };\n";
 		let fixed = "let x = unsafe { *raw }.unwrap_or(0);\n";
 		assert_ne!(compute("scanner", "src/x.rs", original), compute("scanner", "src/x.rs", fixed),);
@@ -162,7 +160,6 @@ mod tests {
 		assert_eq!(extract_window(source, 4, 99, 1), "line3\nline4\nline5");
 		// Way out of bounds — empty string, not panic.
 		assert_eq!(extract_window(source, 100, 200, 1), "");
-		// Empty file.
 		assert_eq!(extract_window("", 1, 1, 2), "");
 	}
 

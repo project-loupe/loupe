@@ -9,6 +9,7 @@ pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Returned by the server (in a 400 body) when a client speaks a version
 /// outside the server's supported window.
+// debug-ok: mismatch contains only three numeric protocol versions.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[error(
 	"loupe protocol version mismatch: client sent {client}, server supports [{server_min}, {server_max}]"
@@ -21,8 +22,7 @@ pub struct ProtocolMismatch {
 
 /// Helper for the server side: confirm a request's `protocol_version`
 /// falls within `[min, max]` (inclusive). The current build accepts
-/// `PROTOCOL_VERSION..=PROTOCOL_VERSION`, but the function takes a range
-/// so we can widen later without touching every call site.
+/// `PROTOCOL_VERSION..=PROTOCOL_VERSION`.
 pub fn check_protocol_version(
 	client: u16, server_min: u16, server_max: u16,
 ) -> Result<(), ProtocolMismatch> {
@@ -62,6 +62,33 @@ mod tests {
 	#[test]
 	fn ancient_version_is_rejected() {
 		assert!(check_protocol_version(1, PROTOCOL_VERSION, PROTOCOL_VERSION).is_err());
+	}
+
+	#[test]
+	fn mismatch_display_names_all_three_versions() {
+		for (client, server_min, server_max, message) in [
+			(
+				0,
+				1,
+				65535,
+				"loupe protocol version mismatch: client sent 0, server supports [1, 65535]",
+			),
+			(
+				65535,
+				42,
+				4096,
+				"loupe protocol version mismatch: client sent 65535, server supports [42, 4096]",
+			),
+			(
+				9,
+				1200,
+				3,
+				"loupe protocol version mismatch: client sent 9, server supports [1200, 3]",
+			),
+		] {
+			let error = ProtocolMismatch { client, server_min, server_max };
+			assert_eq!(error.to_string(), message);
+		}
 	}
 
 	#[test]

@@ -6,14 +6,17 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use clap::builder::TypedValueParser;
 use git2::{Repository, Signature};
-use loupe_proto::{
-	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, PROTOCOL_VERSION,
-};
+use loupe_core::text::BoundedText;
+use loupe_core::{ReportingDestination, ScannerDocument};
+use loupe_proto::{RegisterWorkerResponse, ScanRequest, ScanResponse, PROTOCOL_VERSION};
+use loupe_provenance::{Ingress, Mark, Operator, Secret, Untrusted, Unvalidated, Validate};
+use loupe_server::config::{HostnameParser, PathParser};
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
-use loupe_storage::Db;
+use loupe_storage::repos::NewRepo;
+use loupe_storage::{registry, Db};
 use loupe_tls::Ca;
 use loupe_worker::scanners::RegexSecretsScanner;
 use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
@@ -51,31 +54,68 @@ fn make_planted_repo() -> (tempfile::TempDir, String) {
 	(tmp, url)
 }
 
+/// The HTTPS-only registration route cannot select this local fixture. Admit
+/// its authored Operator values, then use the production registry transaction.
+struct LocalRepository;
+impl Validate<&str, Operator> for LocalRepository {
+	type Output = NewRepo<Operator>;
+	type Error = loupe_core::text::Error;
+	fn validate<'a>(
+		self, input: Unvalidated<'a, &str>, mark: Mark<'a, Operator>,
+	) -> Result<Self::Output, Self::Error> {
+		Ok(NewRepo {
+			clone_url: BoundedText::new(&mark, input.get())?,
+			host: BoundedText::new(&mark, "github.com")?,
+			owner: BoundedText::new(&mark, "loupe")?,
+			repo: BoundedText::new(&mark, "test-target")?,
+			default_branch: None,
+			scan_interval_seconds: None,
+			scanner_config: ScannerDocument::registered(&mark, serde_json::Value::Null),
+			reporting: ReportingDestination::GithubIssue {
+				target_owner: BoundedText::new(&mark, "x")?,
+				target_repo: BoundedText::new(&mark, "y")?,
+				pat_secret_id: None,
+			},
+			verification_enabled: false,
+			require_approval: None,
+		})
+	}
+}
+
+fn fixture_operator() -> Ingress<Operator> {
+	// SAFETY: this test authors the local repository's synthetic Operator input.
+	#[allow(unsafe_code)]
+	unsafe {
+		Ingress::new()
+	}
+}
+
 #[tokio::test]
 async fn worker_runs_a_scan_and_emits_a_finding() {
 	let (_repo_tmp, clone_url) = make_planted_repo();
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
+	let command = clap::Command::new("fixture");
+	let server_path = PathParser.parse_ref(&command, None, server_dir.path().as_os_str()).unwrap();
+	let hostname =
+		HostnameParser.parse_ref(&command, None, std::ffi::OsStr::new("loupe-server")).unwrap();
+	let init = run_init(&server_path, &[hostname], None).unwrap();
 
 	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: init.layout.server_cert.read_tls_pem().unwrap(),
+		server_key_pem: init.layout.server_key.read_tls_pem().unwrap(),
+		ca_cert_pem: init.layout.ca_cert.read_tls_pem().unwrap(),
+		ca_key_pem: init.layout.ca_key.read_tls_pem().unwrap(),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let state = AppState::new(
 		db.clone(),
 		Arc::new(ca),
@@ -84,52 +124,31 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	let server_handle = serve(cfg, state).await.unwrap();
 	let addr: SocketAddr = server_handle.local_addr;
 
-	// Admin client: register a (faked) https URL via the route, then
-	// rewrite the row in-place to point at our local file:// repo so
-	// the worker's git2 fetch hits the filesystem.
+	// Admin client drives the real worker registration, scan and read routes.
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
 		.unwrap();
 
-	let resp = admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
-			protocol_version: PROTOCOL_VERSION,
-			clone_url: "https://github.com/loupe/test-target.git".into(),
-			branch: None,
-			scan_interval_seconds: None,
-			reporting: ReportingSetup::GithubIssue {
-				target_owner: "x".into(),
-				target_repo: "y".into(),
-				github_pat: Some("ghp".into()),
-			},
-			scanner_config: serde_json::Value::Null,
-			verification_enabled: Some(false),
-			require_approval: None,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-
-	db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(&clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
+	let repository =
+		Untrusted::new(clone_url.as_str(), fixture_operator()).validate(LocalRepository).unwrap();
+	let registry::ReportingWrite::Done(repo_id) = registry::register_repository(
+		&db,
+		&fixture_operator(),
+		&repository,
+		Some(&Secret::new("ghp".into())),
+		0,
+	)
+	.unwrap() else {
+		panic!("fixture PAT registration must succeed")
+	};
 
 	let resp = admin
 		.post("https://loupe-server/v1/workers")
-		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: "w1".into() })
+		.json(&serde_json::json!({"protocol_version": PROTOCOL_VERSION, "name": "w1"}))
 		.send()
 		.await
 		.unwrap();
@@ -140,7 +159,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	// hand it to ServerClient via `from_parts`.
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -148,7 +167,6 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	let server_client =
 		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
 
-	// Trigger a scan.
 	let resp = admin
 		.post(format!("https://loupe-server/v1/repos/{}/scan", repo_id))
 		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
@@ -156,9 +174,10 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 		.await
 		.unwrap();
 	assert_eq!(resp.status(), 201);
+	let queued: ScanResponse = resp.json().await.unwrap();
 
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	let runner = Runner::new(server_client, cache, scanners);
 
@@ -166,26 +185,32 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 	let stepped = runner.step(&cancel).await.unwrap();
 	assert!(stepped, "runner should have leased and run the queued job");
 
-	let count: i64 = db
-		.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
+	let findings: serde_json::Value = admin
+		.get(format!("https://loupe-server/v1/repos/{repo_id}/findings"))
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap()
+		.json()
+		.await
 		.unwrap();
-	assert_eq!(count, 1, "expected exactly one finding");
+	assert_eq!(findings["findings"].as_array().unwrap().len(), 1, "expected exactly one finding");
+	assert_eq!(findings["findings"][0]["repo_id"].as_i64(), Some(repo_id));
+	assert_eq!(findings["findings"][0]["job_id"].as_i64(), Some(queued.job_id));
 
-	let state: String = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM jobs LIMIT 1", [], |r| r.get::<_, String>(0))?)
-		})
+	let job: serde_json::Value = admin
+		.get(format!("https://loupe-server/v1/jobs/{}", queued.job_id))
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap()
+		.json()
+		.await
 		.unwrap();
-	assert_eq!(state, "succeeded");
-
-	let head_sha: Option<String> = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT head_sha FROM jobs LIMIT 1", [], |r| {
-				r.get::<_, Option<String>>(0)
-			})?)
-		})
-		.unwrap();
-	assert!(head_sha.is_some(), "head_sha should have been persisted on success");
+	assert_eq!(job["state"].as_str(), Some("succeeded"));
+	assert!(job["head_sha"].as_str().is_some(), "head_sha should have been persisted on success");
 
 	server_handle.shutdown().await;
 }

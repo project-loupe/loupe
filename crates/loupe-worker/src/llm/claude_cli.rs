@@ -1,6 +1,6 @@
 //! Backend that shells out to the `claude` CLI.
 //!
-//! Runs `claude --dangerously-skip-permissions -p "$prompt"` inside the
+//! Runs `claude --dangerously-skip-permissions -p` with the prompt on stdin in the
 //! bubblewrap sandbox so the agent can read the worktree at `/workdir`
 //! but can't write to it or persist any state across invocations. The
 //! `--dangerously-skip-permissions` flag is acceptable here only
@@ -22,22 +22,24 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
+use super::cli_output::MAX_CLI_OUTPUT_BYTES;
 use super::mcp::{
 	bind_mcp_into_sandbox, McpBroker, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
 };
 use super::model_broker::{
 	bind_model_into_sandbox, ModelBrokerBackend, ModelBrokerContext, SANDBOX_MODEL_SOCKET,
 };
-use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
-use crate::sandbox::{SandboxBuilder, SandboxNetworkConfig};
+use super::{LlmBackend, LlmRequest, LlmResponse};
+use crate::config::{SandboxAgentConfig, SandboxLaunchConfig, SandboxNetworkPolicy};
+use crate::sandbox::{PreparedCommand, SandboxBinary, SandboxBuilder, SandboxPath, SandboxValue};
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_CLAUDE_EFFORT: &str = "max";
+#[cfg(test)]
 const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 const MODEL_PROXY_LISTEN: &str = "127.0.0.1:0";
 const SANDBOX_MODEL_PORT_FILE: &str = "/tmp/loupe-model.port";
@@ -56,10 +58,19 @@ const SANDBOX_MCP_CONFIG: &str = "/loupe/mcp-config.json";
 /// config that `claude --mcp-config` reads. The `TempDir` is
 /// returned so the caller keeps it alive until after claude exits;
 /// dropping the `TempDir` unlinks the config file.
-struct McpScratch {
+pub(crate) struct McpScratch {
 	#[allow(dead_code)] // RAII — drop at end of caller's scope cleans up.
-	dir: tempfile::TempDir,
+	dir: std::sync::Arc<tempfile::TempDir>,
 	config_path: PathBuf,
+}
+
+impl McpScratch {
+	pub(crate) fn config_path(&self) -> &std::path::Path {
+		&self.config_path
+	}
+	pub(crate) fn mount_owner(&self) -> std::sync::Arc<tempfile::TempDir> {
+		self.dir.clone()
+	}
 }
 
 fn prepare_mcp_scratch(ctx: &McpContext, broker: &McpBroker, repo_id: i64) -> Result<McpScratch> {
@@ -74,15 +85,11 @@ fn prepare_mcp_scratch(ctx: &McpContext, broker: &McpBroker, repo_id: i64) -> Re
 		"loupe".to_string(),
 		serde_json::json!({
 			"type": "stdio",
-			// Inside the sandbox the worker binary is mounted at
-			// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
-			// — see the bind_ro calls above.
+			// The mounted worker binary runs only the credential-free proxy.
 			"command": SANDBOX_LOUPE_BIN,
 			"args": args,
-			// The MCP child inherits the bwrap'd env, including any
-			// explicit Claude credential forwarded to the agent
-			// (irrelevant for the MCP child but harmless). No extra
-			// env is needed at this layer.
+			// The MCP child inherits the sandbox environment; authentication
+			// remains in the host broker and requires no child environment values.
 			"env": {}
 		}),
 	);
@@ -100,27 +107,28 @@ fn prepare_mcp_scratch(ctx: &McpContext, broker: &McpBroker, repo_id: i64) -> Re
 				"type": "stdio",
 				"command": SANDBOX_BKB_MCP_BIN,
 				"args": [],
-				"env": { "BKB_API_URL": ctx.bkb_api_url.as_str() }
+				"env": { "BKB_API_URL": ctx.bkb_api_url.for_sandbox() }
 			}),
 		);
 	}
 	let config = serde_json::json!({ "mcpServers": servers });
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The Claude adapter writes its typed MCP configuration to its owned fresh scratch file."
+	)]
 	std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
-		.with_context(|| format!("writing MCP config at {}", config_path.display()))?;
-	tracing::debug!(
-		config_path = %config_path.display(),
-		repo_id,
-		"loupe-mcp: prepared per-call scratch config",
-	);
-	Ok(McpScratch { dir, config_path })
+		.context("writing MCP config")?;
+	tracing::debug!(repo_id, "loupe-mcp: prepared per-call scratch config");
+	Ok(McpScratch { dir: std::sync::Arc::new(dir), config_path })
 }
 
 pub struct ClaudeCliBackend {
-	bin: String,
-	agent: CliModelConfig,
+	bin: std::ffi::OsString,
+	agent: SandboxAgentConfig,
+	launch: SandboxLaunchConfig,
 	mcp: Option<McpContext>,
 	model_broker: Option<ModelBrokerContext>,
-	network: SandboxNetworkConfig,
+	network: SandboxNetworkPolicy,
 	log_agent_output: bool,
 	#[cfg(test)]
 	disable_sandbox: bool,
@@ -130,15 +138,14 @@ pub struct ClaudeCliBackend {
 
 impl ClaudeCliBackend {
 	pub fn new() -> Self {
+		let launch = SandboxLaunchConfig::default();
 		Self {
-			bin: CLAUDE_BIN.to_owned(),
-			agent: CliModelConfig {
-				model: DEFAULT_CLAUDE_MODEL.to_owned(),
-				effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
-			},
+			bin: CLAUDE_BIN.into(),
+			agent: launch.claude().clone(),
+			launch,
 			mcp: None,
 			model_broker: None,
-			network: SandboxNetworkConfig::default(),
+			network: SandboxNetworkPolicy::default(),
 			log_agent_output: false,
 			#[cfg(test)]
 			disable_sandbox: false,
@@ -147,11 +154,12 @@ impl ClaudeCliBackend {
 		}
 	}
 
-	pub fn with_bin(bin: impl Into<String>) -> Self {
+	#[cfg(any(test, feature = "test-support"))]
+	pub fn with_bin(bin: impl Into<std::ffi::OsString>) -> Self {
 		Self { bin: bin.into(), ..Self::new() }
 	}
 
-	pub fn with_agent_config(mut self, agent: CliModelConfig) -> Self {
+	pub fn with_agent_config(mut self, agent: SandboxAgentConfig) -> Self {
 		self.agent = agent;
 		self
 	}
@@ -161,8 +169,12 @@ impl ClaudeCliBackend {
 		self
 	}
 
-	pub fn with_network_config(mut self, network: SandboxNetworkConfig) -> Self {
+	pub fn with_network_config(mut self, network: SandboxNetworkPolicy) -> Self {
 		self.network = network;
+		self
+	}
+	pub fn with_launch_config(mut self, launch: SandboxLaunchConfig) -> Self {
+		self.launch = launch;
 		self
 	}
 
@@ -201,6 +213,9 @@ impl Default for ClaudeCliBackend {
 
 #[async_trait]
 impl LlmBackend for ClaudeCliBackend {
+	fn credential_watch(&self) -> Option<super::model_broker::CredentialWatch> {
+		self.model_broker.as_ref().map(ModelBrokerContext::credential_watch)
+	}
 	fn id(&self) -> &'static str {
 		BACKEND_ID
 	}
@@ -208,10 +223,7 @@ impl LlmBackend for ClaudeCliBackend {
 	async fn run(&self, req: LlmRequest) -> Result<LlmResponse> {
 		tracing::debug!(
 			backend = BACKEND_ID,
-			workdir = %req.workdir.display(),
-			model = %self.agent.model,
-			effort = %self.agent.effort,
-			prompt_chars = req.prompt.chars().count(),
+			prompt_chars = req.prompt.expose().chars().count(),
 			timeout_ms = req.timeout.as_millis() as u64,
 			"claude-cli: invoking",
 		);
@@ -222,10 +234,13 @@ impl LlmBackend for ClaudeCliBackend {
 			.context("claude backend requires a host-side model broker context")?;
 		let mut model_broker = Some(
 			model_context
-				.start_session(ModelBrokerBackend::Claude {
-					model: self.agent.model.clone(),
-					effort: self.agent.effort.clone(),
-				})
+				.start_session(
+					ModelBrokerBackend::Claude {
+						model: self.agent.model().model_policy()?,
+						effort: self.agent.effort().model_policy()?,
+					},
+					req.security.clone(),
+				)
 				.await
 				.context("starting host-side Claude model broker")?,
 		);
@@ -234,10 +249,10 @@ impl LlmBackend for ClaudeCliBackend {
 		let sandbox_builder = if self.disable_sandbox {
 			SandboxBuilder::disabled_for_tests(&req.workdir)
 		} else {
-			SandboxBuilder::new(&req.workdir)
+			SandboxBuilder::new(req.sandbox_workdir.clone(), &self.launch)
 		};
 		#[cfg(not(test))]
-		let sandbox_builder = SandboxBuilder::new(&req.workdir);
+		let sandbox_builder = SandboxBuilder::new(req.sandbox_workdir.clone(), &self.launch);
 
 		#[cfg(test)]
 		let attach_network = !self.disable_network;
@@ -248,7 +263,7 @@ impl LlmBackend for ClaudeCliBackend {
 				.mcp
 				.as_ref()
 				.filter(|ctx| ctx.bkb_mcp_path.is_some())
-				.map(|ctx| ctx.bkb_api_url.as_str());
+				.map(|ctx| &ctx.bkb_api_url);
 			let required_hosts = super::required_network_hosts(bkb_api_url)?;
 			if super::sandbox_requires_egress_setup(&self.network, &required_hosts) {
 				sandbox_builder
@@ -260,21 +275,28 @@ impl LlmBackend for ClaudeCliBackend {
 		} else {
 			sandbox_builder
 		};
-		let mut sandbox = sandbox_builder
+		let agent_binary =
+			SandboxBinary::discover(std::ffi::OsStr::new(&self.bin), self.launch.path())?;
+		let mut sandbox = req
+			.security
+			.mount(sandbox_builder)
 			// Make the `claude` install reachable — by default the
 			// sandbox only mounts system binaries, libraries, and public
 			// runtime files, so per-user installs at ~/.local/bin/... are
 			// invisible without this.
-			.allow_binary(&self.bin)
-			.with_context(|| format!("preparing sandbox for `{}`", self.bin))?
+			.allow_binary(&agent_binary)
 			// Claude requires a value before attempting an API call. This
 			// fixed sentinel is not authority; the host broker strips it.
-			.set_env("ANTHROPIC_AUTH_TOKEN", "loupe-brokered")
-			.set_env("DISABLE_AUTOUPDATER", "1")
-			.set_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-			.set_env("DISABLE_TELEMETRY", "1")
-			.set_env("DISABLE_ERROR_REPORTING", "1")
-			.set_env("DISABLE_BUG_COMMAND", "1");
+			.set_env("ANTHROPIC_AUTH_TOKEN", SandboxValue::r#static("loupe-brokered"))
+			.set_env("DISABLE_AUTOUPDATER", SandboxValue::r#static("1"))
+			.set_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", SandboxValue::r#static("1"))
+			.set_env("DISABLE_TELEMETRY", SandboxValue::r#static("1"))
+			.set_env("DISABLE_ERROR_REPORTING", SandboxValue::r#static("1"))
+			.set_env("DISABLE_BUG_COMMAND", SandboxValue::r#static("1"));
+		#[allow(
+			clippy::expect_used,
+			reason = "The model broker Option was just initialized successfully and has not been taken."
+		)]
 		let model_session = model_broker.as_ref().expect("model broker was just started");
 		sandbox = bind_model_into_sandbox(sandbox, model_context, model_session);
 
@@ -290,7 +312,7 @@ impl LlmBackend for ClaudeCliBackend {
 				let scratch = prepare_mcp_scratch(ctx, &broker, repo_id)
 					.context("preparing MCP scratch directory")?;
 				sandbox = bind_mcp_into_sandbox(sandbox, ctx, &broker)
-					.bind_ro(scratch.config_path.clone(), SANDBOX_MCP_CONFIG);
+					.bind_ro(SandboxPath::claude_config(&scratch), SANDBOX_MCP_CONFIG);
 				mcp_broker = Some(broker);
 				Some(scratch)
 			},
@@ -304,54 +326,36 @@ impl LlmBackend for ClaudeCliBackend {
 			_ => None,
 		};
 
-		let mut agent_args = claude_invocation_args(&self.agent, &req.prompt);
+		let mut agent_args = claude_invocation_args(&self.agent);
 		if _mcp_scratch.is_some() {
-			agent_args.extend(claude_mcp_args().into_iter().map(str::to_owned));
+			agent_args.extend(claude_mcp_args().into_iter().map(SandboxValue::r#static));
 		}
 		#[cfg(test)]
 		let mut cmd = if self.disable_sandbox {
-			let mut cmd =
-				sandbox.set_env("ANTHROPIC_BASE_URL", "http://127.0.0.1:1").build(&self.bin);
-			cmd.args(&agent_args);
-			cmd
+			sandbox
+				.set_env("ANTHROPIC_BASE_URL", SandboxValue::r#static("http://127.0.0.1:1"))
+				.build(SandboxValue::path(agent_binary.sandbox_path()), &agent_args)
 		} else {
-			build_model_proxied_command(&sandbox, &self.bin, &agent_args)
+			build_model_proxied_command(&sandbox, agent_binary.sandbox_path(), &agent_args)
 		};
 		#[cfg(not(test))]
-		let mut cmd = build_model_proxied_command(&sandbox, &self.bin, &agent_args);
-		cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+		let mut cmd =
+			build_model_proxied_command(&sandbox, agent_binary.sandbox_path(), &agent_args);
+		cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		cmd.kill_on_drop(true);
 
-		let mut child = cmd
-			.spawn()
-			.with_context(|| format!("spawning `{}` (is the claude CLI installed?)", self.bin))?;
+		let mut child =
+			cmd.spawn().context("spawning agent executable (is the claude CLI installed?)")?;
 
-		let stdout_handle = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-		let stderr_handle = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
-
-		let cancel = req.cancel.clone();
-		let run_outcome = timeout(req.timeout, async {
-			let mut stdout_buf = Vec::new();
-			let mut stderr_buf = Vec::new();
-			let mut so = stdout_handle;
-			let mut se = stderr_handle;
-			let wait_fut = async {
-				tokio::select! {
-					biased;
-					_ = cancel.cancelled() => {
-						let _ = child.kill().await;
-						Err(anyhow!("cancelled"))
-					}
-					res = child.wait() => res.map_err(Into::into),
-				}
-			};
-			let (status, _, _) = tokio::join!(
-				wait_fut,
-				so.read_to_end(&mut stdout_buf),
-				se.read_to_end(&mut stderr_buf),
-			);
-			Result::<_>::Ok((status?, stdout_buf, stderr_buf))
-		})
+		let run_outcome = timeout(
+			req.timeout,
+			super::cli_stdin::drive(
+				&mut child,
+				&req.prompt,
+				req.cancel.clone(),
+				req.security.cancellation(),
+			),
+		)
 		.await;
 
 		// `kill_on_drop` only sends the signal. Explicitly kill and wait
@@ -393,14 +397,18 @@ impl LlmBackend for ClaudeCliBackend {
 			None => Ok(()),
 		};
 
-		let (status, stdout, stderr) = match run_outcome {
-			Ok(inner) => inner?,
-			Err(_) => return Err(anyhow!("claude CLI timed out after {:?}", req.timeout)),
-		};
+		req.security.admit(loupe_core::security_event::Operation::ModelRequest)?;
 
-		if !status.success() {
-			let stderr_text = String::from_utf8_lossy(&stderr);
-			let stdout_text = String::from_utf8_lossy(&stdout);
+		let super::cli_stdin::CliRun { status, stdout, stderr, stdin_failed, killed_for_stdin } =
+			match run_outcome {
+				Ok(inner) => inner?,
+				Err(_) => return Err(anyhow!("claude CLI timed out after {:?}", req.timeout)),
+			};
+
+		let output_truncated = stdout.truncated || stderr.truncated;
+		if !status.success() && !killed_for_stdin {
+			let stderr_text = stderr.diagnostic();
+			let stdout_text = stdout.diagnostic();
 			tracing::debug!(
 				backend = BACKEND_ID,
 				exit = ?status.code(),
@@ -409,55 +417,46 @@ impl LlmBackend for ClaudeCliBackend {
 				elapsed_ms = started.elapsed().as_millis() as u64,
 				"claude-cli: subprocess failed",
 			);
-			// Some CLIs (claude included) print "please log in" /
-			// auth-error messages to stdout, not stderr — surface
-			// both so the operator's log shows whichever the CLI
-			// chose. Trim and truncate so a multi-MB diagnostic dump
-			// doesn't drown the log line.
-			let combined = format!(
-				"stderr(chars={})=`{}` stdout(chars={})=`{}`",
-				stderr_text.chars().count(),
-				summarize_cli_stream_for_error(&stderr_text, MAX_CLI_DIAGNOSTIC_CHARS),
-				stdout_text.chars().count(),
-				summarize_cli_stream_for_error(&stdout_text, MAX_CLI_DIAGNOSTIC_CHARS),
-			);
-			return Err(anyhow!("claude CLI exited with {}: {}", status, combined));
+			// Retain both bounded streams under their opaque diagnostic owners.
+			// Human error formatting reports only the closed process outcome.
+			return Err(super::cli_output::CliProcessFailure {
+				backend: "claude",
+				status,
+				stderr: stderr_text,
+				stdout: stdout_text,
+				#[cfg(test)]
+				max_chars: MAX_CLI_DIAGNOSTIC_CHARS,
+			}
+			.into());
+		}
+		if stdin_failed {
+			return Err(anyhow!("CLI prompt stdin delivery failed"));
 		}
 		// Reported last: a CLI failure explains a broker failure, so the
 		// CLI diagnostic is the more useful error to surface.
 		broker_outcome?;
 		model_broker_outcome?;
 
-		let text = String::from_utf8(stdout)
-			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
-		// Debug instrumentation hooks (no-ops when env vars unset):
-		//
-		// - worker config `[logging].agent_output = true` dumps the full
-		//   agent stdout/stderr at info level so a debugging session can
-		//   see the agent's prose (the regular flow only logs char counts).
-		// - claude's stderr on a *successful* exit is otherwise dropped;
-		//   we surface non-empty stderr content at info regardless when
-		//   the env var is set, which catches claude's own diagnostics
-		//   ("rate-limit hit, retrying", auth warnings, etc.).
+		if output_truncated {
+			return Err(anyhow!(
+				"claude CLI output exceeds {MAX_CLI_OUTPUT_BYTES} bytes per stream"
+			));
+		}
+		let text = stdout.text().map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
+		// The compatibility flag publishes counts only. Agent prose and
+		// stderr remain opaque even when operator diagnostics are enabled.
 		if self.log_agent_output {
 			tracing::info!(
 				backend = BACKEND_ID,
-				agent_stdout = %text,
-				"claude-cli: agent stdout (full)"
+				stdout_chars = text.char_count(),
+				stderr_bytes = stderr.len(),
+				"agent output captured; content redacted"
 			);
-			if !stderr.is_empty() {
-				let stderr_text = String::from_utf8_lossy(&stderr);
-				tracing::info!(
-					backend = BACKEND_ID,
-					agent_stderr = %stderr_text,
-					"claude-cli: agent stderr (full)"
-				);
-			}
 		}
 		tracing::debug!(
 			backend = BACKEND_ID,
 			elapsed_ms = started.elapsed().as_millis() as u64,
-			stdout_chars = text.chars().count(),
+			stdout_chars = text.char_count(),
 			stderr_chars = stderr.len(),
 			"claude-cli: subprocess succeeded",
 		);
@@ -466,10 +465,9 @@ impl LlmBackend for ClaudeCliBackend {
 }
 
 fn build_model_proxied_command(
-	sandbox: &SandboxBuilder, agent_bin: &str, agent_args: &[String],
-) -> tokio::process::Command {
-	let mut cmd = sandbox.build(SANDBOX_LOUPE_BIN);
-	cmd.args([
+	sandbox: &SandboxBuilder, agent_bin: SandboxPath, agent_args: &[SandboxValue],
+) -> PreparedCommand {
+	let mut args = [
 		"model-proxy",
 		"--socket",
 		SANDBOX_MODEL_SOCKET,
@@ -478,27 +476,138 @@ fn build_model_proxied_command(
 		"--port-file",
 		SANDBOX_MODEL_PORT_FILE,
 		"--",
-		agent_bin,
-	]);
-	cmd.args(agent_args);
-	cmd
+	]
+	.into_iter()
+	.map(SandboxValue::r#static)
+	.collect::<Vec<_>>();
+	args.push(SandboxValue::path(agent_bin));
+	args.extend_from_slice(agent_args);
+	sandbox.build(SandboxValue::r#static(SANDBOX_LOUPE_BIN), &args)
 }
 
-fn claude_invocation_args(agent: &CliModelConfig, prompt: &str) -> Vec<String> {
+fn claude_invocation_args(agent: &SandboxAgentConfig) -> Vec<SandboxValue> {
 	vec![
-		"--dangerously-skip-permissions".to_owned(),
-		"--model".to_owned(),
-		agent.model.clone(),
-		"--effort".to_owned(),
-		agent.effort.clone(),
-		"--no-session-persistence".to_owned(),
-		"-p".to_owned(),
-		prompt.to_owned(),
+		SandboxValue::r#static("--dangerously-skip-permissions"),
+		SandboxValue::r#static("--model"),
+		SandboxValue::non_secret(agent.model().clone()),
+		SandboxValue::r#static("--effort"),
+		SandboxValue::non_secret(agent.effort().clone()),
+		SandboxValue::r#static("--no-session-persistence"),
+		SandboxValue::r#static("-p"),
 	]
 }
 
 #[cfg(test)]
+type PromptTestBackend = ClaudeCliBackend;
+
+#[cfg(test)]
+#[path = "prompt_delivery_tests.rs"]
+mod prompt_delivery_tests;
+
+#[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	async fn run_output_fixture(
+		stdout_bytes: usize, stderr_bytes: usize, exit_code: u8,
+	) -> (Result<LlmResponse>, bool) {
+		use std::os::unix::fs::PermissionsExt;
+		let workdir = tempfile::tempdir().unwrap();
+		let script = workdir.path().join("output-fixture");
+		let finished = workdir.path().join("finished");
+		std::fs::write(&script, format!(
+			"#!/bin/sh\nhead -c {stdout_bytes} /dev/zero | tr '\\000' x\nprintf 'stdout-tail-diagnostic'\nhead -c {stderr_bytes} /dev/zero | tr '\\000' x >&2\nprintf 'stderr-tail-diagnostic' >&2\ntouch {}\nexit {exit_code}\n",
+			sh_single_quote(&finished),
+		)).unwrap();
+		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+		let backend = ClaudeCliBackend::with_bin(script.as_os_str())
+			.with_sandbox_disabled_for_tests()
+			.with_model_broker_context(test_model_broker("/bin/true"));
+		let result = backend
+			.run(LlmRequest {
+				security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+				tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+				prompt: crate::llm::prompts::Prompt::instruction("fixture").unwrap(),
+				sandbox_workdir: crate::sandbox::SandboxPath::fixture(workdir.path().to_owned()),
+				workdir: workdir.path().to_owned(),
+				timeout: Duration::from_secs(5),
+				cancel: CancellationToken::new(),
+				repo_id: None,
+				job_id: None,
+				job_capability: None,
+				finding_id: None,
+			})
+			.await;
+		(result, finished.exists())
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn stdout_collection_has_a_budget_and_drains_the_pipe() {
+		// Concurrent test forks can inherit a writable script descriptor and cause ETXTBSY.
+		if !in_env(
+			"llm::claude_cli::tests::stdout_collection_has_a_budget_and_drains_the_pipe",
+			"output-fixture",
+			&[],
+		) {
+			return;
+		}
+		let (result, finished) = run_output_fixture(1024 * 1024 + 65536, 0, 0).await;
+		assert!(finished, "collector must drain the child pipe to avoid deadlock: {result:?}");
+		assert!(result.is_err(), "CLI accepted stdout beyond collection budget");
+		assert!(result.unwrap_err().to_string().contains("output exceeds"));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn stderr_collection_has_a_budget_and_drains_the_pipe() {
+		if !in_env(
+			"llm::claude_cli::tests::stderr_collection_has_a_budget_and_drains_the_pipe",
+			"output-fixture",
+			&[],
+		) {
+			return;
+		}
+		let (result, finished) = run_output_fixture(0, 1024 * 1024 + 65536, 0).await;
+		assert!(finished, "collector must drain the child pipe to avoid deadlock: {result:?}");
+		assert!(result.is_err(), "CLI accepted stderr beyond collection budget");
+		assert!(result.unwrap_err().to_string().contains("output exceeds"));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn oversized_failed_output_keeps_bounded_head_and_actionable_tail() {
+		if !in_env(
+			"llm::claude_cli::tests::oversized_failed_output_keeps_bounded_head_and_actionable_tail",
+			"output-fixture",
+			&[],
+		) {
+			return;
+		}
+		let (result, finished) =
+			run_output_fixture(1024 * 1024 + 65536, 1024 * 1024 + 65536, 1).await;
+		assert!(finished, "both pipes must drain concurrently: {result:?}");
+		let error = result.unwrap_err();
+		let error = error
+			.downcast_ref::<super::super::cli_output::CliProcessFailure>()
+			.unwrap()
+			.test_diagnostic();
+		assert!(error.contains("stdout-tail-diagnostic"));
+		assert!(error.contains("stderr-tail-diagnostic"));
+		for stream in ["stdout", "stderr"] {
+			let start = error.find(&format!("{stream}(chars=")).unwrap();
+			let count = error[start..]
+				.split_once('=')
+				.unwrap()
+				.1
+				.split_once(')')
+				.unwrap()
+				.0
+				.parse::<usize>()
+				.unwrap();
+			assert!(count <= 1024 * 1024, "{stream} retained more than collection budget: {count}");
+		}
+	}
+
 	use std::path::Path;
 	use std::time::Duration;
 
@@ -525,9 +634,9 @@ mod tests {
 			.unwrap_or(false)
 	}
 
-	fn test_model_broker(worker_binary: impl Into<PathBuf>) -> ModelBrokerContext {
+	pub(super) fn test_model_broker(worker_binary: impl Into<PathBuf>) -> ModelBrokerContext {
 		ModelBrokerContext::new(
-			worker_binary.into(),
+			crate::sandbox::SandboxPath::fixture(worker_binary.into()),
 			"http://127.0.0.1:9".parse().unwrap(),
 			super::super::model_broker::ModelCredential::anthropic_api_key("host-test-secret"),
 			super::super::model_broker::ModelBrokerLimits::default(),
@@ -602,7 +711,7 @@ mod tests {
 		}
 
 		let model_broker = super::super::model_broker::ModelBrokerContext::new(
-			proxy_path,
+			crate::sandbox::SandboxPath::fixture(proxy_path),
 			"http://127.0.0.1:9".parse().unwrap(),
 			super::super::model_broker::ModelCredential::anthropic_oauth_token("host-oauth-secret"),
 			super::super::model_broker::ModelBrokerLimits::default(),
@@ -611,7 +720,10 @@ mod tests {
 			.with_network_disabled_for_tests()
 			.with_model_broker_context(model_broker);
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
+			sandbox_workdir: crate::sandbox::SandboxPath::fixture(workdir.path().to_path_buf()),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -623,14 +735,14 @@ mod tests {
 
 		let response = backend.run(req).await.expect("fake Claude CLI should run");
 		assert_eq!(
-			response.text.trim(),
+			response.text.for_log().trim(),
 			"SAFE",
 			"the sandbox must receive only local broker configuration, not host auth"
 		);
 	}
 
 	#[cfg(unix)]
-	fn sh_single_quote(path: &Path) -> String {
+	pub(super) fn sh_single_quote(path: &Path) -> String {
 		format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 	}
 
@@ -684,7 +796,10 @@ mod tests {
 		let backend = ClaudeCliBackend::with_bin("loupe-worker-no-such-bin")
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
+			sandbox_workdir: crate::sandbox::SandboxPath::fixture(workdir.path().to_path_buf()),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
@@ -718,11 +833,14 @@ mod tests {
 		let survived_path = scratch.path().join("survived");
 		write_fake_cli(&bin_path, &pid_path, &survived_path);
 
-		let backend = ClaudeCliBackend::with_bin(bin_path.to_string_lossy())
+		let backend = ClaudeCliBackend::with_bin(bin_path.as_os_str())
 			.with_sandbox_disabled_for_tests()
 			.with_model_broker_context(test_model_broker("/bin/true"));
 		let req = LlmRequest {
-			prompt: "irrelevant".into(),
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			prompt: crate::llm::prompts::Prompt::instruction("irrelevant").unwrap(),
+			sandbox_workdir: crate::sandbox::SandboxPath::fixture(workdir.path().to_path_buf()),
 			workdir: workdir.path().to_path_buf(),
 			timeout: Duration::from_millis(500),
 			cancel: CancellationToken::new(),
@@ -754,14 +872,18 @@ mod tests {
 
 	#[test]
 	fn invocation_args_include_configured_model_and_effort() {
-		let args = claude_invocation_args(
-			&CliModelConfig { model: "claude-test".into(), effort: "xhigh".into() },
-			"hello",
-		);
+		let args =
+			SandboxValue::test_text(claude_invocation_args(&crate::test_support::sandbox_agent(
+				false,
+				crate::llm::CliModelConfig {
+					model: crate::config::ConfiguredText::Builtin("claude-test"),
+					effort: crate::config::ConfiguredText::Builtin("xhigh"),
+				},
+			)));
 
 		assert!(args.windows(2).any(|w| w == ["--model", "claude-test"]));
 		assert!(args.windows(2).any(|w| w == ["--effort", "xhigh"]));
 		assert!(args.iter().any(|arg| arg == "--no-session-persistence"));
-		assert!(args.windows(2).any(|w| w == ["-p", "hello"]));
+		assert_eq!(args.last().map(String::as_str), Some("-p"));
 	}
 }

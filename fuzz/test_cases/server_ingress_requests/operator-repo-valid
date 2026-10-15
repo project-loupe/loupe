@@ -1,0 +1,1 @@
+{"protocol_version":2,"clone_url":"https://example.org/owner/repo.git","branch":" main ","reporting":{"kind":"github_issue","target_owner":" owner ","target_repo":"repo","github_pat":"private_body_sentinel"},"scanner_config":{"unknown":{"nil":null}},"verification_enabled":false}

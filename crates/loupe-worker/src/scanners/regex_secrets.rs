@@ -10,7 +10,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::{Finding, Severity};
+use loupe_core::Finding;
+use loupe_provenance::{Ingress, Repo, Untrusted};
 use regex::Regex;
 use walkdir::WalkDir;
 
@@ -19,6 +20,9 @@ use crate::scanner::{ScanContext, Scanner};
 const SCANNER_ID: &str = "regex-secrets";
 const CAPABILITIES: &[&str] = &["scan:secrets"];
 const MAX_FILE_BYTES: u64 = 1_048_576; // 1 MB; bigger files are skipped.
+mod ingress;
+#[cfg(fuzzing)]
+pub use ingress::observe::RepoFindingObservation;
 
 pub struct RegexSecretsScanner {
 	re: Regex,
@@ -29,8 +33,32 @@ impl RegexSecretsScanner {
 		// AWS access key id: 16-char base32-ish suffix after AKIA prefix.
 		// We only check the prefix shape; the dispatcher / verifier later
 		// confirms whether it's a live credential.
+		#[allow(
+			clippy::expect_used,
+			reason = "The compiled AWS access-key pattern is a fixed literal validated by scanner tests."
+		)]
 		let re = Regex::new(r"AKIA[0-9A-Z]{16}").expect("compile-time AKIA regex must be valid");
 		Self { re }
+	}
+
+	/// Fuzz the synchronous walk used by `scan` without a runtime per input.
+	#[cfg(fuzzing)]
+	pub fn fuzz_walk(
+		&self, workdir: &Path, cancelled: bool,
+	) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
+		let cancel = tokio_util::sync::CancellationToken::new();
+		if cancelled {
+			cancel.cancel();
+		}
+		walk(workdir, &self.re, "fuzz-head", &cancel)
+	}
+	#[cfg(fuzzing)]
+	pub fn fuzz_walk_observed(
+		&self, workdir: &Path, cancelled: bool,
+	) -> Result<(Vec<Finding<loupe_provenance::Repo>>, Vec<RepoFindingObservation>)> {
+		let observation = ingress::observe::Scope::begin();
+		let findings = self.fuzz_walk(workdir, cancelled)?;
+		Ok((findings, observation.finish()))
 	}
 }
 
@@ -50,7 +78,7 @@ impl Scanner for RegexSecretsScanner {
 		CAPABILITIES
 	}
 
-	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding>> {
+	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 		let mut findings = Vec::new();
 		let workdir = ctx.workdir.clone();
 		let re = self.re.clone();
@@ -59,9 +87,10 @@ impl Scanner for RegexSecretsScanner {
 		// the runtime on a large worktree.
 		let head_sha = ctx.head_sha.clone();
 		let cancel = ctx.cancel.clone();
-		let result = tokio::task::spawn_blocking(move || walk(&workdir, &re, &head_sha, &cancel))
-			.await
-			.map_err(|e| anyhow::anyhow!("scanner task panicked: {e}"))??;
+		let result =
+			tokio::task::spawn_blocking(move || walk(&workdir, &re, head_sha.expose(), &cancel))
+				.await
+				.map_err(|e| anyhow::anyhow!("scanner task panicked: {e}"))??;
 		findings.extend(result);
 		Ok(findings)
 	}
@@ -69,7 +98,7 @@ impl Scanner for RegexSecretsScanner {
 
 fn walk(
 	workdir: &Path, re: &Regex, head_sha: &str, cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<Finding>> {
+) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 	let mut out = Vec::new();
 	for entry in WalkDir::new(workdir).into_iter().filter_entry(|e| !is_git_metadata(e.path())) {
 		if cancel.is_cancelled() {
@@ -89,43 +118,28 @@ fn walk(
 		if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
 			continue;
 		}
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Regex scanner reads an admitted contained source file before the named Repo finding validator."
+		)]
 		let bytes = match fs::read(entry.path()) {
 			Ok(b) => b,
 			Err(_) => continue,
 		};
-		// Skip binary-looking files.
-		if bytes.iter().take(8192).any(|b| *b == 0) {
-			continue;
-		}
-		let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-		for m in re.find_iter(text) {
-			let line_start = 1 + text[..m.start()].matches('\n').count() as u32;
-			let rel = entry.path().strip_prefix(workdir).unwrap_or(entry.path()).to_string_lossy();
-			// Fingerprint shape: `(scanner_id, file, matched_secret)`.
-			// Deliberately excludes line_start (line shifts when an
-			// unrelated line is added above the match) and head_sha
-			// (every scan would otherwise produce a fresh fingerprint
-			// for the same secret, defeating the dedup index). The
-			// matched bytes themselves are stable across cosmetic
-			// edits and uniquely identify the secret.
-			let _ = head_sha;
-			let fingerprint = crate::fingerprint::compute(SCANNER_ID, &rel, m.as_str());
-			out.push(Finding {
-				scanner_id: SCANNER_ID.into(),
-				severity: Severity::High,
-				title: "Possible AWS access key id".into(),
-				description: format!(
-					"Found a string matching the AWS access key id pattern (`AKIA…`) at {rel}:{line_start}. \
-					 Treat as a potential secret leak — confirm against the AWS account before reporting."
-				),
-				file_path: Some(rel.into_owned()),
-				line_start: Some(line_start),
-				line_end: Some(line_start),
-				cwe: Some("CWE-798".into()),
-				patch_unified: None,
-				poc_unified: None,
-				fingerprint,
-			});
+		let input = ingress::RepoFileInput {
+			bytes,
+			relative_path: entry.path().strip_prefix(workdir).unwrap_or(entry.path()).to_owned(),
+		};
+		// SAFETY: actual file bytes and native repository-relative path from
+		// this walk entry, before text decoding or matching.
+		#[allow(unsafe_code)]
+		let input = Untrusted::new(input, unsafe { Ingress::<Repo>::new() });
+		let _ = head_sha;
+		match input.validate(ingress::RegexSecretFindings { regex: re })? {
+			ingress::FileFindings::UnrepresentablePath => continue,
+			ingress::FileFindings::Findings(findings) => {
+				out.extend(findings.into_iter().map(ingress::RepoFinding::into_finding))
+			},
 		}
 	}
 	Ok(out)
@@ -139,29 +153,42 @@ fn is_git_metadata(path: &Path) -> bool {
 mod tests {
 	use std::fs;
 
-	use loupe_core::RepoSpec;
-	use tokio_util::sync::CancellationToken;
+	use loupe_core::Severity;
 
 	use super::*;
 
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn regex_repo_paths_never_alias_non_utf8_names() {
+		use std::os::unix::ffi::OsStringExt;
+		let dir = tempfile::tempdir().unwrap();
+		let invalid = std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec());
+		fs::write(dir.path().join(invalid), "AKIAIOSFODNN7EXAMPLE").unwrap();
+		fs::write(dir.path().join("visible.rs"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+		let findings = RegexSecretsScanner::new().scan(&make_ctx(dir.path())).await.unwrap();
+		assert_eq!(
+			findings.len(),
+			1,
+			"unrepresentable native Repo path produced a lossy finding alias"
+		);
+		assert_eq!(findings[0].file_path.as_ref().map(|v| v.expose()), Some("visible.rs"));
+	}
+
 	fn make_ctx(workdir: &Path) -> ScanContext {
-		ScanContext {
-			workdir: workdir.to_path_buf(),
-			repo_id: 1,
-			job_id: 1,
-			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
-			repo: RepoSpec {
-				host: "github.com".into(),
-				owner: "a".into(),
-				repo: "b".into(),
-				clone_url: "https://github.com/a/b.git".into(),
-				branch: None,
-			},
-			head_sha: "abc".into(),
-			base_sha: None,
-			config: serde_json::Value::Null,
-			cancel: CancellationToken::new(),
-		}
+		crate::test_support::scan_context(workdir, "abc")
+	}
+
+	#[tokio::test]
+	async fn finding_debug_does_not_expose_repository_secret() {
+		let dir = tempfile::tempdir().unwrap();
+		let secret = "AKIAIOSFODNN7EXAMPLE";
+		std::fs::write(dir.path().join(format!("{secret}.rs")), secret).unwrap();
+		let findings = RegexSecretsScanner::new().scan(&make_ctx(dir.path())).await.unwrap();
+		assert_eq!(findings.len(), 1, "fixture must produce a finding");
+		assert!(
+			!format!("{:?}", findings[0]).contains(secret),
+			"Finding Debug exposed the repository secret through a source path"
+		);
 	}
 
 	#[tokio::test]
@@ -174,9 +201,9 @@ mod tests {
 		let scanner = RegexSecretsScanner::new();
 		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
 		assert_eq!(findings.len(), 1);
-		assert_eq!(findings[0].scanner_id, SCANNER_ID);
+		assert_eq!(findings[0].scanner_id.expose(), SCANNER_ID);
 		assert_eq!(findings[0].severity, Severity::High);
-		assert_eq!(findings[0].file_path.as_deref(), Some("config.rs"));
+		assert_eq!(findings[0].file_path.as_ref().map(|v| v.expose()), Some("config.rs"));
 		assert_eq!(findings[0].line_start, Some(1));
 	}
 

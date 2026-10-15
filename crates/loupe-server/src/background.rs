@@ -7,9 +7,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use loupe_core::JobKind;
-use loupe_storage::jobs::{self, NewJob};
-use loupe_storage::{findings, repos, Db};
+#[cfg(test)]
+use loupe_storage::jobs;
+use loupe_storage::Db;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -31,33 +33,9 @@ fn now_secs() -> i64 {
 /// enqueued. Exposed so tests can drive a tick directly without waiting
 /// for a real timer.
 pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
-	let due = db.with_conn(|c| Ok(repos::list_due_for_scan(c, now)?))?;
-	let mut enqueued = 0;
-	for repo in due {
-		let since_sha = repo.last_scanned_sha.clone();
-		// If a queued or leased scan already exists for this repo, skip
-		// — we don't want to pile up duplicates.
-		let pending: i64 = db.with_conn(|c| Ok(jobs::count_active_scans_for_repo(c, repo.id)?))?;
-		if pending > 0 {
-			tracing::debug!(repo = %repo.clone_url, "skipping due repo: prior scan still in flight");
-			continue;
-		}
-		db.with_conn(|c| {
-			jobs::enqueue(
-				c,
-				&NewJob {
-					repo_id: repo.id,
-					kind: JobKind::Scan,
-					incremental: since_sha.is_some(),
-					since_sha,
-					parent_job_id: None,
-					target_finding_id: None,
-				},
-				now,
-			)
-		})?;
-		enqueued += 1;
-		tracing::info!(repo = %repo.clone_url, "scheduler enqueued periodic scan");
+	let enqueued = loupe_storage::maintenance::schedule_due(db, now)?;
+	if enqueued != 0 {
+		tracing::info!(enqueued, "scheduler enqueued periodic scans");
 	}
 	Ok(enqueued)
 }
@@ -65,7 +43,7 @@ pub fn schedule_due(db: &Db, now: i64) -> anyhow::Result<usize> {
 /// Reaper tick: reclaim leases past their TTL. Re-queue if attempts <
 /// MAX, fail otherwise. Wraps `loupe-storage::jobs::reap_stale_leases`.
 pub fn reap_once(db: &Db, now: i64) -> anyhow::Result<usize> {
-	let n = db.with_conn(|c| jobs::reap_stale_leases(c, now))?;
+	let n = loupe_storage::maintenance::reap_leases(db, now)?;
 	if n > 0 {
 		tracing::info!(reclaimed = n, "reaper transitioned stale leases");
 	}
@@ -73,7 +51,7 @@ pub fn reap_once(db: &Db, now: i64) -> anyhow::Result<usize> {
 	// Stale validating findings sit invisible to the dispatcher (state
 	// is 'validating', not 'confirmed') so without a reaper they'd
 	// never escape their own state.
-	let dismissed = db.with_conn(|c| Ok(findings::reap_stale_validating(c, now)?))?;
+	let dismissed = loupe_storage::maintenance::reap_validating(db, now)?;
 	if dismissed > 0 {
 		tracing::info!(dismissed, "reaper dismissed stale validating findings");
 	}
@@ -135,8 +113,6 @@ pub fn spawn_reaper(
 mod tests {
 	use loupe_core::ReportingDestination;
 	use loupe_storage::repos::NewRepo;
-	use loupe_storage::secrets::{self, SecretKind};
-	use loupe_storage::workers::{self, WorkerKind};
 
 	use super::*;
 
@@ -144,35 +120,41 @@ mod tests {
 		let db = std::sync::Arc::new(
 			Db::open_in_memory(&loupe_storage::secrets::MasterKey::for_tests()).unwrap(),
 		);
-		let secret_id =
-			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
-		let repo_id = db
-			.with_conn(|c| {
-				Ok(repos::insert(
-					c,
-					&NewRepo {
-						clone_url: "https://github.com/a/b.git".into(),
-						host: "github.com".into(),
-						owner: "a".into(),
-						repo: "b".into(),
-						default_branch: None,
-						scan_interval_seconds: Some(60),
-						scanner_config: serde_json::Value::Null,
-						reporting: ReportingDestination::GithubIssue {
-							target_owner: "x".into(),
-							target_repo: "y".into(),
-							pat_secret_id: Some(secret_id),
-						},
-						verification_enabled: false,
-						require_approval: None,
+		let loupe_storage::registry::ReportingWrite::Done(repo_id) =
+			loupe_storage::registry::register_repository(
+				&db,
+				&crate::test_support::operator(),
+				&NewRepo {
+					clone_url: crate::test_support::text("https://github.com/a/b.git"),
+					host: crate::test_support::text("github.com"),
+					owner: crate::test_support::text("a"),
+					repo: crate::test_support::text("b"),
+					default_branch: None,
+					scan_interval_seconds: Some(60),
+					scanner_config: crate::test_support::scanner(serde_json::Value::Null),
+					reporting: ReportingDestination::GithubIssue {
+						target_owner: crate::test_support::text("x"),
+						target_repo: crate::test_support::text("y"),
+						pat_secret_id: None,
 					},
-					0,
-				)?)
-			})
-			.unwrap();
-		let worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w1", WorkerKind::Worker, &[1u8; 32], 0)?))
-			.unwrap();
+					verification_enabled: false,
+					require_approval: None,
+				},
+				Some(&loupe_provenance::Secret::new("x".into())),
+				0,
+			)
+			.unwrap()
+		else {
+			panic!("PAT registration")
+		};
+		let worker_id = loupe_storage::registry::register_worker(
+			&db,
+			&crate::test_support::operator(),
+			&crate::test_support::text("w1"),
+			&[1u8; 32],
+			0,
+		)
+		.unwrap();
 		(db, repo_id, worker_id)
 	}
 
@@ -190,37 +172,37 @@ mod tests {
 	#[test]
 	fn reaper_reclaims_stale_leases() {
 		let (db, repo_id, worker_id) = fixture();
-		db.with_conn(|c| {
-			jobs::enqueue(
-				c,
-				&NewJob {
-					repo_id,
-					kind: JobKind::Scan,
-					incremental: false,
-					since_sha: None,
-					parent_job_id: None,
-					target_finding_id: None,
-				},
-				0,
-			)
-		})
+		loupe_storage::scope::with_operator_repository(
+			&db,
+			&crate::test_support::operator(),
+			loupe_storage::scope::OperatorTarget::Repository(repo_id),
+			|scope| {
+				jobs::enqueue(
+					scope,
+					&jobs::QueuedJob {
+						kind: JobKind::<loupe_provenance::Db>::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					0,
+				)
+			},
+		)
 		.unwrap();
 		// Lease at t=100 with TTL=10. Reap at t=200 ⇒ requeue.
-		db.with_conn(|c| {
-			loupe_storage::transaction::immediate(c, |tx| {
-				loupe_storage::scheduler::claim(
-					tx,
-					&loupe_storage::scheduler::ClaimRequest {
-						worker_id,
-						kinds: &[JobKind::Scan],
-						now: 100,
-						legacy_lease_seconds: 10,
-						capability_hash: &[1; 32],
-						policy: &loupe_storage::scheduler::ClaimPolicy::default(),
-					},
-				)
-			})
-		})
+		loupe_storage::scheduler::claim(
+			&db,
+			&loupe_storage::scheduler::ClaimRequest {
+				worker_id,
+				kinds: &[JobKind::<loupe_provenance::Db>::Scan],
+				now: 100,
+				legacy_lease_seconds: 10,
+				capability_hash: &[1; 32],
+				policy: &loupe_storage::scheduler::ClaimPolicy::default(),
+			},
+		)
 		.unwrap();
 		let n = reap_once(&db, 200).unwrap();
 		assert_eq!(n, 1);

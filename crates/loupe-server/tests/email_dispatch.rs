@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use git2::{Repository, Signature};
-use loupe_proto::{
+use common::wire::{
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
 	ScanRequest, PROTOCOL_VERSION,
 };
+use git2::{Repository, Signature};
 use loupe_server::init::run_init;
 use loupe_server::reporters::{EmailReporter, GithubReporter};
 use loupe_server::{serve, AppState, Config};
@@ -62,27 +62,32 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	let (sendmail_bin, captured_path) = write_fake_sendmail(scratch.path());
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), Arc::new(GithubReporter::new().unwrap()))
 		.with_email_reporter(EmailReporter::with_bin(&sendmail_bin));
 	let server = serve(cfg, state).await.unwrap();
@@ -90,16 +95,17 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
 		.unwrap();
 
 	// Register a repo with Email reporting.
-	let resp = admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
+	let repo_id = common::register_local_repo(
+		&db,
+		&clone_url,
+		RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
 			branch: None,
@@ -112,21 +118,8 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval: None,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-	db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(&clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
+		},
+	);
 
 	// Mint a worker, run a scan.
 	let resp = admin
@@ -139,7 +132,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
@@ -155,7 +148,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 		.unwrap();
 
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 	let runner = Runner::new(server_client, cache, scanners);
 	let cancel = CancellationToken::new();
@@ -168,15 +161,10 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	assert!(captured.contains("To: security@example.com"));
 	assert!(captured.contains("Subject: [scan]"));
 	assert!(captured.contains("AWS access key"), "captured: {captured}");
-	let reviewed_sha: String = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT head_sha FROM jobs WHERE repo_id = ?1", [repo_id], |r| {
-				r.get(0)
-			})?)
-		})
-		.unwrap();
+	let jobs = common::jobs(&db, repo_id);
+	let reviewed_sha = jobs[0].head_sha.as_ref().unwrap().expose();
 	assert!(
-		captured.contains(&format!("reviewed revision: {reviewed_sha}")),
+		captured.contains(&format!("- reviewed revision:\n```\n{reviewed_sha}\n```")),
 		"captured: {captured}"
 	);
 

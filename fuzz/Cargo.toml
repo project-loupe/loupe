@@ -1,0 +1,93 @@
+[package]
+name = "loupe-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+clap = { version = "4", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_urlencoded = { version = "0.7", default-features = false }
+blake3 = { version = "1", default-features = false, features = ["std"] }
+loupe-core = { path = "../crates/loupe-core" }
+loupe-cli = { path = "../crates/loupe-cli" }
+loupe-http = { path = "../crates/loupe-http" }
+loupe-proto = { path = "../crates/loupe-proto" }
+loupe-provenance = { path = "../crates/loupe-provenance", features = ["ingress"] }
+loupe-server = { path = "../crates/loupe-server" }
+loupe-storage = { path = "../crates/loupe-storage" }
+loupe-tls = { path = "../crates/loupe-tls" }
+loupe-worker = { path = "../crates/loupe-worker" }
+loupe-web = { path = "../crates/loupe-web" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+mime = "0.3"
+percent-encoding = "2.3"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time"] }
+sha2 = { version = "0.10", default-features = false }
+http = { version = "1", default-features = false, features = ["std"] }
+hyper = { version = "1", default-features = false }
+url = { version = "2", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tempfile = { version = "3", default-features = false }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+subtle = { version = "2", default-features = false }
+unicode-general-category = { version = "1.1", default-features = false }
+unicode-normalization = { version = "0.1.25", default-features = false, features = ["std"] }
+# Structure-aware inputs for typed, stateful targets (see README,
+# "Dependencies"). Fuzz workspace only; never a product dependency.
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std", "preserve_order"] }
+
+# Prevent this from interfering with the product workspace.
+[workspace]
+members = [".", "runners"]
+
+# Same policy as the root workspace. The harness needs `unsafe` for the
+# extern "C" entry points; every such site needs an allow that
+# ci/unsafe-allow.txt lists.
+[workspace.lints.rust]
+unused_must_use = "deny"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "forbid", check-cfg = ["cfg(fuzzing)"] }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+# `&s[a..b]` on a str panics on a non-boundary; use `get`, `split_at_checked`
+# or `char_indices`.
+string_slice = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+undocumented_unsafe_blocks = "deny"
+# Sink-entry restrictions apply to production; harnesses exercise those APIs.
+disallowed_methods = "allow"
+# The workspace rustfmt formats doc-comment code with hard tabs.
+tabs_in_doc_comments = "allow"
+
+[lints]
+workspace = true
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+debug-assertions = true
+overflow-checks = true
+
+# When replaying a large corpus, -O1 offers a nice speedup.
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[lib]
+name = "loupe_fuzz"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]

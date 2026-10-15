@@ -1,0 +1,3 @@
+# Corpora are byte-exact inputs, including intentional whitespace and CRLF.
+* -text -diff
+**/* -text -diff

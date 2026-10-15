@@ -1,0 +1,67 @@
+//! Fuzz targets for Loupe.
+//!
+//! Target runners are generated from the registry in `src/bin/gen_target.sh`.
+//! Shared oracle and fixture modules do not have runners of their own.
+//! See `README.md` for coverage requirements and invocation instructions.
+
+#[cfg(not(fuzzing))]
+compile_error!("Fuzz targets need cfg=fuzzing");
+
+pub mod utils;
+
+mod cli_common;
+pub mod cli_config_input;
+pub mod cli_ingress_response;
+pub mod cli_render;
+mod cli_response_oracle;
+pub mod core_canonical;
+pub mod core_json_string;
+pub mod core_state_machine;
+pub mod core_text_bounded;
+pub mod core_text_exact;
+pub mod core_text_ident;
+pub mod core_text_json;
+pub mod core_text_repo_path;
+mod fixtures;
+pub mod proto_dto;
+pub mod proto_version;
+pub mod server_capability_header;
+mod server_common;
+pub mod server_config;
+pub mod server_github_response;
+pub mod server_ingress_requests;
+pub mod server_ingress_transport;
+pub mod server_report_email;
+pub mod server_report_github;
+pub mod server_request_parsers;
+pub mod smoke;
+pub mod storage_identity;
+pub mod storage_policy_snapshot;
+pub mod storage_scope_sequence;
+pub mod storage_source_refs;
+pub mod tls_fingerprint;
+pub mod tls_input;
+pub mod tls_pem;
+pub mod web_api;
+pub mod web_server_response;
+mod web_support;
+mod wire_oracle;
+pub mod worker_broker_policy;
+pub mod worker_broker_usage;
+pub mod worker_canary_observe;
+pub mod worker_citation;
+pub mod worker_client_ingress;
+pub mod worker_config;
+pub mod worker_extract_json;
+pub mod worker_mcp_ingress;
+pub mod worker_mcp_rpc;
+pub mod worker_mcp_submission;
+pub mod worker_network_host;
+pub mod worker_network_parsers;
+pub mod worker_prompt_render;
+pub mod worker_regex_secrets;
+pub mod worker_repo_cache;
+pub mod worker_repo_observations;
+pub mod worker_sandbox_args;
+pub mod worker_server_response;
+pub mod worker_source_discovery;

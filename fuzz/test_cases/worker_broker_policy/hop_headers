@@ -1,0 +1,9 @@
+Connection: keep-alive
+Keep-Alive: timeout=5
+Proxy-Authenticate: x
+Proxy-Authorization: y
+TE: trailers
+Trailer: x
+Transfer-Encoding: chunked
+Upgrade: websocket
+

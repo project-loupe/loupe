@@ -20,23 +20,25 @@ use futures_util::{stream, Stream, StreamExt};
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{
-	HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST,
-	PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+	HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, TRAILER,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use loupe_core::security_event::{Broker, Operation};
+use loupe_provenance::{Ingress, Provider, Sandbox, Secret, Untrusted};
 use tokio::net::UnixListener;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::SandboxBuilder;
 
+mod ingress;
+
 pub const SANDBOX_MODEL_DIR: &str = "/loupe/model";
 pub const SANDBOX_MODEL_SOCKET: &str = "/loupe/model/session.sock";
 
-const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ADAPTER_CONNECTIONS: usize = 16;
 const BROKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const BROKER_ERROR_TRAILER: &str = "loupe-broker-error";
@@ -47,10 +49,11 @@ type UpstreamByteStream =
 	Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>;
 
 /// Provider protocol plus the model policy fixed for one job.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// debug-ok: Closed provider choice with redacted configured model and effort.
+#[derive(Clone, Debug)]
 pub enum ModelBrokerBackend {
-	Claude { model: String, effort: String },
-	Codex { model: String, effort: String },
+	Claude { model: crate::config::ConfiguredText, effort: crate::config::ConfiguredText },
+	Codex { model: crate::config::ConfiguredText, effort: crate::config::ConfiguredText },
 }
 
 impl ModelBrokerBackend {
@@ -63,17 +66,18 @@ impl ModelBrokerBackend {
 
 	fn model(&self) -> &str {
 		match self {
-			Self::Claude { model, .. } | Self::Codex { model, .. } => model,
+			Self::Claude { model, .. } | Self::Codex { model, .. } => model.for_operation(),
 		}
 	}
 
 	fn effort(&self) -> &str {
 		match self {
-			Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort,
+			Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort.for_operation(),
 		}
 	}
 }
 
+// debug-ok: Closed fieldless variants; no dynamic content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelProvider {
 	Claude,
@@ -90,25 +94,79 @@ impl ModelProvider {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CredentialKind {
+pub(super) enum CredentialKind {
 	AnthropicApiKey,
 	AnthropicOAuthToken,
 	OpenAiApiKey,
 }
 
-/// Host-held provider authentication. Deliberately does not implement
-/// `Debug`, so logging a broker configuration cannot print the secret.
-#[derive(Clone)]
+/// Host-held provider authentication with a shared, erased-on-drop owner.
 pub struct ModelCredential {
 	kind: CredentialKind,
-	secret: String,
+	secret: Arc<Secret<String>>,
+}
+
+/// Read-only watch sharing the selected credential's existing erased owner.
+/// It exposes neither plaintext nor a callback into the secret owner.
+#[derive(Clone)]
+pub struct CredentialWatch(ModelCredential);
+
+impl std::fmt::Debug for CredentialWatch {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("CredentialWatch([redacted])")
+	}
+}
+
+impl CredentialWatch {
+	pub(crate) fn matches(&self, candidate: &[u8]) -> bool {
+		crate::canary::contains_bytes(candidate, self.0.secret.expose().as_bytes())
+	}
+}
+
+impl Clone for ModelCredential {
+	fn clone(&self) -> Self {
+		Self { kind: self.kind, secret: Arc::clone(&self.secret) }
+	}
+}
+
+impl std::fmt::Debug for ModelCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+
+impl std::fmt::Display for ModelCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[redacted]")
+	}
+}
+
+// Only this private HTTP-egress adapter exposes bytes to Bytes/HTTP. API keys
+// borrow the shared raw owner; Bearer headers own one guarded prefixed buffer.
+enum ModelHeaderOwner {
+	ApiKey(Arc<Secret<String>>),
+	Bearer(Secret<Vec<u8>>),
+}
+
+impl AsRef<[u8]> for ModelHeaderOwner {
+	fn as_ref(&self) -> &[u8] {
+		match self {
+			Self::ApiKey(secret) => secret.expose().as_bytes(),
+			Self::Bearer(secret) => secret.expose(),
+		}
+	}
+}
+
+struct ModelAuthHeader {
+	name: HeaderName,
+	value: HeaderValue,
 }
 
 /// Worker-owned ingredients reused to create a fresh broker session for
 /// each invocation of one backend.
 #[derive(Clone)]
 pub struct ModelBrokerContext {
-	worker_binary: PathBuf,
+	worker_binary: crate::sandbox::SandboxPath,
 	upstream: reqwest::Url,
 	credential: ModelCredential,
 	limits: ModelBrokerLimits,
@@ -116,24 +174,31 @@ pub struct ModelBrokerContext {
 
 impl ModelBrokerContext {
 	pub fn new(
-		worker_binary: PathBuf, upstream: reqwest::Url, credential: ModelCredential,
-		limits: ModelBrokerLimits,
+		worker_binary: crate::sandbox::SandboxPath, upstream: reqwest::Url,
+		credential: ModelCredential, limits: ModelBrokerLimits,
 	) -> Self {
 		Self { worker_binary, upstream, credential, limits }
 	}
 
-	pub async fn start_session(&self, backend: ModelBrokerBackend) -> Result<ModelBrokerSession> {
-		ModelBrokerSession::start(
+	pub fn credential_watch(&self) -> CredentialWatch {
+		self.credential.watch()
+	}
+
+	pub async fn start_session(
+		&self, backend: ModelBrokerBackend, security: Arc<crate::canary::JobSecurity>,
+	) -> Result<ModelBrokerSession> {
+		ModelBrokerSession::start_for_job(
 			backend,
 			self.upstream.clone(),
 			self.credential.clone(),
 			self.limits,
+			security,
 		)
 		.await
 	}
 
-	pub fn worker_binary(&self) -> &Path {
-		&self.worker_binary
+	pub fn worker_binary(&self) -> crate::sandbox::SandboxPath {
+		self.worker_binary.clone()
 	}
 }
 
@@ -142,24 +207,32 @@ pub fn bind_model_into_sandbox(
 ) -> SandboxBuilder {
 	sandbox
 		.bind_ro(context.worker_binary.clone(), super::mcp::SANDBOX_LOUPE_BIN)
-		.bind_ro(session.host_dir(), SANDBOX_MODEL_DIR)
+		.bind_ro(crate::sandbox::SandboxPath::model_broker(session), SANDBOX_MODEL_DIR)
 }
 
 impl ModelCredential {
+	pub fn watch(&self) -> CredentialWatch {
+		CredentialWatch(self.clone())
+	}
+
 	pub fn anthropic_api_key(secret: impl Into<String>) -> Self {
-		Self { kind: CredentialKind::AnthropicApiKey, secret: secret.into() }
+		Self::from_secret(CredentialKind::AnthropicApiKey, Secret::new(secret.into()))
 	}
 
 	pub fn anthropic_oauth_token(secret: impl Into<String>) -> Self {
-		Self { kind: CredentialKind::AnthropicOAuthToken, secret: secret.into() }
+		Self::from_secret(CredentialKind::AnthropicOAuthToken, Secret::new(secret.into()))
 	}
 
 	pub fn openai_api_key(secret: impl Into<String>) -> Self {
-		Self { kind: CredentialKind::OpenAiApiKey, secret: secret.into() }
+		Self::from_secret(CredentialKind::OpenAiApiKey, Secret::new(secret.into()))
 	}
 
-	fn validate_for(&self, provider: ModelProvider) -> Result<()> {
-		if self.secret.is_empty() {
+	pub(super) fn from_secret(kind: CredentialKind, secret: Secret<String>) -> Self {
+		Self { kind, secret: Arc::new(secret) }
+	}
+
+	fn prepare_for(&self, provider: ModelProvider) -> Result<ModelAuthHeader> {
+		if self.secret.expose().is_empty() {
 			anyhow::bail!("model broker credential must not be empty");
 		}
 		let matches = matches!(
@@ -171,12 +244,28 @@ impl ModelCredential {
 		if !matches {
 			anyhow::bail!("model broker credential does not match the configured provider");
 		}
-		HeaderValue::from_str(&self.secret)
+		let (name, owner) = match self.kind {
+			CredentialKind::AnthropicApiKey => (
+				HeaderName::from_static("x-api-key"),
+				ModelHeaderOwner::ApiKey(Arc::clone(&self.secret)),
+			),
+			CredentialKind::AnthropicOAuthToken | CredentialKind::OpenAiApiKey => {
+				let mut bytes = Vec::with_capacity(b"Bearer ".len() + self.secret.expose().len());
+				bytes.extend_from_slice(b"Bearer ");
+				bytes.extend_from_slice(self.secret.expose().as_bytes());
+				(AUTHORIZATION, ModelHeaderOwner::Bearer(Secret::new(bytes)))
+			},
+		};
+		// Actual Bytes preserves the guarded owner through HTTP header clones.
+		// Sensitivity controls formatting; HTTP/TLS/kernel copies are opaque.
+		let mut value = HeaderValue::from_maybe_shared(Bytes::from_owner(owner))
 			.context("model broker credential is not valid as an HTTP header value")?;
-		Ok(())
+		value.set_sensitive(true);
+		Ok(ModelAuthHeader { name, value })
 	}
 }
 
+// debug-ok: Numeric ceilings and counters only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelBrokerLimits {
 	pub request_ceiling: u64,
@@ -205,6 +294,7 @@ impl Default for ModelBrokerLimits {
 	}
 }
 
+// debug-ok: Numeric ceilings and counters only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModelBrokerUsage {
 	pub requests: u64,
@@ -305,17 +395,19 @@ impl LimitKind {
 }
 
 struct BrokerState {
+	security: Arc<crate::canary::JobSecurity>,
 	backend: ModelBrokerBackend,
 	upstream: reqwest::Url,
-	credential: ModelCredential,
+	auth: ModelAuthHeader,
 	limits: ModelBrokerLimits,
+	ingress_limits: crate::limits::Limits,
 	usage: Arc<UsageCounters>,
 	http: reqwest::Client,
 }
 
 /// Trusted authority for one job's model traffic.
 pub struct ModelBrokerSession {
-	dir: tempfile::TempDir,
+	dir: Arc<tempfile::TempDir>,
 	socket_path: PathBuf,
 	usage: Arc<UsageCounters>,
 	shutdown: CancellationToken,
@@ -323,12 +415,22 @@ pub struct ModelBrokerSession {
 }
 
 impl ModelBrokerSession {
+	/// Explicit standalone diagnostic invocation; production jobs use start_for_job.
 	pub async fn start(
 		backend: ModelBrokerBackend, upstream: reqwest::Url, credential: ModelCredential,
 		limits: ModelBrokerLimits,
 	) -> Result<Self> {
+		let security =
+			crate::canary::JobSecurity::new(Default::default(), vec![credential.watch()])?;
+		Self::start_for_job(backend, upstream, credential, limits, security).await
+	}
+
+	pub async fn start_for_job(
+		backend: ModelBrokerBackend, upstream: reqwest::Url, credential: ModelCredential,
+		limits: ModelBrokerLimits, security: Arc<crate::canary::JobSecurity>,
+	) -> Result<Self> {
 		limits.validate()?;
-		credential.validate_for(backend.provider())?;
+		let auth = credential.prepare_for(backend.provider())?;
 		if !matches!(upstream.scheme(), "http" | "https") || upstream.host_str().is_none() {
 			anyhow::bail!("model broker upstream must be an HTTP(S) URL with a host");
 		}
@@ -347,15 +449,21 @@ impl ModelBrokerSession {
 		let listener = UnixListener::bind(&socket_path)
 			.with_context(|| format!("binding model broker socket at {}", socket_path.display()))?;
 		let usage = Arc::new(UsageCounters::default());
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The model broker owns its selected provider transport with redirects disabled."
+		)]
 		let http = reqwest::Client::builder()
 			.redirect(reqwest::redirect::Policy::none())
 			.build()
 			.context("building model broker HTTP client")?;
 		let state = Arc::new(BrokerState {
+			security,
 			backend,
 			upstream,
-			credential,
+			auth,
 			limits,
+			ingress_limits: crate::limits::Limits::default(),
 			usage: usage.clone(),
 			http,
 		});
@@ -363,7 +471,7 @@ impl ModelBrokerSession {
 		let task_shutdown = shutdown.clone();
 		let task = tokio::spawn(serve_session(listener, state, task_shutdown));
 
-		Ok(Self { dir, socket_path, usage, shutdown, task: Some(task) })
+		Ok(Self { dir: Arc::new(dir), socket_path, usage, shutdown, task: Some(task) })
 	}
 
 	pub fn socket_path(&self) -> &Path {
@@ -373,6 +481,9 @@ impl ModelBrokerSession {
 	pub fn host_dir(&self) -> &Path {
 		self.dir.path()
 	}
+	pub(crate) fn mount_owner(&self) -> Arc<tempfile::TempDir> {
+		self.dir.clone()
+	}
 
 	pub fn usage(&self) -> ModelBrokerUsage {
 		self.usage.snapshot()
@@ -381,6 +492,10 @@ impl ModelBrokerSession {
 	/// Revoke the socket and any in-flight response stream.
 	pub async fn finish(mut self) -> Result<ModelBrokerUsage> {
 		self.shutdown.cancel();
+		#[allow(
+			clippy::expect_used,
+			reason = "Consuming finish owns the sole task slot; only finish or Drop can take it."
+		)]
 		let mut task = self.task.take().expect("broker task is present until finish");
 		match tokio::time::timeout(BROKER_SHUTDOWN_TIMEOUT, &mut task).await {
 			Ok(result) => result.context("model broker task panicked")??,
@@ -454,7 +569,10 @@ async fn proxy_request(
 	request: Request<Incoming>, state: Arc<BrokerState>,
 ) -> std::result::Result<Response<BrokerBody>, Infallible> {
 	let response = handle_request(request, state).await.unwrap_or_else(|error| {
-		tracing::warn!(error = %error, "model broker rejected an internal proxy failure");
+		if error.is::<crate::canary::JobQuarantined>() {
+			return quarantined_response();
+		}
+		tracing::warn!("model broker rejected an internal proxy failure");
 		local_error(StatusCode::BAD_GATEWAY, "upstream_error", "model upstream request failed")
 	});
 	Ok(response)
@@ -463,6 +581,7 @@ async fn proxy_request(
 async fn handle_request(
 	request: Request<Incoming>, state: Arc<BrokerState>,
 ) -> Result<Response<BrokerBody>> {
+	state.security.admit(Operation::ModelRequest)?;
 	if state.backend.provider() == ModelProvider::Claude
 		&& request.method() == Method::HEAD
 		&& request.uri().path() == "/api/hello"
@@ -489,9 +608,19 @@ async fn handle_request(
 	}
 	let query = query.map(str::to_owned);
 
-	let headers = sanitize_request_headers(request.headers(), &state.credential)?;
-	let body = match Limited::new(request.into_body(), MAX_REQUEST_BODY_BYTES).collect().await {
+	let headers = sanitize_request_headers(request.headers(), &state.auth);
+	let body = match state
+		.security
+		.run(Operation::ModelRequest, async {
+			Limited::new(request.into_body(), state.ingress_limits.model_request_bytes)
+				.collect()
+				.await
+				.map_err(|_| anyhow::anyhow!("model request collection failed"))
+		})
+		.await
+	{
 		Ok(body) => body.to_bytes(),
+		Err(error) if error.is::<crate::canary::JobQuarantined>() => return Err(error),
 		Err(_) => {
 			return Ok(local_error(
 				StatusCode::PAYLOAD_TOO_LARGE,
@@ -500,7 +629,13 @@ async fn handle_request(
 			));
 		},
 	};
-	let body = match enforce_request_policy(&body, &state.backend) {
+	state.security.observe(&body, Broker::Model);
+	state.security.admit(Operation::ModelRequest)?;
+	// SAFETY: this body was just read from the session's sandbox Unix socket
+	// through the existing finite HTTP body collector.
+	#[allow(unsafe_code)]
+	let body = Untrusted::new(body, unsafe { Ingress::<Sandbox>::new() });
+	let body = match ingress::UpstreamRequest::admit(body, &state.backend) {
 		Ok(body) => body,
 		Err(RequestPolicyError::InvalidJson) => {
 			return Ok(local_error(
@@ -509,8 +644,11 @@ async fn handle_request(
 				"model request must be a JSON object",
 			));
 		},
-		Err(RequestPolicyError::DeniedTool(tool_type)) => {
-			tracing::warn!(tool_type, "model broker denied a provider-side fetch tool");
+		Err(RequestPolicyError::DeniedTool(reason)) => {
+			tracing::warn!(
+				reason = reason.as_str(),
+				"model broker denied a provider-side fetch tool"
+			);
 			return Ok(local_error(
 				StatusCode::UNPROCESSABLE_ENTITY,
 				"tool_policy_denied",
@@ -526,12 +664,12 @@ async fn handle_request(
 	upstream.set_path(endpoint);
 	upstream.set_query(query.as_deref());
 	upstream.set_fragment(None);
-	let response = state
-		.http
-		.post(upstream)
-		.headers(headers)
-		.body(body)
-		.send()
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "The broker constructs an HTTP request only for its selected provider endpoint and opaque credential."
+	)]
+	let response = body
+		.send(state.http.post(upstream).headers(headers), &state.security)
 		.await
 		.context("sending model request to configured upstream")?;
 	if response.status().is_redirection() {
@@ -544,9 +682,11 @@ async fn handle_request(
 	Ok(stream_upstream_response(response, state))
 }
 
-fn sanitize_request_headers(
-	headers: &HeaderMap, credential: &ModelCredential,
-) -> Result<HeaderMap> {
+fn quarantined_response() -> Response<BrokerBody> {
+	local_error(StatusCode::FORBIDDEN, "job_quarantined", "job_quarantined")
+}
+
+fn sanitize_request_headers(headers: &HeaderMap, auth: &ModelAuthHeader) -> HeaderMap {
 	let connection_headers = connection_header_names(headers);
 	let mut sanitized = HeaderMap::new();
 	for (name, value) in headers {
@@ -554,19 +694,8 @@ fn sanitize_request_headers(
 			sanitized.append(name.clone(), value.clone());
 		}
 	}
-	let secret = HeaderValue::from_str(&credential.secret)
-		.context("model broker credential is not valid as an HTTP header value")?;
-	match credential.kind {
-		CredentialKind::AnthropicApiKey => {
-			sanitized.insert(HeaderName::from_static("x-api-key"), secret);
-		},
-		CredentialKind::AnthropicOAuthToken | CredentialKind::OpenAiApiKey => {
-			let bearer = HeaderValue::from_str(&format!("Bearer {}", credential.secret))
-				.context("model broker bearer credential is not a valid HTTP header value")?;
-			sanitized.insert(AUTHORIZATION, bearer);
-		},
-	}
-	Ok(sanitized)
+	sanitized.insert(auth.name.clone(), auth.value.clone());
+	sanitized
 }
 
 fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
@@ -580,30 +709,56 @@ fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
 }
 
 fn strip_request_header(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
-	name == AUTHORIZATION
-		|| name == COOKIE
-		|| name == HeaderName::from_static("x-api-key")
-		|| name == HOST
-		|| name == CONTENT_LENGTH
-		|| is_hop_by_hop(name)
-		|| connection_headers.contains(name)
-		|| name.as_str().starts_with("proxy-")
+	strip_request_header_name(name.as_str().as_bytes(), connection_headers.contains(name))
+}
+
+/// HeaderName supplies a lowercase ASCII name; connection membership is
+/// collected from the request before applying this pure forwarding policy.
+pub(crate) fn strip_request_header_name(name: &[u8], connection_named: bool) -> bool {
+	matches!(name, b"authorization" | b"cookie" | b"x-api-key" | b"host" | b"content-length")
+		|| is_hop_by_hop_name(name)
+		|| connection_named
+		|| name.starts_with(b"proxy-")
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-	name == CONNECTION
-		|| name == HeaderName::from_static("keep-alive")
-		|| name == PROXY_AUTHENTICATE
-		|| name == PROXY_AUTHORIZATION
-		|| name == TE
-		|| name == TRAILER
-		|| name == TRANSFER_ENCODING
-		|| name == UPGRADE
+	is_hop_by_hop_name(name.as_str().as_bytes())
 }
 
-enum RequestPolicyError {
+fn is_hop_by_hop_name(name: &[u8]) -> bool {
+	matches!(
+		name,
+		b"connection"
+			| b"keep-alive"
+			| b"proxy-authenticate"
+			| b"proxy-authorization"
+			| b"te"
+			| b"trailer"
+			| b"transfer-encoding"
+			| b"upgrade"
+	)
+}
+
+pub(crate) enum RequestPolicyError {
 	InvalidJson,
-	DeniedTool(String),
+	DeniedTool(DeniedToolReason),
+}
+
+/// Closed policy facts; rejected tool spelling is never diagnostic context.
+pub(crate) enum DeniedToolReason {
+	ProviderFetch,
+	RemoteMcp,
+	McpServers,
+}
+
+impl DeniedToolReason {
+	fn as_str(&self) -> &'static str {
+		match self {
+			Self::ProviderFetch => "provider_fetch",
+			Self::RemoteMcp => "remote_mcp",
+			Self::McpServers => "mcp_servers",
+		}
+	}
 }
 
 fn enforce_request_policy(
@@ -611,6 +766,17 @@ fn enforce_request_policy(
 ) -> std::result::Result<Bytes, RequestPolicyError> {
 	let mut value: serde_json::Value =
 		serde_json::from_slice(body).map_err(|_| RequestPolicyError::InvalidJson)?;
+	if !apply_request_policy(&mut value, backend)? {
+		return Ok(body.clone());
+	}
+	serde_json::to_vec(&value).map(Bytes::from).map_err(|_| RequestPolicyError::InvalidJson)
+}
+
+/// Apply the configured provider policy, returning whether serialization is
+/// needed. An already matching request retains its original wire bytes.
+pub(crate) fn apply_request_policy(
+	value: &mut serde_json::Value, backend: &ModelBrokerBackend,
+) -> std::result::Result<bool, RequestPolicyError> {
 	let object = value.as_object_mut().ok_or(RequestPolicyError::InvalidJson)?;
 	// The Messages API `mcp_servers` field makes the provider itself connect
 	// to caller-chosen URLs — the same capability class as the denied
@@ -618,14 +784,19 @@ fn enforce_request_policy(
 	if object.get("mcp_servers").is_some_and(
 		|servers| !matches!(servers, serde_json::Value::Array(items) if items.is_empty()),
 	) {
-		return Err(RequestPolicyError::DeniedTool("mcp_servers".to_owned()));
+		return Err(RequestPolicyError::DeniedTool(DeniedToolReason::McpServers));
 	}
 	if let Some(tools) = object.get("tools").and_then(serde_json::Value::as_array) {
 		for tool in tools {
 			if let Some(tool_type) = tool.get("type").and_then(serde_json::Value::as_str)
 				&& denied_tool_type(backend.provider(), tool_type)
 			{
-				return Err(RequestPolicyError::DeniedTool(tool_type.to_owned()));
+				let reason = if matches!(tool_type, "mcp" | "remote_mcp") {
+					DeniedToolReason::RemoteMcp
+				} else {
+					DeniedToolReason::ProviderFetch
+				};
+				return Err(RequestPolicyError::DeniedTool(reason));
 			}
 		}
 	}
@@ -642,7 +813,7 @@ fn enforce_request_policy(
 		.and_then(serde_json::Value::as_str)
 		== Some(backend.effort());
 	if model_matches && effort_matches {
-		return Ok(body.clone());
+		return Ok(false);
 	}
 	object.insert("model".to_owned(), serde_json::Value::String(backend.model().to_owned()));
 	let effort_config = object
@@ -651,11 +822,15 @@ fn enforce_request_policy(
 	if !effort_config.is_object() {
 		*effort_config = serde_json::Value::Object(serde_json::Map::new());
 	}
+	#[allow(
+		clippy::expect_used,
+		reason = "The preceding branch replaces every non-object with an object before this access."
+	)]
 	effort_config
 		.as_object_mut()
 		.expect("effort config was made an object")
 		.insert("effort".to_owned(), serde_json::Value::String(backend.effort().to_owned()));
-	serde_json::to_vec(&value).map(Bytes::from).map_err(|_| RequestPolicyError::InvalidJson)
+	Ok(true)
 }
 
 fn denied_tool_type(provider: ModelProvider, tool_type: &str) -> bool {
@@ -674,15 +849,16 @@ fn stream_upstream_response(
 	let status = upstream.status();
 	let headers = sanitize_response_headers(upstream.headers());
 	let stream_state = OutputStreamState {
+		security: state.security.clone(),
 		upstream: Box::pin(upstream.bytes_stream()),
 		usage: state.usage.clone(),
 		output_ceiling: state.limits.output_ceiling_bytes,
-		capture: Vec::new(),
+		capture: ingress::ProviderCapture::default(),
 		overflowed: false,
 		terminal: false,
 	};
 	let output = stream::unfold(stream_state, |mut state| async move {
-		if state.terminal {
+		if state.terminal || state.security.is_quarantined() {
 			return None;
 		}
 		if state.overflowed {
@@ -694,10 +870,31 @@ fn stream_upstream_response(
 			);
 			return Some((Ok(Frame::trailers(trailers)), state));
 		}
-		match state.upstream.next().await {
+		let cancel = state.security.cancellation();
+		let next = tokio::select! {
+			biased;
+			_ = cancel.cancelled() => return None,
+			next = state.upstream.next() => next,
+		};
+		if state.security.is_quarantined() {
+			return None;
+		}
+		match next {
 			Some(Ok(chunk)) => {
-				let allowed = state.usage.reserve_output(chunk.len(), state.output_ceiling);
-				if allowed == 0 {
+				// SAFETY: this chunk came directly from the configured provider's
+				// response stream, before interpretation or sandbox forwarding.
+				#[allow(unsafe_code)]
+				let chunk = Untrusted::new(chunk, unsafe { Ingress::<Provider>::new() });
+				let forwarded = match chunk.validate(ingress::ToSandbox {
+					capture: &mut state.capture,
+					usage: &state.usage,
+					output_ceiling: state.output_ceiling,
+				}) {
+					Ok(value) => value,
+					Err(never) => match never {},
+				};
+				state.overflowed = forwarded.overflowed;
+				let Some(chunk) = forwarded.bytes else {
 					state.overflowed = true;
 					let mut trailers = HeaderMap::new();
 					trailers.insert(
@@ -706,14 +903,7 @@ fn stream_upstream_response(
 					);
 					state.terminal = true;
 					return Some((Ok(Frame::trailers(trailers)), state));
-				}
-				let chunk = if allowed < chunk.len() {
-					state.overflowed = true;
-					chunk.slice(..allowed)
-				} else {
-					chunk
 				};
-				state.capture.extend_from_slice(&chunk);
 				Some((Ok(Frame::data(chunk)), state))
 			},
 			Some(Err(error)) => {
@@ -721,7 +911,7 @@ fn stream_upstream_response(
 				Some((Err(Box::new(error) as BoxError), state))
 			},
 			None => {
-				let tokens = token_usage_from_response(&state.capture);
+				let tokens = state.capture.token_usage();
 				state.usage.tokens.fetch_add(tokens, Ordering::Relaxed);
 				None
 			},
@@ -736,10 +926,11 @@ fn stream_upstream_response(
 }
 
 struct OutputStreamState {
+	security: Arc<crate::canary::JobSecurity>,
 	upstream: UpstreamByteStream,
 	usage: Arc<UsageCounters>,
 	output_ceiling: u64,
-	capture: Vec<u8>,
+	capture: ingress::ProviderCapture,
 	overflowed: bool,
 	terminal: bool,
 }
@@ -812,6 +1003,10 @@ impl ParsedTokenUsage {
 fn local_error(
 	status: StatusCode, code: &'static str, message: &'static str,
 ) -> Response<BrokerBody> {
+	#[allow(
+		clippy::expect_used,
+		reason = "The local error contains only fixed string keys and values, which JSON serialization cannot reject."
+	)]
 	let body = serde_json::to_vec(&serde_json::json!({
 		"error": { "type": "loupe_model_broker", "code": code, "message": message }
 	}))
@@ -830,6 +1025,109 @@ fn empty_response(status: StatusCode) -> Response<BrokerBody> {
 	let mut response = Response::new(body);
 	*response.status_mut() = status;
 	response
+}
+
+/// Pure policy/accounting seams; no broker listener or provider is started.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+	use super::*;
+	// debug-ok: Closed fieldless variants; no dynamic content.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub enum PolicyError {
+		InvalidJson,
+		ProviderFetch,
+		RemoteMcp,
+		McpServers,
+	}
+	#[allow(unsafe_code)]
+	pub fn request_policy(
+		body: &[u8], backend: &ModelBrokerBackend,
+	) -> Result<Vec<u8>, PolicyError> {
+		// SAFETY: original cfg-only Sandbox request bytes, before the real policy owner.
+		let body = loupe_provenance::Untrusted::new(Bytes::copy_from_slice(body), unsafe {
+			loupe_provenance::Ingress::<loupe_provenance::Sandbox>::new()
+		});
+		ingress::UpstreamRequest::admit(body, backend)
+			.map(ingress::UpstreamRequest::observe_forwarded)
+			.map_err(|error| match error {
+				RequestPolicyError::InvalidJson => PolicyError::InvalidJson,
+				RequestPolicyError::DeniedTool(DeniedToolReason::ProviderFetch) => {
+					PolicyError::ProviderFetch
+				},
+				RequestPolicyError::DeniedTool(DeniedToolReason::RemoteMcp) => {
+					PolicyError::RemoteMcp
+				},
+				RequestPolicyError::DeniedTool(DeniedToolReason::McpServers) => {
+					PolicyError::McpServers
+				},
+			})
+	}
+	// debug-ok: Cfg(fuzzing) synthetic observation only; raw values support independent oracle comparisons.
+	#[derive(Debug)]
+	pub struct ProviderObservation {
+		pub forwarded: Vec<u8>,
+		pub captured: Vec<u8>,
+		pub overflow: bool,
+		pub output_total: u64,
+		pub tokens: u64,
+	}
+	#[allow(unsafe_code)]
+	pub fn provider_chunks(
+		chunks: &[&[u8]], initial_output: u64, ceiling: u64,
+	) -> ProviderObservation {
+		let usage = UsageCounters::default();
+		usage.output_bytes.store(initial_output, Ordering::Relaxed);
+		let mut capture = ingress::ProviderCapture::default();
+		let mut forwarded = Vec::new();
+		let mut overflow = false;
+		for original in chunks {
+			// SAFETY: original cfg-only Provider chunk, before capture or interpretation.
+			let chunk =
+				loupe_provenance::Untrusted::new(Bytes::copy_from_slice(original), unsafe {
+					loupe_provenance::Ingress::<loupe_provenance::Provider>::new()
+				});
+			let admitted = chunk
+				.validate(ingress::ToSandbox {
+					capture: &mut capture,
+					usage: &usage,
+					output_ceiling: ceiling,
+				})
+				.unwrap();
+			if let Some(bytes) = admitted.bytes {
+				forwarded.extend_from_slice(&bytes);
+			}
+			if admitted.overflowed {
+				overflow = true;
+				break;
+			}
+		}
+		ProviderObservation {
+			forwarded,
+			captured: capture.observe_captured(),
+			overflow,
+			output_total: usage.snapshot().output_bytes,
+			tokens: capture.token_usage(),
+		}
+	}
+
+	pub fn strip_header(name: &HeaderName, headers: &HeaderMap) -> bool {
+		strip_request_header(name, &connection_header_names(headers))
+	}
+
+	#[derive(Default)]
+	pub struct OutputBudget(UsageCounters);
+	impl OutputBudget {
+		pub fn reserve(&self, requested: usize, ceiling: u64) -> usize {
+			self.0.reserve_output(requested, ceiling)
+		}
+		pub fn total(&self) -> u64 {
+			self.0.snapshot().output_bytes
+		}
+	}
+
+	pub fn response_headers(headers: &HeaderMap) -> HeaderMap {
+		sanitize_response_headers(headers)
+	}
 }
 
 #[cfg(test)]
@@ -852,6 +1150,248 @@ mod tests {
 
 	use super::*;
 
+	#[path = "quarantine_tests.rs"]
+	mod quarantine_tests;
+	#[path = "security_log_tests.rs"]
+	mod security_log_tests;
+
+	fn credential_headers(headers: &HeaderMap, credential: &ModelCredential) -> Result<HeaderMap> {
+		let provider = match credential.kind {
+			CredentialKind::AnthropicApiKey | CredentialKind::AnthropicOAuthToken => {
+				ModelProvider::Claude
+			},
+			CredentialKind::OpenAiApiKey => ModelProvider::Codex,
+		};
+		Ok(sanitize_request_headers(headers, &credential.prepare_for(provider)?))
+	}
+
+	#[test]
+	fn model_credential_formatting_is_exactly_redacted() {
+		let credential = ModelCredential::openai_api_key("format-canary");
+		assert_eq!(format!("{credential:?}"), "[redacted]");
+		assert_eq!(format!("{credential}"), "[redacted]");
+	}
+
+	#[test]
+	fn model_api_header_owns_the_shared_allocation_until_last_clone_drops() {
+		let credential = ModelCredential::anthropic_api_key("synthetic-long-key-".repeat(1024));
+		let weak = Arc::downgrade(&credential.secret);
+		let header = credential.prepare_for(ModelProvider::Claude).unwrap();
+		assert_eq!(header.value.as_bytes().as_ptr(), credential.secret.expose().as_ptr());
+		let clone = header.value.clone();
+		assert_eq!(header.value.as_bytes().as_ptr(), clone.as_bytes().as_ptr());
+		drop(credential);
+		assert!(weak.upgrade().is_some());
+		drop(header);
+		assert!(weak.upgrade().is_some());
+		assert!(clone.is_sensitive());
+		assert_eq!(clone.as_bytes(), "synthetic-long-key-".repeat(1024).as_bytes());
+		drop(clone);
+		assert!(weak.upgrade().is_none(), "last header clone retained its source owner");
+	}
+
+	#[test]
+	fn model_bearer_header_clones_share_the_prepared_prefixed_bytes() {
+		let credential = ModelCredential::openai_api_key("synthetic-bearer");
+		let weak = Arc::downgrade(&credential.secret);
+		let header = credential.prepare_for(ModelProvider::Codex).unwrap();
+		let clone = header.value.clone();
+		assert_eq!(header.value.as_bytes().as_ptr(), clone.as_bytes().as_ptr());
+		drop(credential);
+		assert!(weak.upgrade().is_none(), "prepared bearer needlessly retained raw source");
+		drop(header);
+		assert!(clone.is_sensitive());
+		assert_eq!(clone.as_bytes(), b"Bearer synthetic-bearer");
+	}
+
+	#[tokio::test]
+	async fn model_context_session_retains_api_owner_until_shutdown() {
+		let credential = ModelCredential::anthropic_api_key("session-owner");
+		let weak = Arc::downgrade(&credential.secret);
+		let context = ModelBrokerContext::new(
+			crate::sandbox::SandboxPath::fixture("unused-worker".into()),
+			"http://127.0.0.1:1".parse().unwrap(),
+			credential,
+			limits(),
+		);
+		let cloned = context.clone();
+		assert!(Arc::ptr_eq(&context.credential.secret, &cloned.credential.secret));
+		let session = cloned
+			.start_session(
+				claude_backend(),
+				crate::canary::JobSecurity::new(
+					Default::default(),
+					vec![cloned.credential_watch()],
+				)
+				.unwrap(),
+			)
+			.await
+			.unwrap();
+		drop(context);
+		drop(cloned);
+		assert!(weak.upgrade().is_some());
+		session.finish().await.unwrap();
+		assert!(weak.upgrade().is_none());
+	}
+
+	#[test]
+	fn model_credential_clone_shares_raw_allocation() {
+		let original = ModelCredential::anthropic_api_key("synthetic-model-key-".repeat(1024));
+		let cloned = original.clone();
+		assert_eq!(original.secret.expose(), cloned.secret.expose());
+		assert_eq!(
+			original.secret.expose().as_ptr(),
+			cloned.secret.expose().as_ptr(),
+			"ModelCredential Clone duplicated the raw secret allocation"
+		);
+	}
+
+	#[test]
+	fn model_api_key_header_is_sensitive() {
+		let headers = credential_headers(
+			&HeaderMap::new(),
+			&ModelCredential::anthropic_api_key("synthetic-api-key"),
+		)
+		.unwrap();
+		let header = &headers["x-api-key"];
+		assert_eq!(header.as_bytes(), b"synthetic-api-key");
+		assert!(header.is_sensitive(), "generated API-key header is not sensitive");
+	}
+
+	#[test]
+	fn model_bearer_header_is_sensitive() {
+		for credential in [
+			ModelCredential::anthropic_oauth_token("synthetic-oauth"),
+			ModelCredential::openai_api_key("synthetic-oauth"),
+		] {
+			let headers = credential_headers(&HeaderMap::new(), &credential).unwrap();
+			let header = &headers[AUTHORIZATION];
+			assert_eq!(header.as_bytes(), b"Bearer synthetic-oauth");
+			assert!(header.is_sensitive(), "generated Bearer header is not sensitive");
+		}
+	}
+
+	#[test]
+	fn model_credential_header_admission_preserves_exact_bytes() {
+		for value in ["\tkey\t", " key ", "clé-秘密", " ", &"long-key".repeat(4096)] {
+			for (credential, provider, name, expected) in [
+				(
+					ModelCredential::anthropic_api_key(value),
+					ModelProvider::Claude,
+					"x-api-key",
+					value.to_owned(),
+				),
+				(
+					ModelCredential::anthropic_oauth_token(value),
+					ModelProvider::Claude,
+					"authorization",
+					format!("Bearer {value}"),
+				),
+				(
+					ModelCredential::openai_api_key(value),
+					ModelProvider::Codex,
+					"authorization",
+					format!("Bearer {value}"),
+				),
+			] {
+				credential.prepare_for(provider).unwrap();
+				let headers = credential_headers(&HeaderMap::new(), &credential).unwrap();
+				assert_eq!(headers[name].as_bytes(), expected.as_bytes());
+			}
+		}
+		for value in ["", "key\0", "key\r", "key\n", "key\u{7f}"] {
+			assert!(ModelCredential::anthropic_api_key(value)
+				.prepare_for(ModelProvider::Claude)
+				.is_err());
+			assert!(ModelCredential::openai_api_key(value)
+				.prepare_for(ModelProvider::Codex)
+				.is_err());
+		}
+		assert!(ModelCredential::openai_api_key("valid")
+			.prepare_for(ModelProvider::Claude)
+			.is_err());
+		assert!(ModelCredential::anthropic_api_key("valid")
+			.prepare_for(ModelProvider::Codex)
+			.is_err());
+	}
+
+	#[test]
+	fn model_environment_selection_preserves_precedence_and_invalid_utf8() {
+		use std::ffi::{OsStr, OsString};
+		use std::os::unix::ffi::OsStringExt;
+
+		use crate::test_env::in_env;
+		let invalid = OsString::from_vec(b"synthetic-invalid-\xff".to_vec());
+		for (provider, preferred, fallback) in [
+			("claude", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+			("codex", "CODEX_API_KEY", "OPENAI_API_KEY"),
+		] {
+			for (case, primary, secondary, expected, present) in [
+				(
+					"preferred",
+					Some(OsStr::new("preferred")),
+					Some(OsStr::new("fallback")),
+					Some("preferred"),
+					true,
+				),
+				("fallback", None, Some(OsStr::new("fallback")), Some("fallback"), true),
+				(
+					"empty",
+					Some(OsStr::new("")),
+					Some(OsStr::new("fallback")),
+					Some("fallback"),
+					true,
+				),
+				("missing", None, None, None, false),
+				("invalid", Some(invalid.as_os_str()), Some(OsStr::new("fallback")), None, true),
+			] {
+				if !in_env("llm::model_broker::tests::model_environment_selection_preserves_precedence_and_invalid_utf8", &format!("{provider}-{case}"), &[(preferred, primary), (fallback, secondary)]) {
+					continue;
+				}
+				let runtime = super::super::ModelBrokerRuntimeConfig {
+					worker_binary: crate::sandbox::SandboxPath::fixture("unused-worker".into()),
+					limits: ModelBrokerLimits::default(),
+				};
+				let (available, result) = if provider == "claude" {
+					(
+						super::super::claude_auth_available(),
+						super::super::claude_model_broker_context(runtime),
+					)
+				} else {
+					(
+						super::super::codex_auth_available(),
+						super::super::codex_model_broker_context(runtime),
+					)
+				};
+				assert_eq!(available, present);
+				match expected {
+					Some(expected) => {
+						let context = result.unwrap();
+						assert_eq!(context.credential.secret.expose(), expected);
+						if provider == "claude" {
+							assert!(
+								context.credential.kind
+									== if case == "preferred" {
+										CredentialKind::AnthropicApiKey
+									} else {
+										CredentialKind::AnthropicOAuthToken
+									}
+							);
+						}
+					},
+					None => {
+						let error = result.err().expect("invalid/missing credential was accepted");
+						assert!(!format!("{error:#}").contains("synthetic-invalid"));
+						if case == "invalid" {
+							assert!(error.to_string().contains("valid UTF-8"));
+						}
+					},
+				}
+			}
+		}
+	}
+
+	// debug-ok: Private cfg(test) synthetic protocol fixture; exact fixture values are assertion diagnostics only.
 	#[derive(Clone, Debug)]
 	struct CapturedRequest {
 		path: String,
@@ -933,11 +1473,17 @@ mod tests {
 	}
 
 	fn claude_backend() -> ModelBrokerBackend {
-		ModelBrokerBackend::Claude { model: "claude-test".into(), effort: "high".into() }
+		ModelBrokerBackend::Claude {
+			model: crate::config::ConfiguredText::Builtin("claude-test"),
+			effort: crate::config::ConfiguredText::Builtin("high"),
+		}
 	}
 
 	fn codex_backend() -> ModelBrokerBackend {
-		ModelBrokerBackend::Codex { model: "gpt-test".into(), effort: "high".into() }
+		ModelBrokerBackend::Codex {
+			model: crate::config::ConfiguredText::Builtin("gpt-test"),
+			effort: crate::config::ConfiguredText::Builtin("high"),
+		}
 	}
 
 	fn limits() -> ModelBrokerLimits {
@@ -1030,15 +1576,15 @@ mod tests {
 
 		let workdir = tempfile::tempdir().unwrap();
 		let context = ModelBrokerContext::new(
-			"/bin/true".into(),
+			crate::sandbox::SandboxPath::fixture("/bin/true".into()),
 			upstream.url,
 			ModelCredential::anthropic_api_key("unused-host-secret"),
 			limits(),
 		);
 		let sandbox =
-			bind_model_into_sandbox(SandboxBuilder::new(workdir.path()), &context, &session_a);
+			bind_model_into_sandbox(SandboxBuilder::fixture(workdir.path()), &context, &session_a);
 		let output = sandbox
-			.build("/bin/sh")
+			.build_fixture("/bin/sh")
 			.args([
 				"-c",
 				"test -S /loupe/model/session.sock && test ! -e \"$1\"",
@@ -1177,6 +1723,106 @@ mod tests {
 		session.finish().await.unwrap();
 	}
 
+	#[test]
+	fn forwarding_header_matrix_strips_authority_and_connection_tokens() {
+		let mut headers = HeaderMap::new();
+		let denied = [
+			"authorization",
+			"cookie",
+			"host",
+			"content-length",
+			"keep-alive",
+			"proxy-authenticate",
+			"proxy-authorization",
+			"te",
+			"trailer",
+			"transfer-encoding",
+			"upgrade",
+			"proxy-custom",
+			"x-nominated",
+			"x-second",
+		];
+		for name in denied {
+			headers.insert(HeaderName::from_static(name), HeaderValue::from_static("client"));
+		}
+		headers.insert(CONNECTION, HeaderValue::from_static("x-nominated, X-Second"));
+		headers.insert("x-api-key", HeaderValue::from_static("client-secret"));
+		headers.insert("x-retained", HeaderValue::from_static("ordinary"));
+		let sanitized =
+			credential_headers(&headers, &ModelCredential::anthropic_api_key("host-secret"))
+				.unwrap();
+		for name in denied {
+			assert!(!sanitized.contains_key(name), "forwarded denied header {name}");
+		}
+		assert!(!sanitized.contains_key(CONNECTION));
+		assert_eq!(sanitized.get("x-retained").unwrap(), "ordinary");
+		assert_eq!(sanitized.get("x-api-key").unwrap(), "host-secret");
+		assert_eq!(sanitized.len(), 2);
+	}
+
+	#[test]
+	fn response_headers_drop_hop_state_and_keep_end_to_end_values() {
+		let denied = [
+			"content-length",
+			"connection",
+			"keep-alive",
+			"proxy-authenticate",
+			"proxy-authorization",
+			"te",
+			"trailer",
+			"transfer-encoding",
+			"upgrade",
+			"x-nominated",
+		];
+		let mut headers = HeaderMap::new();
+		for name in denied {
+			headers.insert(HeaderName::from_static(name), HeaderValue::from_static("value"));
+		}
+		headers.insert(CONNECTION, HeaderValue::from_static("X-Nominated"));
+		headers.insert("content-type", HeaderValue::from_static("application/json"));
+		headers.insert("x-retained", HeaderValue::from_static("ordinary"));
+		let sanitized = sanitize_response_headers(&headers);
+		for name in denied {
+			assert!(!sanitized.contains_key(name), "forwarded response hop header {name}");
+		}
+		assert_eq!(sanitized.get("content-type").unwrap(), "application/json");
+		assert_eq!(sanitized.get("x-retained").unwrap(), "ordinary");
+		assert_eq!(sanitized.len(), 2);
+	}
+
+	#[test]
+	fn request_policy_repairs_each_partial_configuration() {
+		for (backend, field) in
+			[(claude_backend(), "output_config"), (codex_backend(), "reasoning")]
+		{
+			for model in [backend.model(), "other-model"] {
+				for effort in [
+					serde_json::json!({"effort": backend.effort(), "retained": true}),
+					serde_json::json!({"effort": "other-effort", "retained": true}),
+					serde_json::Value::Null,
+					serde_json::json!("not-an-object"),
+				] {
+					let mut input =
+						serde_json::json!({"model": model, "preserved": {"nested": true}});
+					input[field] = effort.clone();
+					let body = Bytes::from(serde_json::to_vec(&input).unwrap());
+					let output = enforce_request_policy(&body, &backend)
+						.unwrap_or_else(|_| panic!("ordinary policy input was denied"));
+					let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+					assert_eq!(output["model"], backend.model());
+					assert_eq!(output[field]["effort"], backend.effort());
+					assert_eq!(output["preserved"], input["preserved"]);
+					if effort.is_object() {
+						assert_eq!(
+							output[field]["retained"], true,
+							"preserve other effort settings"
+						);
+					}
+				}
+			}
+		}
+	}
+
 	#[tokio::test]
 	async fn claude_oauth_uses_host_bearer_authentication() {
 		let upstream = FakeUpstream::start("{}").await;
@@ -1272,7 +1918,9 @@ mod tests {
 		let mut client = connect(&session).await;
 		let mut oversized_request =
 			request("/v1/responses", r#"{"model":"gpt-test","input":"hi"}"#);
-		oversized_request.headers_mut().insert(TE, HeaderValue::from_static("trailers"));
+		oversized_request
+			.headers_mut()
+			.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
 		let response = client.send_request(oversized_request).await.unwrap();
 		let body = response.into_body().collect().await.unwrap();
 		let trailer =

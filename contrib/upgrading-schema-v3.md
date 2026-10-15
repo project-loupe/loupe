@@ -57,31 +57,49 @@ server to resolve leases, then repeat the offline steps above. Do not edit
 version markers or job kinds to bypass a refusal.
 
 If legacy data contains duplicate queued verify jobs for a finding, the new
-unique index cannot be created. SQLite's underlying diagnostic names
-`jobs.target_finding_id`; Loupe adds `idx_jobs_active_verify`, the conflicting
-finding ID, and the recovery action. The migration rolls back. Restart the old
+unique index cannot be created. The diagnostic identifies
+`jobs.target_finding_id`, one conflicting job's numeric row ID, and the
+recovery action. The migration rolls back. Restart the old
 server with workers stopped, inspect the jobs, cancel the redundant queued
 verify job, then stop the server and retry the upgrade. There is no automatic
 job cancellation or data repair during migration.
 
 Supported upgrades are v2 → v3 and v1 → v3:
 
-- Before v3 commits, any failure rolls back its entire change, leaving a
-  complete v2 database. For v2 input, legacy data and schema remain unchanged.
-- On v1 input, the existing v2 capability migration commits first: interrupted
-  leases are requeued and verifies with recorded verdicts are completed. A
-  subsequent v3 refusal therefore leaves **v2, not v1**, with both version
-  markers at 2. A v0.1 server can reopen it.
-- All copy, foreign-key, and integrity validation precedes the transactional
-  update of both `schema_meta.version` and `PRAGMA user_version` to 3.
-- If restoring foreign-key enforcement fails after commit, startup fails and
-  discards the connection, but the database is already complete v3 with both
-  markers at 3. Reopening with the new server enables FKs and has no migration
-  left to apply. Do not use an old binary on that database.
+- All pending schema versions form one atomic upgrade. Any failure preserves
+  the original logical schema, every original row, and both version markers.
+  A failed v1 upgrade remains v1; a failed v2 upgrade remains v2.
+- On successful v1 upgrades, the v2 capability migration requeues interrupted
+  leases and completes verifies with recorded verdicts. Those changes commit
+  only after all later migrations and startup checks have succeeded.
+- Exact copy checks, foreign-key and integrity validation, startup
+  initialization, both version writes, and verified restoration of the prior
+  foreign-key setting all precede the single commit. A restoration failure
+  therefore rolls back the upgrade as well.
+- Diagnostics identify the source and target versions, failure stage, known
+  table/column and numeric row ID when available, and a closed reason or
+  SQLite numeric code. They omit stored payloads and raw SQLite messages.
 
 Every subsequent startup rejects job kinds missing from `job_kinds`, even if
-schema v3 was already applied. Investigate the reported kinds rather than
+schema v3 was already applied. Investigate the reported row rather than
 disabling validation.
+
+When later versions are pending, startup also streams every stored content
+table through its current admission rules before committing. This includes
+disabled repositories, revoked workers, terminal jobs, retired review state,
+replay records, and proof/detail rows. Valid UTF-8 scanner configuration with
+malformed JSON retains its historical fallback; registered future job kinds
+and accepted legacy reporting formats remain supported. Validation never
+rewrites historical text or JSON.
+
+An admission refusal identifies the source/target versions, table, numeric
+row ID, SQL column, and policy rule or safe failure category. Stop automatic
+restarts, inspect that row using authorized database tooling, and correct the
+invalid value before retrying. Neither payloads nor credential values appear
+in the diagnostic. GitHub App storage validation checks the complete stored
+document; credential syntax and authentication remain with their consumers.
+Report-identity entropy or backfill failures identify the affected finding
+row and also roll back all pending versions, including earlier rebuilds.
 
 After successful migration, old binaries reject schema v3. There is no
 automatic downgrade: restoring the external backup with its matching key is

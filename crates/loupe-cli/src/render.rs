@@ -17,11 +17,25 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use loupe_core::{FindingState, Severity};
-use loupe_proto::FindingDetail;
+use loupe_provenance::{Agent, Server};
+type FindingDetail = loupe_proto::FindingDetail<Agent, Server>;
+type FindingSummary = loupe_proto::FindingSummary<Agent, Server>;
+
+/// Escape unknown job-kind spellings at the terminal sink.
+pub fn job_kind(kind: &loupe_core::JobKind<Server>) -> String {
+	match kind {
+		loupe_core::JobKind::Scan => "Scan".into(),
+		loupe_core::JobKind::Verify => "Verify".into(),
+		loupe_core::JobKind::Survey => "Survey".into(),
+		loupe_core::JobKind::Drilldown => "Drilldown".into(),
+		loupe_core::JobKind::Unknown(text) => format!("Unknown({:?})", text.expose()),
+	}
+}
 
 /// Whether to emit ANSI escape sequences. Detected once per call by
 /// [`Style::detect`], threaded through the renderer so callers can
 /// force one mode or the other (e.g. in unit tests).
+// debug-ok: terminal styling is a closed enum of unit variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
 	Plain,
@@ -43,8 +57,9 @@ impl Style {
 	}
 
 	fn paint(self, code: &str, text: &str) -> String {
+		let text = TerminalText(text);
 		match self {
-			Style::Plain => text.to_owned(),
+			Style::Plain => text.to_string(),
 			Style::Color => format!("\x1b[{code}m{text}\x1b[0m"),
 		}
 	}
@@ -57,15 +72,68 @@ const GREEN: &str = "32";
 const YELLOW: &str = "33";
 const CYAN: &str = "36";
 
-/// Render a [`FindingDetail`] as multi-line plain text.
+/// Escape before adding our own ANSI styling. Printable Unicode is preserved;
+/// terminal commands and other C0/C1 controls remain visible as literal escapes.
+pub struct TerminalText<'a>(pub &'a str);
+
+impl std::fmt::Display for TerminalText<'_> {
+	fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		for character in self.0.chars() {
+			if character.is_control() {
+				write!(out, "{}", character.escape_default())?;
+			} else {
+				out.write_char(character)?;
+			}
+		}
+		Ok(())
+	}
+}
+
+/// Render one human listing row; tabs belong to the layout, never to data.
+pub fn finding_list_row(f: &FindingSummary) -> String {
+	format!(
+		"{:>5}\tjob={}\t{:?}\t{}\tstate={}\tverify={}\t{}\t{}",
+		f.id,
+		f.job_id,
+		f.severity,
+		TerminalText(f.scanner_id.expose()),
+		f.state,
+		f.verification_required,
+		TerminalText(&summary_location(f)),
+		TerminalText(f.title.expose())
+	)
+}
+
+/// Render one search result using the same text boundary as finding details.
+pub fn finding_search_row(f: &FindingSummary) -> String {
+	format!(
+		"{:>5}\t{:?}\t{}\tstate={}\t{}\t{}",
+		f.id,
+		f.severity,
+		TerminalText(f.scanner_id.expose()),
+		f.state,
+		TerminalText(&summary_location(f)),
+		TerminalText(f.title.expose())
+	)
+}
+
+fn summary_location(f: &FindingSummary) -> String {
+	match (f.file_path.as_ref().map(|path| path.expose()), f.line_start) {
+		(Some(path), Some(line)) => format!("{path}:{line}"),
+		(Some(path), None) => path.to_owned(),
+		_ => "-".into(),
+	}
+}
+
+/// Render a [`loupe_proto::FindingDetail`] as multi-line plain text.
 pub fn finding(f: &FindingDetail, style: Style) -> String {
 	let mut out = String::with_capacity(1024);
 	header(&mut out, f, style);
 	metadata(&mut out, f, style);
-	if !f.description.trim().is_empty() {
+	if !f.description.expose().trim().is_empty() {
 		section(&mut out, "Description", style);
-		for line in f.description.lines() {
-			let _ = writeln!(out, "  {line}");
+		for line in f.description.expose().lines() {
+			let _ = writeln!(out, "  {}", TerminalText(line));
 		}
 		out.push('\n');
 	}
@@ -83,31 +151,41 @@ fn header(out: &mut String, f: &FindingDetail, style: Style) {
 		"{} {} — {}",
 		style.paint(BOLD, &format!("Finding #{}", f.id)),
 		style.paint(sev_color, &format!("[{sev_label}]")),
-		style.paint(BOLD, &f.title),
+		style.paint(BOLD, f.title.expose()),
 	);
 	let bar = "─".repeat(60);
 	let _ = writeln!(out, "{}", style.paint(DIM, &bar));
 }
 
 fn metadata(out: &mut String, f: &FindingDetail, style: Style) {
-	let location = match (f.file_path.as_deref(), f.line_start, f.line_end) {
+	let location = match (f.file_path.as_ref().map(|path| path.expose()), f.line_start, f.line_end)
+	{
 		(Some(p), Some(start), Some(end)) if end > start => format!("{p}:{start}-{end}"),
 		(Some(p), Some(start), _) => format!("{p}:{start}"),
 		(Some(p), None, _) => p.to_string(),
 		_ => "(unknown)".into(),
 	};
-	let _ = writeln!(out, "  {} {location}", style.paint(DIM, "Location:"));
+	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Location:"), TerminalText(&location));
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Repo:    "), f.repo_id);
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Job:     "), f.job_id);
-	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Scanner: "), f.scanner_id);
+	let _ = writeln!(
+		out,
+		"  {} {}",
+		style.paint(DIM, "Scanner: "),
+		TerminalText(f.scanner_id.expose())
+	);
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "State:   "), state_painted(&f.state, style));
 	if let Some(cwe) = &f.cwe {
-		let _ = writeln!(out, "  {} {}", style.paint(DIM, "CWE:     "), cwe);
+		let _ = writeln!(out, "  {} {}", style.paint(DIM, "CWE:     "), TerminalText(cwe.expose()));
 	}
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Created: "), format_unix(f.created_at));
 	let _ = writeln!(out, "  {} {}", style.paint(DIM, "Verify:  "), f.verification_required);
-	let _ =
-		writeln!(out, "  {} {}", style.paint(DIM, "FP:      "), style.paint(DIM, &f.fingerprint),);
+	let _ = writeln!(
+		out,
+		"  {} {}",
+		style.paint(DIM, "FP:      "),
+		style.paint(DIM, f.fingerprint.expose()),
+	);
 	out.push('\n');
 }
 
@@ -118,7 +196,7 @@ fn poc(out: &mut String, f: &FindingDetail, style: Style) {
 		return;
 	};
 	section(out, "Proof of concept (regression test, fails on HEAD)", style);
-	render_unified_diff(out, diff, style);
+	render_unified_diff(out, diff.expose(), style);
 	out.push('\n');
 }
 
@@ -127,7 +205,7 @@ fn patch(out: &mut String, f: &FindingDetail, style: Style) {
 		return;
 	};
 	section(out, "Suggested fix", style);
-	render_unified_diff(out, diff, style);
+	render_unified_diff(out, diff.expose(), style);
 	out.push('\n');
 }
 
@@ -136,11 +214,27 @@ fn audit(out: &mut String, f: &FindingDetail, style: Style) {
 		return;
 	}
 	section(out, "Audit", style);
-	if let (Some(at), Some(by)) = (f.approved_at, f.approved_by_cn.as_deref()) {
-		let _ = writeln!(out, "  {} {} by {}", style.paint(GREEN, "approved"), format_unix(at), by);
+	if let (Some(at), Some(by)) =
+		(f.approved_at, f.approved_by_cn.as_ref().map(|text| text.expose()))
+	{
+		let _ = writeln!(
+			out,
+			"  {} {} by {}",
+			style.paint(GREEN, "approved"),
+			format_unix(at),
+			TerminalText(by)
+		);
 	}
-	if let (Some(at), Some(by)) = (f.rejected_at, f.rejected_by_cn.as_deref()) {
-		let _ = writeln!(out, "  {} {} by {}", style.paint(RED, "rejected"), format_unix(at), by);
+	if let (Some(at), Some(by)) =
+		(f.rejected_at, f.rejected_by_cn.as_ref().map(|text| text.expose()))
+	{
+		let _ = writeln!(
+			out,
+			"  {} {} by {}",
+			style.paint(RED, "rejected"),
+			format_unix(at),
+			TerminalText(by)
+		);
 	}
 	out.push('\n');
 }
@@ -166,7 +260,7 @@ fn render_unified_diff(out: &mut String, diff: &str, style: Style) {
 		} else if line.starts_with("diff ") || line.starts_with("index ") {
 			style.paint(DIM, line)
 		} else {
-			line.to_owned()
+			TerminalText(line).to_string()
 		};
 		let _ = writeln!(out, "  {painted}");
 	}
@@ -205,15 +299,11 @@ fn state_painted(state: &FindingState, style: Style) -> String {
 /// pulling in a date crate. The civil-from-days math is the
 /// classic Howard Hinnant algorithm; readable and exact for any
 /// timestamp the system clock can produce.
-fn format_unix(ts: i64) -> String {
-	let (days, seconds_of_day) = if ts >= 0 {
-		(ts / 86_400, ts % 86_400)
-	} else {
-		// Floor-div so negatives go the right way.
-		let d = -((-ts + 86_399) / 86_400);
-		let s = ts - d * 86_400;
-		(d, s)
-	};
+pub fn format_unix(ts: i64) -> String {
+	// Euclidean division floors negatives without negating i64::MIN or
+	// multiplying a rounded-down day count beyond the timestamp range.
+	let days = ts.div_euclid(86_400);
+	let seconds_of_day = ts.rem_euclid(86_400);
 	let hours = seconds_of_day / 3600;
 	let minutes = (seconds_of_day % 3600) / 60;
 	let secs = seconds_of_day % 60;
@@ -242,6 +332,18 @@ mod tests {
 	use loupe_proto::PROTOCOL_VERSION;
 
 	use super::*;
+	use crate::legacy_responses::FindingDetail;
+
+	// Rendering fixtures enter through the actual response owner. There is
+	// no unchecked constructor capable of labelling invalid test strings.
+	fn render(input: &FindingDetail, style: Style) -> anyhow::Result<String> {
+		let raw = serde_json::to_vec(input).unwrap();
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let received = crate::ingress::test_support::received(&raw).await;
+			let finding = crate::ingress::get_finding(received)?;
+			Ok(super::finding(&finding, style))
+		})
+	}
 
 	fn sample() -> FindingDetail {
 		FindingDetail {
@@ -279,8 +381,73 @@ mod tests {
 	}
 
 	#[test]
+	fn invalid_controls_cannot_reach_typed_finding_renderers() {
+		let payload: String = (0..=159)
+			.filter_map(char::from_u32)
+			.filter(|c| c.is_control() && !matches!(c, '\n' | '\r'))
+			.collect();
+		for field in 0..10 {
+			let mut f = sample();
+			match field {
+				0 => f.title = payload.clone(),
+				1 => f.description = payload.clone(),
+				2 => f.file_path = Some(payload.clone()),
+				3 => f.scanner_id = payload.clone(),
+				4 => f.cwe = Some(payload.clone()),
+				5 => f.fingerprint = payload.clone(),
+				6 => f.poc_unified = Some(payload.clone()),
+				7 => f.patch_unified = Some(payload.clone()),
+				8 => {
+					f.approved_at = Some(0);
+					f.approved_by_cn = Some(payload.clone());
+				},
+				_ => {
+					f.rejected_at = Some(0);
+					f.rejected_by_cn = Some(payload.clone());
+				},
+			}
+			for style in [Style::Plain, Style::Color] {
+				assert!(render(&f, style).is_err(), "field {field} reached typed renderer");
+			}
+		}
+	}
+
+	#[test]
+	fn terminal_data_controls_keep_their_visible_spelling() {
+		let payload: String =
+			(0..=159).filter_map(char::from_u32).filter(|c| c.is_control()).collect();
+		for style in [Style::Plain, Style::Color] {
+			let mut rendered = style.paint(BOLD, &payload);
+			for code in ["0", BOLD] {
+				rendered = rendered.replace(&format!("\x1b[{code}m"), "");
+			}
+			assert!(!rendered.chars().any(char::is_control));
+			for c in payload.chars() {
+				assert!(rendered.contains(&c.escape_default().to_string()), "lost {c:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn title_newlines_cannot_enter_the_typed_renderer() {
+		let mut f = sample();
+		f.title = "safe\r\nforged".into();
+		assert!(render(&f, Style::Plain).is_err());
+		assert_eq!(TerminalText("safe\r\nforged").to_string(), "safe\\r\\nforged");
+	}
+
+	#[test]
+	fn format_unix_handles_extreme_timestamps() {
+		for ts in [i64::MIN, i64::MIN + 86_400, i64::MAX] {
+			let rendered = format_unix(ts);
+			assert!(rendered.ends_with(" UTC"));
+			assert!(!rendered.contains(":-"));
+		}
+	}
+
+	#[test]
 	fn plain_render_carries_all_review_critical_fields() {
-		let out = finding(&sample(), Style::Plain);
+		let out = render(&sample(), Style::Plain).unwrap();
 		assert!(out.contains("Finding #42"));
 		assert!(out.contains("[high]"));
 		assert!(out.contains("AWS access key in source"));
@@ -290,19 +457,15 @@ mod tests {
 		assert!(out.contains("Proof of concept"));
 		assert!(out.contains("fn no_aws_keys()"));
 		assert!(out.contains("awaiting_approval"));
-		// Plain rendering must contain no ANSI escapes.
 		assert!(!out.contains('\x1b'), "plain rendering must be ANSI-free, got: {out:?}");
 	}
 
 	#[test]
 	fn color_render_emits_ansi_for_severity_and_diff_lines() {
-		let out = finding(&sample(), Style::Color);
-		// Header severity tag is colored.
+		let out = render(&sample(), Style::Color).unwrap();
 		assert!(out.contains("\x1b[31m[high]\x1b[0m"), "expected red severity in: {out:?}");
-		// `+` lines green, `-` lines red.
 		assert!(out.contains("\x1b[32m+#[test]\x1b[0m"), "expected green addition: {out:?}");
 		assert!(out.contains("\x1b[31m-unrelated\x1b[0m"), "expected red removal: {out:?}");
-		// Hunk header cyan.
 		assert!(out.contains("\x1b[36m@@ "));
 	}
 
@@ -310,7 +473,7 @@ mod tests {
 	fn missing_poc_renders_explicit_placeholder() {
 		let mut f = sample();
 		f.poc_unified = None;
-		let out = finding(&f, Style::Plain);
+		let out = render(&f, Style::Plain).unwrap();
 		assert!(out.contains("Proof of concept"));
 		assert!(out.contains("(none"));
 	}
@@ -318,17 +481,16 @@ mod tests {
 	#[test]
 	fn audit_section_only_renders_when_a_decision_was_recorded() {
 		let mut f = sample();
-		assert!(!finding(&f, Style::Plain).contains("Audit"));
+		assert!(!render(&f, Style::Plain).unwrap().contains("Audit"));
 		f.approved_at = Some(1_756_000_001);
 		f.approved_by_cn = Some("admin".into());
-		assert!(finding(&f, Style::Plain).contains("approved"));
+		assert!(render(&f, Style::Plain).unwrap().contains("approved"));
 	}
 
 	#[test]
 	fn format_unix_known_timestamps() {
 		// 1_756_000_000 = 2025-08-24 01:46:40 UTC.
 		assert_eq!(format_unix(1_756_000_000), "2025-08-24 01:46:40 UTC");
-		// Epoch.
 		assert_eq!(format_unix(0), "1970-01-01 00:00:00 UTC");
 		// One second before epoch — exercises the negative-days branch.
 		assert_eq!(format_unix(-1), "1969-12-31 23:59:59 UTC");

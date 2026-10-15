@@ -1,0 +1,25 @@
+[package]
+name = "loupe-fuzz-runners"
+version = "0.0.1"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+afl_fuzz = ["afl"]
+honggfuzz_fuzz = ["honggfuzz"]
+libfuzzer_fuzz = ["libfuzzer-sys"]
+stdin_fuzz = []
+
+[dependencies]
+loupe-fuzz = { path = ".." }
+
+afl = { version = "0.15", optional = true }
+honggfuzz = { version = "0.5", optional = true, default-features = false }
+libfuzzer-sys = { version = "0.4", optional = true }
+
+[lints]
+workspace = true

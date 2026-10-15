@@ -48,9 +48,9 @@ async fn authorised_client_handshakes_and_reads_payload() {
 	let client_cert = ca.mint_client("worker-1").unwrap();
 
 	let server_cfg =
-		server_config(&server_cert.cert_pem, &server_cert.key_pem, ca.cert_pem()).unwrap();
+		server_config(&server_cert.cert_pem, server_cert.key_pem.expose(), ca.cert_pem()).unwrap();
 	let client_cfg =
-		client_config(&client_cert.cert_pem, &client_cert.key_pem, ca.cert_pem()).unwrap();
+		client_config(&client_cert.cert_pem, client_cert.key_pem.expose(), ca.cert_pem()).unwrap();
 
 	let addr = spawn_server(server_cfg).await;
 	let payload = try_client(addr, client_cfg).await.expect("handshake should succeed");
@@ -65,13 +65,17 @@ async fn client_with_foreign_ca_is_rejected_by_server() {
 	let foreign_client_cert = ca_b.mint_client("intruder").unwrap(); // signed by the WRONG CA
 
 	let server_cfg =
-		server_config(&server_cert.cert_pem, &server_cert.key_pem, ca_a.cert_pem()).unwrap();
+		server_config(&server_cert.cert_pem, server_cert.key_pem.expose(), ca_a.cert_pem())
+			.unwrap();
 
 	// The client trusts ca_a for the server cert but presents a cert
 	// that ca_a never signed.
-	let client_cfg =
-		client_config(&foreign_client_cert.cert_pem, &foreign_client_cert.key_pem, ca_a.cert_pem())
-			.unwrap();
+	let client_cfg = client_config(
+		&foreign_client_cert.cert_pem,
+		foreign_client_cert.key_pem.expose(),
+		ca_a.cert_pem(),
+	)
+	.unwrap();
 
 	let addr = spawn_server(server_cfg).await;
 	let result = try_client(addr, client_cfg).await;

@@ -4,11 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
-use loupe_proto::{GithubAppResponse, GithubAppSummary, SetGithubAppRequest, PROTOCOL_VERSION};
-use loupe_storage::github_app::{self, StoredGithubApp};
-use loupe_storage::repos;
+use axum::{Extension, Json};
+use loupe_proto::{GithubAppResponse, GithubAppSummary, PROTOCOL_VERSION};
+use loupe_storage::github_app::StoredGithubApp;
+use loupe_storage::registry::{self, ClearedApp as Outcome};
 
+use crate::auth::AuthedWorker;
 use crate::reporters::github_app::GithubAppKey;
 use crate::state::AppState;
 
@@ -16,8 +17,10 @@ use crate::state::AppState;
 /// against GitHub's `GET /app`, checks the app id matches, and stores
 /// the credential. Replaces any previously stored app.
 pub async fn set(
-	State(state): State<AppState>, Json(req): Json<SetGithubAppRequest>,
+	State(state): State<AppState>, Extension(operator): Extension<AuthedWorker>,
+	body: crate::ingress::OperatorJson,
 ) -> Result<StatusCode, (StatusCode, String)> {
+	let req = crate::ingress::registry::SetGithubAppDecoder::decode(body)?;
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -27,7 +30,7 @@ pub async fn set(
 	if req.app_id == 0 {
 		return Err((StatusCode::BAD_REQUEST, "app_id must be positive".into()));
 	}
-	let key = GithubAppKey::from_pem(req.app_id, &req.private_key_pem)
+	let key = GithubAppKey::from_pem(req.app_id, req.private_key_pem.expose())
 		.map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid GitHub App private key: {e:#}")))?;
 	let info = state.github_reporter.verify_app(&key).await.map_err(|e| {
 		(StatusCode::BAD_REQUEST, format!("GitHub rejected the app credential: {e:#}"))
@@ -37,7 +40,9 @@ pub async fn set(
 			StatusCode::BAD_REQUEST,
 			format!(
 				"private key belongs to GitHub App {} ({}), not {}",
-				info.id, info.slug, req.app_id
+				info.id,
+				info.slug.expose(),
+				req.app_id
 			),
 		));
 	}
@@ -48,9 +53,7 @@ pub async fn set(
 		slug: info.slug,
 		private_key_pem: req.private_key_pem,
 	};
-	state
-		.db
-		.with_conn(|c| Ok(github_app::set(c, &stored, now)?))
+	registry::store_github_app(&state.db, &operator.require_operator()?, &stored, now)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("storing GitHub App: {e}")))?;
 	Ok(StatusCode::NO_CONTENT)
 }
@@ -58,11 +61,9 @@ pub async fn set(
 /// `GET /v1/github-app` — admin only. Reports which app is configured
 /// without ever returning the key.
 pub async fn get(
-	State(state): State<AppState>,
-) -> Result<Json<GithubAppResponse>, (StatusCode, String)> {
-	let stored = state
-		.db
-		.with_conn(|c| Ok(github_app::get(c)?))
+	State(state): State<AppState>, Extension(operator): Extension<AuthedWorker>,
+) -> Result<Json<GithubAppResponse<loupe_provenance::Db>>, (StatusCode, String)> {
+	let stored = registry::github_app_summary(&state.db, &operator.require_operator()?)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("reading GitHub App: {e}")))?;
 	Ok(Json(GithubAppResponse {
 		protocol_version: PROTOCOL_VERSION,
@@ -74,24 +75,10 @@ pub async fn get(
 /// unless a repo still reports through it: dropping the key under those
 /// repos would make every one of their dispatches fail, so the operator
 /// has to re-point them (to a PAT or another destination) first.
-pub async fn clear(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, String)> {
-	enum Outcome {
-		Removed,
-		Missing,
-		InUse(usize),
-	}
-	let outcome = state
-		.db
-		.with_conn(|c| {
-			let tx = c.transaction()?;
-			let referencing = repos::count_github_app_references(&tx)?;
-			if referencing > 0 {
-				return Ok(Outcome::InUse(referencing));
-			}
-			let removed = github_app::clear(&tx)?;
-			tx.commit()?;
-			Ok(if removed { Outcome::Removed } else { Outcome::Missing })
-		})
+pub async fn clear(
+	State(state): State<AppState>, Extension(operator): Extension<AuthedWorker>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	let outcome = registry::clear_github_app(&state.db, &operator.require_operator()?)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clearing GitHub App: {e}")))?;
 	match outcome {
 		Outcome::Removed => Ok(StatusCode::NO_CONTENT),

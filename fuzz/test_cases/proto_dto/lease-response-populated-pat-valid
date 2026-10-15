@@ -1,0 +1,1 @@
+{"kind":"lease","protocol_version":2,"job_id":1,"job_capability":"capability-secret","repo_id":1,"repo":{"host":"example.test","owner":"owner","repo":"repo","clone_url":"https://example.test/owner/repo"},"head_branch":null,"lease_expires_at":42,"scanner_config":null,"payload":{"kind":"scan"},"github_pat":"ghp_protocol_fuzz_pat"}

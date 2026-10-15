@@ -1,7 +1,11 @@
 //! DAO for the `workers` table.
 
+use loupe_core::text::policy::WorkerName;
+use loupe_core::text::BoundedText;
+use loupe_provenance::{Db, Source};
 use rusqlite::{params, Connection, OptionalExtension};
 
+// debug-ok: worker roles are closed discriminants with no identity content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerKind {
 	Worker,
@@ -17,10 +21,11 @@ impl WorkerKind {
 	}
 }
 
+// debug-ok: worker name redacts; certificate fingerprint is public identity metadata, never certificate or key bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRow {
 	pub id: i64,
-	pub name: String,
+	pub name: BoundedText<WorkerName, Db>,
 	pub kind: WorkerKind,
 	pub cert_fingerprint: Vec<u8>,
 	pub created_at: i64,
@@ -31,20 +36,28 @@ pub struct WorkerRow {
 /// Insert a worker row. Returns the assigned id. Caller passes an
 /// already-hashed fingerprint (see `loupe-tls::cert_fingerprint`); this
 /// DAO never sees raw cert material.
-pub fn insert(
-	conn: &Connection, name: &str, kind: WorkerKind, cert_fingerprint: &[u8], now: i64,
+pub(crate) fn insert<S: Source>(
+	conn: &Connection, name: &BoundedText<WorkerName, S>, kind: WorkerKind,
+	cert_fingerprint: &[u8], now: i64,
 ) -> rusqlite::Result<i64> {
 	conn.execute(
 		"INSERT INTO workers (name, kind, cert_fingerprint, created_at)
 		 VALUES (?1, ?2, ?3, ?4)",
-		params![name, kind.as_str(), cert_fingerprint, now],
+		params![name.expose(), kind.as_str(), cert_fingerprint, now],
 	)?;
+	Ok(conn.last_insert_rowid())
+}
+/// Initial administrator identity is a closed installation fact.
+pub(crate) fn insert_bootstrap_admin(
+	conn: &Connection, cert_fingerprint: &[u8], now: i64,
+) -> rusqlite::Result<i64> {
+	conn.execute("INSERT INTO workers (name,kind,cert_fingerprint,created_at) VALUES ('admin','admin',?1,?2)", params![cert_fingerprint, now])?;
 	Ok(conn.last_insert_rowid())
 }
 
 /// Look up a worker by certificate fingerprint. Returns `None` for
 /// unknown certs or revoked workers — the caller treats both as "deny".
-pub fn find_active_by_fingerprint(
+pub(crate) fn find_active_by_fingerprint(
 	conn: &Connection, cert_fingerprint: &[u8],
 ) -> rusqlite::Result<Option<WorkerRow>> {
 	conn.query_row(
@@ -57,7 +70,7 @@ pub fn find_active_by_fingerprint(
 	.optional()
 }
 
-pub fn revoke(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<bool> {
+pub(crate) fn revoke(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<bool> {
 	let n = conn.execute(
 		"UPDATE workers SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
 		params![now, id],
@@ -65,33 +78,41 @@ pub fn revoke(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<bool> {
 	Ok(n > 0)
 }
 
-pub fn touch_last_seen(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
+pub(crate) fn touch_last_seen(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
 	conn.execute("UPDATE workers SET last_seen_at = ?1 WHERE id = ?2", params![now, id])?;
 	Ok(())
 }
 
 fn row_to_worker(row: &rusqlite::Row) -> rusqlite::Result<WorkerRow> {
-	let kind_str: String = row.get(2)?;
-	let kind = match kind_str.as_str() {
+	let kind = match row.get_ref(2)?.as_str().map_err(|_| crate::review::invalid_scalar(2))? {
 		"worker" => WorkerKind::Worker,
 		"admin" => WorkerKind::Admin,
-		other => {
+		_ => {
 			return Err(rusqlite::Error::FromSqlConversionFailure(
 				2,
 				rusqlite::types::Type::Text,
-				format!("unknown worker kind: {other}").into(),
+				"invalid stored worker kind".into(),
 			))
 		},
 	};
 	Ok(WorkerRow {
 		id: row.get(0)?,
-		name: row.get(1)?,
+		name: crate::ingress::worker_name(row, 1)?,
 		kind,
 		cert_fingerprint: row.get(3)?,
 		created_at: row.get(4)?,
 		last_seen_at: row.get(5)?,
 		revoked_at: row.get(6)?,
 	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(
+		conn,
+		"workers",
+		"id,name,kind,cert_fingerprint,created_at,last_seen_at,revoked_at",
+		row_to_worker,
+	)
 }
 
 #[cfg(test)]
@@ -107,14 +128,22 @@ mod tests {
 	fn insert_and_lookup_round_trip() {
 		let db = open();
 		let id = db
-			.with_conn(|c| Ok(insert(c, "admin", WorkerKind::Admin, &[1u8; 32], 1_000)?))
+			.with_conn(|c| {
+				Ok(insert(
+					c,
+					&crate::test_support::text("admin").unwrap(),
+					WorkerKind::Admin,
+					&[1u8; 32],
+					1_000,
+				)?)
+			})
 			.unwrap();
 		let row = db
 			.with_conn(|c| Ok(find_active_by_fingerprint(c, &[1u8; 32])?))
 			.unwrap()
 			.expect("inserted worker should be found");
 		assert_eq!(row.id, id);
-		assert_eq!(row.name, "admin");
+		assert_eq!(row.name.expose(), "admin");
 		assert_eq!(row.kind, WorkerKind::Admin);
 		assert_eq!(row.cert_fingerprint, vec![1u8; 32]);
 	}
@@ -129,8 +158,17 @@ mod tests {
 	#[test]
 	fn revoked_worker_no_longer_resolves() {
 		let db = open();
-		let id =
-			db.with_conn(|c| Ok(insert(c, "w1", WorkerKind::Worker, &[2u8; 32], 1_000)?)).unwrap();
+		let id = db
+			.with_conn(|c| {
+				Ok(insert(
+					c,
+					&crate::test_support::text("w1").unwrap(),
+					WorkerKind::Worker,
+					&[2u8; 32],
+					1_000,
+				)?)
+			})
+			.unwrap();
 		let revoked = db.with_conn(|c| Ok(revoke(c, id, 2_000)?)).unwrap();
 		assert!(revoked);
 		let row = db.with_conn(|c| Ok(find_active_by_fingerprint(c, &[2u8; 32])?)).unwrap();
@@ -140,8 +178,17 @@ mod tests {
 	#[test]
 	fn touch_last_seen_updates_column() {
 		let db = open();
-		let id =
-			db.with_conn(|c| Ok(insert(c, "w1", WorkerKind::Worker, &[3u8; 32], 1_000)?)).unwrap();
+		let id = db
+			.with_conn(|c| {
+				Ok(insert(
+					c,
+					&crate::test_support::text("w1").unwrap(),
+					WorkerKind::Worker,
+					&[3u8; 32],
+					1_000,
+				)?)
+			})
+			.unwrap();
 		db.with_conn(|c| Ok(touch_last_seen(c, id, 5_000)?)).unwrap();
 		let row =
 			db.with_conn(|c| Ok(find_active_by_fingerprint(c, &[3u8; 32])?)).unwrap().unwrap();
@@ -151,9 +198,26 @@ mod tests {
 	#[test]
 	fn duplicate_fingerprint_is_rejected() {
 		let db = open();
-		db.with_conn(|c| Ok(insert(c, "w1", WorkerKind::Worker, &[7u8; 32], 1_000)?)).unwrap();
-		let result =
-			db.with_conn(|c| Ok(insert(c, "w2", WorkerKind::Worker, &[7u8; 32], 1_000).is_ok()));
+		db.with_conn(|c| {
+			Ok(insert(
+				c,
+				&crate::test_support::text("w1").unwrap(),
+				WorkerKind::Worker,
+				&[7u8; 32],
+				1_000,
+			)?)
+		})
+		.unwrap();
+		let result = db.with_conn(|c| {
+			Ok(insert(
+				c,
+				&crate::test_support::text("w2").unwrap(),
+				WorkerKind::Worker,
+				&[7u8; 32],
+				1_000,
+			)
+			.is_ok())
+		});
 		match result {
 			Ok(true) => panic!("UNIQUE constraint should have rejected dup fingerprint"),
 			Ok(false) => {},

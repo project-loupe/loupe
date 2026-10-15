@@ -1,0 +1,1 @@
+{"env":[[0,"\u0000\n--"],[1,"/home/other"],[2," /tmp"],[3,"path"]],"binds":[["some path","/target"]],"workdir":"/tmp/tree","program":"/bin/sh","args":["-c","printf x"]}

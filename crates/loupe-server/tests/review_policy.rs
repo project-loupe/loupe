@@ -1,3 +1,4 @@
+mod common;
 use loupe_server::review::policy::ReviewPolicy;
 use loupe_server::FileConfig;
 
@@ -5,7 +6,7 @@ use loupe_server::FileConfig;
 fn review_policy_defaults_and_snapshot_are_stable() {
 	let policy = ReviewPolicy::default();
 	policy.validate().unwrap();
-	let snapshot = policy.snapshot().unwrap();
+	let snapshot = common::stored_policy(&policy);
 	assert_eq!(
 		snapshot.expose(),
 		r#"{"campaign_deadline_seconds":21600,"campaign_handoff_reserve":2,"campaign_max_jobs":64,"drilldown_deadline_seconds":2700,"drilldown_submit_margin_seconds":420,"drilldown_token_budget":null,"max_attempts":3,"retry_backoff_base_seconds":60,"retry_backoff_cap_seconds":3600,"survey_deadline_seconds":1800,"survey_submit_margin_seconds":300,"survey_token_budget":null,"survey_units_per_job":4,"verify_deadline_seconds":3600,"verify_submit_margin_seconds":600,"verify_token_budget":null,"version":1}"#
@@ -37,7 +38,7 @@ fn server_snapshots_round_trip_through_storage_policy() {
 		survey_token_budget: Some(1000),
 		..ReviewPolicy::default()
 	};
-	let snapshot = policy.snapshot().unwrap();
+	let snapshot = common::stored_policy(&policy);
 	let decoded = loupe_storage::scheduler::CampaignPolicy::from_snapshot(&snapshot).unwrap();
 	assert_eq!(decoded.campaign_max_jobs, 19);
 	assert_eq!(decoded.campaign_handoff_reserve, 3);
@@ -45,8 +46,8 @@ fn server_snapshots_round_trip_through_storage_policy() {
 	assert_eq!(decoded.max_attempts, 5);
 	assert_eq!(decoded.survey_token_budget, Some(1000));
 	assert_eq!(
-		snapshot,
-		loupe_core::text::BoundedJson::new(&serde_json::to_string(&decoded).unwrap()).unwrap()
+		snapshot.canonical(),
+		loupe_core::canonical::canonical_bytes(&serde_json::to_value(&decoded).unwrap())
 	);
 }
 
@@ -124,7 +125,7 @@ fn review_toml_is_strict_and_uses_defaults() {
 		"[review]\nactive_jobs_total = 8",
 		"[review]\nsurvey_token_budget = 900\nverify_reserved_slots = 0",
 	] {
-		let config: FileConfig = toml::from_str(raw).unwrap();
+		let config: FileConfig = common::file_config(raw).unwrap();
 		let policy = config.review.resolve().unwrap();
 		assert_eq!(policy.survey_units_per_job, 4);
 	}
@@ -134,7 +135,7 @@ fn review_toml_is_strict_and_uses_defaults() {
 		"[review]\nsurvey_token_budget = -1",
 		"[review]\nlease_seconds = '600'",
 	] {
-		assert!(toml::from_str::<FileConfig>(raw).is_err(), "{raw}");
+		assert!(common::file_config(raw).is_err(), "{raw}");
 	}
 	for raw in [
 		"[review]\nsurvey_units_per_job = 33",
@@ -142,14 +143,14 @@ fn review_toml_is_strict_and_uses_defaults() {
 		"[review]\nlease_seconds = 1800",
 		"[review]\nverify_reserved_slots = 3",
 	] {
-		assert!(toml::from_str::<FileConfig>(raw).unwrap().review.resolve().is_err(), "{raw}");
+		assert!(common::file_config(raw).unwrap().review.resolve().is_err(), "{raw}");
 	}
 	assert!(FileConfig::default().review.resolve().unwrap().survey_token_budget.is_none());
 }
 
 #[test]
 fn review_section_accepts_known_policy_keys() {
-	let parsed = toml::from_str::<FileConfig>(
+	let parsed = common::file_config(
 		"[review]\nactive_jobs_per_repo = 4\nsurvey_units_per_job = 6\nlease_seconds = 500\n",
 	);
 	assert!(parsed.is_ok(), "review configuration must be accepted: {parsed:?}");

@@ -1,0 +1,19 @@
+{
+  "from": "loupe@example.test",
+  "to": [
+    "operator@example.test"
+  ],
+  "subject": "findings",
+  "finding": {
+    "scanner_id": "fixture",
+    "severity": "high",
+    "title": " title\nwords ",
+    "description": "details",
+    "fingerprint": "fixture",
+    "file_path": "src/lib.rs",
+    "line_start": 1,
+    "line_end": 2,
+    "poc_unified": "+ safe",
+    "patch_unified": "- before\n+ after"
+  }
+}

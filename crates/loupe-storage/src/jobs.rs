@@ -7,13 +7,14 @@
 
 use std::sync::LazyLock;
 
+use loupe_core::text::policy::{JobDiagnostic, RevisionText};
+use loupe_core::text::BoundedText;
 use loupe_core::{
 	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
 };
+use loupe_provenance::{Db as DbSource, Source};
 use rusqlite::types::Value;
-use rusqlite::{
-	params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
-};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
 /// Lease lifetime in seconds. Worker must heartbeat or complete before
 /// `lease_expires_at` or the reaper will reclaim the job.
@@ -27,7 +28,7 @@ pub const JOB_CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by admin";
 pub const LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR: &str = "lease expired after max attempts";
 
 /// Widen only when the runtime can authorize and finish the added kinds.
-pub const RUNTIME_KINDS: &[JobKind] = &[JobKind::Scan, JobKind::Verify];
+pub const RUNTIME_KINDS: &[JobKind<DbSource>] = &[JobKind::Scan, JobKind::Verify];
 
 fn runtime_kinds_sql() -> &'static str {
 	static SQL: LazyLock<String> = LazyLock::new(|| {
@@ -47,15 +48,16 @@ pub(crate) const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, sin
         scheduling_band, effective_priority, eligible_at, soft_deadline_at,
         hard_deadline_at, submit_by, token_budget, recipe, workflow_contract_version";
 
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
 	pub id: i64,
 	pub repo_id: i64,
-	pub kind: JobKind,
+	pub kind: JobKind<DbSource>,
 	pub state: JobState,
 	pub incremental: bool,
-	pub since_sha: Option<String>,
-	pub head_sha: Option<String>,
+	pub since_sha: Option<BoundedText<RevisionText, DbSource>>,
+	pub head_sha: Option<BoundedText<RevisionText, DbSource>>,
 	pub parent_job_id: Option<i64>,
 	pub target_finding_id: Option<i64>,
 	pub worker_id: Option<i64>,
@@ -64,7 +66,7 @@ pub struct JobRow {
 	pub enqueued_at: i64,
 	pub started_at: Option<i64>,
 	pub finished_at: Option<i64>,
-	pub error: Option<String>,
+	pub error: Option<BoundedText<JobDiagnostic, DbSource>>,
 	pub campaign_id: Option<i64>,
 	pub generation_id: Option<i64>,
 	pub assigned_lead_id: Option<i64>,
@@ -76,33 +78,138 @@ pub struct JobRow {
 	pub hard_deadline_at: Option<i64>,
 	pub submit_by: Option<i64>,
 	pub token_budget: Option<u64>,
-	pub recipe: Option<loupe_core::text::BoundedJson<loupe_core::text::policy::Payload>>,
+	pub recipe: Option<loupe_core::text::BoundedJson<loupe_core::text::policy::Payload, DbSource>>,
 	pub workflow_contract_version: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct LeaseIdentity<'a> {
 	pub job_id: i64,
 	pub worker_id: i64,
 	pub capability_hash: &'a [u8],
 }
+impl std::fmt::Debug for LeaseIdentity<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("LeaseIdentity")
+			.field("job_id", &self.job_id)
+			.field("worker_id", &self.worker_id)
+			.field("capability_hash", &"[redacted]")
+			.finish()
+	}
+}
 
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone, Copy)]
 pub struct ActiveLease<'a> {
 	pub identity: LeaseIdentity<'a>,
 	pub now: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct NewJob {
-	pub repo_id: i64,
-	pub kind: JobKind,
+/// Operator work input. Repository authority comes only from the scope.
+pub struct QueuedJob<S: Source> {
+	pub kind: JobKind<S>,
 	pub incremental: bool,
-	pub since_sha: Option<String>,
+	pub since_sha: Option<BoundedText<RevisionText, S>>,
 	pub parent_job_id: Option<i64>,
 	pub target_finding_id: Option<i64>,
 }
 
+pub fn get(scope: &crate::scope::RepoScope<'_>, id: i64) -> crate::Result<Option<JobRow>> {
+	Ok(scope
+		.conn
+		.query_row(
+			&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id=?1 AND repo_id=?2"),
+			params![id, scope.repo_id],
+			row_to_job,
+		)
+		.optional()?)
+}
+
+pub fn enqueue<S: Source>(
+	scope: &crate::scope::RepoScope<'_>, new: &QueuedJob<S>, now: i64,
+) -> crate::Result<i64> {
+	scope.require_operator()?;
+	if let Some(parent) = new.parent_job_id
+		&& get(scope, parent)?.is_none()
+	{
+		return Err(crate::Error::ScopeDenied);
+	}
+	if let Some(target) = new.target_finding_id
+		&& crate::findings::get(scope, target)?.is_none()
+	{
+		return Err(crate::Error::ScopeDenied);
+	}
+	enqueue_raw(
+		scope.conn,
+		&NewJob {
+			repo_id: scope.repo_id,
+			kind: new.kind.clone(),
+			incremental: new.incremental,
+			since_sha: new.since_sha.clone(),
+			parent_job_id: new.parent_job_id,
+			target_finding_id: new.target_finding_id,
+		},
+		now,
+	)
+}
+
+pub fn catalog<S: Source>(
+	db: &crate::Db, _operator: &loupe_provenance::Ingress<loupe_provenance::Operator>,
+	filter: &JobFilter<S>,
+) -> crate::Result<Vec<JobRow>> {
+	db.with_conn(|conn| Ok(list(conn, filter)?))
+}
+
+/// Preliminary authentication facts; authority is rechecked by the issuer.
+pub fn active_lease_facts(
+	db: &crate::Db, worker: i64, hash: &[u8], now: i64,
+) -> crate::Result<Option<JobRow>> {
+	db.with_conn(|conn| Ok(get_active_by_capability_hash(conn, worker, hash, now)?))
+}
+
+pub fn extend_lease(
+	scope: &crate::scope::AssignmentScope<'_>, seconds: i64,
+) -> crate::Result<Option<i64>> {
+	heartbeat(
+		scope.repo.conn,
+		scope.job.id,
+		scope.lease.identity.worker_id,
+		scope.lease.now,
+		seconds,
+		scope.lease.identity.capability_hash,
+	)
+	.map_err(Into::into)
+}
+
+pub fn has_verdict(scope: &crate::scope::AssignmentScope<'_>) -> crate::Result<bool> {
+	Ok(scope.repo.conn.query_row("SELECT EXISTS(SELECT 1 FROM finding_verifications v JOIN findings f ON f.id=v.finding_id WHERE v.job_id=?1 AND f.repo_id=?2)", params![scope.job.id,scope.repo.repo_id], |row| row.get(0))?)
+}
+
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
+#[derive(Debug)]
+pub(crate) struct NewJob<S: Source> {
+	pub repo_id: i64,
+	pub kind: JobKind<S>,
+	pub incremental: bool,
+	pub since_sha: Option<BoundedText<RevisionText, S>>,
+	pub parent_job_id: Option<i64>,
+	pub target_finding_id: Option<i64>,
+}
+
+impl<S: Source> Clone for NewJob<S> {
+	fn clone(&self) -> Self {
+		Self {
+			repo_id: self.repo_id,
+			kind: self.kind.clone(),
+			incremental: self.incremental,
+			since_sha: self.since_sha.clone(),
+			parent_job_id: self.parent_job_id,
+			target_finding_id: self.target_finding_id,
+		}
+	}
+}
+
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelOutcome {
 	Cancelled(Box<JobRow>),
@@ -111,6 +218,7 @@ pub enum CancelOutcome {
 	UnsupportedKind,
 }
 
+// debug-ok: retry conflicts are composed only from fixed host phrases, integer IDs and closed job states; JobRow redacts content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryOutcome {
 	Retried(Box<JobRow>),
@@ -120,10 +228,12 @@ pub enum RetryOutcome {
 }
 
 /// Insert a `queued` job, returning the new id.
-pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> {
+pub(crate) fn enqueue_raw<S: Source>(
+	conn: &Connection, new: &NewJob<S>, now: i64,
+) -> crate::Result<i64> {
 	// NewJob is also the public legacy input, so enforce this at runtime.
 	// Match the enum, not its text: Unknown("scan") is still unknown.
-	if !RUNTIME_KINDS.contains(&new.kind) {
+	if !matches!(new.kind, JobKind::Scan | JobKind::Verify) {
 		return Err(
 			loupe_core::text::Error::new("job_kind", loupe_core::text::Rule::Identifier).into()
 		);
@@ -140,7 +250,7 @@ pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> 
 			new.kind.as_str(),
 			initial_state.as_str(),
 			new.incremental as i64,
-			new.since_sha,
+			new.since_sha.as_ref().map(BoundedText::expose),
 			new.parent_job_id,
 			new.target_finding_id,
 			now,
@@ -152,7 +262,7 @@ pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> crate::Result<i64> 
 /// Extend a lease. Returns `Ok(None)` if the job isn't currently and
 /// actively leased to `worker_id` (which means the caller's token is
 /// stale and they should drop the work).
-pub fn heartbeat(
+pub(crate) fn heartbeat(
 	conn: &Connection, job_id: i64, worker_id: i64, now: i64, lease_seconds: i64,
 	job_capability_hash: &[u8],
 ) -> rusqlite::Result<Option<i64>> {
@@ -176,9 +286,10 @@ pub fn heartbeat(
 
 /// Mark a leased job as complete. Caller picks the new state
 /// (`succeeded` or `failed`).
-pub fn complete(
-	conn: &Connection, lease: LeaseIdentity<'_>, new_state: JobState, head_sha: Option<&str>,
-	error: Option<&str>, now: i64,
+pub(crate) fn complete<RevisionS: Source, DiagnosticS: Source>(
+	conn: &Connection, lease: LeaseIdentity<'_>, new_state: JobState,
+	head_sha: Option<&BoundedText<RevisionText, RevisionS>>,
+	error: Option<&BoundedText<JobDiagnostic, DiagnosticS>>, now: i64,
 ) -> rusqlite::Result<bool> {
 	let transition = match new_state {
 		JobState::Succeeded => JobTransition::CompleteSucceeded,
@@ -208,8 +319,8 @@ pub fn complete(
 		),
 		params![
 			target_state.as_str(),
-			head_sha,
-			error,
+			head_sha.map(BoundedText::expose),
+			error.map(BoundedText::expose),
 			now,
 			lease.job_id,
 			JobState::Leased.as_str(),
@@ -224,9 +335,11 @@ pub fn complete(
 /// Cancel queued or leased work. Scan jobs may have inserted pending
 /// findings while leased; remove those so a later scan retry is not
 /// blocked by fingerprint deduplication.
-pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<CancelOutcome> {
-	let tx = conn.transaction()?;
-	let Some(row) = get(&tx, job_id)? else { return Ok(CancelOutcome::NotFound) };
+pub(crate) fn cancel(
+	conn: &mut Connection, job_id: i64, now: i64,
+) -> rusqlite::Result<CancelOutcome> {
+	let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+	let Some(row) = get_raw(&tx, job_id)? else { return Ok(CancelOutcome::NotFound) };
 	if !RUNTIME_KINDS.contains(&row.kind) {
 		return Ok(CancelOutcome::UnsupportedKind);
 	}
@@ -244,24 +357,27 @@ pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<
 		       job_capability_hash = NULL,
 		       finished_at = ?3,
 		       error = ?4
-		 WHERE id = ?1 AND state IN ('queued','leased') AND kind IN ({})",
+		 WHERE id = ?1 AND repo_id=?5 AND state IN ('queued','leased') AND kind IN ({})",
 			runtime_kinds_sql()
 		),
-		(job_id, target_state.as_str(), now, JOB_CANCELLED_BY_ADMIN_ERROR),
+		(job_id, target_state.as_str(), now, JOB_CANCELLED_BY_ADMIN_ERROR, row.repo_id),
 	)?;
 	if updated == 0 {
-		let state = get(&tx, job_id)?.map(|row| row.state).unwrap_or(JobState::Cancelled);
+		let state = get_raw(&tx, job_id)?.map(|row| row.state).unwrap_or(JobState::Cancelled);
 		return Ok(CancelOutcome::NotCancellable(state));
 	}
 	if row.kind == JobKind::Scan {
-		crate::findings::delete_pending_for_job(&tx, job_id)?;
+		tx.execute(
+			"DELETE FROM findings WHERE job_id=?1 AND repo_id=?2 AND state='pending'",
+			params![job_id, row.repo_id],
+		)?;
 	}
-	let row = get(&tx, job_id)?.expect("cancelled job row still exists");
+	let row = get_raw(&tx, job_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
 	tx.commit()?;
 	Ok(CancelOutcome::Cancelled(Box::new(row)))
 }
 
-pub fn enqueue_verify_jobs_for_scan(
+pub(crate) fn enqueue_verify_jobs_for_scan(
 	conn: &Connection, repo_id: i64, scan_job_id: i64, now: i64,
 ) -> rusqlite::Result<usize> {
 	let initial_state =
@@ -272,11 +388,11 @@ pub fn enqueue_verify_jobs_for_scan(
 		    target_finding_id, enqueued_at)
 		 SELECT ?1, ?2, ?3, 0, ?4, id, ?5
 		 FROM findings
-		 WHERE job_id = ?4 AND state = ?6
+		 WHERE job_id = ?4 AND repo_id=?1 AND state = ?6
 		   AND EXISTS (SELECT 1 FROM jobs WHERE id = ?4 AND repo_id = ?1 AND kind = 'scan')",
 		params![
 			repo_id,
-			JobKind::Verify.as_str(),
+			JobKind::<DbSource>::Verify.as_str(),
 			initial_state.as_str(),
 			scan_job_id,
 			now,
@@ -285,11 +401,11 @@ pub fn enqueue_verify_jobs_for_scan(
 	)
 }
 
-pub fn retry_failed(
+pub(crate) fn retry_failed(
 	conn: &mut Connection, job_id: i64, now: i64, validating_deadline: i64,
 ) -> rusqlite::Result<RetryOutcome> {
-	let tx = conn.transaction()?;
-	let Some(row) = get(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
+	let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+	let Some(row) = get_raw(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
 	if !RUNTIME_KINDS.contains(&row.kind) {
 		return Ok(RetryOutcome::UnsupportedKind);
 	}
@@ -302,11 +418,14 @@ pub fn retry_failed(
 				"verify job {job_id} has no target finding"
 			)));
 		};
-		let Some(finding) = crate::findings::get(&tx, finding_id)? else {
+		let Some(finding) = crate::findings::get_raw(&tx, finding_id)? else {
 			return Ok(RetryOutcome::Conflict(format!(
 				"verify job {job_id} target finding {finding_id} no longer exists"
 			)));
 		};
+		if finding.repo_id != row.repo_id {
+			return Ok(RetryOutcome::Conflict("verify target repository mismatch".into()));
+		}
 		match finding.state {
 			FindingState::Validating => {},
 			FindingState::Dismissed => {
@@ -345,22 +464,23 @@ pub fn retry_failed(
 				"verify job {job_id} target finding {finding_id} already has active verify job {active_verify}"
 			)));
 		}
-		if !crate::findings::retry_verification(&tx, finding_id, validating_deadline)? {
+		if !crate::findings::retry_verification(&tx, row.repo_id, finding_id, validating_deadline)?
+		{
 			return Ok(RetryOutcome::Conflict(format!(
 				"verify job {job_id} target finding {finding_id} changed before retry"
 			)));
 		}
 	}
 
-	let Some(row) = requeue_failed(&tx, job_id, now)? else {
+	let Some(row) = requeue_failed(&tx, row.repo_id, job_id, now)? else {
 		return Ok(RetryOutcome::Conflict(format!("job {job_id} changed before retry")));
 	};
 	tx.commit()?;
 	Ok(RetryOutcome::Retried(Box::new(row)))
 }
 
-pub fn requeue_failed(
-	conn: &Connection, job_id: i64, now: i64,
+pub(crate) fn requeue_failed(
+	conn: &Connection, repo_id: i64, job_id: i64, now: i64,
 ) -> rusqlite::Result<Option<JobRow>> {
 	let target_state =
 		JobState::Failed.apply(JobTransition::Retry).map_err(sql_state_transition_error)?;
@@ -377,19 +497,24 @@ pub fn requeue_failed(
 		       error = NULL,
 		       head_sha = NULL,
 		       enqueued_at = ?2
-		 WHERE id = ?3 AND state = ?4
+		 WHERE id = ?3 AND state = ?4 AND repo_id=?5
 		   AND kind IN ({})",
 			runtime_kinds_sql()
 		),
-		(target_state.as_str(), now, job_id, JobState::Failed.as_str()),
+		(target_state.as_str(), now, job_id, JobState::Failed.as_str(), repo_id),
 	)?;
 	if updated == 0 {
 		return Ok(None);
 	}
-	get(conn, job_id)
+	conn.query_row(
+		&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id=?1 AND repo_id=?2"),
+		params![job_id, repo_id],
+		row_to_job,
+	)
+	.optional()
 }
 
-pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
+pub(crate) fn get_raw(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	conn.query_row(
 		&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
 		params![id],
@@ -398,23 +523,34 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	.optional()
 }
 
-/// Optional narrowing for [`list`]. `Default` means "everything, newest
-/// first" — the historical behaviour.
+/// Optional narrowing for job listings. `Default` means "everything, newest
+/// first".
 ///
 /// `states` is a set rather than a single value because the useful
 /// grouping for an operator is "finished", which spans three states.
 /// Asking for them together is one query against the shared connection
 /// instead of three.
-#[derive(Debug, Clone, Default)]
-pub struct JobFilter {
+// debug-ok: content members delegate to redacted typed owners; other members are numeric identifiers or closed states.
+#[derive(Debug)]
+pub struct JobFilter<S: Source> {
 	/// Empty means "any state".
 	pub states: Vec<JobState>,
-	pub kind: Option<JobKind>,
+	pub kind: Option<JobKind<S>>,
 	pub limit: Option<i64>,
+}
+impl<S: Source> Clone for JobFilter<S> {
+	fn clone(&self) -> Self {
+		Self { states: self.states.clone(), kind: self.kind.clone(), limit: self.limit }
+	}
+}
+impl<S: Source> Default for JobFilter<S> {
+	fn default() -> Self {
+		Self { states: Vec::new(), kind: None, limit: None }
+	}
 }
 
 /// Resolve an opaque capability to its one exact, live lease.
-pub fn get_active_by_capability_hash(
+pub(crate) fn get_active_by_capability_hash(
 	conn: &Connection, worker_id: i64, job_capability_hash: &[u8], now: i64,
 ) -> rusqlite::Result<Option<JobRow>> {
 	conn.query_row(
@@ -437,11 +573,12 @@ pub fn get_active_by_capability_hash(
 /// Run a mutation in one transaction tied to the exact lease the
 /// caller previously authorized. Returning `None` means that lease is
 /// no longer active and the mutation was not run.
-pub fn with_active_lease_transaction<T>(
+#[cfg(test)]
+pub(crate) fn with_active_lease_transaction<T>(
 	conn: &mut Connection, lease: ActiveLease<'_>,
 	mutate: impl FnOnce(&Transaction<'_>, &JobRow) -> crate::Result<T>,
 ) -> crate::Result<Option<T>> {
-	let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+	let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 	let Some(row) = get_active_by_capability_hash(
 		&tx,
 		lease.identity.worker_id,
@@ -459,7 +596,9 @@ pub fn with_active_lease_transaction<T>(
 	Ok(Some(value))
 }
 
-pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRow>> {
+pub(crate) fn list<S: Source>(
+	conn: &Connection, filter: &JobFilter<S>,
+) -> rusqlite::Result<Vec<JobRow>> {
 	let mut clauses: Vec<String> = Vec::new();
 	let mut args: Vec<Value> = Vec::new();
 
@@ -502,7 +641,9 @@ pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRo
 /// Count scan jobs for `repo_id` that are still queued or leased.
 /// Used by the scheduler to avoid piling up duplicate scans for the
 /// same repo.
-pub fn count_active_scans_for_repo(conn: &Connection, repo_id: i64) -> rusqlite::Result<i64> {
+pub(crate) fn count_active_scans_for_repo(
+	conn: &Connection, repo_id: i64,
+) -> rusqlite::Result<i64> {
 	conn.query_row(
 		"SELECT COUNT(*) FROM jobs
 		 WHERE repo_id = ?1 AND kind = 'scan' AND state IN ('queued','leased')",
@@ -515,7 +656,8 @@ pub fn count_active_scans_for_repo(conn: &Connection, repo_id: i64) -> rusqlite:
 /// on `repo_id`. Used by server-side prior-finding routes so a worker
 /// can only search/read finding history for the repo it is actively
 /// scanning or verifying.
-pub fn worker_has_active_lease_for_repo(
+#[cfg(test)]
+pub(crate) fn worker_has_active_lease_for_repo(
 	conn: &Connection, worker_id: i64, repo_id: i64, now: i64,
 ) -> rusqlite::Result<bool> {
 	let found: i64 = conn.query_row(
@@ -540,44 +682,63 @@ pub fn worker_has_active_lease_for_repo(
 /// Reap leases that have expired. For each, transitions back to
 /// `queued` if `attempts < MAX_ATTEMPTS`, else `failed` with an error
 /// message. Returns the number of rows affected.
-pub fn reap_stale_leases(conn: &mut Connection, now: i64) -> crate::Result<usize> {
+pub(crate) fn reap_stale_leases(conn: &mut Connection, now: i64) -> crate::Result<usize> {
 	// Legacy rows first, in their own transaction: their liveness must never
 	// depend on the health of any campaign row.
 	let legacy = crate::transaction::immediate(conn, |tx| reap_legacy(tx, now))?;
 	let campaign_jobs = conn
 		.prepare(
-			"SELECT id FROM jobs
+			"SELECT id,repo_id FROM jobs
 			 WHERE campaign_id IS NOT NULL AND state = 'leased' AND lease_expires_at < ?1
 			   AND kind IN ('survey','drilldown','verify')",
 		)?
-		.query_map([now], |r| r.get::<_, i64>(0))?
+		.query_map([now], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
 		.collect::<rusqlite::Result<Vec<_>>>()?;
-	let error = loupe_core::text::BoundedText::new(LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR)?;
 	let mut reaped = legacy;
-	for id in campaign_jobs {
-		// One transaction per job so a single undecidable row (for example a
-		// policy snapshot this binary cannot read) cannot stall the others.
-		let outcome = crate::transaction::immediate(conn, |tx| {
-			crate::scheduler::retry_or_fail(tx, id, now, &error)
-		});
-		match outcome {
-			Ok(_) => reaped += 1,
-			Err(cause) => {
-				let message = format!("reaper could not decide a retry: {cause}");
-				let failed = crate::transaction::immediate(conn, |tx| {
-					Ok(tx.execute(
-						"UPDATE jobs
-						   SET state = 'failed', error = ?2, finished_at = ?3, worker_id = NULL,
-						       lease_expires_at = NULL, job_capability_hash = NULL
-						 WHERE id = ?1 AND state = 'leased'",
-						params![id, message, now],
-					)?)
-				})?;
-				reaped += failed;
-			},
-		}
+	for (id, repo) in campaign_jobs {
+		reaped += reap_campaign_selection(conn, id, repo, now)?;
 	}
 	Ok(reaped)
+}
+
+fn reap_campaign_selection(
+	conn: &mut Connection, id: i64, repo: i64, now: i64,
+) -> crate::Result<usize> {
+	// One transaction per job so a single undecidable row (for example a
+	// policy snapshot this binary cannot read) cannot stall the others.
+	let outcome = crate::transaction::immediate(conn, |tx| {
+		let eligible: bool = tx.query_row(
+				"SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND repo_id=?2 AND campaign_id IS NOT NULL AND state='leased' AND lease_expires_at<?3 AND kind IN ('survey','drilldown','verify'))",
+				params![id,repo,now], |row| row.get(0))?;
+		if !eligible {
+			return Ok(false);
+		}
+		crate::scheduler::retry_or_fail(
+			tx,
+			id,
+			now,
+			crate::scheduler::FailureReason::<DbSource>::LeaseExpired,
+		)?;
+		Ok(true)
+	});
+	match outcome {
+		Ok(reaped) => Ok(usize::from(reaped)),
+		Err(cause) => {
+			let message = format!("reaper could not decide a retry: {cause}");
+			let failed = crate::transaction::immediate(conn, |tx| {
+				Ok(tx.execute(
+					"UPDATE jobs
+						   SET state = 'failed', error = ?2, finished_at = ?3, worker_id = NULL,
+						       lease_expires_at = NULL, job_capability_hash = NULL
+						 WHERE id = ?1 AND repo_id=?4 AND state = 'leased'
+						   AND campaign_id IS NOT NULL AND lease_expires_at<?3
+						   AND kind IN ('survey','drilldown','verify')",
+					params![id, message, now, repo],
+				)?)
+			})?;
+			Ok(failed)
+		},
+	}
 }
 
 fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
@@ -587,14 +748,16 @@ fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 		JobState::Leased.apply(JobTransition::ReapToFailed).map_err(sql_state_transition_error)?;
 	let failing_scan_jobs = {
 		let mut stmt = conn.prepare(
-			"SELECT id FROM jobs
+			"SELECT id,repo_id FROM jobs
 			 WHERE kind = 'scan'
 			   AND campaign_id IS NULL
 			   AND state = 'leased'
 			   AND lease_expires_at < ?1
 			   AND attempts >= ?2",
 		)?;
-		let rows = stmt.query_map(params![now, MAX_ATTEMPTS], |r| r.get::<_, i64>(0))?;
+		let rows = stmt.query_map(params![now, MAX_ATTEMPTS], |r| {
+			Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+		})?;
 		rows.collect::<rusqlite::Result<Vec<_>>>()?
 	};
 	let requeued = conn.execute(
@@ -632,8 +795,8 @@ fn reap_legacy(conn: &Transaction<'_>, now: i64) -> crate::Result<usize> {
 		),
 		params![now, MAX_ATTEMPTS, failed_state.as_str(), LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR],
 	)?;
-	for job_id in failing_scan_jobs {
-		crate::findings::delete_pending_for_job(conn, job_id)?;
+	for (job_id, repo_id) in failing_scan_jobs {
+		crate::findings::delete_pending_for_job(conn, repo_id, job_id)?;
 	}
 	Ok(requeued + failed)
 }
@@ -643,20 +806,16 @@ fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
 }
 
 pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
-	let kind_str: String = row.get(2)?;
-	let state_str: String = row.get(3)?;
-	let kind = kind_str.parse::<JobKind>().expect("infallible kind parser");
-	let state = state_str.parse::<JobState>().map_err(|e| {
-		rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into())
-	})?;
+	let kind = crate::ingress::job_kind(row, 2)?;
+	let state = crate::review::parsed(row, 3)?;
 	Ok(JobRow {
 		id: row.get(0)?,
 		repo_id: row.get(1)?,
 		kind,
 		state,
 		incremental: row.get::<_, i64>(4)? != 0,
-		since_sha: row.get(5)?,
-		head_sha: row.get(6)?,
+		since_sha: crate::ingress::optional_revision(row, 5)?,
+		head_sha: crate::ingress::optional_revision(row, 6)?,
 		parent_job_id: row.get(7)?,
 		target_finding_id: row.get(8)?,
 		worker_id: row.get(9)?,
@@ -665,7 +824,7 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		enqueued_at: row.get(12)?,
 		started_at: row.get(13)?,
 		finished_at: row.get(14)?,
-		error: row.get(15)?,
+		error: crate::ingress::optional_diagnostic(row, 15)?,
 		campaign_id: row.get(16)?,
 		generation_id: row.get(17)?,
 		assigned_lead_id: row.get(18)?,
@@ -677,13 +836,39 @@ pub(crate) fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		hard_deadline_at: row.get(24)?,
 		submit_by: row.get(25)?,
 		token_budget: row.get(26)?,
-		recipe: crate::review::optional(row, 27)?,
+		recipe: crate::ingress::optional_db_payload(row, 27)?,
 		workflow_contract_version: row.get(28)?,
+	})
+}
+
+pub(crate) fn validate_stored_rows(conn: &Connection) -> crate::Result<()> {
+	crate::migrations::admission::scan(conn, "jobs", JOB_COLUMNS, |row| {
+		let job = row_to_job(row)?;
+		// Campaign summaries consume kinds as JSON leaves, including registered
+		// future kinds. Use the same projection instead of a closed kind list.
+		if job.campaign_id.is_some() {
+			crate::ingress::count_json_leaf(row, 2)?;
+		}
+		Ok::<_, rusqlite::Error>(())
+	})?;
+	crate::migrations::admission::scan(conn, "jobs", "job_capability_hash", |_| {
+		Ok::<_, rusqlite::Error>(())
 	})
 }
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn lease_debug_never_discloses_capability_hash() {
+		let hash = [77; 32];
+		let lease = super::ActiveLease {
+			identity: super::LeaseIdentity { job_id: 12, worker_id: 34, capability_hash: &hash },
+			now: 56,
+		};
+		let debug = format!("{lease:?}");
+		assert!(!debug.contains("77, 77"), "lease Debug must redact capability bytes");
+		assert!(debug.contains("12") && debug.contains("34"), "safe identifiers remain useful");
+	}
 	use std::sync::atomic::{AtomicU64, Ordering};
 
 	use loupe_core::{Finding, ReportingDestination, Severity};
@@ -696,16 +881,75 @@ mod tests {
 
 	static NEXT_TEST_CAPABILITY: AtomicU64 = AtomicU64::new(1);
 
+	#[test]
+	fn scope_safety_reaper_fallback_cannot_revoke_a_renewed_selection() {
+		let db = crate::review_tests::fixture();
+		db.with_conn(|conn| {
+			conn.execute("UPDATE jobs SET state='leased',lease_expires_at=1000 WHERE id=101", [])?;
+			assert_eq!(
+				reap_campaign_selection(conn, 101, 1, 2)?,
+				0,
+				"fallback must recheck the selected lease after a renewal"
+			);
+			assert_eq!(get_raw(conn, 101)?.unwrap().state, JobState::Leased);
+			Ok(())
+		})
+		.unwrap();
+	}
+
+	#[test]
+	fn new_job_clone_needs_only_source_and_preserves_all_fields() {
+		fn cloned<S: Source>(value: &NewJob<S>) -> NewJob<S> {
+			value.clone()
+		}
+
+		let original = NewJob {
+			repo_id: 7,
+			kind: JobKind::Unknown(crate::test_support::text("future-job").unwrap()),
+			incremental: true,
+			since_sha: Some(crate::test_support::text("base-revision").unwrap()),
+			parent_job_id: Some(11),
+			target_finding_id: Some(13),
+		};
+		let copy = cloned(&original);
+		assert_eq!(copy.repo_id, original.repo_id);
+		assert_eq!(copy.kind, original.kind);
+		assert_eq!(copy.incremental, original.incremental);
+		assert_eq!(copy.since_sha, original.since_sha);
+		assert_eq!(copy.parent_job_id, original.parent_job_id);
+		assert_eq!(copy.target_finding_id, original.target_finding_id);
+	}
+
+	#[test]
+	fn job_filter_clone_needs_only_source_and_preserves_all_fields() {
+		fn cloned<S: Source>(value: &JobFilter<S>) -> JobFilter<S> {
+			value.clone()
+		}
+
+		let original = JobFilter {
+			states: vec![JobState::Failed, JobState::Succeeded],
+			kind: Some(JobKind::Unknown(crate::test_support::text("future-filter").unwrap())),
+			limit: Some(17),
+		};
+		let copy = cloned(&original);
+		assert_eq!(copy.states, original.states);
+		assert_eq!(copy.kind, original.kind);
+		assert_eq!(copy.limit, original.limit);
+	}
+
 	fn lease(
 		conn: &mut Connection, worker_id: i64, accepts_verify: bool, now: i64, lease_seconds: i64,
 	) -> crate::Result<Option<JobRow>> {
 		let mut hash = [0u8; 32];
 		hash[..8]
 			.copy_from_slice(&NEXT_TEST_CAPABILITY.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-		let kinds =
-			if accepts_verify { vec![JobKind::Scan, JobKind::Verify] } else { vec![JobKind::Scan] };
+		let kinds = if accepts_verify {
+			vec![JobKind::<loupe_provenance::Db>::Scan, JobKind::<loupe_provenance::Db>::Verify]
+		} else {
+			vec![JobKind::<loupe_provenance::Db>::Scan]
+		};
 		crate::transaction::immediate(conn, |tx| {
-			crate::scheduler::claim(
+			crate::scheduler::claim_raw(
 				tx,
 				&crate::scheduler::ClaimRequest {
 					worker_id,
@@ -738,12 +982,14 @@ mod tests {
 		head_sha: Option<&str>, error: Option<&str>, now: i64,
 	) -> rusqlite::Result<bool> {
 		let hash = active_capability_hash(conn, job_id)?;
-		super::complete(
+		let head_sha = head_sha.map(|raw| crate::test_support::text(raw).unwrap());
+		let error = error.map(|raw| crate::test_support::text(raw).unwrap());
+		super::complete::<loupe_provenance::Agent, loupe_provenance::Agent>(
 			conn,
 			LeaseIdentity { job_id, worker_id, capability_hash: &hash },
 			new_state,
-			head_sha,
-			error,
+			head_sha.as_ref(),
+			error.as_ref(),
 			now,
 		)
 	}
@@ -757,16 +1003,17 @@ mod tests {
 				Ok(repos::insert(
 					c,
 					&NewRepo {
-						clone_url: "https://github.com/a/b.git".into(),
-						host: "github.com".into(),
-						owner: "a".into(),
-						repo: "b".into(),
+						clone_url: crate::test_support::db_text("https://github.com/a/b.git")
+							.unwrap(),
+						host: crate::test_support::db_text("github.com").unwrap(),
+						owner: crate::test_support::db_text("a").unwrap(),
+						repo: crate::test_support::db_text("b").unwrap(),
 						default_branch: None,
 						scan_interval_seconds: None,
-						scanner_config: serde_json::Value::Null,
+						scanner_config: crate::test_support::scanner(serde_json::Value::Null),
 						reporting: ReportingDestination::GithubIssue {
-							target_owner: "a".into(),
-							target_repo: "t".into(),
+							target_owner: crate::test_support::db_text("a").unwrap(),
+							target_repo: crate::test_support::db_text("t").unwrap(),
 							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
@@ -777,14 +1024,22 @@ mod tests {
 			})
 			.unwrap();
 		let worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w1", WorkerKind::Worker, &[1u8; 32], 0)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w1").unwrap(),
+					WorkerKind::Worker,
+					&[1u8; 32],
+					0,
+				)?)
+			})
 			.unwrap();
 		(db, repo_id, worker_id)
 	}
 
-	fn enqueue_job(db: &Db, repo_id: i64, kind: JobKind, at: i64) -> i64 {
+	fn enqueue_job(db: &Db, repo_id: i64, kind: JobKind<loupe_provenance::Db>, at: i64) -> i64 {
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
@@ -800,7 +1055,9 @@ mod tests {
 		.unwrap()
 	}
 
-	fn listed(db: &Db, filter: &JobFilter) -> Vec<(i64, JobState, JobKind)> {
+	fn listed(
+		db: &Db, filter: &JobFilter<loupe_provenance::Db>,
+	) -> Vec<(i64, JobState, JobKind<loupe_provenance::Db>)> {
 		db.with_conn(|c| Ok(list(c, filter)?))
 			.unwrap()
 			.into_iter()
@@ -811,18 +1068,18 @@ mod tests {
 	#[test]
 	fn future_kind_is_readable_without_breaking_other_jobs() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
-		enqueue_job(&db, repo_id, JobKind::Scan, 1);
+		enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 1);
 		db.with_conn(|c| {
 			c.execute("INSERT INTO job_kinds VALUES ('future', 0)", [])?;
 			c.execute("INSERT INTO jobs (repo_id, kind, state, enqueued_at) VALUES (?1, 'future', 'queued', 2)", [repo_id])?;
-			let rows = list(c, &JobFilter::default());
+			let rows = list(c, &JobFilter::<loupe_provenance::Db>::default());
 			assert!(rows.is_ok(), "one future kind must not break listing: {rows:?}");
 			let rows = rows.unwrap();
 			assert_eq!(rows.len(), 2);
 			assert_eq!(rows[0].kind.as_str(), "future");
-			assert_eq!(get(c, rows[0].id)?.unwrap(), rows[0]);
-			assert_eq!(rows[1].kind, JobKind::Scan);
-			assert_eq!(lease(c, worker_id, true, 10, 100)?.unwrap().kind, JobKind::Scan);
+			assert_eq!(get_raw(c, rows[0].id)?.unwrap(), rows[0]);
+			assert_eq!(rows[1].kind, JobKind::<loupe_provenance::Db>::Scan);
+			assert_eq!(lease(c, worker_id, true, 10, 100)?.unwrap().kind, JobKind::<loupe_provenance::Db>::Scan);
 			assert!(lease(c, worker_id, true, 10, 100)?.is_none());
 			Ok(())
 		}).unwrap();
@@ -835,19 +1092,21 @@ mod tests {
 			for raw in ["future", "scan", "verify", "survey", "drilldown"] {
 				let new = NewJob {
 					repo_id,
-					kind: JobKind::Unknown(raw.into()),
+					kind: JobKind::<loupe_provenance::Db>::Unknown(
+						crate::test_support::db_text(raw).unwrap(),
+					),
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
 					target_finding_id: None,
 				};
-				let result = enqueue(c, &new, 0);
+				let result = enqueue_raw(c, &new, 0);
 				assert!(
 					matches!(result, Err(crate::Error::Validation(_))),
 					"unsupported kinds are validation errors"
 				);
 			}
-			assert!(list(c, &JobFilter::default())?.is_empty());
+			assert!(list(c, &JobFilter::<loupe_provenance::Db>::default())?.is_empty());
 			Ok(())
 		})
 		.unwrap();
@@ -879,10 +1138,10 @@ mod tests {
 					!matches!(cancel(c, id, 10)?, CancelOutcome::Cancelled(_)),
 					"unsupported phase must not be cancelled with legacy semantics"
 				);
-				assert_eq!(get(c, id)?.unwrap().state, JobState::Leased);
+				assert_eq!(get_raw(c, id)?.unwrap().state, JobState::Leased);
 				c.execute("UPDATE jobs SET state = 'failed' WHERE id = ?1", [id])?;
 				assert!(matches!(retry_failed(c, id, 10, 100)?, RetryOutcome::UnsupportedKind));
-				assert_eq!(get(c, id)?.unwrap().state, JobState::Failed);
+				assert_eq!(get_raw(c, id)?.unwrap().state, JobState::Failed);
 				Ok(())
 			})
 			.unwrap();
@@ -893,7 +1152,10 @@ mod tests {
 	fn unsupported_phase_kinds_cannot_be_enqueued() {
 		let (db, repo_id, _) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			for kind in [JobKind::Survey, JobKind::Drilldown] {
+			for kind in [
+				JobKind::<loupe_provenance::Db>::Survey,
+				JobKind::<loupe_provenance::Db>::Drilldown,
+			] {
 				let new = NewJob {
 					repo_id,
 					kind,
@@ -903,7 +1165,7 @@ mod tests {
 					target_finding_id: None,
 				};
 				assert!(
-					enqueue(c, &new, 0).is_err(),
+					enqueue_raw(c, &new, 0).is_err(),
 					"known but unsupported kinds must not enter the legacy runtime"
 				);
 			}
@@ -997,7 +1259,7 @@ mod tests {
 		let (db, _, worker, id) = future_leased_fixture();
 		db.with_conn(|c| {
 			assert!(
-				!super::complete(
+				!super::complete::<loupe_provenance::Agent, loupe_provenance::Agent>(
 					c,
 					LeaseIdentity { job_id: id, worker_id: worker, capability_hash: &[0; 32] },
 					JobState::Succeeded,
@@ -1056,10 +1318,10 @@ mod tests {
 
 	#[test]
 	fn future_kind_requeue_cannot_mutate_before_decoding() {
-		let (db, _, _, id) = future_leased_fixture();
+		let (db, repo, _, id) = future_leased_fixture();
 		db.with_conn(|c| {
 			c.execute("UPDATE jobs SET state = 'failed' WHERE id = ?1", [id])?;
-			let outcome = requeue_failed(c, id, 10);
+			let outcome = requeue_failed(c, repo, id, 10);
 			let state: String =
 				c.query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| r.get(0))?;
 			assert_eq!(
@@ -1075,44 +1337,63 @@ mod tests {
 	#[test]
 	fn list_filters_by_state_and_kind() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
-		let queued_scan = enqueue_job(&db, repo_id, JobKind::Scan, 100);
-		let queued_verify = enqueue_job(&db, repo_id, JobKind::Verify, 200);
-		let leased_scan = enqueue_job(&db, repo_id, JobKind::Scan, 300);
+		let queued_scan = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 100);
+		let queued_verify = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Verify, 200);
+		let leased_scan = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 300);
 
 		// Verify jobs are leased first, so ask twice to move the scan too.
 		for _ in 0..2 {
 			db.with_conn(|c| lease(c, worker_id, true, 400, DEFAULT_LEASE_SECONDS)).unwrap();
 		}
 		// Of the three, the verify job and the *oldest* scan got leased.
-		let all = listed(&db, &JobFilter::default());
+		let all = listed(&db, &JobFilter::<loupe_provenance::Db>::default());
 		assert_eq!(all.len(), 3, "default filter returns everything: {all:?}");
 
 		let queued =
 			listed(&db, &JobFilter { states: vec![JobState::Queued], ..Default::default() });
-		assert_eq!(queued, vec![(leased_scan, JobState::Queued, JobKind::Scan)]);
+		assert_eq!(
+			queued,
+			vec![(leased_scan, JobState::Queued, JobKind::<loupe_provenance::Db>::Scan)]
+		);
 
 		let leased =
 			listed(&db, &JobFilter { states: vec![JobState::Leased], ..Default::default() });
 		assert_eq!(leased.len(), 2, "two jobs were leased: {leased:?}");
 		assert!(leased.iter().all(|(_, s, _)| *s == JobState::Leased));
 
-		let verify = listed(&db, &JobFilter { kind: Some(JobKind::Verify), ..Default::default() });
-		assert_eq!(verify, vec![(queued_verify, JobState::Leased, JobKind::Verify)]);
+		let verify = listed(
+			&db,
+			&JobFilter {
+				kind: Some(JobKind::<loupe_provenance::Db>::Verify),
+				..Default::default()
+			},
+		);
+		assert_eq!(
+			verify,
+			vec![(queued_verify, JobState::Leased, JobKind::<loupe_provenance::Db>::Verify)]
+		);
 
 		// state and kind compose as AND.
 		let leased_scans = listed(
 			&db,
-			&JobFilter { states: vec![JobState::Leased], kind: Some(JobKind::Scan), limit: None },
+			&JobFilter {
+				states: vec![JobState::Leased],
+				kind: Some(JobKind::<loupe_provenance::Db>::Scan),
+				limit: None,
+			},
 		);
-		assert_eq!(leased_scans, vec![(queued_scan, JobState::Leased, JobKind::Scan)]);
+		assert_eq!(
+			leased_scans,
+			vec![(queued_scan, JobState::Leased, JobKind::<loupe_provenance::Db>::Scan)]
+		);
 	}
 
 	#[test]
 	fn list_accepts_a_set_of_states() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
-		let to_succeed = enqueue_job(&db, repo_id, JobKind::Scan, 100);
-		let to_fail = enqueue_job(&db, repo_id, JobKind::Scan, 200);
-		let stays_queued = enqueue_job(&db, repo_id, JobKind::Scan, 300);
+		let to_succeed = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 100);
+		let to_fail = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 200);
+		let stays_queued = enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, 300);
 
 		for (job_id, outcome) in [(to_succeed, JobState::Succeeded), (to_fail, JobState::Failed)] {
 			db.with_conn(|c| lease(c, worker_id, false, 400, DEFAULT_LEASE_SECONDS))
@@ -1143,7 +1424,7 @@ mod tests {
 	fn list_applies_limit_alongside_filters() {
 		let (db, repo_id, _worker_id) = db_with_repo_and_worker();
 		for at in [100, 200, 300] {
-			enqueue_job(&db, repo_id, JobKind::Scan, at);
+			enqueue_job(&db, repo_id, JobKind::<loupe_provenance::Db>::Scan, at);
 		}
 		let limited =
 			listed(&db, &JobFilter { states: vec![JobState::Queued], kind: None, limit: Some(2) });
@@ -1155,11 +1436,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1185,11 +1466,11 @@ mod tests {
 	fn lease_is_atomic_across_concurrent_callers() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1213,11 +1494,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		// One scan job and one verify job, scan first.
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1228,11 +1509,11 @@ mod tests {
 		})
 		.unwrap();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Verify,
+					kind: JobKind::<loupe_provenance::Db>::Verify,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1246,13 +1527,19 @@ mod tests {
 		// Worker that does NOT accept verify: leases scan, then sees
 		// the queue as empty (verify is gated).
 		let first = db.with_conn(|c| lease(c, worker_id, false, 200, 60)).unwrap();
-		assert!(matches!(first.as_ref().map(|r| &r.kind), Some(JobKind::Scan)));
+		assert!(matches!(
+			first.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Scan)
+		));
 		let second = db.with_conn(|c| lease(c, worker_id, false, 201, 60)).unwrap();
 		assert!(second.is_none(), "verify job must be invisible to non-verify workers");
 
 		// A verify-capable worker DOES pick it up.
 		let third = db.with_conn(|c| lease(c, worker_id, true, 202, 60)).unwrap();
-		assert!(matches!(third.as_ref().map(|r| &r.kind), Some(JobKind::Verify)));
+		assert!(matches!(
+			third.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Verify)
+		));
 	}
 
 	#[test]
@@ -1260,11 +1547,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let scan_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1276,11 +1563,11 @@ mod tests {
 			.unwrap();
 		let verify_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Verify,
+						kind: JobKind::<loupe_provenance::Db>::Verify,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: Some(scan_id),
@@ -1293,11 +1580,17 @@ mod tests {
 
 		let first = db.with_conn(|c| lease(c, worker_id, true, 300, 60)).unwrap();
 		assert_eq!(first.as_ref().map(|r| r.id), Some(verify_id));
-		assert!(matches!(first.as_ref().map(|r| &r.kind), Some(JobKind::Verify)));
+		assert!(matches!(
+			first.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Verify)
+		));
 
 		let second = db.with_conn(|c| lease(c, worker_id, true, 301, 60)).unwrap();
 		assert_eq!(second.as_ref().map(|r| r.id), Some(scan_id));
-		assert!(matches!(second.as_ref().map(|r| &r.kind), Some(JobKind::Scan)));
+		assert!(matches!(
+			second.as_ref().map(|r| &r.kind),
+			Some(JobKind::<loupe_provenance::Db>::Scan)
+		));
 	}
 
 	#[test]
@@ -1311,11 +1604,11 @@ mod tests {
 	fn heartbeat_extends_lease() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1334,11 +1627,11 @@ mod tests {
 	fn heartbeat_cannot_revive_an_expired_lease() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1353,7 +1646,7 @@ mod tests {
 		let new_until = db.with_conn(|c| Ok(heartbeat(c, leased.id, worker_id, 161, 60)?)).unwrap();
 
 		assert_eq!(new_until, None, "an expired lease must not be renewable");
-		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, leased.id)?)).unwrap().unwrap();
 		assert_eq!(
 			row.lease_expires_at,
 			Some(160),
@@ -1365,11 +1658,11 @@ mod tests {
 	fn heartbeat_from_wrong_worker_is_rejected() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1381,10 +1674,83 @@ mod tests {
 		.unwrap();
 		let leased = db.with_conn(|c| lease(c, worker_id, false, 100, 60)).unwrap().unwrap();
 		let other_worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w2", WorkerKind::Worker, &[2u8; 32], 0)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w2").unwrap(),
+					WorkerKind::Worker,
+					&[2u8; 32],
+					0,
+				)?)
+			})
 			.unwrap();
 		let res = db.with_conn(|c| Ok(heartbeat(c, leased.id, other_worker_id, 150, 60)?)).unwrap();
 		assert_eq!(res, None, "stranger heartbeat must not extend the lease");
+	}
+
+	#[test]
+	fn active_capability_and_transaction_include_exact_expiry() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|conn| {
+			let job_id = enqueue_raw(
+				conn,
+				&NewJob {
+					repo_id,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?;
+			let leased = lease(conn, worker_id, false, 100, 60)?.unwrap();
+			assert_eq!(leased.id, job_id);
+			let hash = active_capability_hash(conn, job_id)?;
+			let identity = LeaseIdentity { job_id, worker_id, capability_hash: &hash };
+			let other_worker = workers::insert(
+				conn,
+				&crate::test_support::text("other").unwrap(),
+				WorkerKind::Worker,
+				&[91; 32],
+				0,
+			)?;
+			let mut wrong_hash = hash.clone();
+			wrong_hash[0] ^= 1;
+			assert!(
+				get_active_by_capability_hash(conn, other_worker, &hash, 160)?.is_none(),
+				"correct capability cannot authorize another worker"
+			);
+			assert!(
+				get_active_by_capability_hash(conn, worker_id, &wrong_hash, 160)?.is_none(),
+				"correct worker cannot authorize another capability"
+			);
+			assert_eq!(
+				get_active_by_capability_hash(conn, worker_id, &hash, 160)?.map(|job| job.id),
+				Some(job_id),
+				"the exact expiry instant remains authorized"
+			);
+			assert!(
+				get_active_by_capability_hash(conn, worker_id, &hash, 161)?.is_none(),
+				"one tick after expiry is unauthorized"
+			);
+			let calls = std::cell::Cell::new(0);
+			let mutate = |_: &Transaction<'_>, row: &JobRow| {
+				calls.set(calls.get() + 1);
+				Ok(row.id)
+			};
+			assert_eq!(
+				with_active_lease_transaction(conn, ActiveLease { identity, now: 160 }, mutate)?,
+				Some(job_id)
+			);
+			assert_eq!(
+				with_active_lease_transaction(conn, ActiveLease { identity, now: 161 }, mutate)?,
+				None
+			);
+			assert_eq!(calls.get(), 1, "expired authorization must never enter the mutation");
+			Ok(())
+		})
+		.unwrap();
 	}
 
 	#[test]
@@ -1392,11 +1758,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1410,7 +1776,15 @@ mod tests {
 		assert_eq!(leased.as_ref().map(|j| j.id), Some(job_id));
 
 		let other_worker_id = db
-			.with_conn(|c| Ok(workers::insert(c, "w3", WorkerKind::Worker, &[9u8; 32], 100)?))
+			.with_conn(|c| {
+				Ok(workers::insert(
+					c,
+					&crate::test_support::text("w3").unwrap(),
+					WorkerKind::Worker,
+					&[9u8; 32],
+					100,
+				)?)
+			})
 			.unwrap();
 		assert!(db
 			.with_conn(|c| Ok(worker_has_active_lease_for_repo(c, worker_id, repo_id, 250)?))
@@ -1433,11 +1807,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1484,11 +1858,11 @@ mod tests {
 	fn complete_succeeded_terminates_job() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1505,9 +1879,9 @@ mod tests {
 			})
 			.unwrap();
 		assert!(ok);
-		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, leased.id)?)).unwrap().unwrap();
 		assert_eq!(row.state, JobState::Succeeded);
-		assert_eq!(row.head_sha.as_deref(), Some("abc"));
+		assert_eq!(row.head_sha.as_ref().map(loupe_core::text::BoundedText::expose), Some("abc"));
 		assert_eq!(row.finished_at, Some(150));
 	}
 
@@ -1515,11 +1889,11 @@ mod tests {
 	fn complete_rejects_an_expired_lease() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1538,7 +1912,7 @@ mod tests {
 			.unwrap();
 
 		assert!(!completed, "an expired lease must not complete a job");
-		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		let row = db.with_conn(|c| Ok(get_raw(c, leased.id)?)).unwrap().unwrap();
 		assert_eq!(row.state, JobState::Leased);
 		assert!(row.head_sha.is_none(), "a rejected completion must not record a revision");
 		assert!(row.finished_at.is_none(), "a rejected completion must not finish the job");
@@ -1549,11 +1923,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1568,7 +1942,10 @@ mod tests {
 		let CancelOutcome::Cancelled(row) = outcome else { panic!("expected cancelled outcome") };
 		assert_eq!(row.state, JobState::Cancelled);
 		assert_eq!(row.finished_at, Some(200));
-		assert_eq!(row.error.as_deref(), Some(JOB_CANCELLED_BY_ADMIN_ERROR));
+		assert_eq!(
+			row.error.as_ref().map(loupe_core::text::BoundedText::expose),
+			Some(JOB_CANCELLED_BY_ADMIN_ERROR)
+		);
 		assert!(row.worker_id.is_none());
 		assert!(row.lease_expires_at.is_none());
 
@@ -1582,11 +1959,11 @@ mod tests {
 	fn cancel_leased_scan_discards_pending_findings() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1603,17 +1980,18 @@ mod tests {
 				repo_id,
 				leased.id,
 				&Finding {
-					scanner_id: "regex".into(),
+					scanner_id: crate::test_support::text("regex").unwrap(),
 					severity: Severity::High,
-					title: "Cancelled finding".into(),
-					description: "submitted before cancellation".into(),
-					file_path: Some("src/x.rs".into()),
+					title: crate::test_support::text("Cancelled finding").unwrap(),
+					description: crate::test_support::text("submitted before cancellation")
+						.unwrap(),
+					file_path: Some(crate::test_support::path("src/x.rs").unwrap()),
 					line_start: Some(1),
 					line_end: Some(1),
 					cwe: None,
 					patch_unified: None,
 					poc_unified: None,
-					fingerprint: "fp-cancelled".into(),
+					fingerprint: crate::test_support::text("fp-cancelled").unwrap(),
 				},
 				true,
 				210,
@@ -1642,11 +2020,11 @@ mod tests {
 	fn reap_requeues_under_max_attempts() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1660,7 +2038,11 @@ mod tests {
 		db.with_conn(|c| lease(c, worker_id, false, 100, 10)).unwrap();
 		let n = db.with_conn(|c| reap_stale_leases(c, 200)).unwrap();
 		assert_eq!(n, 1);
-		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
+		let row = db
+			.with_conn(|c| Ok(list(c, &JobFilter::<loupe_provenance::Db>::default())?))
+			.unwrap()
+			.pop()
+			.unwrap();
 		assert_eq!(row.state, JobState::Queued);
 		assert_eq!(row.attempts, 1, "reap doesn't reset attempts");
 	}
@@ -1670,11 +2052,11 @@ mod tests {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
 			.with_conn(|c| {
-				enqueue(
+				enqueue_raw(
 					c,
 					&NewJob {
 						repo_id,
-						kind: JobKind::Scan,
+						kind: JobKind::<loupe_provenance::Db>::Scan,
 						incremental: false,
 						since_sha: None,
 						parent_job_id: None,
@@ -1692,7 +2074,7 @@ mod tests {
 		assert_eq!(first.started_at, Some(100));
 
 		db.with_conn(|c| reap_stale_leases(c, 200)).unwrap();
-		let queued = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		let queued = db.with_conn(|c| Ok(get_raw(c, job_id)?)).unwrap().unwrap();
 		assert_eq!(
 			queued.started_at, None,
 			"requeue must discard the expired attempt's start time"
@@ -1708,7 +2090,7 @@ mod tests {
 		})
 		.unwrap();
 
-		let finished = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		let finished = db.with_conn(|c| Ok(get_raw(c, job_id)?)).unwrap().unwrap();
 		assert_eq!(finished.started_at, Some(300));
 		assert_eq!(finished.finished_at, Some(305));
 	}
@@ -1717,11 +2099,11 @@ mod tests {
 	fn reap_fails_after_max_attempts() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1742,7 +2124,11 @@ mod tests {
 		// to failed.
 		db.with_conn(|c| lease(c, worker_id, false, 999, 10)).unwrap();
 		db.with_conn(|c| reap_stale_leases(c, 9_999)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
+		let row = db
+			.with_conn(|c| Ok(list(c, &JobFilter::<loupe_provenance::Db>::default())?))
+			.unwrap()
+			.pop()
+			.unwrap();
 		assert_eq!(row.state, JobState::Failed);
 	}
 
@@ -1750,11 +2136,11 @@ mod tests {
 	fn reap_failed_scan_discards_pending_findings() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		db.with_conn(|c| {
-			enqueue(
+			enqueue_raw(
 				c,
 				&NewJob {
 					repo_id,
-					kind: JobKind::Scan,
+					kind: JobKind::<loupe_provenance::Db>::Scan,
 					incremental: false,
 					since_sha: None,
 					parent_job_id: None,
@@ -1771,17 +2157,18 @@ mod tests {
 				repo_id,
 				leased.id,
 				&Finding {
-					scanner_id: "regex".into(),
+					scanner_id: crate::test_support::text("regex").unwrap(),
 					severity: Severity::High,
-					title: "Partial scan finding".into(),
-					description: "submitted before lease expiry".into(),
-					file_path: Some("src/x.rs".into()),
+					title: crate::test_support::text("Partial scan finding").unwrap(),
+					description: crate::test_support::text("submitted before lease expiry")
+						.unwrap(),
+					file_path: Some(crate::test_support::path("src/x.rs").unwrap()),
 					line_start: Some(1),
 					line_end: Some(1),
 					cwe: None,
 					patch_unified: None,
 					poc_unified: None,
-					fingerprint: "fp-reaped".into(),
+					fingerprint: crate::test_support::text("fp-reaped").unwrap(),
 				},
 				true,
 				1_000,
@@ -1800,7 +2187,11 @@ mod tests {
 		.unwrap();
 
 		db.with_conn(|c| reap_stale_leases(c, 9_999)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
+		let row = db
+			.with_conn(|c| Ok(list(c, &JobFilter::<loupe_provenance::Db>::default())?))
+			.unwrap()
+			.pop()
+			.unwrap();
 		assert_eq!(row.state, JobState::Failed);
 		let pending_findings: i64 = db
 			.with_conn(|c| {

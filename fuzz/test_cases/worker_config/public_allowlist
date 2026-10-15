@@ -1,0 +1,4 @@
+[sandbox]
+network="public"
+allowlist=["api.example"]
+

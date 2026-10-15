@@ -16,12 +16,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use git2::{Repository, Signature};
-use loupe_core::{Severity, Verdict, VerdictPatch};
-use loupe_proto::{
+use common::wire::{
 	LlmFindingSubmission, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
 	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
+use git2::{Repository, Signature};
+use loupe_core::{Severity, Verdict, VerdictPatch};
 use serde::Deserialize;
 
 /// Test-input shape mirroring what the verifier agent would call
@@ -45,16 +45,22 @@ struct VerifyStubPatch {
 }
 
 impl VerifyStubInput {
-	fn into_verdict(self) -> Verdict {
+	fn into_verdict(self) -> Verdict<loupe_provenance::Agent> {
 		match self.verdict.as_str() {
 			"confirmed" => Verdict::Confirmed {
-				notes: Some(self.notes),
-				patch: self
-					.patch
-					.map(|p| VerdictPatch { patch_unified: p.patch_unified, notes: p.notes }),
+				notes: Some(common::marked::agent::text(&self.notes)),
+				patch: self.patch.map(|p| VerdictPatch {
+					patch_unified: common::marked::agent::text(&p.patch_unified),
+					notes: common::marked::agent::text(&p.notes),
+				}),
 			},
-			"dismissed" => Verdict::Dismissed { notes: Some(self.notes) },
-			"inconclusive" => Verdict::Inconclusive { reason: self.notes, terminal: false },
+			"dismissed" => {
+				Verdict::Dismissed { notes: Some(common::marked::agent::text(&self.notes)) }
+			},
+			"inconclusive" => Verdict::Inconclusive {
+				reason: common::marked::agent::text(&self.notes),
+				terminal: false,
+			},
 			other => panic!("unknown verdict in test input: {other}"),
 		}
 	}
@@ -140,32 +146,37 @@ fn make_planted_repo() -> (tempfile::TempDir, String) {
 /// rejection test.
 async fn run_flow(
 	verify_response: &'static str,
-) -> (Arc<Db>, GithubStubState, loupe_server::ServeHandle) {
+) -> (Arc<Db>, i64, GithubStubState, loupe_server::ServeHandle) {
 	let (_repo_tmp, clone_url) = make_planted_repo();
 	let (stub_addr, stub_state) = spawn_github_stub().await;
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();
@@ -173,15 +184,16 @@ async fn run_flow(
 
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
 		.unwrap();
 
-	let resp = admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
+	let repo_id = common::register_local_repo(
+		&db,
+		&clone_url,
+		RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
 			branch: None,
@@ -189,26 +201,13 @@ async fn run_flow(
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_pat".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_pat".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(true),
 			require_approval: None,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-	db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(&clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
+		},
+	);
 
 	let resp = admin
 		.post("https://loupe-server/v1/workers")
@@ -220,11 +219,12 @@ async fn run_flow(
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
 		.unwrap();
+	let stub_http = raw.clone();
 	let server_client =
 		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
 
@@ -247,11 +247,13 @@ async fn run_flow(
 	//     `Verdict::Confirmed { ..., patch: Some(...) }`. The stub
 	//     parses the test-supplied JSON into a real `Verdict` and
 	//     POSTs it.
+	let http_for_stub = stub_http;
 	let server_client_for_stub = server_client.clone();
 	let backend = Arc::new(StubLlmBackend::new_async("stub", move |req: LlmRequest| {
+		let http = http_for_stub.clone();
 		let server_client = server_client_for_stub.clone();
 		async move {
-			if req.prompt.contains("independent second opinion") {
+			if req.prompt.expose().contains("independent second opinion") {
 				let job_id = req.job_id.expect("verify sessions must carry a job_id");
 				let job_capability =
 					req.job_capability.expect("verify sessions must carry a job capability");
@@ -294,13 +296,19 @@ async fn run_flow(
 						.into(),
 				fingerprint: "e".repeat(64),
 			};
-			server_client.submit_llm_finding(job_id, &job_capability, &finding).await?;
+			http.post(format!("https://loupe-server/v1/jobs/{job_id}/llm-findings"))
+				.header(loupe_proto::PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+				.header(loupe_proto::JOB_CAPABILITY_HEADER, job_capability.expose_secret())
+				.json(&finding)
+				.send()
+				.await?
+				.error_for_status()?;
 			Ok(String::new())
 		}
 	}));
 
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![
 		Arc::new(LlmCodeReviewScanner::new(backend.clone())),
 		Arc::new(LlmVerifierScanner::new(backend)),
@@ -315,36 +323,21 @@ async fn run_flow(
 	// flips and dispatches.
 	assert!(runner.step(&cancel).await.unwrap(), "verify step ran");
 
-	(db, stub_state, server)
+	(db, repo_id, stub_state, server)
 }
 
 #[tokio::test]
 async fn confirmed_verdict_dispatches_the_finding() {
-	let (db, stub, server) =
+	let (db, repo_id, stub, server) =
 		run_flow(r#"{"verdict":"confirmed","notes":"OOB confirmed on empty slice"}"#).await;
 
 	// Finding is reported (the dispatch path stamps state='reported').
-	let state: String = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM findings LIMIT 1", [], |r| r.get::<_, String>(0))?)
-		})
-		.unwrap();
+	let findings = common::findings(&db, repo_id);
+	let state = findings[0].state.as_str();
 	assert_eq!(state, "reported");
 
-	// Verifications row recorded the verdict (with the verifier's
-	// real job_id, not NULL — that's the reaper's signature).
-	let (count, with_job): (i64, i64) = db
-		.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT COUNT(*), SUM(CASE WHEN job_id IS NOT NULL THEN 1 ELSE 0 END)
-				 FROM finding_verifications",
-				[],
-				|r| Ok((r.get(0)?, r.get(1)?)),
-			)?)
-		})
-		.unwrap();
-	assert_eq!(count, 1);
-	assert_eq!(with_job, 1, "verifier-issued verdict must carry a job_id");
+	// The private verification-row count and non-null job-id oracle lives in
+	// storage's verifier_confirmation_persists_exact_assigned_job test.
 
 	// GitHub stub captured exactly one issue.
 	let captured = stub.captured.lock().unwrap().clone();
@@ -366,7 +359,7 @@ async fn confirmed_verdict_with_patch_attaches_diff_and_audit() {
 	// verdict insert + state transition; the dispatcher reads the
 	// row *after* the tx commits, so the auto-filed GitHub issue
 	// includes the patch.
-	let (db, stub, server) = run_flow(
+	let (db, repo_id, stub, server) = run_flow(
 		r#"{
 			"verdict": "confirmed",
 			"notes": "OOB confirmed on empty slice",
@@ -378,30 +371,23 @@ async fn confirmed_verdict_with_patch_attaches_diff_and_audit() {
 	)
 	.await;
 
-	let row: (String, Option<String>, Option<String>, Option<String>, Option<i64>) = db
-		.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT state, patch_unified, patch_notes, patch_proposed_by_cn, patch_proposed_at
-				 FROM findings LIMIT 1",
-				[],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-			)?)
-		})
-		.unwrap();
-	let (state, patch_unified, patch_notes, by_cn, at) = row;
+	let findings = common::findings(&db, repo_id);
+	let stored = &findings[0];
+	let (state, patch_unified, patch_notes, by_cn, at) = (
+		stored.state.as_str(),
+		stored.patch_unified.as_ref().map(|value| value.expose()),
+		stored.patch_notes.as_ref().map(|value| value.expose()),
+		stored.patch_proposed_by_cn.as_ref().map(|value| value.expose()),
+		stored.patch_proposed_at,
+	);
 	assert_eq!(state, "reported");
 	let patch = patch_unified.expect("patch_unified must be set when verdict carries a patch");
 	assert!(patch.contains("if i < arr.len()"), "stored diff must match what the verdict carried");
-	assert_eq!(
-		patch_notes.as_deref(),
-		Some("guard the index lookup so an empty slice can't panic")
-	);
-	assert_eq!(by_cn.as_deref(), Some("w1"), "audit must record the verifier worker's name");
+	assert_eq!(patch_notes, Some("guard the index lookup so an empty slice can't panic"));
+	assert_eq!(by_cn, Some("w1"), "audit must record the verifier worker's name");
 	assert!(at.is_some(), "patch_proposed_at must be stamped");
 
-	// GitHub stub got the issue (already covered by the confirmed-
-	// without-patch test); just sanity-check the body now carries
-	// the diff so the human reviewer sees the fix on the issue.
+	// The delivered issue must include the proposed diff for human review.
 	let captured = stub.captured.lock().unwrap().clone();
 	assert_eq!(captured.len(), 1);
 	let body = captured[0]["body"].as_str().unwrap();
@@ -415,14 +401,11 @@ async fn confirmed_verdict_with_patch_attaches_diff_and_audit() {
 
 #[tokio::test]
 async fn dismissed_verdict_blocks_dispatch() {
-	let (db, stub, server) =
+	let (db, repo_id, stub, server) =
 		run_flow(r#"{"verdict":"dismissed","notes":"false positive — ignore"}"#).await;
 
-	let state: String = db
-		.with_conn(|c| {
-			Ok(c.query_row("SELECT state FROM findings LIMIT 1", [], |r| r.get::<_, String>(0))?)
-		})
-		.unwrap();
+	let findings = common::findings(&db, repo_id);
+	let state = findings[0].state.as_str();
 	assert_eq!(state, "dismissed");
 
 	// And no issue was dispatched.

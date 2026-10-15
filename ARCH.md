@@ -10,6 +10,7 @@ crates/
   loupe-core      shared types: Finding, Severity, Verdict, RepoSpec,
                   ReportingDestination
   loupe-proto     wire-format DTOs + protocol versioning
+  loupe-http      shared bounded response transport for worker, CLI, web
   loupe-tls       internal CA + cert minting + fingerprint helpers
   loupe-storage   SQLCipher-encrypted SQLite DAO surface, FTS5 index,
                   migrations, secrets table
@@ -32,6 +33,80 @@ convenience: it
 holds the same admin certificate `loupectl` uses and proxies the same
 routes, so it adds no new authority to the system and no new trust root.
 It binds loopback only, for the reasons in README §9.
+
+### Client response budget
+
+The worker, CLI, and web clients share `loupe-http::MAX_RESPONSE_BYTES =
+16 * 1024 * 1024` (16 MiB) for successful and error responses. The transport
+reader rejects an oversized declared length before reading and checks each
+streamed chunk before copying it. Neither buffer length nor requested buffer
+capacity exceeds the budget. HTTP framing buffers and decoded DTO allocations
+are separate from this collected-body budget. JSON decoding stays in the
+clients, so `loupe-proto` remains independent of HTTP transport.
+
+This is an explicit transport budget: there is no finite largest legitimate
+response today. Admin lists can grow without bound, and even a worker search
+limited to 100 findings can exceed it because legacy summary fields have no
+uniform size cap. Oversized responses fail explicitly without truncation;
+pagination remains future work.
+
+A conservative single-object fixture reserves 262,144 bytes each for a PoC
+and patch and 16,384 description characters. With six-byte JSON escaping of
+every character, those fields occupy 3,244,032 bytes before metadata
+(`6 * (262144 + 262144 + 16384)`). Strict LLM submissions have a tighter
+combined description/PoC limit of 60,000 characters. The 16 MiB budget gives
+this conservative fixture room for metadata and lease repository/scanner
+configuration; arbitrarily large configuration is still subject to the same
+transport budget. Transport boundary regressions use valid JSON with trailing
+whitespace at the exact budget and one byte over, including chunked responses
+without Content-Length.
+
+### Git credential delivery
+
+The worker keeps the Git CLI for bare clone and fetch. A PAT stays in its
+shared `Arc<Secret<String>>` owner and is available only to a private,
+operation-scoped host helper. The helper socket lives in a random 0700 host
+`/tmp` directory with a 0600 socket, outside the cache, worktrees and sandbox
+binds. The internal `git-credential` worker mode loads no worker configuration
+or tracing. Only socket metadata enters its arguments; credential bytes cross
+the socket and Git's helper stdout pipe.
+
+PAT delivery requires HTTPS and an exact normalized host, effective port and
+decoded repository path. HTTP(S) userinfo and ambiguous/control-bearing URLs
+are rejected. Git's credential context already decodes paths, so the helper
+does not decode it again. `store` and `erase` discard input without persistence.
+Protocol buffers have a fixed 16 KiB limit and wipe on drop; PATs are at most
+8 KiB. Each helper exchange has a three-second I/O deadline, and an operation
+accepts at most 16 connections. These are helper limits, not a network-transfer
+timeout for the Git child.
+
+For a credentialed operation, a bounded local Git query resolves the current
+URL's rewrite without a helper or network access. A unique invocation-only
+transport alias pins that exact validated spelling through Git's single rewrite
+pass. Exact HTTP settings reject redirects even when inherited URL-specific
+settings allow them. Command-owned config keys and values are separate so an
+`=` in the URL cannot alter a config key. Inherited helpers, askpass, config
+environment and Git/curl tracing are reset. Clone skips templates and resets
+the merged origin URL list, explicitly selecting the `origin` remote; fetch
+uses the explicit transport alias with the
+three branch/remote-HEAD refspecs, pruning and tags.
+
+The rewrite projection validates borrowed bytes before placing the resolved
+URL in command metadata. It rejects URI userinfo after one percent-decoding
+pass, malformed authority escapes, controls, ambiguous delimiters and brackets.
+Native SSH's unusual cross-path bracketed-host syntax is also refused. SCP
+syntax stays literal; local paths with a slash before the first colon retain
+Git's local-path interpretation, including names containing `@`. Accepted URL
+spelling remains unchanged.
+
+Every cached fetch first replaces all local origin URL values from the current
+clean lease URL, including leases without a PAT. Clone restores that clean URL
+before returning. Neither path reads an old credential-bearing origin to derive
+its replacement. The blocking operation owns its repository lock, cache pin,
+helper and token until the real Git child exits, even if its async waiter is
+cancelled or the helper reaches its connection limit. Git, TLS and kernel
+copies are outside Loupe's owned-buffer erasure guarantee; cleanup of current
+origin contents does not erase filesystem snapshots or forensic remnants.
 
 ## Component diagram
 
@@ -324,6 +399,24 @@ operator's master key — the same key the server gets at startup via
 directory" + "Run the server" sections for the master-key sourcing
 rules.
 
+GitHub App authentication keeps JWTs and installation tokens in guarded
+allocations. Cached tokens share one guarded owner across concurrent dispatches;
+the cache still expires them after 50 minutes and refreshes once after an App
+401. PAT dispatch borrows its stored allocation and never retries a 401.
+The private HTTP bearer adapter reserves the complete `Bearer ` buffer and
+retains its guard through sensitive header clones. Token-mint HTTP responses
+have a separate 256 KiB streaming limit, checked against both Content-Length
+and received chunks; exact-limit bodies remain accepted. The collector reserves
+that capacity once and wipes it on completion, error, or cancellation. This
+does not change the pure GitHub response decoder or the 16 MiB Loupe API limit.
+
+Returned private DER is wiped after RSA parsing through its actual zeroization
+implementation. JWT signature and output scratch are guarded, with base64
+written into the final reserved output. These guarantees cover Loupe's current
+owned buffers. PEM/serde parser scratch, opaque ring signing state, codec or
+compiler temporaries, HTTP/TLS encoding, and kernel/receiver copies remain
+outside that guarantee; a redacted holder does not erase those allocations.
+
 ## Storage layout for the review harness
 
 Schema v3 has a typed storage API ahead of the v2 scheduler and endpoints.
@@ -369,9 +462,14 @@ leads; only stale-closed identities can create a successor.
 
 ### Text and digest boundaries
 
-`loupe-core::text` provides private, policy-bound values. Agent-authored
-strings enter the new DAOs only through these validated types; commit SHAs,
-IDs, times, capability hashes, and captured binary content are host inputs.
+`loupe-core::text` provides private, policy-bound values with a source type.
+Named ingress validators retain original input spans and attach their actual
+source; designated finding content carried through worker, sandbox, server or
+database input remains `Agent`. Repository paths and Git revisions retain
+`Repo`, configuration retains `Config`, and database metadata retains `Db`.
+Source labels remain on DTOs and domain values through storage and rendering;
+validation does not make their text trusted. IDs, times and capability hashes
+are separate scalar or guarded host values.
 Proof-command `argv` and `env_names` are agent-authored requests: they pass
 the payload policy *before* the host executes them, so the recorded command
 is byte-for-byte the executed one (an argument with a control character or
@@ -410,12 +508,90 @@ repository; artifact length and hash are copied from that blob.
 
 Text validation does not prevent prompt injection expressed as ordinary
 prose. Newtypes have redacted `Debug`; rendering requires explicit
-`.expose()`. Future sinks must label untrusted content and use a structured
-boundary or a per-render random boundary of at least 128 bits verified
-absent from that content. A fixed sentinel is not collision-safe. Logs use
-redacted values, UI isolates bidirectional text, reports escape Markdown,
-and CLI rendering escapes controls. Searching for formatting sites is an
-audit aid, not proof of these guarantees.
+`.expose()`. The worker's `PromptBuilder` accepts static instructions and
+source-labelled text, JSON and paths. Its closed finding projections select
+the content required by verification and prior-finding tools without exposing
+audit fields. Output is bounded to 16 MiB and 64 parts before allocation.
+
+Initial prompt renders draw 128-bit random boundaries and reject a candidate
+found in any original or encoded data field. Three collisions or unavailable
+entropy fail rendering. Delimited mode retains exact bytes; Marked mode
+doubles literal U+241E and inserts U+241E followed by a period after every
+32 original Unicode scalars when more remain. The inverse recovers exact
+UTF-8, including CRLF and decomposed Unicode.
+
+The runner creates a separate tool boundary once per job and carries it
+through every file invocation and MCP session. Prior-finding tool results
+use this fixed boundary and return a fixed error on collision. Their existing
+JSON-RPC envelope, repository scope and result limits remain enforced.
+Both CLI adapters write complete prompts to stdin while draining output;
+failed writes, cancellation and timeout close stdin and reap the child.
+Prompts do not enter process arguments.
+
+These boundaries establish data framing and provenance, not model obedience.
+Files read directly by external CLI tools and BKB results remain outside this
+renderer. The boundary-selection Kani harness exhausted its bounded attempts
+and is explicitly listed as no verdict; runtime and fuzz evidence are not a
+substitute proof. CLI terminal rendering separately escapes control characters.
+Searching for formatting sites is an audit aid, not proof of sink safety.
+
+Report builders accept labelled fields and paths. GitHub descriptions and
+diffs use backtick fences longer than every run in the input; paths use
+literal code spans, so a path cannot create a link or HTML element. Complete
+issue bodies, including their framing, must fit 65,536 Unicode scalars and
+262,144 bytes. Email uses a fixed host layout and selected stored settings
+for headers; finding text belongs in the body. Each complete header line is
+limited to 8,192 bytes, the header section to 65,536 bytes and the complete
+message to 16 MiB. Rejected output is not truncated into a different report.
+
+### Sandbox operands and job containment
+
+Sandbox arguments and environment values come from static literals, numerical
+ports, admitted nonsecret configuration or concrete path owners. Configuration
+captures the host PATH once. Mounted paths and path-valued environment entries
+retain their checkout, binary, broker or scratch owners through the prepared
+command and child lifetime. The public prepared command exposes lifecycle and
+stdio operations; it cannot append arbitrary arguments or environment values.
+
+Every worker job owns a random fake credential in a read-only sandbox file.
+MCP records and model-broker requests are checked for that value and selected
+host credentials in raw bytes and valid JSON string runs. A match publishes
+irreversible quarantine and cancellation before emitting a closed security
+event. Pending broker work stops, further job operations are refused, and the
+host can still report failed completion. This detects exact watched values,
+including JSON escapes; it does not detect every possible encoding or prove
+that a model follows instructions.
+
+Finding citations must match exact, nonempty fenced bytes within the submitted
+inclusive line range. One opened regular-file descriptor supplies the check
+and fingerprint; special-file opening is nonblocking before descriptor
+admission. An 8 KiB streaming reader checks UTF-8 and cancellation while
+retaining the existing fingerprint normalization, including Unicode lowercase
+context. Citation matching itself preserves original whitespace, line endings
+and Unicode bytes. Failures expose a closed reason and numerical location,
+without source paths or quoted text.
+
+### Transaction and delivery authority
+
+The storage crate owns raw SQLite connections. Public repository DAOs take a
+`RepoScope` borrowed from a synchronous transaction callback. Authenticated
+Operator authority selects a repository, job or finding; worker operations
+receive an `AssignmentScope` only after checking the exact worker, capability,
+job and expiry under an IMMEDIATE transaction. Scopes cannot be constructed,
+cloned, deserialized or retained beyond that callback. Queries and mutations
+also retain explicit repository predicates. Global scheduling, recovery and
+registration have named storage owners instead of a public SQL callback.
+
+Report preparation selects owned content, destination settings and credentials
+inside the same transaction. Its completion receipt remains inactive until
+commit and binds the original database, repository and exact finding
+incarnations. Delivery then runs without the transaction or database mutex.
+GitHub marks each successful issue separately; a later failure preserves those
+completed rows. Email marks the selected batch atomically after successful
+sendmail exit. Rollback, a different database, a nonmember or a replaced row
+cannot authorize completion. A failed or oversized report remains available
+for explicit retry, and size rejections emit a closed `report_output` budget
+event without including report contents.
 
 The future phase endpoints must enforce HTTP body caps before
 deserialization, validate payload field semantics and job-specific
@@ -425,10 +601,10 @@ this storage layer.
 
 ## Cross-references
 
-- Finding state machine details (verdict rollup policy, approval
-  gate audit trail): `crates/loupe-server/src/routes/jobs.rs` —
-  `submit_verdict` and `complete` handlers walk through the
-  transitions inline.
+- Finding state machine and report completion:
+  `crates/loupe-storage/src/reports.rs` owns the scoped transitions and
+  receipts; `crates/loupe-server/src/routes/jobs.rs` dispatches the committed
+  results after the transaction ends.
 - Sandbox mount layout (which host paths get bind-mounted where):
   `crates/loupe-worker/src/sandbox.rs` module docs.
 - MCP tool catalogue: `crates/loupe-worker/src/mcp.rs` —

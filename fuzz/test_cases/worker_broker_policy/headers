@@ -1,0 +1,11 @@
+Authorization: sender
+Cookie: sender
+x-api-key: sender
+Host: host
+Content-Length: 9
+Connection: x-private, X-Other
+x-private: hidden
+X-Other: hidden
+x-kept: good
+Proxy-Thing: hidden
+

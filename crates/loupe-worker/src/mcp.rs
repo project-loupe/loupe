@@ -7,7 +7,7 @@
 //! (`initialize`, `tools/list`, `tools/call`).
 //! `initialize` returns both the MCP protocol version and Loupe's own
 //! MCP tool protocol version, and every tool schema accepts an optional
-//! `protocol_version` argument so future workers can reject tool-call
+//! `protocol_version` argument so workers can reject tool-call
 //! shapes they do not understand without mis-parsing them.
 //!
 //! Tools currently exposed:
@@ -42,13 +42,20 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use loupe_core::{format_finding_id, Finding, Severity};
-use loupe_proto::{
-	validate_llm_finding_submission, JobCapability, LlmFindingSubmission, PROTOCOL_VERSION,
-};
-use serde::{Deserialize, Serialize};
+pub(crate) use ingress::McpFindingSubmission;
+pub use ingress::QueryText;
+use loupe_core::security_event::{Broker, Operation};
+#[cfg(test)]
+use loupe_core::Severity;
+use loupe_proto::JobCapability;
+#[cfg(test)]
+use loupe_proto::PROTOCOL_VERSION;
+use loupe_provenance::{Agent, Ingress, Repo, Sandbox, Untrusted};
+#[cfg(test)]
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
 use crate::scanners::llm_code_review::SCANNER_ID;
 use crate::ServerClient;
@@ -67,29 +74,36 @@ const LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
 /// staying narrow enough that touching the bug body shifts it.
 const FINGERPRINT_CONTEXT_LINES: u32 = 2;
 
-/// Pull a required string argument out of an MCP `tools/call` payload.
-/// Compresses the `args.get(k).and_then(as_str).context(...)` triplet
-/// repeated across every tool handler.
-fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-	args.get(key)
-		.and_then(|v| v.as_str())
-		.with_context(|| format!("`{key}` argument is required and must be a string"))
+fn check_submitted_membership(
+	workdir: &Path, file: &loupe_core::text::RepoPath<Agent>,
+) -> Result<Option<repo_ingress::ObservedSubmittedPath>> {
+	let rel = Path::new(file.expose());
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "MCP membership canonicalizes the trusted checkout root before checking the submitted relative path."
+	)]
+	let workdir = workdir.canonicalize().context("canonicalizing submitted workdir")?;
+	let candidate = workdir.join(rel);
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "MCP membership checks and canonicalizes an existing submitted path before admitting containment."
+	)]
+	if candidate.exists() {
+		let canonical = candidate.canonicalize().context("canonicalizing submitted file")?;
+		// SAFETY: native canonical path returned by the actual filesystem.
+		#[allow(unsafe_code)]
+		let canonical = Untrusted::new(canonical, unsafe { Ingress::<Repo>::new() });
+		let observed = canonical
+			.validate(repo_ingress::SubmittedPathMembership { workdir: &workdir })
+			.context("`file` resolves outside the workdir")?;
+		return Ok(Some(observed));
+	}
+	Ok(None)
 }
 
-/// Pull a required positive `u32` argument out of an MCP `tools/call`
-/// payload. Saturates at `u32::MAX` so a model that emits an absurdly
-/// large line number doesn't poison downstream arithmetic — line
-/// counts are 1-indexed and capped well below 4 billion in any real
-/// source file.
-fn arg_u32(args: &Value, key: &str) -> Result<u32> {
-	let v = args
-		.get(key)
-		.and_then(|v| v.as_u64())
-		.with_context(|| format!("`{key}` argument is required and must be a positive integer"))?;
-	Ok(v.min(u32::MAX as u64) as u32)
-}
-
-fn normalize_submitted_file(workdir: &Path, file: &str) -> Result<String> {
+/// Lexical normalization, independent of filesystem containment.
+/// Its acceptance remains distinct from the first `RepoPath` admission.
+pub fn normalize_path_component_rules(file: &str) -> Result<String> {
 	let stripped = file.strip_prefix("/workdir/").unwrap_or(file);
 	let path = Path::new(stripped);
 	if stripped.trim().is_empty() {
@@ -114,34 +128,7 @@ fn normalize_submitted_file(workdir: &Path, file: &str) -> Result<String> {
 		anyhow::bail!("`file` must name a file inside the workdir");
 	}
 
-	let workdir = workdir.canonicalize().with_context(|| {
-		format!("canonicalizing workdir {} before validating submitted path", workdir.display())
-	})?;
-	let candidate = workdir.join(&rel);
-	if candidate.exists() {
-		let canonical = candidate
-			.canonicalize()
-			.with_context(|| format!("canonicalizing submitted file {}", candidate.display()))?;
-		if !canonical.starts_with(&workdir) {
-			anyhow::bail!("`file` resolves outside the workdir: {}", rel.display());
-		}
-	}
-
 	Ok(rel.to_string_lossy().into_owned())
-}
-
-/// Format a finding's location as `path:line[-end]` for human display
-/// in MCP tool text output. Used for both `query_prior_findings`
-/// summaries (which lack `line_end`) and `get_finding_by_id` detail
-/// views — `line_end` is only rendered when it strictly exceeds
-/// `line_start` to keep "1:5-5" out of the output.
-fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option<u32>) -> String {
-	match (path, line_start, line_end) {
-		(Some(p), Some(s), Some(e)) if e > s => format!("{p}:{s}-{e}"),
-		(Some(p), Some(s), _) => format!("{p}:{s}"),
-		(Some(p), None, _) => p.to_owned(),
-		_ => "(no location)".into(),
-	}
 }
 
 /// Per-call session state that flows into every tool handler. Built
@@ -151,12 +138,15 @@ fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option
 /// across multiple tool calls and the second-call locks need to
 /// consult what the first call set.
 struct Session {
+	security: Arc<crate::canary::JobSecurity>,
+	tool_boundary: crate::llm::prompt::JobToolBoundary,
+	data_mode: crate::llm::prompt::DataMode,
 	client: Arc<ServerClient>,
 	job_capability: JobCapability,
 	repo_id: i64,
 	/// Job id the agent is reporting findings against. `None` means
 	/// `submit_finding` is unavailable — the MCP server is in
-	/// read-only mode (e.g. a future read-only diagnostic flow).
+	/// read-only mode.
 	job_id: Option<i64>,
 	/// Host worktree the agent is reasoning over. The trusted broker
 	/// uses it for fingerprint extraction and diff validation while
@@ -186,22 +176,25 @@ struct VerifySessionState {
 	inner: tokio::sync::Mutex<VerifySessionInner>,
 }
 
+// debug-ok: Typed Agent verdict and patch fields use their redacted formatters.
 #[derive(Debug, Default)]
 struct VerifySessionInner {
 	/// Locked on first `submit_verdict`. A second call returns an
 	/// error so the agent can't revise mid-session.
-	verdict: Option<loupe_core::Verdict>,
+	verdict: Option<loupe_core::Verdict<Agent>>,
 	/// Locked on first `submit_patch`. Held separately from the
 	/// verdict's own `patch` field so we can pin "patch tool was
 	/// called once" even if the merge into Verdict::Confirmed
 	/// happens later, at flush time.
-	patch: Option<loupe_core::VerdictPatch>,
+	patch: Option<loupe_core::VerdictPatch<Agent>>,
 }
 
 /// JSON-RPC 2.0 envelope shapes. Kept small — we don't need batch
 /// requests, notifications-with-body, or any of the optional MCP
 /// surface beyond the three methods above.
-#[derive(Debug, Deserialize)]
+#[cfg(test)]
+// debug-ok: Private cfg(test) synthetic protocol fixture; exact fixture values are assertion diagnostics only.
+#[derive(Debug, Deserialize, Serialize)]
 struct Request {
 	#[allow(dead_code)]
 	jsonrpc: String,
@@ -212,7 +205,7 @@ struct Request {
 	params: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct Response {
 	jsonrpc: &'static str,
 	id: Value,
@@ -220,6 +213,11 @@ struct Response {
 	result: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	error: Option<RpcError>,
+}
+impl std::fmt::Debug for Response {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("Response([redacted])")
+	}
 }
 
 impl Response {
@@ -237,12 +235,17 @@ impl Response {
 	}
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct RpcError {
 	code: i64,
 	message: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	data: Option<Value>,
+}
+impl std::fmt::Debug for RpcError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RpcError").field("code", &self.code).finish_non_exhaustive()
+	}
 }
 
 /// Immutable authority and filesystem scope for one host-side MCP
@@ -265,6 +268,8 @@ struct RpcError {
 /// posts `complete(failed)` and the validating-deadline reaper
 /// later marks the verdict inconclusive.
 pub struct McpSessionContext {
+	pub security: Arc<crate::canary::JobSecurity>,
+	pub tool_boundary: crate::llm::prompt::JobToolBoundary,
 	pub client: Arc<ServerClient>,
 	pub job_capability: JobCapability,
 	pub repo_id: i64,
@@ -274,9 +279,7 @@ pub struct McpSessionContext {
 }
 
 /// Run one host-side MCP broker session until the sandbox proxy closes.
-pub async fn run_stream_server<R, W>(
-	context: McpSessionContext, reader: R, mut writer: W,
-) -> Result<()>
+pub async fn run_stream_server<R, W>(context: McpSessionContext, reader: R, writer: W) -> Result<()>
 where
 	R: AsyncBufRead + Unpin,
 	W: AsyncWrite + Unpin,
@@ -294,6 +297,9 @@ where
 		(None, _) => None,
 	};
 	let session = Arc::new(Session {
+		security: context.security,
+		tool_boundary: context.tool_boundary,
+		data_mode: crate::llm::prompt::DataMode::Delimited,
 		client: context.client,
 		job_capability: context.job_capability,
 		repo_id: context.repo_id,
@@ -301,17 +307,48 @@ where
 		workdir: context.workdir,
 		verify,
 	});
-	let mut lines = reader.lines();
+	run_session(session, reader, writer, crate::limits::Limits::default()).await
+}
 
-	while let Some(line) = lines.next_line().await? {
-		if line.trim().is_empty() {
-			continue;
-		}
-		tracing::debug!(request = %line, "loupe-mcp: received request");
-
-		let request: Request = match serde_json::from_str(&line) {
-			Ok(r) => r,
+async fn run_session<R, W>(
+	session: Arc<Session>, mut reader: R, mut writer: W, limits: crate::limits::Limits,
+) -> Result<()>
+where
+	R: AsyncBufRead + Unpin,
+	W: AsyncWrite + Unpin,
+{
+	loop {
+		let record = session
+			.security
+			.run(Operation::ReadFinding, framing::next_record(&mut reader, limits.mcp_record_bytes))
+			.await?;
+		let Some(record) = record else { break };
+		let line_bytes = record.len();
+		session.security.observe(&record, Broker::Mcp);
+		// SAFETY: this is the original bounded record just read from this
+		// session's sandbox stdin/socket, before UTF-8 or JSON interpretation.
+		#[allow(unsafe_code)]
+		let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
+		let request = match record.as_bytes().validate_carrying(ingress::McpRequestDecoder) {
+			Ok(Some(r)) => r,
+			Ok(None) => continue,
+			Err(ingress::RecordError::Utf8) => {
+				if session.security.is_quarantined() {
+					write_response(&mut writer, &quarantined_response(Value::Null)).await?;
+					return Err(crate::canary::JobQuarantined.into());
+				}
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"MCP record is not UTF-8",
+				)
+				.into());
+			},
 			Err(e) => {
+				if session.security.is_quarantined() {
+					write_response(&mut writer, &quarantined_response(Value::Null)).await?;
+					return Err(crate::canary::JobQuarantined.into());
+				}
+				tracing::debug!(method = "invalid", line_bytes, "loupe-mcp: received request");
 				write_response(
 					&mut writer,
 					&Response::err(Value::Null, -32700, format!("parse error: {e}")),
@@ -320,11 +357,18 @@ where
 				continue;
 			},
 		};
+		tracing::debug!(
+			method = request.method.log_label(),
+			line_bytes,
+			"loupe-mcp: received request"
+		);
 
 		// Notifications (no `id`) require no response per JSON-RPC.
-		let Some(id) = request.id.clone() else { continue };
+		let Some(id) = request.id else { continue };
 
-		let response = handle_request(&session, &request, id).await;
+		let response =
+			handle_decoded_request(&session, request.method, request.call, id.into_response_id())
+				.await;
 		write_response(&mut writer, &response).await?;
 	}
 
@@ -335,9 +379,27 @@ where
 	Ok(())
 }
 
-async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Response {
-	match req.method.as_str() {
-		"initialize" => Response::ok(
+mod framing;
+#[cfg(kani)]
+pub(crate) use framing::admitted_record_len;
+mod citation;
+#[cfg(fuzzing)]
+pub use citation::fuzzing as citation_fuzzing;
+mod ingress;
+#[cfg(test)]
+mod legacy_test_api;
+mod repo_ingress;
+#[cfg(test)]
+use legacy_test_api::*;
+
+async fn handle_decoded_request(
+	session: &Arc<Session>, method: ingress::Method, call: ingress::ToolCall, id: Value,
+) -> Response {
+	if session.security.is_quarantined() {
+		return quarantined_response(id);
+	}
+	match method {
+		ingress::Method::Initialize => Response::ok(
 			id,
 			json!({
 				"protocolVersion": MCP_PROTOCOL_VERSION,
@@ -346,18 +408,34 @@ async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Res
 				"_meta": loupe_mcp_meta(),
 			}),
 		),
-		"tools/list" => Response::ok(
+		ingress::Method::List => Response::ok(
 			id,
 			json!({
 				"tools": tool_definitions(session.job_id.is_some(), session.verify.is_some()),
 				"_meta": loupe_mcp_meta(),
 			}),
 		),
-		"tools/call" => handle_tool_call(session, req, id).await,
+		ingress::Method::Call => handle_decoded_tool_call(session, call, id).await,
 		// Common no-op MCP notifications/requests we just ack.
-		"notifications/initialized" | "ping" => Response::ok(id, json!({})),
-		other => Response::err(id, -32601, format!("method not found: {other}")),
+		ingress::Method::Initialized | ingress::Method::Ping => Response::ok(id, json!({})),
+		ingress::Method::Unknown(other) => {
+			Response::err(id, -32601, format!("method not found: {other}"))
+		},
 	}
+}
+
+fn quarantined_response(id: Value) -> Response {
+	// Numeric/null IDs carry no submitted strings. On a security refusal,
+	// arbitrary string/compound IDs are never echoed back to the sandbox.
+	let id = if id.is_number() { id } else { Value::Null };
+	Response::ok(
+		id,
+		json!({
+			"content": [{"type":"text", "text":"injection_suspected"}],
+			"isError": true,
+			"_meta": loupe_mcp_meta(),
+		}),
+	)
 }
 
 fn loupe_mcp_meta() -> Value {
@@ -667,39 +745,55 @@ fn add_tool_protocol_version(tools: &mut [Value]) {
 	}
 }
 
-async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> Response {
-	let params = req.params.as_ref();
-	let tool_name = params.and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-	let arguments = params
-		.and_then(|p| p.get("arguments"))
-		.cloned()
-		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-
-	let result: Result<String> = match check_tool_protocol_version(&arguments) {
-		Err(e) => Err(e),
-		Ok(()) => match tool_name {
-			"query_prior_findings" => {
-				tool_query_prior_findings(
-					&session.client,
-					&session.job_capability,
-					session.repo_id,
-					&arguments,
-				)
-				.await
-			},
-			"get_finding_by_id" => {
-				tool_get_finding_by_id(&session.client, &session.job_capability, &arguments).await
-			},
-			"submit_finding" => tool_submit_finding(session, &arguments).await,
-			"validate_poc" => tool_validate_diff(&session.workdir, &arguments, "poc_unified").await,
-			"submit_verdict" => tool_submit_verdict(session, &arguments).await,
-			"submit_patch" => tool_submit_patch(session, &arguments).await,
-			"validate_patch" => {
-				tool_validate_diff(&session.workdir, &arguments, "patch_unified").await
-			},
-			other => Err(anyhow::anyhow!("unknown tool: {other}")),
-		},
-	};
+async fn handle_decoded_tool_call(
+	session: &Arc<Session>, call: ingress::ToolCall, id: Value,
+) -> Response {
+	let tool_name = call.name.log_label();
+	let operation = call.name.operation();
+	let result: Result<String> = session
+		.security
+		.run(operation, async {
+			match call.arguments {
+				Err(e) => Err(e),
+				Ok(arguments) => match arguments {
+					ingress::Arguments::Query(args) => {
+						query_prior_findings(
+							&session.client,
+							&session.job_capability,
+							session.repo_id,
+							&args.query,
+							args.limit,
+							session.tool_boundary,
+							session.data_mode,
+						)
+						.await
+					},
+					ingress::Arguments::Get(finding_id) => {
+						get_finding_by_id(
+							&session.client,
+							&session.job_capability,
+							finding_id,
+							session.tool_boundary,
+							session.data_mode,
+						)
+						.await
+					},
+					ingress::Arguments::Finding(args) => tool_submit_finding(session, args).await,
+					ingress::Arguments::Poc(diff) => {
+						validate_diff(&session.workdir, AgentDiff::Poc(&diff)).await
+					},
+					ingress::Arguments::Verdict(args) => submit_verdict(session, args).await,
+					ingress::Arguments::Patch(args) => submit_patch(session, args).await,
+					ingress::Arguments::ValidatePatch(diff) => {
+						validate_diff(&session.workdir, AgentDiff::Patch(&diff)).await
+					},
+				},
+			}
+		})
+		.await;
+	if session.security.is_quarantined() {
+		return quarantined_response(id);
+	}
 
 	match result {
 		Ok(text) => Response::ok(
@@ -710,14 +804,25 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 			}),
 		),
 		Err(e) => {
-			tracing::warn!(tool = tool_name, error = %e, "loupe-mcp: tool call failed");
+			tracing::warn!(tool = tool_name, "loupe-mcp: tool call failed");
+			let text = if e.is::<ingress::UnknownTool>() {
+				#[allow(
+					clippy::expect_used,
+					reason = "UnknownTool is produced only by the Unknown ToolName branch, which owns this response projection."
+				)]
+				call.name.unknown_tool_response().expect("unknown tool output")
+			} else if let Some(error) = e.downcast_ref::<ApplicabilityError>() {
+				format!("Error: {}", error.for_tool_response())
+			} else {
+				format!("Error: {e:#}")
+			};
 			// MCP convention: tool errors flow through `result` with
 			// `isError: true`, not the JSON-RPC `error` field (which
 			// is reserved for protocol-level failures).
 			Response::ok(
 				id,
 				json!({
-					"content": [{ "type": "text", "text": format!("Error: {e:#}") }],
+					"content": [{ "type": "text", "text": text }],
 					"isError": true,
 					"_meta": loupe_mcp_meta(),
 				}),
@@ -726,6 +831,7 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 	}
 }
 
+#[cfg(test)]
 fn check_tool_protocol_version(args: &Value) -> Result<()> {
 	let Some(value) = args.get("protocol_version") else {
 		return Ok(());
@@ -742,164 +848,112 @@ fn check_tool_protocol_version(args: &Value) -> Result<()> {
 	Ok(())
 }
 
-async fn tool_get_finding_by_id(
-	client: &Arc<ServerClient>, job_capability: &JobCapability, args: &Value,
+async fn get_finding_by_id(
+	client: &Arc<ServerClient>, job_capability: &JobCapability, id: i64,
+	boundary: crate::llm::prompt::JobToolBoundary, mode: crate::llm::prompt::DataMode,
 ) -> Result<String> {
-	let id = args
-		.get("id")
-		.and_then(|value| {
-			// Keep accepting numeric IDs from older MCP callers. Models see
-			// prefixed references in tool responses and can pass them back intact.
-			value.as_i64().or_else(|| {
-				let reference = value.as_str()?;
-				let id = reference.strip_prefix("LUP-")?.parse::<i64>().ok()?;
-				(format_finding_id(id) == reference).then_some(id)
-			})
-		})
-		.filter(|id| *id > 0)
-		.context("`id` must be a finding reference such as LUP-1234 or a positive integer")?;
 	let detail = client
 		.get_finding(id, job_capability)
 		.await
 		.with_context(|| format!("calling /v1/findings/{id}"))?;
-	let loc = format_location(detail.file_path.as_deref(), detail.line_start, detail.line_end);
-	let mut out = String::with_capacity(detail.description.len() + 256);
-	let _ = std::fmt::Write::write_fmt(
-		&mut out,
-		format_args!(
-			"Finding {} [{:?}] state={} {}\n{}\n",
-			format_finding_id(detail.id),
-			detail.severity,
-			detail.state,
-			loc,
-			detail.title,
-		),
-	);
-	if let Some(cwe) = &detail.cwe {
-		let _ = std::fmt::Write::write_fmt(&mut out, format_args!("CWE: {cwe}\n"));
-	}
-	out.push_str("\nDescription:\n");
-	out.push_str(&detail.description);
-	if let Some(poc) = &detail.poc_unified {
-		out.push_str("\n\nProof of concept (unified diff):\n");
-		out.push_str(poc);
-	}
-	if let Some(patch) = &detail.patch_unified {
-		out.push_str("\n\nSuggested fix (unified diff):\n");
-		out.push_str(patch);
-	}
-	Ok(out)
+	let rendered = (|| {
+		let mut builder = crate::llm::prompt::PromptBuilder::new("").mode(mode);
+		builder.prior_detail(&detail)?;
+		builder.render_fixed(boundary)
+	})();
+	rendered.map(crate::llm::prompt::Prompt::into_tool_text).map_err(
+		|_: crate::llm::prompt::PromptError| {
+			anyhow::anyhow!("tool response cannot be safely framed")
+		},
+	)
 }
 
-async fn tool_query_prior_findings(
-	client: &Arc<ServerClient>, job_capability: &JobCapability, repo_id: i64, args: &Value,
+async fn query_prior_findings(
+	client: &Arc<ServerClient>, job_capability: &JobCapability, repo_id: i64,
+	query: &loupe_core::text::BoundedText<QueryText, Agent>, limit: i64,
+	boundary: crate::llm::prompt::JobToolBoundary, mode: crate::llm::prompt::DataMode,
 ) -> Result<String> {
-	let query = arg_str(args, "query")?;
-	let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 100);
-
 	let resp = client
 		.search_findings(repo_id, job_capability, query, limit)
 		.await
 		.context("calling /v1/repos/:id/findings/search")?;
-
-	if resp.findings.is_empty() {
-		return Ok(format!(
-			"No prior findings on repo {repo_id} match `{query}`. Treat this as a novel finding."
-		));
-	}
-	let mut out = String::with_capacity(512);
-	out.push_str(&format!(
-		"{} prior finding(s) on repo {repo_id} match `{query}`:\n\n",
-		resp.findings.len()
-	));
-	for f in &resp.findings {
-		// Search summaries don't include line_end; pass None so the
-		// helper renders `path:line` instead of falling through.
-		let loc = format_location(f.file_path.as_deref(), f.line_start, None);
-		out.push_str(&format!(
-			"- {} [{:?}] state={} {} — {}\n",
-			format_finding_id(f.id),
-			f.severity,
-			f.state,
-			loc,
-			f.title,
-		));
-	}
-	Ok(out)
+	let rendered = (|| {
+		let mut builder = crate::llm::prompt::PromptBuilder::new("").mode(mode);
+		if resp.findings.is_empty() {
+			builder.instruction("No prior findings match. Treat this as a novel finding.\n")?;
+		}
+		builder.data("query", query)?;
+		builder.prior_summaries(repo_id, &resp.findings)?;
+		builder.render_fixed(boundary)
+	})();
+	rendered.map(crate::llm::prompt::Prompt::into_tool_text).map_err(
+		|_: crate::llm::prompt::PromptError| {
+			anyhow::anyhow!("tool response cannot be safely framed")
+		},
+	)
 }
 
-/// Build a [`Finding`] from `submit_finding` arguments.
+/// Build a mixed-source submission from `submit_finding` arguments.
 ///
-/// Pure function — extracted from `tool_submit_finding` so tests can
-/// exercise the fingerprint / clamp / parse logic without standing
-/// up an MCP server or a real HTTP backend.
-pub(crate) fn build_finding_from_args(workdir: &Path, args: &Value) -> Result<Finding> {
-	let severity_str = arg_str(args, "severity")?;
-	let severity: Severity =
-		severity_str.parse().with_context(|| format!("unknown severity: `{severity_str}`"))?;
-	let title = arg_str(args, "title")?.to_owned();
-	let file = arg_str(args, "file")?;
-	let line_start = arg_u32(args, "line_start")?;
-	let line_end = arg_u32(args, "line_end")?;
-	let description = arg_str(args, "description")?.to_owned();
-	let poc_unified = arg_str(args, "poc_unified")?.to_owned();
-	let cwe = args.get("cwe").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
-
-	// Sandbox-leak guard: the agent occasionally echoes the in-bwrap
-	// path. Normalize it to a repo-relative path and reject traversal
-	// before reading source for the fingerprint.
-	let rel_file = normalize_submitted_file(workdir, file)?;
-	let fingerprint = fingerprint_for(workdir, &rel_file, line_start, line_end);
-
-	Ok(Finding {
-		scanner_id: SCANNER_ID.into(),
-		severity,
-		title,
-		description,
-		file_path: Some(rel_file),
-		line_start: Some(line_start),
-		line_end: Some(line_end),
-		cwe,
-		patch_unified: None,
-		poc_unified: Some(poc_unified),
-		fingerprint,
-	})
+/// Uses the real argument decoder and local membership/fingerprint checks
+/// without contacting the server.
+#[cfg(test)]
+pub(crate) fn build_finding_from_args(
+	workdir: &Path, args: &Value,
+) -> Result<McpFindingSubmission> {
+	ingress::fuzz_support::finding_fixture(workdir, args)
 }
 
-async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<String> {
+async fn tool_submit_finding(
+	session: &Arc<Session>, args: ingress::DecodedFindingArgs,
+) -> Result<String> {
+	session.security.admit(Operation::McpSubmitFinding)?;
 	let job_id = session.job_id.context(
 		"submit_finding called but the MCP server was started without --job-id; \
 		 nowhere to attribute the submission. This is a worker-side configuration \
 		 bug — the tool should not have been advertised.",
 	)?;
-	let finding = build_finding_from_args(&session.workdir, args)?;
-	let title = finding.title.clone();
-	let file = finding.file_path.clone().unwrap_or_default();
-	let fingerprint = finding.fingerprint.clone();
-	let submission = LlmFindingSubmission {
-		protocol_version: PROTOCOL_VERSION,
-		severity: finding.severity,
-		title: finding.title,
-		description: finding.description,
-		file_path: file.clone(),
-		line_start: finding.line_start.context("LLM finding is missing line_start")?,
-		line_end: finding.line_end.context("LLM finding is missing line_end")?,
-		cwe: finding.cwe,
-		poc_unified: finding.poc_unified.context("LLM finding is missing poc_unified")?,
-		fingerprint: fingerprint.clone(),
+	let mut submission = args.into_pending_submission(&session.workdir)?;
+	submission.fingerprint = match validate_local_llm_submission(
+		&session.workdir,
+		&submission,
+		session.security.cancellation(),
+	)
+	.await
+	{
+		Ok(fingerprint) => fingerprint,
+		Err(error) => {
+			if let Some(reason) = error
+				.downcast_ref::<citation::CitationError>()
+				.and_then(citation::CitationError::reason)
+			{
+				loupe_core::security_event::emit(
+					loupe_core::security_event::SecurityEvent::CitationMismatch {
+						context: loupe_core::security_event::EventContext {
+							job_id: session.job_id,
+							repo_id: Some(session.repo_id),
+							..Default::default()
+						},
+						location_index: 0,
+						line_start: Some(submission.line_start),
+						line_end: Some(submission.line_end),
+						reason,
+					},
+				);
+			}
+			return Err(error);
+		},
 	};
-	validate_local_llm_submission(&session.workdir, &submission).await?;
+	let fingerprint = submission.fingerprint.for_submission();
 	session
-		.client
-		.submit_llm_finding(job_id, &session.job_capability, &submission)
+		.security
+		.run(
+			Operation::McpSubmitFinding,
+			session.client.submit_llm_finding(job_id, &session.job_capability, &submission),
+		)
 		.await
-		.with_context(|| {
-			format!("submitting finding for {file} to /v1/jobs/{job_id}/llm-findings")
-		})?;
-	tracing::info!(
-		job_id, repo_id = session.repo_id, %file, %title, fingerprint = %fingerprint,
-		"loupe-mcp: agent submitted a finding",
-	);
+		.context("submitting validated finding failed")?;
+	tracing::info!(job_id, repo_id = session.repo_id, "loupe-mcp: agent submitted a finding",);
 	Ok(format!(
 		"Submitted. job={job_id} fingerprint={fingerprint}\n\
 		 The server applies UNIQUE(repo_id, fingerprint) on insert; if this finding hash-matches a \
@@ -908,35 +962,56 @@ async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<Str
 }
 
 async fn validate_local_llm_submission(
-	workdir: &Path, submission: &LlmFindingSubmission,
-) -> Result<()> {
-	validate_llm_finding_submission(submission).map_err(anyhow::Error::msg)?;
-	let path = workdir.join(&submission.file_path);
-	// Repository-sized reads on the broker's runtime thread: the
-	// discovery scanner fans out one agent session per file, so a
-	// blocking read here stalls every other session's tool calls.
-	let metadata = tokio::fs::metadata(&path)
-		.await
-		.with_context(|| format!("submitted file does not exist: {}", submission.file_path))?;
-	if !metadata.is_file() {
-		anyhow::bail!("submitted path is not a regular file: {}", submission.file_path);
+	workdir: &Path, submission: &McpFindingSubmission, cancel: tokio_util::sync::CancellationToken,
+) -> Result<repo_ingress::ComputedFingerprint> {
+	if submission.line_start == 0 || submission.line_start > submission.line_end {
+		return Err(citation::CitationError::Range.into());
 	}
-	let source = tokio::fs::read_to_string(&path)
-		.await
-		.with_context(|| format!("reading submitted file {}", submission.file_path))?;
-	let line_count = source.lines().count().max(1) as u64;
-	if u64::from(submission.line_end) > line_count {
-		anyhow::bail!(
-			"line_end {} exceeds {} lines in {}",
-			submission.line_end,
-			line_count,
-			submission.file_path
-		);
-	}
-	match check_diff_applies(workdir, &submission.poc_unified).await? {
-		DiffCheck::Applies => Ok(()),
+	submission.validate().map_err(anyhow::Error::msg)?;
+	// Quarantine propagates into this operation, while dropping its async
+	// waiter (including forced broker shutdown) stops the blocking traversal
+	// without cancelling other sessions or the shared job security token.
+	let cancel = cancel.child_token();
+	let _cancel_on_drop = cancel.clone().drop_guard();
+	let path = workdir.join(submission.file_path.expose());
+	let claim = citation::CitationClaim {
+		file: submission.file_path.clone(),
+		description: submission.description.clone(),
+		start: submission.line_start,
+		end: submission.line_end,
+		cancel,
+	};
+	let fingerprint = tokio::task::spawn_blocking(move || {
+		use std::os::unix::fs::OpenOptionsExt;
+		if claim.cancel.is_cancelled() {
+			return Err(citation::CitationError::Cancelled);
+		}
+		// A special file must not block open before descriptor-based regular-file
+		// admission. NONBLOCK does not change reads of admitted regular files.
+		#[allow(clippy::disallowed_methods, reason = "Citation ingress opens the contained path once and validates the descriptor as a regular file before reading.")]
+		let file = std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+			.open(path)
+			.map_err(|error| {
+				if error.kind() == std::io::ErrorKind::NotFound {
+					citation::CitationError::Missing
+				} else {
+					citation::CitationError::Io
+				}
+			})?;
+		// SAFETY: the actual once-opened repository file, before reading or
+		// interpreting its bytes. The named validator retains this descriptor.
+		#[allow(unsafe_code)]
+		let source = Untrusted::new(file, unsafe { Ingress::<Repo>::new() });
+		source.validate(claim)
+	})
+	.await
+	.map_err(|_| citation::CitationError::Task)??;
+	match check_diff_applies(workdir, AgentDiff::Poc(&submission.poc_unified)).await? {
+		DiffCheck::Applies => Ok(fingerprint),
 		DiffCheck::Rejects { stderr } => {
-			anyhow::bail!("poc_unified does not apply to the reviewed revision: {stderr}")
+			Err(ApplicabilityError { field: "poc_unified", diagnostic: stderr }.into())
 		},
 	}
 }
@@ -946,9 +1021,7 @@ async fn validate_local_llm_submission(
 /// `validate_patch(patch_unified)`. The field name is the only
 /// difference, so both tools dispatch into this with the
 /// appropriate `field` argument.
-async fn tool_validate_diff(workdir: &Path, args: &Value, field: &str) -> Result<String> {
-	let diff = arg_str(args, field)?;
-
+async fn validate_diff(workdir: &Path, diff: AgentDiff<'_>) -> Result<String> {
 	let outcome = check_diff_applies(workdir, diff).await?;
 	let payload = match outcome {
 		DiffCheck::Applies => json!({
@@ -957,33 +1030,36 @@ async fn tool_validate_diff(workdir: &Path, args: &Value, field: &str) -> Result
 		}),
 		DiffCheck::Rejects { stderr } => json!({
 			"applies": false,
-			"error": stderr,
+			"error": stderr.for_tool_response(),
 		}),
 	};
 	// Tools return a string `text` per MCP convention; serialise the
 	// JSON payload so the agent gets a structured-looking response.
+	#[allow(
+		clippy::expect_used,
+		reason = "The fixed tool response schema contains JSON values only, with infallible serialization."
+	)]
 	Ok(serde_json::to_string(&payload).expect("payload serialises"))
 }
 
-async fn tool_submit_verdict(session: &Arc<Session>, args: &Value) -> Result<String> {
+async fn submit_verdict(
+	session: &Arc<Session>, args: ingress::DecodedVerdictArgs,
+) -> Result<String> {
+	session.security.admit(Operation::McpSubmitVerdict)?;
 	let verify = session.verify.as_ref().context(
 		"submit_verdict called but the MCP server is in discovery mode \
 		 (no --finding-id was passed). This is a worker-side configuration \
 		 bug — the tool should not have been advertised.",
 	)?;
 
-	let verdict_str = arg_str(args, "verdict")?;
-	let notes = arg_str(args, "notes")?.to_owned();
-	let verdict = match verdict_str {
-		"confirmed" => loupe_core::Verdict::Confirmed { notes: Some(notes), patch: None },
-		"dismissed" => loupe_core::Verdict::Dismissed { notes: Some(notes) },
-		"inconclusive" => loupe_core::Verdict::Inconclusive { reason: notes, terminal: false },
-		other => anyhow::bail!(
-			"unknown verdict `{other}`; must be one of `confirmed`, `dismissed`, `inconclusive`"
-		),
+	let verdict = args.verdict;
+	let verdict_str = match &verdict {
+		loupe_core::Verdict::Confirmed { .. } => "confirmed",
+		loupe_core::Verdict::Dismissed { .. } => "dismissed",
+		loupe_core::Verdict::Inconclusive { .. } => "inconclusive",
 	};
 
-	let mut inner = verify.inner.lock().await;
+	let mut inner = session.security.lock(Operation::McpSubmitVerdict, &verify.inner).await?;
 	if inner.verdict.is_some() {
 		anyhow::bail!(
 			"verdict already locked for this session; cannot submit a second verdict. \
@@ -1014,24 +1090,22 @@ async fn tool_submit_verdict(session: &Arc<Session>, args: &Value) -> Result<Str
 	}
 }
 
-async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<String> {
+async fn submit_patch(session: &Arc<Session>, args: ingress::DecodedPatchArgs) -> Result<String> {
+	session.security.admit(Operation::McpSubmitPatch)?;
 	let verify = session.verify.as_ref().context(
 		"submit_patch called but the MCP server is in discovery mode \
 		 (no --finding-id was passed). This is a worker-side configuration \
 		 bug — the tool should not have been advertised.",
 	)?;
 
-	let patch_unified = arg_str(args, "patch_unified")?.to_owned();
-	let notes = arg_str(args, "notes")?.to_owned();
+	let loupe_core::VerdictPatch { patch_unified, notes } = args.patch;
 
 	// Cheap state checks first — verdict shape, then "patch slot
 	// already taken." Saves spawning `git apply --check` when the
 	// call is going to be rejected on the verdict alone. Hold the
-	// lock across the diff check too so a concurrent submit_patch
-	// (impossible today since the agent's MCP session is
-	// single-threaded over stdin, but cheap insurance against future
-	// regressions) can't race past the patch.is_some() guard.
-	let mut inner = verify.inner.lock().await;
+	// lock only during these synchronous checks. Recheck after validation
+	// before taking the slot, so no guard survives network or Git I/O.
+	let inner = session.security.lock(Operation::McpSubmitPatch, &verify.inner).await?;
 	match &inner.verdict {
 		None => anyhow::bail!(
 			"submit_patch called before submit_verdict. Lock a verdict first, \
@@ -1053,13 +1127,20 @@ async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<Strin
 	if inner.patch.is_some() {
 		anyhow::bail!("patch already submitted for this session; one patch per verify session");
 	}
+	drop(inner);
 	// Check the whole report before taking the patch slot. A rejected
 	// patch must remain retryable within the same agent session.
-	let finding = session.client.get_finding(verify.finding_id, &session.job_capability).await?;
+	let finding = session
+		.security
+		.run(
+			Operation::ReadFinding,
+			session.client.get_finding(verify.finding_id, &session.job_capability),
+		)
+		.await?;
 	loupe_core::report_limits::validate_report_content(
-		&finding.description,
-		finding.poc_unified.as_deref(),
-		Some(&patch_unified),
+		finding.description.expose(),
+		finding.poc_unified.as_ref().map(|v| v.expose()),
+		Some(patch_unified.expose()),
 	)
 	.map_err(anyhow::Error::msg)?;
 
@@ -1067,16 +1148,27 @@ async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<Strin
 	// `attach_proposed_patch` won't catch a bad diff because storage
 	// doesn't validate; surfacing the failure here gives the agent a
 	// chance to revise.
-	match check_diff_applies(&session.workdir, &patch_unified).await? {
+	match session
+		.security
+		.run(
+			Operation::McpSubmitPatch,
+			check_diff_applies(&session.workdir, AgentDiff::Patch(&patch_unified)),
+		)
+		.await?
+	{
 		DiffCheck::Applies => {},
 		DiffCheck::Rejects { stderr } => {
-			anyhow::bail!(
-				"patch_unified does not apply against the worktree (`git apply --check` \
-				 rejected it). Revise and re-call `validate_patch` first. stderr: {stderr}"
-			);
+			return Err(ApplicabilityError { field: "patch_unified", diagnostic: stderr }.into());
 		},
 	}
 
+	let mut inner = session.security.lock(Operation::McpSubmitPatch, &verify.inner).await?;
+	if !matches!(inner.verdict, Some(loupe_core::Verdict::Confirmed { .. })) {
+		anyhow::bail!("patch requires a buffered confirmed verdict");
+	}
+	if inner.patch.is_some() {
+		anyhow::bail!("patch already submitted for this session; one patch per verify session");
+	}
 	inner.patch = Some(loupe_core::VerdictPatch { patch_unified, notes });
 
 	tracing::info!(finding_id = verify.finding_id, "loupe-mcp: agent submitted verifier patch",);
@@ -1086,10 +1178,11 @@ async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<Strin
 		.into())
 }
 
+// debug-ok: Only a closed outcome or static field label plus an opaque RepoDiffCheck formatter.
 #[derive(Debug)]
 enum DiffCheck {
 	Applies,
-	Rejects { stderr: String },
+	Rejects { stderr: repo_ingress::RepoDiffCheck },
 }
 
 /// Run `git apply --check` against `workdir`, feeding `diff` over
@@ -1098,13 +1191,20 @@ enum DiffCheck {
 /// mount. Errors here are infrastructure-level (couldn't spawn git);
 /// a clean "this diff doesn't apply" is a `DiffCheck::Rejects`.
 /// Build the `git apply --check` command with the host environment and
-/// git configuration neutralized. This validation now runs in the
+/// git configuration neutralized. This validation runs in the
 /// trusted worker process (not the sandbox), so config files and
 /// environment overrides such as `GIT_CONFIG_COUNT`, `GIT_DIR`, or
 /// `GIT_CONFIG_PARAMETERS` must not change whether an agent-supplied
 /// diff validates. Clearing the environment also keeps unrelated
 /// worker credentials out of the parser subprocess.
 fn git_apply_check_command(workdir: &Path) -> tokio::process::Command {
+	#[cfg(fuzzing)]
+	let mut cmd = tokio::process::Command::new(workdir.join("fuzz-git"));
+	#[cfg(not(fuzzing))]
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "MCP applicability owns a fixed git apply --check command with sanitized configuration and typed diff stdin."
+	)]
 	let mut cmd = tokio::process::Command::new("git");
 	configure_git_apply_check_command(&mut cmd, workdir);
 	cmd
@@ -1126,13 +1226,30 @@ fn configure_git_apply_check_command(cmd: &mut tokio::process::Command, workdir:
 		.stderr(Stdio::piped());
 }
 
-async fn check_diff_applies(workdir: &Path, diff: &str) -> Result<DiffCheck> {
-	check_diff_applies_with_command(git_apply_check_command(workdir), diff).await
+enum AgentDiff<'a> {
+	Poc(&'a loupe_core::text::BoundedText<loupe_core::text::policy::PocUnified, Agent>),
+	Patch(&'a loupe_core::text::BoundedText<loupe_core::text::policy::PatchUnified, Agent>),
+}
+impl AgentDiff<'_> {
+	fn for_git_stdin(&self) -> &str {
+		match self {
+			Self::Poc(v) => v.expose(),
+			Self::Patch(v) => v.expose(),
+		}
+	}
+}
+
+async fn check_diff_applies(workdir: &Path, diff: AgentDiff<'_>) -> Result<DiffCheck> {
+	check_diff_applies_with_command(git_apply_check_command(workdir), diff.for_git_stdin()).await
 }
 
 async fn check_diff_applies_with_command(
 	mut command: tokio::process::Command, diff: &str,
 ) -> Result<DiffCheck> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "MCP applicability starts only its fixed Git checker and admits original process output as Repo."
+	)]
 	let mut child = command.spawn().context("spawning `git apply --check`")?;
 	{
 		let mut stdin = child.stdin.take().context("git apply stdin already taken")?;
@@ -1140,63 +1257,117 @@ async fn check_diff_applies_with_command(
 		stdin.shutdown().await.ok();
 	}
 	let output = child.wait_with_output().await.context("waiting on git apply")?;
-	if output.status.success() {
-		Ok(DiffCheck::Applies)
-	} else {
-		// Cap stderr — pathological diffs can produce many lines and we
-		// want to leave room in the agent's tool-result for surrounding
-		// reasoning. 4 KiB is plenty for a "patch doesn't apply at line
-		// N" message; longer diagnostics get truncated.
-		let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-		const MAX_STDERR: usize = 4096;
-		if stderr.len() > MAX_STDERR {
-			stderr.truncate(MAX_STDERR);
-			stderr.push_str("\n…(truncated)");
-		}
-		if stderr.trim().is_empty() {
-			stderr = format!("git apply exited {}", output.status);
-		}
-		Ok(DiffCheck::Rejects { stderr })
+	// SAFETY: actual Git operation output before interpretation. The existing
+	// response cap is applied by the decoder; it is not a collection budget.
+	#[allow(unsafe_code)]
+	let output = Untrusted::new(output, unsafe { Ingress::<Repo>::new() });
+	Ok(output.validate(repo_ingress::RepoDiffCheckDecoder)?.into_outcome())
+}
+
+// debug-ok: Only a closed outcome or static field label plus an opaque RepoDiffCheck formatter.
+#[derive(Debug)]
+struct ApplicabilityError {
+	field: &'static str,
+	diagnostic: repo_ingress::RepoDiffCheck,
+}
+impl std::fmt::Display for ApplicabilityError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{} does not apply to the reviewed revision", self.field)
 	}
 }
+impl ApplicabilityError {
+	/// Original Git diagnostic is restricted to the submitting agent's tool response.
+	fn for_tool_response(&self) -> String {
+		if self.field == "patch_unified" {
+			return format!(
+				"patch_unified does not apply against the worktree (`git apply --check` \
+			 rejected it). Revise and re-call `validate_patch` first. stderr: {}",
+				self.diagnostic.for_tool_response()
+			);
+		}
+		format!(
+			"{} does not apply to the reviewed revision: {}",
+			self.field,
+			self.diagnostic.for_tool_response()
+		)
+	}
+}
+impl std::error::Error for ApplicabilityError {}
 
 /// Read `workdir/file` and compute the fingerprint for the bug at
 /// `line_start..=line_end`. Falls back to a degenerate-but-safe input
 /// when the file can't be read (model hallucinated a path, file is
 /// non-UTF-8, etc.) so submission still succeeds — the line range
 /// alone is the worst-case fingerprint input.
-fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -> String {
+#[cfg(any(test, fuzzing))]
+fn fingerprint_for(
+	workdir: &Path, file: &str, line_start: u32, line_end: u32,
+) -> repo_ingress::ComputedFingerprint {
 	let abs = workdir.join(file);
-	let source = match std::fs::read_to_string(&abs) {
-		Ok(s) => s,
+	let source = match std::fs::File::open(&abs) {
+		Ok(s) => {
+			// SAFETY: actual repository descriptor before streaming fixture hashing.
+			#[allow(unsafe_code)]
+			let source = Untrusted::new(s, unsafe { Ingress::<Repo>::new() });
+			source
+				.validate(citation::FingerprintSource { file, start: line_start, end: line_end })
+				.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))
+		},
+		Err(error) => Err(error),
+	};
+	match source {
+		Ok(digest) => digest,
 		Err(e) => {
 			tracing::warn!(
-				file, error = %e,
+				error_kind = ?e.kind(),
 				"fingerprint: could not read worktree file; falling back to line-range-only window",
 			);
-			return crate::fingerprint::compute(
-				SCANNER_ID,
-				file,
-				&format!("L{line_start}-L{line_end}"),
-			);
+			repo_ingress::ComputedFingerprint::line_range(file, line_start, line_end)
 		},
-	};
-	let window = crate::fingerprint::extract_window(
-		&source,
-		line_start,
-		line_end,
-		FINGERPRINT_CONTEXT_LINES,
-	);
-	crate::fingerprint::compute(SCANNER_ID, file, &window)
+	}
 }
 
 async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> Result<()> {
-	let line = serde_json::to_string(resp)?;
-	tracing::debug!(response = %line, "loupe-mcp: sending response");
-	w.write_all(line.as_bytes()).await?;
+	// Tool content and original request IDs are separately bounded. JSON can
+	// expand each input byte at most sixfold; count the concrete envelope first.
+	const RESPONSE_LIMIT: usize =
+		6 * (crate::llm::prompt::MAX_TOOL_TEXT_BYTES + 16 * 1024 * 1024) + 4096;
+	let mut counted = ResponseWriter { bytes: None, len: 0, limit: RESPONSE_LIMIT };
+	serde_json::to_writer(&mut counted, resp)?;
+	let mut bytes = Vec::new();
+	bytes
+		.try_reserve_exact(counted.len)
+		.map_err(|_| anyhow::anyhow!("MCP response allocation failed"))?;
+	let mut writer = ResponseWriter { bytes: Some(bytes), len: 0, limit: counted.len };
+	serde_json::to_writer(&mut writer, resp)?;
+	let line = writer.bytes.ok_or_else(|| anyhow::anyhow!("MCP response unavailable"))?;
+	tracing::debug!(response_bytes = line.len(), "loupe-mcp: sending response");
+	w.write_all(&line).await?;
 	w.write_all(b"\n").await?;
 	w.flush().await?;
 	Ok(())
+}
+
+struct ResponseWriter {
+	bytes: Option<Vec<u8>>,
+	len: usize,
+	limit: usize,
+}
+impl std::io::Write for ResponseWriter {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		self.len = self
+			.len
+			.checked_add(bytes.len())
+			.filter(|n| *n <= self.limit)
+			.ok_or_else(|| std::io::Error::other("MCP response size exceeded"))?;
+		if let Some(out) = &mut self.bytes {
+			out.extend_from_slice(bytes);
+		}
+		Ok(bytes.len())
+	}
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
 }
 
 /// End-of-session flush for verify mode: take the buffered verdict
@@ -1212,12 +1383,13 @@ async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> Re
 /// failure — the agent didn't do its job — and we surface the
 /// failure rather than silently letting the verify slot stay open.
 async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
-	let verify = session.verify.as_ref().expect("flush_verify_session: verify state required");
+	session.security.admit(Operation::SubmitVerdict)?;
+	let verify = session.verify.as_ref().context("verify state required")?;
 	let job_id = session
 		.job_id
 		.context("flush_verify_session: verify mode requires --job-id (checked at startup)")?;
 
-	let inner = verify.inner.lock().await;
+	let inner = session.security.lock(Operation::SubmitVerdict, &verify.inner).await?;
 	let verdict = inner.verdict.clone().context(
 		"verify session ended without `submit_verdict` being called. \
 		 The verifier agent didn't produce a verdict — treating as a \
@@ -1251,14 +1423,17 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 		"loupe-mcp: flushing verify session verdict",
 	);
 	session
-		.client
-		.submit_verdict(
-			job_id,
-			&session.job_capability,
-			&loupe_proto::VerdictSubmission {
-				protocol_version: loupe_proto::PROTOCOL_VERSION,
-				verdict: final_verdict,
-			},
+		.security
+		.run(
+			Operation::SubmitVerdict,
+			session.client.submit_verdict(
+				job_id,
+				&session.job_capability,
+				&loupe_proto::VerdictSubmission {
+					protocol_version: loupe_proto::PROTOCOL_VERSION,
+					verdict: final_verdict,
+				},
+			),
 		)
 		.await
 		.context("POSTing buffered verdict to /v1/jobs/:id/verdict")?;
@@ -1266,7 +1441,80 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 }
 
 #[cfg(test)]
+mod security_tests;
+
+#[cfg(test)]
+mod prompt_baseline_tests;
+
+#[cfg(test)]
+mod citation_tests;
+
+#[cfg(fuzzing)]
+pub mod fuzz_support;
+
+#[cfg(test)]
 mod tests {
+	#[test]
+	fn rpc_debug_omits_wire_content() {
+		let sentinel = "private-rpc-diagnostic-sentinel";
+		let response = super::Response::ok(json!(sentinel), json!({"text": sentinel}));
+		let error =
+			super::RpcError { code: -1, message: sentinel.into(), data: Some(json!(sentinel)) };
+		assert_eq!(
+			(format!("{response:?}").contains(sentinel), format!("{error:?}").contains(sentinel)),
+			(false, false),
+			"RPC Debug leaked wire content"
+		);
+		assert_eq!(serde_json::to_value(&response).unwrap()["result"]["text"], sentinel);
+		assert_eq!(serde_json::to_value(&error).unwrap()["message"], sentinel);
+	}
+
+	#[tokio::test]
+	async fn applicability_error_diagnostics_omit_git_stderr() {
+		let directory = tempfile::tempdir().unwrap();
+		let diff = "--- a/private-applicability-sentinel\n+++ b/private-applicability-sentinel\n@@ -1 +1 @@\n-old\n+new\n";
+		let args = json!({"poc_unified": diff});
+		let response = tool_validate_diff(directory.path(), &args, "poc_unified").await.unwrap();
+		let response: Value = serde_json::from_str(&response).unwrap();
+		assert!(
+			response["error"].as_str().unwrap().contains("private-applicability-sentinel"),
+			"the named tool response must preserve the actual Git diagnostic"
+		);
+		let DiffCheck::Rejects { stderr } =
+			check_diff_applies_with_command(git_apply_check_command(directory.path()), diff)
+				.await
+				.unwrap()
+		else {
+			panic!("missing file must reject");
+		};
+		let expected = format!(
+			"poc_unified does not apply to the reviewed revision: {}",
+			stderr.for_tool_response()
+		);
+		let error = ApplicabilityError { field: "poc_unified", diagnostic: stderr };
+		assert_eq!(
+			error.for_tool_response(),
+			expected,
+			"the explicit MCP projection preserves every original diagnostic byte"
+		);
+		let error: anyhow::Error = error.into();
+		assert!(
+			!format!("{error:#} {error:?}").contains("private-applicability-sentinel"),
+			"Git stderr leaked through applicability error formatting"
+		);
+		let DiffCheck::Rejects { stderr } =
+			check_diff_applies_with_command(git_apply_check_command(directory.path()), diff)
+				.await
+				.unwrap()
+		else {
+			panic!("missing file must reject");
+		};
+		let expected = format!("patch_unified does not apply against the worktree (`git apply --check` rejected it). Revise and re-call `validate_patch` first. stderr: {}", stderr.for_tool_response());
+		let error = ApplicabilityError { field: "patch_unified", diagnostic: stderr };
+		assert_eq!(error.for_tool_response(), expected);
+		assert!(!format!("{error} {error:?}").contains("private-applicability-sentinel"));
+	}
+
 	use super::*;
 
 	async fn prior_findings_client() -> (Arc<ServerClient>, tokio::task::JoinHandle<()>) {
@@ -1317,7 +1565,12 @@ mod tests {
 			.await
 			.unwrap();
 		task.abort();
-		assert!(text.contains("- LUP-1234 [High]"), "search must return prefixed IDs: {text}");
+		let data: Value = serde_json::from_str(crate::llm::prompts::prompt_baseline_tests::block(
+			&text, "findings", "agent",
+		))
+		.unwrap();
+		assert_eq!(data["findings"][0]["id"], "LUP-1234", "search must return prefixed IDs");
+		assert_eq!(data["findings"][0]["severity"], "high");
 	}
 
 	#[tokio::test]
@@ -1328,10 +1581,12 @@ mod tests {
 			.await
 			.expect("legacy numeric IDs must still work");
 		task.abort();
-		assert!(
-			text.starts_with("Finding LUP-1234 [High]"),
-			"detail must return a prefixed ID: {text}"
-		);
+		let data: Value = serde_json::from_str(crate::llm::prompts::prompt_baseline_tests::block(
+			&text, "finding", "agent",
+		))
+		.unwrap();
+		assert_eq!(data["id"], "LUP-1234", "detail must return a prefixed ID");
+		assert_eq!(data["severity"], "high");
 		assert!(text.contains("See upstream issue #1234."), "real GitHub references must survive");
 	}
 
@@ -1343,7 +1598,12 @@ mod tests {
 			.await
 			.expect("prefixed IDs must resolve through the numeric HTTP endpoint");
 		task.abort();
-		assert!(text.starts_with("Finding LUP-1234 [High]"), "detail: {text}");
+		let data: Value = serde_json::from_str(crate::llm::prompts::prompt_baseline_tests::block(
+			&text, "finding", "agent",
+		))
+		.unwrap();
+		assert_eq!(data["id"], "LUP-1234");
+		assert_eq!(data["severity"], "high");
 	}
 
 	#[tokio::test]
@@ -1413,43 +1673,84 @@ mod tests {
 		}
 	}
 
-	fn valid_local_submission() -> (tempfile::TempDir, LlmFindingSubmission) {
+	pub(super) fn valid_local_submission() -> (tempfile::TempDir, McpFindingSubmission) {
 		let workdir = tempfile::tempdir().unwrap();
 		std::fs::create_dir_all(workdir.path().join("src")).unwrap();
 		std::fs::write(workdir.path().join("src/lib.rs"), "fn vulnerable() {}\n").unwrap();
-		let submission = LlmFindingSubmission {
-			protocol_version: PROTOCOL_VERSION,
-			severity: Severity::High,
-			title: "Unchecked operation terminates the service".into(),
-			description: "An attacker-controlled request reaches the vulnerable operation without validation and can reliably terminate the service process.".into(),
-			file_path: "src/lib.rs".into(),
-			line_start: 1,
-			line_end: 1,
-			cwe: Some("CWE-20".into()),
-			poc_unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn vulnerable() {}\n+#[test] fn demonstrates_failure() {}\n".into(),
-			fingerprint: "c".repeat(64),
-		};
+		let submission = build_finding_from_args(workdir.path(), &json!({
+			"protocol_version": LOUPE_MCP_PROTOCOL_VERSION,
+			"severity": "high",
+			"title": "Unchecked operation terminates the service",
+			"description": "An attacker-controlled request reaches the vulnerable operation without validation and can reliably terminate the service process.",
+			"file": "src/lib.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"cwe": "CWE-20",
+			"poc_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn vulnerable() {}\n+#[test] fn demonstrates_failure() {}\n"
+		})).unwrap();
 		(workdir, submission)
+	}
+
+	#[tokio::test]
+	async fn r2_final_owner_keeps_spaces_and_rejects_only_the_strict_whitespace_path() {
+		let (workdir, valid) = valid_local_submission();
+		let mut args = serde_json::to_value(valid).unwrap();
+		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
+		for (file, normalized, strict) in [
+			(" /", " ", false),
+			(" /./", " ", false),
+			(" /a", " /a", true),
+			(" a/", " a", true),
+			("src/lib.rs", "src/lib.rs", true),
+		] {
+			args["file"] = json!(file);
+			let submission = build_finding_from_args(workdir.path(), &args).unwrap();
+			assert_eq!(submission.file_path.expose(), normalized, "first owner changed");
+			assert_eq!(submission.validate().is_ok(), strict, "final strict path check: {file:?}");
+			if !strict {
+				let error =
+					validate_local_llm_submission(workdir.path(), &submission, Default::default())
+						.await
+						.unwrap_err();
+				assert_eq!(error.to_string(), "file_path must be a normalized repo-relative path");
+			}
+		}
+		args["file"] = json!(" ");
+		assert!(
+			build_finding_from_args(workdir.path(), &args).is_err(),
+			"raw whitespace fails the first owner"
+		);
 	}
 
 	#[tokio::test]
 	async fn local_llm_validation_checks_revision_and_line_bounds() {
 		let (workdir, submission) = valid_local_submission();
-		validate_local_llm_submission(workdir.path(), &submission).await.unwrap();
+		validate_local_llm_submission(workdir.path(), &submission, Default::default())
+			.await
+			.unwrap();
 
-		let mut out_of_bounds = submission.clone();
+		let mut args = serde_json::to_value(&submission).unwrap();
+		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
+		args["file"] = json!(submission.file_path.expose());
+		let mut out_of_bounds = build_finding_from_args(workdir.path(), &args).unwrap();
 		out_of_bounds.line_end = 2;
-		let error = validate_local_llm_submission(workdir.path(), &out_of_bounds)
-			.await
-			.expect_err("line beyond the reviewed file must fail");
-		assert!(error.to_string().contains("exceeds"));
+		let error =
+			validate_local_llm_submission(workdir.path(), &out_of_bounds, Default::default())
+				.await
+				.expect_err("line beyond the reviewed file must fail");
+		assert_eq!(error.to_string(), "citation_range_invalid");
+		assert_eq!(
+			error.downcast_ref::<citation::CitationError>().unwrap().reason(),
+			Some(loupe_core::security_event::CitationFailure::RangeInvalid)
+		);
 
-		let mut non_applying = submission;
-		non_applying.poc_unified =
-			non_applying.poc_unified.replace("fn vulnerable() {}", "fn other() {}");
-		let error = validate_local_llm_submission(workdir.path(), &non_applying)
-			.await
-			.expect_err("PoC for different source must fail");
+		args["poc_unified"] =
+			json!(submission.poc_unified.expose().replace("fn vulnerable() {}", "fn other() {}"));
+		let non_applying = build_finding_from_args(workdir.path(), &args).unwrap();
+		let error =
+			validate_local_llm_submission(workdir.path(), &non_applying, Default::default())
+				.await
+				.expect_err("PoC for different source must fail");
 		assert!(error.to_string().contains("does not apply"));
 	}
 
@@ -1467,6 +1768,9 @@ mod tests {
 		let stub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 		let (workdir, submission) = valid_local_submission();
 		let session = Arc::new(Session {
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			data_mode: crate::llm::prompt::DataMode::Delimited,
 			client: Arc::new(ServerClient::from_parts(
 				reqwest::Client::new(),
 				base.parse().unwrap(),
@@ -1479,7 +1783,7 @@ mod tests {
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
-		args["file"] = json!(submission.file_path);
+		args["file"] = json!(submission.file_path.expose());
 		let response = handle_tool_call(
 			&session,
 			&Request {
@@ -1505,6 +1809,9 @@ mod tests {
 	async fn oversized_report_is_rejected_by_the_mcp_broker() {
 		let (workdir, submission) = valid_local_submission();
 		let session = Arc::new(Session {
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			data_mode: crate::llm::prompt::DataMode::Delimited,
 			client: Arc::new(ServerClient::from_parts(
 				reqwest::Client::new(),
 				"http://127.0.0.1:1".parse().unwrap(),
@@ -1517,8 +1824,9 @@ mod tests {
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
-		args["file"] = json!(submission.file_path);
-		args["poc_unified"] = json!(format!("{}{}", submission.poc_unified, "x".repeat(60_000)));
+		args["file"] = json!(submission.file_path.expose());
+		args["poc_unified"] =
+			json!(format!("{}{}", submission.poc_unified.expose(), "x".repeat(60_000)));
 		let response = handle_tool_call(
 			&session,
 			&Request {
@@ -1633,7 +1941,7 @@ mod tests {
 		assert!(names.contains(&"get_finding_by_id"));
 	}
 
-	fn fake_session_for_verify(finding_id: i64) -> Arc<Session> {
+	pub(super) fn fake_session_for_verify(finding_id: i64) -> Arc<Session> {
 		// Locking checks precede the patch budget lookup, so a no-op
 		// ServerClient is enough for verdict ordering tests. Tests that
 		// reach patch validation replace this client with a real stub.
@@ -1642,6 +1950,9 @@ mod tests {
 			"http://invalid.example/".parse().unwrap(),
 		));
 		Arc::new(Session {
+			security: crate::canary::JobSecurity::new(Default::default(), Vec::new()).unwrap(),
+			tool_boundary: crate::llm::prompt::JobToolBoundary::new().unwrap(),
+			data_mode: crate::llm::prompt::DataMode::Delimited,
 			client,
 			job_capability: JobCapability::from_secret("test-capability"),
 			repo_id: 1,
@@ -1763,12 +2074,8 @@ mod tests {
 
 	#[test]
 	fn verify_mode_swaps_the_tool_catalog() {
-		// Discovery and verify expose disjoint write surfaces. If a
-		// future refactor accidentally leaves both on at once, a
-		// verifier agent could call submit_finding (no `--job-id` for
-		// discovery) and a discovery agent could call submit_verdict
-		// (verdict POSTs would 400 server-side, but the prompt would
-		// be confused). Pin the disjointness here.
+		// Discovery and verify expose disjoint write tools; each prompt must see
+		// only the submissions its session can perform.
 		let verify = tool_definitions(true, true);
 		let verify_names: Vec<&str> =
 			verify.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
@@ -1792,12 +2099,8 @@ mod tests {
 
 	#[test]
 	fn build_finding_extracts_window_and_fingerprints_it() {
-		// Two cosmetically-different fixtures with the same bug body
-		// must produce the same fingerprint — that's the whole point
-		// of the normalisation in `fingerprint::compute`. Pinned here
-		// because the fingerprint logic now lives in the MCP server,
-		// not the scanner; if the helper drifts off the normalisation
-		// contract we want this test to flag it.
+		// MCP fingerprints must ignore cosmetic differences in the quoted
+		// source window, matching fingerprint::compute's normalization.
 		let workdir_a = tempfile::tempdir().unwrap();
 		std::fs::create_dir_all(workdir_a.path().join("src")).unwrap();
 		std::fs::write(
@@ -1826,13 +2129,21 @@ mod tests {
 		let f_a = build_finding_from_args(workdir_a.path(), &args).expect("a");
 		let f_b = build_finding_from_args(workdir_b.path(), &args).expect("b");
 		assert_eq!(
-			f_a.fingerprint, f_b.fingerprint,
+			f_a.fingerprint.for_submission(),
+			f_b.fingerprint.for_submission(),
 			"whitespace-only difference must not shift the fingerprint",
 		);
-		assert_eq!(f_a.scanner_id, SCANNER_ID);
+		assert_eq!(
+			f_a.fingerprint.for_submission(),
+			crate::fingerprint::compute(
+				SCANNER_ID,
+				"src/lib.rs",
+				"pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }"
+			)
+		);
 		assert_eq!(f_a.severity, Severity::High);
-		assert_eq!(f_a.file_path.as_deref(), Some("src/lib.rs"));
-		assert!(f_a.poc_unified.as_deref().unwrap().contains("#[test]"));
+		assert_eq!(f_a.file_path.expose(), "src/lib.rs");
+		assert!(f_a.poc_unified.expose().contains("#[test]"));
 	}
 
 	#[test]
@@ -1855,7 +2166,7 @@ mod tests {
 			"poc_unified": "x",
 		});
 		let f = build_finding_from_args(workdir.path(), &args).expect("ok");
-		assert_eq!(f.file_path.as_deref(), Some("src/lib.rs"));
+		assert_eq!(f.file_path.expose(), "src/lib.rs");
 	}
 
 	#[test]
@@ -1919,7 +2230,6 @@ mod tests {
 	#[test]
 	fn build_finding_rejects_missing_required_fields() {
 		let workdir = tempfile::tempdir().unwrap();
-		// No `title`.
 		let args = json!({
 			"severity": "low",
 			"file": "src/x.rs",
@@ -1993,8 +2303,6 @@ mod tests {
 			return;
 		}
 		let workdir = tempfile::tempdir().unwrap();
-		// Don't create any source file. The diff references a file
-		// that doesn't exist in workdir.
 		let diff = "\
 --- a/nonexistent.txt\n\
 +++ b/nonexistent.txt\n\
@@ -2029,8 +2337,7 @@ mod tests {
 	fn validate_poc_is_advertised_regardless_of_submissions_setting() {
 		// Even when --job-id is omitted we keep validate_poc on the
 		// list — it's read-only against the worktree and useful for
-		// diagnostics. Pinned because future "tighten the surface"
-		// refactors might be tempted to gate it.
+		// diagnostics.
 		for enabled in [true, false] {
 			let v = tool_definitions(enabled, false);
 			let names: Vec<&str> =
@@ -2042,3 +2349,9 @@ mod tests {
 		}
 	}
 }
+
+#[cfg(test)]
+mod ingress_syntax_tests;
+
+#[cfg(test)]
+mod quarantine_tests;

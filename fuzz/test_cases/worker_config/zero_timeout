@@ -1,0 +1,3 @@
+[scanner_defaults]
+per_request_timeout_seconds=0
+

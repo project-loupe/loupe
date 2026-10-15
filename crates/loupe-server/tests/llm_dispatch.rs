@@ -13,12 +13,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use git2::{Repository, Signature};
-use loupe_core::Severity;
-use loupe_proto::{
+use common::wire::{
 	LlmFindingSubmission, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
 	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
+use git2::{Repository, Signature};
+use loupe_core::Severity;
 use loupe_server::init::run_init;
 use loupe_server::reporters::GithubReporter;
 use loupe_server::{serve, AppState, Config};
@@ -111,26 +111,31 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	let stub_base = format!("http://{stub_addr}");
 
 	let server_dir = tempfile::tempdir().unwrap();
-	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
-	let ca = Ca::from_pem(
-		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
-		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	let init = run_init(
+		&common::config_path(server_dir.path()),
+		&[common::config_hostname("loupe-server")],
+		None,
 	)
 	.unwrap();
-	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
-	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
-	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
-	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap(),
+		&std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(init.layout.server_cert.as_path()).unwrap();
+	let server_key_pem = std::fs::read_to_string(init.layout.server_key.as_path()).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(init.layout.ca_cert.as_path()).unwrap();
+	let ca_key_pem = std::fs::read_to_string(init.layout.ca_key.as_path()).unwrap();
 
 	let cfg = Config {
 		bind_addr: "127.0.0.1:0".parse().unwrap(),
 		db_path: init.layout.db_path.clone(),
-		server_cert_pem,
-		server_key_pem,
-		ca_cert_pem: ca_cert_pem.clone(),
-		ca_key_pem,
+		server_cert_pem: common::config_pem(&server_cert_pem),
+		server_key_pem: common::config_pem(&server_key_pem),
+		ca_cert_pem: common::config_pem(&ca_cert_pem),
+		ca_key_pem: common::config_pem(&ca_key_pem),
 	};
-	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let db = Arc::new(Db::open(init.layout.db_path.as_path(), &init.master_key).unwrap());
 	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
 	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
 	let server = serve(cfg, state).await.unwrap();
@@ -138,15 +143,16 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 
 	let admin = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, init.admin_bundle.key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
 		.unwrap();
 
-	let resp = admin
-		.post("https://loupe-server/v1/repos")
-		.json(&RegisterRepoRequest {
+	let repo_id = common::register_local_repo(
+		&db,
+		&clone_url,
+		RegisterRepoRequest {
 			protocol_version: PROTOCOL_VERSION,
 			clone_url: "https://github.com/loupe/test-target.git".into(),
 			branch: None,
@@ -154,26 +160,13 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: Some("ghp_pat".into()),
+				github_pat: Some(loupe_provenance::Secret::new("ghp_pat".into())),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval: None,
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 201);
-	let body: serde_json::Value = resp.json().await.unwrap();
-	let repo_id = body["repo_id"].as_i64().unwrap();
-	db.with_conn(|c| {
-		c.execute(
-			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
-			(&clone_url, repo_id),
-		)?;
-		Ok(())
-	})
-	.unwrap();
+		},
+	);
 
 	let resp = admin
 		.post("https://loupe-server/v1/workers")
@@ -185,11 +178,12 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
 	let raw = reqwest::Client::builder()
 		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
-		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, bundle.client_key_pem.expose()))
 		.resolve("loupe-server", addr)
 		.use_rustls_tls()
 		.build()
 		.unwrap();
+	let stub_http = raw.clone();
 	let server_client =
 		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
 
@@ -203,12 +197,11 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	// Stub LLM backend simulating one agent session per file. In
 	// production the agent's MCP `submit_finding` tool POSTs to
 	// `/v1/jobs/{job_id}/llm-findings`; the stub mirrors that by calling
-	// `submit_findings` directly on the worker's mTLS-cert-bearing
-	// ServerClient. Body content is canned but the route, auth, and
+	// HTTP directly on the worker's mTLS-cert-bearing test client. Body content is canned but the route, auth, and
 	// downstream pipeline (insert → reporting dispatch) are real.
-	let server_client_for_stub = server_client.clone();
+	let http_for_stub = stub_http;
 	let stub_backend = Arc::new(StubLlmBackend::new_async("stub", move |req| {
-		let server_client = server_client_for_stub.clone();
+		let http = http_for_stub.clone();
 		async move {
 			let job_id = req.job_id.expect("test stub requires job_id (one-pass agent flow)");
 			let job_capability = req.job_capability.expect("test stub requires a job capability");
@@ -234,12 +227,18 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 				// it's stable within this test.
 				fingerprint: "d".repeat(64),
 			};
-			server_client.submit_llm_finding(job_id, &job_capability, &finding).await?;
+			http.post(format!("https://loupe-server/v1/jobs/{job_id}/llm-findings"))
+				.header(loupe_proto::PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+				.header(loupe_proto::JOB_CAPABILITY_HEADER, job_capability.expose_secret())
+				.json(&finding)
+				.send()
+				.await?
+				.error_for_status()?;
 			Ok(String::new())
 		}
 	}));
 	let cache_dir = tempfile::tempdir().unwrap();
-	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX, None).unwrap());
 	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(LlmCodeReviewScanner::new(stub_backend))];
 	let runner = Runner::new(server_client, cache, scanners);
 	let cancel = CancellationToken::new();
@@ -248,20 +247,15 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 
 	// Server-side: the job is succeeded, exactly one finding landed,
 	// and it carries our PoC.
-	let finding_count: i64 = db
-		.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?))
-		.unwrap();
-	assert_eq!(finding_count, 1);
-
-	let (poc, scanner_id, severity, finding_id): (Option<String>, String, String, i64) = db
-		.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT poc_unified, scanner_id, severity, id FROM findings LIMIT 1",
-				[],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-			)?)
-		})
-		.unwrap();
+	let findings = common::findings(&db, repo_id);
+	assert_eq!(findings.len(), 1);
+	let stored = &findings[0];
+	let (poc, scanner_id, severity, finding_id) = (
+		stored.poc_unified.as_ref().map(|poc| poc.expose()),
+		stored.scanner_id.expose(),
+		stored.severity.as_str(),
+		stored.id,
+	);
 	assert_eq!(scanner_id, "llm-code-review");
 	assert_eq!(severity, "high");
 	let poc = poc.expect("poc_unified must be populated");

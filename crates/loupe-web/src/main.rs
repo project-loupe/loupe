@@ -1,3 +1,18 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
+#![forbid(unsafe_code)]
 //! Thin wrapper: parse args, init tracing, serve. The interesting parts
 //! live in the library so integration tests can reach them.
 
@@ -16,25 +31,14 @@ async fn main() -> Result<()> {
 	// below should have happened at all.
 	config::ensure_loopback(cli.bind)?;
 
-	let base = cli.conn.server_url()?;
-	let client = AdminClient::new(
-		base.clone(),
-		&cli.conn.ca_pem()?,
-		&cli.conn.admin_cert_pem()?,
-		&cli.conn.admin_key_pem()?,
-	)?;
+	let client = AdminClient::new(&cli.conn)?;
+	// Argument PEM is no longer needed after the client owns its signer.
+	drop(cli.conn);
 
 	// Fail fast on a broken upstream rather than serving a dashboard whose
 	// every action errors. `/v1/health` needs no auth, so this checks
 	// reachability and protocol agreement, not the admin cert.
-	match client.health().await {
-		Ok(health) => {
-			tracing::info!(server = %base, ?health, "upstream reachable");
-		},
-		Err(e) => {
-			return Err(anyhow::anyhow!("cannot reach loupe-server at {base}: {e}"));
-		},
-	}
+	client.check_startup().await?;
 
 	let token = Token::generate();
 	let listener =

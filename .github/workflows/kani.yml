@@ -1,0 +1,42 @@
+name: Kani
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  kani:
+    name: Fast decision proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: /tmp/cargo-target-loupe-kani-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the verifier
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      - name: Verify fast harnesses through the bounded wrapper
+        shell: bash
+        run: |
+          selected=$(mktemp)
+          trap 'rm -f "$selected"' EXIT
+          for file in crates/loupe-*/kani/mod.rs; do
+            crate=${file#crates/}
+            crate=${crate%%/*}
+            awk -v crate="$crate" '
+              /^[[:space:]]*\/\/ ci: fast$/ { fast = 1 }
+              fast && /^fn / {
+                name = $2; sub(/\(.*/, "", name)
+                print crate, name; fast = 0
+              }
+            ' "$file" >> "$selected"
+          done
+          test -s "$selected"
+          while read -r crate harness; do
+            ci/kani.sh -p "$crate" --exact --harness "kani::$harness"
+          done < "$selected"

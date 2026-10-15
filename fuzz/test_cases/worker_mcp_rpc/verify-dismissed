@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"submit_verdict","arguments":{"verdict":"dismissed","notes":"notes"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"submit_patch","arguments":{"patch_unified":"patch","notes":"notes"}}}

@@ -3,22 +3,40 @@
 //!
 //! ```compile_fail
 //! use loupe_core::text::{BoundedText, policy::{Title, Objective}};
-//! fn title(_: BoundedText<Title>) {}
-//! title(BoundedText::<Objective>::new("not a title").unwrap());
+//! use loupe_provenance::Agent;
+//! fn title(_: BoundedText<Title, Agent>) {}
+//! fn wrong(value: BoundedText<Objective, Agent>) { title(value); }
 //! ```
 
-mod json;
+pub(crate) mod checked;
+#[cfg(doctest)]
+mod contract;
+pub(crate) mod json;
+pub(crate) mod json_string;
 pub mod policy;
+mod values;
 use std::fmt;
-use std::marker::PhantomData;
-use std::str::FromStr;
-use std::sync::LazyLock;
 
-pub use json::BoundedJson;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
+pub use json_string::decode_json_string_bounded;
 use unicode_general_category::{get_general_category, GeneralCategory as G};
 use unicode_normalization::UnicodeNormalization;
+pub use values::{Anchor, BoundedJson, BoundedText, Identifier, RepoPath, SourceRef};
+
+/// Whether field validation normalizes prose or retains admitted UTF-8 bytes.
+// debug-ok: closed normalization policy unit variants contain no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Normalization {
+	Semantic,
+	Exact,
+}
+
+/// Whether boundary whitespace and repeated blank lines are meaningful.
+// debug-ok: closed whitespace policy unit variants contain no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Whitespace {
+	Prose,
+	Significant,
+}
 
 pub trait TextPolicy {
 	const FIELD: &'static str;
@@ -26,6 +44,9 @@ pub trait TextPolicy {
 	const MAX_BYTES: usize;
 	const MULTILINE: bool;
 	const ALLOW_EMPTY: bool = false;
+	const NORMALIZATION: Normalization = Normalization::Semantic;
+	const WHITESPACE: Whitespace = Whitespace::Prose;
+	const ALLOW_CR: bool = false;
 }
 pub trait IdentPolicy {
 	const FIELD: &'static str;
@@ -40,6 +61,7 @@ pub trait JsonPolicy {
 	const MAX_NODES: usize;
 }
 
+// debug-ok: closed validation rule names contain no rejected input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
 	Character,
@@ -85,51 +107,56 @@ impl fmt::Debug for Error {
 	}
 }
 
-fn characters(field: &'static str, text: &str, multiline: bool) -> Result<(), Error> {
+fn characters(
+	field: &'static str, text: &str, multiline: bool, allow_cr: bool,
+) -> Result<(), Error> {
 	for c in text.chars() {
-		if multiline && matches!(c, '\n' | '\t') {
+		if multiline && (matches!(c, '\n' | '\t') || (allow_cr && c == '\r')) {
 			continue;
 		}
 		let cp = c as u32;
-		if matches!(
-			get_general_category(c),
-			G::Control
-				| G::Format
-				| G::Unassigned
-				| G::PrivateUse
-				| G::LineSeparator
-				| G::ParagraphSeparator
-		) || (0xfdd0..=0xfdef).contains(&cp)
-			|| cp & 0xffff >= 0xfffe
-		{
+		if rejects_code_point(cp) {
 			return Err(Error { field, rule: Rule::Character, code_point: Some(cp) });
 		}
 	}
 	Ok(())
 }
 
-fn limits<P: TextPolicy>(text: &str) -> Result<(), Error> {
-	if text.chars().count() > P::MAX_CHARS {
-		return Err(Error::new(P::FIELD, Rule::Chars));
+/// The character policy, independent of UTF-8 decoding and multiline exceptions.
+pub fn rejects_code_point(cp: u32) -> bool {
+	let Some(c) = char::from_u32(cp) else { return true };
+	matches!(
+		get_general_category(c),
+		G::Control
+			| G::Format
+			| G::Unassigned
+			| G::PrivateUse
+			| G::LineSeparator
+			| G::ParagraphSeparator
+	) || (0xfdd0..=0xfdef).contains(&cp)
+		|| cp & 0xffff >= 0xfffe
+}
+
+/// Count UTF-8 leading bytes; callers supply the bytes of a valid `str`.
+/// Preserve the character-limit error before the byte-limit error.
+pub(crate) fn count_within(text: &[u8], max_chars: usize, max_bytes: usize) -> Result<(), Rule> {
+	if text.iter().filter(|byte| **byte & 0xc0 != 0x80).count() > max_chars {
+		return Err(Rule::Chars);
 	}
-	if text.len() > P::MAX_BYTES {
-		return Err(Error::new(P::FIELD, Rule::Bytes));
+	if text.len() > max_bytes {
+		return Err(Rule::Bytes);
 	}
 	Ok(())
 }
 
-fn normalized(raw: &str) -> String {
-	raw.replace("\r\n", "\n").replace('\r', "\n").nfc().collect()
+fn limits<P: TextPolicy>(text: &str) -> Result<(), Error> {
+	count_within(text.as_bytes(), P::MAX_CHARS, P::MAX_BYTES)
+		.map_err(|rule| Error::new(P::FIELD, rule))
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct BoundedText<P: TextPolicy>(String, PhantomData<P>);
-#[derive(Clone, PartialEq, Eq)]
-pub struct Identifier<P: IdentPolicy>(String, PhantomData<P>);
-#[derive(Clone, PartialEq, Eq)]
-pub struct Anchor<P: AnchorPolicy>(String, PhantomData<P>);
-#[derive(Clone, PartialEq, Eq)]
-pub struct RepoPath(String);
+pub(crate) fn normalized(raw: &str) -> String {
+	raw.replace("\r\n", "\n").replace('\r', "\n").nfc().collect()
+}
 
 /// Reject oversized prose before allocating, with a conservative margin for
 /// CRLF folding and NFC contraction. The exact normalized caps follow below.
@@ -142,164 +169,20 @@ fn oversized(field: &'static str, raw: &str, max_bytes: usize) -> Result<(), Err
 	Ok(())
 }
 
-impl<P: TextPolicy> BoundedText<P> {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		oversized(P::FIELD, raw, P::MAX_BYTES)?;
-		let text = normalized(raw);
-		if text.is_empty() && !P::ALLOW_EMPTY {
-			return Err(Error::new(P::FIELD, Rule::Empty));
-		}
-		characters(P::FIELD, &text, P::MULTILINE)?;
-		limits::<P>(&text)?;
-		if text.trim() != text || text.contains("\n\n\n") {
-			return Err(Error::new(P::FIELD, Rule::Whitespace));
-		}
-		Ok(Self(text, PhantomData))
-	}
-}
-impl<P: IdentPolicy> Identifier<P> {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		// Identifiers are never normalized, so the exact cap can go first.
-		if raw.len() > P::MAX_LEN {
-			return Err(Error::new(P::FIELD, Rule::Bytes));
-		}
-		characters(P::FIELD, raw, false)?;
-		if !P::accepts(raw) {
-			return Err(Error::new(P::FIELD, Rule::Identifier));
-		}
-		if raw.trim() != raw || raw.contains("  ") {
-			return Err(Error::new(P::FIELD, Rule::Whitespace));
-		}
-		Ok(Self(raw.to_owned(), PhantomData))
-	}
-}
-impl<P: AnchorPolicy> Anchor<P> {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		let text = normalized(raw);
-		characters(P::FIELD, &text, false)?;
-		let text = text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-		// Case mapping can introduce combining sequences; retain NFC at rest.
-		let text: String = text.nfc().collect();
-		if text.is_empty() {
-			return Err(Error::new(P::FIELD, Rule::Empty));
-		}
-		limits::<P>(&text)?;
-		static TRANSIENT_ID: LazyLock<Regex> = LazyLock::new(|| {
-			Regex::new(r"(?-u:\b(job|campaign|generation|unit|lead|finding|line)[ #_-]?[0-9]+\b)")
-				.unwrap()
-		});
-		for word in text.split_whitespace() {
-			let location = word.rsplit_once(':').is_some_and(|(name, number)| {
-				!name.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
-			});
-			if location {
-				return Err(Error::new(P::FIELD, Rule::IdentityLocation));
-			}
-		}
-		if TRANSIENT_ID.is_match(&text) {
-			return Err(Error::new(P::FIELD, Rule::IdentityTransientId));
-		}
-		if text.split_whitespace().any(|word| {
-			(7..=64).contains(&word.len())
-				&& word.bytes().all(|b| b.is_ascii_hexdigit())
-				&& word.bytes().any(|b| b.is_ascii_digit())
-		}) {
-			return Err(Error::new(P::FIELD, Rule::IdentityHash));
-		}
-		Ok(Self(text, PhantomData))
-	}
-}
-impl RepoPath {
-	pub fn new(raw: &str) -> Result<Self, Error> {
-		characters("path", raw, false)?;
-		if raw.len() > 512 {
-			return Err(Error::new("path", Rule::Bytes));
-		}
-		if raw.contains('\\') || raw.split('/').any(|part| matches!(part, "" | "." | "..")) {
-			return Err(Error::new("path", Rule::Path));
-		}
-		Ok(Self(raw.to_owned()))
-	}
-	pub fn expose(&self) -> &str {
-		&self.0
-	}
-}
-
-macro_rules! text_impls {
-	($ty:ident, $policy:ident) => {
-		impl<P: $policy> $ty<P> {
-			pub fn expose(&self) -> &str {
-				&self.0
-			}
-		}
-		impl<P: $policy> fmt::Debug for $ty<P> {
-			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-				write!(f, "{}<{}>(len={})", stringify!($ty), P::FIELD, self.0.len())
-			}
-		}
-		impl<P: $policy> FromStr for $ty<P> {
-			type Err = Error;
-			fn from_str(raw: &str) -> Result<Self, Error> {
-				Self::new(raw)
-			}
-		}
-		impl<P: $policy> TryFrom<String> for $ty<P> {
-			type Error = Error;
-			fn try_from(raw: String) -> Result<Self, Error> {
-				Self::new(&raw)
-			}
-		}
-		impl<P: $policy> Serialize for $ty<P> {
-			fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-				s.serialize_str(&self.0)
-			}
-		}
-		impl<'de, P: $policy> Deserialize<'de> for $ty<P> {
-			fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-				Self::new(&String::deserialize(d)?).map_err(serde::de::Error::custom)
-			}
-		}
-	};
-}
-text_impls!(BoundedText, TextPolicy);
-text_impls!(Identifier, IdentPolicy);
-text_impls!(Anchor, AnchorPolicy);
-
-impl fmt::Debug for RepoPath {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "RepoPath(len={})", self.0.len())
-	}
-}
-impl FromStr for RepoPath {
-	type Err = Error;
-	fn from_str(raw: &str) -> Result<Self, Error> {
-		Self::new(raw)
-	}
-}
-impl TryFrom<String> for RepoPath {
-	type Error = Error;
-	fn try_from(raw: String) -> Result<Self, Error> {
-		Self::new(&raw)
-	}
-}
-impl Serialize for RepoPath {
-	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-		s.serialize_str(&self.0)
-	}
-}
-impl<'de> Deserialize<'de> for RepoPath {
-	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-		Self::new(&String::deserialize(d)?).map_err(serde::de::Error::custom)
-	}
-}
-
-/// Structured storage reference; protocol adapters may accept path#symbol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceRef {
-	pub path: RepoPath,
-	pub symbol: Option<BoundedText<policy::Symbol>>,
+/// Path structure after the constructor's character and byte-limit checks.
+pub(crate) fn is_repo_path(raw: &[u8]) -> bool {
+	!raw.contains(&b'\\')
+		&& !raw.contains(&0)
+		&& !raw.split(|byte| *byte == b'/').any(|part| matches!(part, b"" | b"." | b".."))
 }
 
 #[cfg(test)]
+mod json_string_tests;
+#[cfg(test)]
 mod tests;
+/// Fuzz-only observation of Payload's actual embedded serde visitor. This
+/// deliberately omits the outer raw-document cap and creates no labelled owner.
+#[cfg(fuzzing)]
+pub fn fuzz_payload_visitor(raw: &str) -> Option<(String, [u8; 32])> {
+	json::payload_visitor_observation(raw)
+}

@@ -68,6 +68,16 @@ Before installing, the host needs:
   compatibility alias. The key is consumed by the worker-host broker and
   is never passed to the Codex sandbox.
   See https://github.com/openai/codex for install instructions.
+
+  Both backends receive prompts through stdin. Host instructions are static;
+  finding content and repository paths enter labelled data blocks with checked
+  random boundaries. Each job also has one fixed boundary for prior-finding
+  tool results. A collision or oversized prompt fails closed. This contains
+  Loupe's rendered data and keeps it out of process arguments; it does not
+  guarantee that a model ignores hostile prose or cover files read directly
+  by external tools. See [Text and digest boundaries](ARCH.md#text-and-digest-boundaries)
+  for the source types, output limits and verification scope.
+
 - **`bkb-mcp`** (optional) on PATH on workers scanning bitcoin /
   lightning / cashu codebases. When the binary is present at startup,
   the discovery agent's per-call MCP config gets a second server
@@ -131,9 +141,29 @@ The binaries land in `target/release/`:
 - `target/release/loupectl` (admin CLI)
 
 `cargo test --workspace --all-targets` runs the unit and integration
-test suites; the LLM-backend live test skips automatically when
-`claude` is not on PATH, and the bubblewrap integration tests skip
-when `bwrap` is missing.
+test suites. Sandbox integration tests require Bubblewrap (`bwrap`),
+`curl`, `mawk`, and permission to create unprivileged user namespaces.
+On Ubuntu, install the tools with `sudo apt-get install bubblewrap curl mawk`.
+The LLM-backend live test skips automatically when `claude` is not on PATH.
+
+Before every commit, run `ci/check.sh` with stable Rust, nightly Rust
+(including rustfmt), and `jq` installed. It checks formatting, lints,
+each crate independently, documentation, and tests. Build output defaults
+to a branch-specific directory under `/tmp`; set `CARGO_TARGET_DIR` to a
+fresh directory there when invoking Cargo directly.
+
+`ci/check.sh --full` adds fuzz corpus replay, generated-runner checks,
+available Kani harnesses, and ignored integration tests. Fuzz replay needs
+only stable Rust. Campaigns additionally need `cargo-fuzz`, Bash and
+util-linux. See [fuzzing](fuzz/README.md) and the [campaign runbook](ci/README.md).
+
+Kani 0.68.0 is optional for ordinary contributor checks and required for the
+full verification gate. Install it with `cargo install --locked kani-verifier
+--version 0.68.0` and `cargo kani setup`, which installs its pinned toolchain.
+Run proofs only through `ci/kani.sh`; it enforces the shared process and
+memory limits and requires satisfied cover properties to rule out empty
+proofs. Weekly CI runs the harnesses marked `// ci: fast`; the complete set
+runs locally through the full gate and continuous campaign.
 
 For release validation and crates.io publication, see
 [the release guide](contrib/releasing.md).
@@ -216,6 +246,43 @@ so `LOUPE_MASTER_KEY` overrides the file. CLI flags and `LOUPE_*`
 env vars override anything the file supplies, so a typical deploy
 keeps stable settings in `config.toml` and uses the env to flip
 per-environment knobs.
+
+Authenticated worker requests share per-worker token buckets across job
+routes, identity, finding search and finding detail. The defaults allow
+bursts of 600 requests, 16 MiB of body bytes and 60 lease attempts, with
+refill of 10 requests, 256 KiB and one lease attempt per whole monotonic
+second. Total admitted traffic can include the burst plus earned refill.
+
+Authentication and charging precede protocol checks and long polling.
+Body accounting uses actual chunks, including input rejected later as
+malformed; received bytes stay charged if a later chunk fails. Exhaustion
+returns 429. Worker bodies above 2 MiB return 413, and broken body streams
+return 400. Public health and operator requests have no worker budget.
+Exhaustion logs contain only a fixed event/category and the worker ID.
+
+These positive settings can be overridden in the server TOML file:
+
+```toml
+[worker_budgets]
+max_workers = 4096
+idle_seconds = 120
+
+[worker_budgets.requests]
+capacity = 600
+refill_per_second = 10
+
+[worker_budgets.bytes]
+capacity = 16777216
+refill_per_second = 262144
+
+[worker_budgets.leases]
+capacity = 60
+refill_per_second = 1
+```
+
+At most `max_workers` identities are retained; a new identity receives
+429 if that map is full. Idle entries are reclaimed only after all three
+buckets have naturally refilled, so eviction cannot reset spent credit.
 
 ### 3. Point `loupectl` at the server
 
@@ -766,6 +833,13 @@ reporting with `repo set-github-reporting`, then run
 verifier-issued `dismiss` and a human `reject` both land on
 `state = 'dismissed'`, but only the human path stamps `rejected_*`.
 
+Reports render finding text and paths as literal content. An oversized report
+fails delivery and remains `confirmed` for retry: GitHub bodies allow 65,536
+characters and 262,144 bytes, including formatting; email allows 8,192 bytes
+per header line, 65,536 bytes for all headers and 16 MiB for the full message.
+Successfully delivered GitHub issues stay marked `reported` if a later issue
+in the batch fails. Email marks the whole batch only after sendmail succeeds.
+
 ## Verification flow (LLM second opinion)
 
 Setting `verification_enabled = true` on a repo causes scan-time
@@ -802,13 +876,15 @@ worker's config.
 
 ## Continuous integration
 
-GitHub Actions (`.github/workflows/ci.yml`) runs three jobs on every
+GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every
 push and pull request:
 
 - **fmt** — `cargo fmt --all -- --check` on a nightly toolchain.
 - **clippy** — `cargo clippy --workspace --all-targets --all-features
   -- -D warnings` on stable.
-- **test** — `cargo test --workspace --all-targets` on stable.
+- **test** — `ci/check.sh`: tests, boundary gates, production lints,
+  per-crate checks and nightly compile-fail doctests.
+- **fuzz-replay** — replay committed seeds and verify generated runners.
 
 ## Layout
 

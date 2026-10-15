@@ -1,3 +1,18 @@
+#![deny(unsafe_code)]
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
 //! `loupe-server` library surface.
 //!
 //! Exposed for integration tests; the binary in `main.rs` is a thin
@@ -6,15 +21,25 @@
 pub mod auth;
 pub mod background;
 pub mod config;
+#[cfg(fuzzing)]
+pub mod fuzz_support;
+mod ingress;
 pub mod init;
-mod job_capability;
+pub mod job_capability;
 pub mod reporters;
+pub mod request_budget;
 pub mod review;
 pub mod router;
 pub mod routes;
 pub mod state;
+#[cfg(test)]
+mod test_support;
 pub mod tls;
 
 pub use config::{Config, FileConfig};
 pub use router::{router, serve, PeerCert, ServeHandle};
 pub use state::AppState;
+
+#[cfg(kani)]
+#[path = "../kani/mod.rs"]
+mod kani;

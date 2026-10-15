@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use loupe_worker::sandbox::SandboxBuilder;
+use loupe_worker::sandbox::{SandboxBuilder, SandboxPath, SandboxValue};
 
 async fn compile_in_sandbox(files: &[(&str, &str)], command: &str) {
 	let source = tempfile::tempdir().unwrap();
@@ -17,14 +17,24 @@ async fn compile_in_sandbox(files: &[(&str, &str)], command: &str) {
 	let script = format!(
 		"set -eu\ncp -R /workdir /tmp/project\ncd /tmp/project\n{command}\nprintf 'TOOLCHAIN_OK\\n'"
 	);
-	let mut process = SandboxBuilder::new(source.path())
-		// Networked worker jobs mount these public certificates. pip reads
-		// them even offline, so retain that mount without enabling egress.
-		.bind_ro("/etc/ssl/certs", "/etc/ssl/certs")
-		.set_env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-		.set_env("CARGO_TARGET_DIR", "/tmp/cargo-target")
-		.build("/bin/sh");
-	process.args(["-c", &script]).kill_on_drop(true);
+	std::fs::write(source.path().join("toolchain-check.sh"), script).unwrap();
+	let mut process =
+		SandboxBuilder::new(SandboxPath::fixture(source.path().to_owned()), &Default::default())
+			// Networked worker jobs mount these public certificates. pip reads
+			// them even offline, so retain that mount without enabling egress.
+			.bind_ro(SandboxPath::fixture("/etc/ssl/certs".into()), "/etc/ssl/certs")
+			.set_env(
+				"PATH",
+				SandboxValue::r#static(
+					"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+				),
+			)
+			.set_env("CARGO_TARGET_DIR", SandboxValue::r#static("/tmp/cargo-target"))
+			.build(
+				SandboxValue::r#static("/bin/sh"),
+				&[SandboxValue::r#static("/workdir/toolchain-check.sh")],
+			);
+	process.kill_on_drop(true);
 	let output = tokio::time::timeout(Duration::from_secs(120), process.output())
 		.await
 		.expect("toolchain check timed out")

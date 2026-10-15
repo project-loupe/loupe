@@ -13,10 +13,14 @@ use tokio::task::JoinSet;
 
 const MAX_BROKER_CONNECTIONS: usize = 16;
 
-#[derive(Debug)]
 pub struct ModelProxy {
 	listener: TcpListener,
 	socket_path: PathBuf,
+}
+impl std::fmt::Debug for ModelProxy {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ModelProxy([redacted])")
+	}
 }
 
 impl ModelProxy {
@@ -24,17 +28,23 @@ impl ModelProxy {
 		if !listen.ip().is_loopback() {
 			anyhow::bail!("model proxy listener must use a loopback address");
 		}
-		let listener = TcpListener::bind(listen)
-			.await
-			.with_context(|| format!("binding model proxy at {listen}"))?;
+		let listener = TcpListener::bind(listen).await.context("binding model proxy listener")?;
 		let local_addr = listener.local_addr().context("reading model proxy listener address")?;
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "The private launcher publishes its numeric loopback port to the selected owned scratch file."
+		)]
 		tokio::fs::write(port_file, format!("{}\n", local_addr.port()))
 			.await
-			.with_context(|| format!("writing model proxy port file at {}", port_file.display()))?;
+			.context("writing model proxy port file")?;
 		Ok(Self { listener, socket_path })
 	}
 
 	pub fn local_addr(&self) -> SocketAddr {
+		#[allow(
+			clippy::expect_used,
+			reason = "The HTTP URL contains only a literal scheme, loopback IP and numeric bound port."
+		)]
 		self.listener.local_addr().expect("bound model proxy listener has an address")
 	}
 
@@ -48,9 +58,9 @@ impl ModelProxy {
 			tokio::select! {
 				biased;
 				Some(result) = connections.join_next(), if !connections.is_empty() => {
-					match result.context("model proxy connection task panicked")? {
+					match result.map_err(|_| anyhow::anyhow!("model proxy connection task panicked"))? {
 						Ok(()) => {},
-						Err(error) => tracing::debug!(%error, "model proxy client connection ended"),
+						Err(_) => tracing::debug!("model proxy client connection ended"),
 					}
 				},
 				accepted = self.listener.accept() => {
@@ -62,9 +72,8 @@ impl ModelProxy {
 						tracing::warn!(limit = MAX_BROKER_CONNECTIONS, "model proxy connection limit reached");
 						continue;
 					}
-					let unix = UnixStream::connect(&self.socket_path).await.with_context(|| {
-						format!("connecting model broker socket at {}", self.socket_path.display())
-					})?;
+					let unix = UnixStream::connect(&self.socket_path).await
+						.context("connecting model broker socket")?;
 					connections.spawn(relay_connection(tcp, unix));
 				},
 			}
@@ -87,6 +96,39 @@ mod tests {
 	use tokio::net::{TcpStream, UnixListener};
 
 	use super::*;
+
+	#[tokio::test]
+	async fn model_proxy_debug_omits_socket_path() {
+		let directory = tempfile::tempdir().unwrap();
+		let proxy = ModelProxy::bind(
+			directory.path().join("private-proxy-socket-sentinel"),
+			"127.0.0.1:0".parse().unwrap(),
+			&directory.path().join("port"),
+		)
+		.await
+		.unwrap();
+		assert!(
+			!format!("{proxy:?}").contains("private-proxy-socket-sentinel"),
+			"model proxy socket path leaked through Debug"
+		);
+	}
+
+	#[tokio::test]
+	async fn model_proxy_path_errors_omit_original_bytes_from_the_chain() {
+		let directory = tempfile::tempdir().unwrap();
+		let port = directory.path().join("private-port-path-sentinel/missing.port");
+		let error = ModelProxy::bind(
+			directory.path().join("socket"),
+			"127.0.0.1:0".parse().unwrap(),
+			&port,
+		)
+		.await
+		.unwrap_err();
+		assert!(
+			!format!("{error:#}").contains("private-port-path-sentinel"),
+			"model proxy path leaked through the public error chain"
+		);
+	}
 
 	#[tokio::test]
 	async fn relays_multiple_loopback_connections_to_the_job_socket() {

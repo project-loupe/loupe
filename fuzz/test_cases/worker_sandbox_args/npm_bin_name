@@ -1,0 +1,1 @@
+{"binary_name":"bin","symlink":true,"network":1,"hosts":["example.test"],"binds":[["--clearenv","/mount"]],"args":["--share-net"]}

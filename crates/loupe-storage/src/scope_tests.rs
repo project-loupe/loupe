@@ -1,17 +1,143 @@
 //! Domain contract tests use real encrypted databases and enabled foreign keys.
-use loupe_core::text::{Anchor, BoundedText, Identifier, RepoPath, SourceRef};
+use loupe_core::text::SourceRef;
 use rusqlite::{params, Transaction};
 
 use crate::identity::Identity;
 use crate::review_tests::{fixture, payload, reason};
 use crate::{transaction, Conflict, Error, Ownership};
 
-fn identity() -> Identity {
+fn identity() -> Identity<loupe_provenance::Agent> {
 	Identity {
-		family: Identifier::new("auth-bypass").unwrap(),
-		anchor: Anchor::new("token refresh handler").unwrap(),
+		family: crate::test_support::identifier("auth-bypass").unwrap(),
+		anchor: crate::test_support::anchor("token refresh handler").unwrap(),
 		instance: None,
 	}
+}
+
+#[test]
+fn issued_lease_holds_immediate_lock_until_callback_commit() {
+	use crate::jobs::{ActiveLease, LeaseIdentity};
+	let directory = tempfile::tempdir().unwrap();
+	let path = directory.path().join("lease.sqlite");
+	let db = crate::Db::open(&path, &crate::secrets::MasterKey::for_tests()).unwrap();
+	db.with_conn(|conn| {
+		conn.execute_batch("INSERT INTO registered_repos(id,clone_url,host,owner,repo,reporting,created_at) VALUES(1,'url','host','owner','repo','{\"kind\":\"manual\"}',0); INSERT INTO workers(id,name,kind,cert_fingerprint,created_at) VALUES(1,'worker','worker',X'01',0); INSERT INTO jobs(id,repo_id,kind,state,worker_id,lease_expires_at,job_capability_hash,enqueued_at) VALUES(1,1,'scan','leased',1,100,zeroblob(32),0);")?;
+		Ok(())
+	}).unwrap();
+	let other = crate::Db::open(&path, &crate::secrets::MasterKey::for_tests()).unwrap();
+	other
+		.with_conn(|conn| {
+			conn.busy_timeout(std::time::Duration::ZERO)?;
+			Ok(())
+		})
+		.unwrap();
+	let lease = ActiveLease {
+		identity: LeaseIdentity { job_id: 1, worker_id: 1, capability_hash: &[0; 32] },
+		now: 50,
+	};
+	let other = crate::scope::with_active_lease(&db, lease, |scope| {
+		let (other, cancellation) = std::thread::spawn(move || {
+			let cancellation = crate::recovery::cancel_job(&other, &crate::test_support::operator_ingress(), 1, 50);
+			(other, cancellation)
+		}).join().unwrap();
+		assert!(matches!(cancellation, Err(Error::Sqlite(rusqlite::Error::SqliteFailure(error,_))) if error.code == rusqlite::ErrorCode::DatabaseBusy), "concurrent cancellation must contend with the issuing IMMEDIATE transaction");
+		assert_eq!(crate::jobs::get(scope.repo(),1)?.unwrap().state, loupe_core::JobState::Leased);
+		assert_eq!(crate::jobs::extend_lease(scope, 60)?, Some(110));
+		Ok(other)
+	}).unwrap().unwrap();
+	assert!(matches!(
+		crate::recovery::cancel_job(&other, &crate::test_support::operator_ingress(), 1, 51)
+			.unwrap(),
+		crate::jobs::CancelOutcome::Cancelled(_)
+	));
+	let called = std::cell::Cell::new(false);
+	assert!(crate::scope::with_active_lease(&db, lease, |_| {
+		called.set(true);
+		Ok(())
+	})
+	.unwrap()
+	.is_none());
+	assert!(!called.get(), "committed cancellation must prevent subsequent issuance");
+}
+
+#[test]
+fn issued_scope_cannot_mark_a_foreign_lead_for_revalidation() {
+	let db = fixture();
+	db.with_conn(|conn| {conn.execute_batch("INSERT INTO leads(lead_id,generation_id,identity_family,identity_anchor,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,created_at) VALUES(11,11,'f','a',zeroblob(32),'{}',zeroblob(32),'base',0),(21,21,'f','a',zeroblob(32),'{}',zeroblob(32),'foreign',0);")?;Ok(())}).unwrap();
+	crate::scope::with_operator_repository(
+		&db,
+		&crate::test_support::operator_ingress(),
+		crate::scope::OperatorTarget::Repository(1),
+		|scope| {
+			crate::leads::mark_needs_revalidation(scope, 11)?;
+			assert!(
+				matches!(
+					crate::leads::mark_needs_revalidation(scope, 21),
+					Err(Error::Conflict(Conflict::LeadState))
+				),
+				"a foreign lead must not be marked through a local issued scope"
+			);
+			let local: i64 = scope.conn.query_row(
+				"SELECT needs_revalidation FROM leads WHERE lead_id=11",
+				[],
+				|row| row.get(0),
+			)?;
+			let foreign: i64 = scope.conn.query_row(
+				"SELECT needs_revalidation FROM leads WHERE lead_id=21",
+				[],
+				|row| row.get(0),
+			)?;
+			assert_eq!((local, foreign), (1, 0));
+			Ok(())
+		},
+	)
+	.unwrap();
+}
+
+#[test]
+fn repository_scope_must_confine_an_id_only_read() {
+	let db = fixture();
+	crate::scope::with_operator_repository(
+		&db,
+		&crate::test_support::operator_ingress(),
+		crate::scope::OperatorTarget::Repository(1),
+		|scope| {
+			assert_eq!(
+				crate::generations::get(scope, 11)?.unwrap().repo_id,
+				1,
+				"local row remains readable"
+			);
+			assert!(
+				crate::generations::get(scope, 21)?.is_none(),
+				"an ID-only DAO must not read a generation outside the selected repository"
+			);
+			Ok(())
+		},
+	)
+	.unwrap();
+}
+
+#[test]
+fn repository_scope_must_not_delete_a_foreign_repository() {
+	let db = fixture();
+	crate::scope::with_operator_repository(
+		&db,
+		&crate::test_support::operator_ingress(),
+		crate::scope::OperatorTarget::Repository(1),
+		|scope| {
+			assert!(crate::repos::get(scope)?.is_some(), "selected local control exists");
+			// The scoped signature accepts no replacement repository ID. Deletion
+			// succeeds for the selected local row and leaves the foreign row intact.
+			assert!(crate::repos::delete(scope)?, "selected local deletion succeeds");
+			assert!(crate::repos::get(scope)?.is_none(), "local row was removed");
+			assert!(
+				crate::repos::get_raw(scope.conn, 2)?.is_some(),
+				"foreign row must remain unchanged"
+			);
+			Ok(())
+		},
+	)
+	.unwrap();
 }
 #[test]
 fn concurrent_lead_submission_creates_once_and_attaches_once() {
@@ -30,21 +156,23 @@ fn concurrent_lead_submission_creates_once_and_attaches_once() {
 			barrier.wait();
 			let identity = identity();
 			let data = payload();
-			l::standalone::submit(
-				c,
-				&l::NewLead {
-					generation_id: 11,
-					unit_id: None,
-					identity: &identity,
-					payload: &data,
-					commit_sha: "base",
-					priority: Priority::Normal,
-					priority_proposal: None,
-					supersedes: None,
-					created_by_job: Some(101),
-				},
-				0,
-			)
+			crate::test_support::scoped(c, 1, |scope| {
+				l::submit(
+					scope,
+					&l::NewLead {
+						generation_id: 11,
+						unit_id: None,
+						identity: &identity,
+						payload: &data,
+						commit_sha: &crate::test_support::db_text("base").unwrap(),
+						priority: Priority::Normal,
+						priority_proposal: None,
+						supersedes: None,
+						created_by_job: Some(101),
+					},
+					0,
+				)
+			})
 		})
 		.expect("concurrent submissions serialize successfully")
 	};
@@ -63,9 +191,16 @@ fn concurrent_lead_submission_creates_once_and_attaches_once() {
 	let reopened = Db::open(&path, &MasterKey::for_tests()).unwrap();
 	reopened
 		.with_conn(|c| {
-			let leads = l::list(c, 11)?;
+			let leads = l::list(&crate::test_support::scope(c, 1), 11)?;
 			assert_eq!(leads.len(), 1);
-			assert_eq!(crate::lead_observations::list(c, leads[0].lead_id)?.len(), 1);
+			assert_eq!(
+				crate::lead_observations::list(
+					&crate::test_support::scope(c, 1),
+					leads[0].lead_id
+				)?
+				.len(),
+				1
+			);
 			Ok(())
 		})
 		.unwrap();
@@ -85,19 +220,18 @@ pub(crate) fn findings(tx: &Transaction<'_>) -> crate::Result<()> {
 }
 #[test]
 fn references_preserve_paths_and_enforce_field_specific_count_caps() {
-	use crate::source_refs::{InspectedRefs, UnitRefs};
 	let reference = SourceRef {
-		path: RepoPath::new("cafe\u{301}.rs").unwrap(),
-		symbol: Some(BoundedText::new("cafe\u{301}").unwrap()),
+		path: crate::test_support::path("cafe\u{301}.rs").unwrap(),
+		symbol: Some(crate::test_support::text("cafe\u{301}").unwrap()),
 	};
-	let refs =
-		UnitRefs::new(vec![reference.clone()]).expect("a valid source reference must be accepted");
+	let refs = crate::test_support::refs::<32>(vec![reference.clone()])
+		.expect("a valid source reference must be accepted");
 	assert!(refs.expose().contains("cafe\u{301}.rs"));
 	assert!(refs.expose().contains("café"));
-	assert_eq!(refs.expose().parse::<UnitRefs>().unwrap(), refs);
-	assert!(UnitRefs::new(vec![reference.clone(); 33]).is_err());
-	assert!(InspectedRefs::new(vec![reference; 33]).is_ok());
-	assert!("[]".repeat(65537).parse::<UnitRefs>().is_err());
+	assert_eq!(crate::test_support::read_unit_refs(refs.expose()).unwrap(), refs);
+	assert!(crate::test_support::refs::<32>(vec![reference.clone(); 33]).is_err());
+	assert!(crate::test_support::refs::<64>(vec![reference; 33]).is_ok());
+	assert!(crate::test_support::read_unit_refs(&"[]".repeat(65537)).is_err());
 	assert!(!format!("{refs:?}").contains("cafe"));
 }
 #[test]
@@ -106,11 +240,11 @@ fn unit_creation_transitions_and_carry_forward() {
 	let db = fixture();
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
-			let key = Identifier::new("scope").unwrap();
-			let title = BoundedText::new("Authentication").unwrap();
-			let objective = BoundedText::new("Review token refresh").unwrap();
-			let refs = crate::source_refs::UnitRefs::new(vec![]).unwrap();
-			let new = u::NewUnit {
+			let key = crate::test_support::identifier("scope").unwrap();
+			let title = crate::test_support::text("Authentication").unwrap();
+			let objective = crate::test_support::text("Review token refresh").unwrap();
+			let refs = crate::test_support::refs::<32>(vec![]).unwrap();
+			let mut new = u::NewUnit {
 				generation_id: 11,
 				client_key: &key,
 				title: &title,
@@ -124,22 +258,42 @@ fn unit_creation_transitions_and_carry_forward() {
 				carried_from: None,
 				created_by_job: Some(101),
 			};
-			let id = u::create(tx, &new, 0).expect("create a typed review unit");
-			assert!(matches!(u::create(tx, &new, 0), Err(Error::Conflict(Conflict::UnitKey))));
-			u::defer(tx, id, &reason())?;
-			assert!(u::defer(tx, id, &reason()).is_err());
-			u::reopen(tx, id)?;
-			u::mark_stale(tx, id, &reason())?;
-			let carried = u::carry_forward(tx, id, 12, Some(102), None, 1)?;
-			let row = u::get(tx, carried)?.unwrap();
+			let id = u::create(&crate::test_support::scope(tx, 1), &new, 0)
+				.expect("create a typed review unit");
+			assert!(matches!(
+				u::create(&crate::test_support::scope(tx, 1), &new, 0),
+				Err(Error::Conflict(Conflict::UnitKey))
+			));
+			u::defer(&crate::test_support::scope(tx, 1), id, &reason())?;
+			assert!(u::defer(&crate::test_support::scope(tx, 1), id, &reason()).is_err());
+			u::reopen(&crate::test_support::scope(tx, 1), id)?;
+			u::mark_stale(&crate::test_support::scope(tx, 1), id, &reason())?;
+			let carried =
+				u::carry_forward(&crate::test_support::scope(tx, 1), id, 12, Some(102), None, 1)?;
+			let row = u::get(&crate::test_support::scope(tx, 1), carried)?.unwrap();
 			assert_eq!(row.carry_depth, 1);
 			assert_eq!(row.carried_from, Some(id));
 			assert!(!row.stale);
-			u::retire(tx, id)?;
-			assert!(u::reopen(tx, id).is_err());
-			assert_eq!(u::list(tx, 11)?.len(), 1);
+			u::retire(&crate::test_support::scope(tx, 1), id)?;
+			assert!(u::reopen(&crate::test_support::scope(tx, 1), id).is_err());
+			assert_eq!(u::list(&crate::test_support::scope(tx, 1), 11)?.len(), 1);
 			assert!(matches!(
-				u::carry_forward(tx, carried, 21, Some(201), None, 1),
+				u::carry_forward(
+					&crate::test_support::scope(tx, 1),
+					carried,
+					21,
+					Some(201),
+					None,
+					1
+				),
+				Err(Error::Ownership(Ownership::InventoryGeneration))
+			));
+			// Selecting the target repository still cannot carry a foreign parent.
+			new.generation_id = 21;
+			new.created_by_job = Some(201);
+			new.carried_from = Some(carried);
+			assert!(matches!(
+				u::create(&crate::test_support::scope(tx, 2), &new, 1),
 				Err(Error::Ownership(Ownership::CarriedUnit))
 			));
 			Ok(())
@@ -154,10 +308,10 @@ fn units_reject_foreign_and_other_generation_jobs() {
 	db.with_conn(|c| {
 		transaction::immediate(c, |tx| {
 			units(tx)?;
-			let key = Identifier::new("scope").unwrap();
-			let title = BoundedText::new("title").unwrap();
-			let objective = BoundedText::new("objective").unwrap();
-			let refs = crate::source_refs::UnitRefs::new(vec![]).unwrap();
+			let key = crate::test_support::identifier("scope").unwrap();
+			let title = crate::test_support::text("title").unwrap();
+			let objective = crate::test_support::text("objective").unwrap();
+			let refs = crate::test_support::refs::<32>(vec![]).unwrap();
 			let mut new = u::NewUnit {
 				generation_id: 11,
 				client_key: &key,
@@ -175,14 +329,14 @@ fn units_reject_foreign_and_other_generation_jobs() {
 			for job in [201, 102] {
 				new.created_by_job = Some(job);
 				assert!(matches!(
-					u::create(tx, &new, 0),
+					u::create(&crate::test_support::scope(tx, 1), &new, 0),
 					Err(Error::Ownership(Ownership::UnitJob))
 				));
 			}
 			new.created_by_job = Some(101);
 			new.carried_from = Some(21);
 			assert!(matches!(
-				u::create(tx, &new, 0),
+				u::create(&crate::test_support::scope(tx, 1), &new, 0),
 				Err(Error::Ownership(Ownership::CarriedUnit))
 			));
 			Ok(())
@@ -217,8 +371,8 @@ fn assignment_positions_continue_across_batches() {
 		transaction::immediate(c, |tx| {
 			units(tx)?;
 			tx.execute("INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,created_at) VALUES (13,11,'second','title','objective','[]',0)",[])?;
-			u::assign(tx, 101, &[u::Assignment { unit_id: 11, expected_epoch: 0 }])?;
-			u::assign(tx, 101, &[u::Assignment { unit_id: 13, expected_epoch: 0 }])?;
+			u::assign(&crate::test_support::scope(tx, 1), 101, &[u::Assignment { unit_id: 11, expected_epoch: 0 }])?;
+			u::assign(&crate::test_support::scope(tx, 1), 101, &[u::Assignment { unit_id: 13, expected_epoch: 0 }])?;
 			let positions: Vec<(i64, i64)> = tx
 				.prepare("SELECT review_unit_id, position FROM job_assigned_review_units WHERE job_id=101 ORDER BY position, review_unit_id")?
 				.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -236,16 +390,18 @@ fn a_failed_assignment_batch_rolls_back_every_epoch() {
 	let db = fixture();
 	db.with_conn(|c| {
 		transaction::immediate(c, units)?;
-		let result = u::standalone::assign(
-			c,
-			101,
-			&[
-				u::Assignment { unit_id: 11, expected_epoch: 0 },
-				u::Assignment { unit_id: 12, expected_epoch: 0 },
-			],
-		);
+		let result = crate::test_support::scoped(c, 1, |scope| {
+			u::assign(
+				scope,
+				101,
+				&[
+					u::Assignment { unit_id: 11, expected_epoch: 0 },
+					u::Assignment { unit_id: 12, expected_epoch: 0 },
+				],
+			)
+		});
 		assert!(matches!(result, Err(Error::Ownership(Ownership::Assignment))));
-		assert_eq!(u::get(c, 11)?.unwrap().assignment_epoch, 0);
+		assert_eq!(u::get(&crate::test_support::scope(c, 1), 11)?.unwrap().assignment_epoch, 0);
 		assert_eq!(
 			c.query_row("SELECT COUNT(*) FROM job_assigned_review_units", [], |r| r
 				.get::<_, i64>(0))?,
@@ -261,8 +417,8 @@ fn carry_forward_does_not_reuse_prior_generation_dependency_ids() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx|{
   tx.execute_batch("INSERT INTO review_units (review_unit_id,generation_id,client_review_unit_key,title,objective,source_refs,depends_on,created_at) VALUES (31,11,'source','title','objective','[]','[32]',0),(32,11,'dependency','title','objective','[]',NULL,0);")?;
-  let id=crate::review_units::carry_forward(tx,31,12,Some(102),None,1)?;
-  assert_eq!(crate::review_units::get(tx,id)?.unwrap().depends_on,None,"dependency IDs must be rebuilt for the successor generation");
+  let id=crate::review_units::carry_forward(&crate::test_support::scope(tx, 1),31,12,Some(102),None,1)?;
+  assert_eq!(crate::review_units::get(&crate::test_support::scope(tx, 1),id)?.unwrap().depends_on,None,"dependency IDs must be rebuilt for the successor generation");
   Ok(())
  })).unwrap();
 }
@@ -272,15 +428,15 @@ fn assignments_require_generation_epoch_and_exclusive_active_ownership() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx|{
  units(tx)?;
- assert!(matches!(u::assign(tx,101,&[u::Assignment{unit_id:12,expected_epoch:0}]),Err(Error::Ownership(Ownership::Assignment))));
- u::assign(tx,101,&[u::Assignment{unit_id:11,expected_epoch:0}]).expect("claim with the current epoch");
- assert_eq!(u::get(tx,11)?.unwrap().assignment_epoch,1);
+ assert!(matches!(u::assign(&crate::test_support::scope(tx, 1),101,&[u::Assignment{unit_id:12,expected_epoch:0}]),Err(Error::Ownership(Ownership::Assignment))));
+ u::assign(&crate::test_support::scope(tx, 1),101,&[u::Assignment{unit_id:11,expected_epoch:0}]).expect("claim with the current epoch");
+ assert_eq!(u::get(&crate::test_support::scope(tx, 1),11)?.unwrap().assignment_epoch,1);
  tx.execute("INSERT INTO jobs (id,repo_id,kind,state,generation_id,enqueued_at) VALUES (103,1,'survey','queued',11,0)",[])?;
- assert!(matches!(u::assign(tx,103,&[u::Assignment{unit_id:11,expected_epoch:1}]),Err(Error::Conflict(Conflict::Assignment))));
+ assert!(matches!(u::assign(&crate::test_support::scope(tx, 1),103,&[u::Assignment{unit_id:11,expected_epoch:1}]),Err(Error::Conflict(Conflict::Assignment))));
  tx.execute("UPDATE jobs SET state='succeeded' WHERE id=101",[])?;
- assert!(matches!(u::assign(tx,103,&[u::Assignment{unit_id:11,expected_epoch:0}]),Err(Error::Conflict(Conflict::Assignment))));
- u::assign(tx,103,&[u::Assignment{unit_id:11,expected_epoch:1}])?;
- assert_eq!(u::get(tx,11)?.unwrap().assignment_epoch,2);
+ assert!(matches!(u::assign(&crate::test_support::scope(tx, 1),103,&[u::Assignment{unit_id:11,expected_epoch:0}]),Err(Error::Conflict(Conflict::Assignment))));
+ u::assign(&crate::test_support::scope(tx, 1),103,&[u::Assignment{unit_id:11,expected_epoch:1}])?;
+ assert_eq!(u::get(&crate::test_support::scope(tx, 1),11)?.unwrap().assignment_epoch,2);
  Ok(())
  })).unwrap();
 }
@@ -289,27 +445,27 @@ fn unit_results_check_all_corroboration_and_job_relations() {
 	use crate::review_unit_results as r;
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx|{
- units(tx)?;let refs=crate::source_refs::InspectedRefs::new(vec![]).unwrap();let data=payload();
- let mut new=r::NewResult{generation_id:11,unit_id:11,produced_by_job:Some(101),commit_sha:"base",profile_version:1,disposition:r::Disposition::NoLeadFound,inspected_refs:&refs,counterevidence:None,proof_gaps:None,payload:&data,corroborates_result:None,corroborates_exclusion:None};
- let id=r::insert(tx,&new,0).expect("append a unit result");
- for job in [102,201] {new.produced_by_job=Some(job);assert!(matches!(r::insert(tx,&new,0),Err(Error::Ownership(Ownership::ResultJob))));}
+ units(tx)?;let refs=crate::test_support::refs::<64>(vec![]).unwrap();let data=payload();
+ let mut new=r::NewResult{generation_id:11,unit_id:11,produced_by_job:Some(101),commit_sha: &crate::test_support::db_text("base").unwrap(),profile_version:1,disposition:r::Disposition::NoLeadFound,inspected_refs:&refs,counterevidence:None,proof_gaps:None,payload:&data,corroborates_result:None,corroborates_exclusion:None};
+ let id=r::insert(&crate::test_support::scope(tx, 1),&new,0).expect("append a unit result");
+ for job in [102,201] {new.produced_by_job=Some(job);assert!(matches!(r::insert(&crate::test_support::scope(tx, 1),&new,0),Err(Error::Ownership(Ownership::ResultJob))));}
  new.produced_by_job=Some(101);new.unit_id=12;
- assert!(matches!(r::insert(tx,&new,0),Err(Error::Ownership(Ownership::ResultUnit))));
+ assert!(matches!(r::insert(&crate::test_support::scope(tx, 1),&new,0),Err(Error::Ownership(Ownership::ResultUnit))));
  new.unit_id=11;new.corroborates_result=Some(id);
- let corroboration=r::insert(tx,&new,1)?;
+ let corroboration=r::insert(&crate::test_support::scope(tx, 1),&new,1)?;
  new.corroborates_result=Some(corroboration);
- assert!(matches!(r::insert(tx,&new,1),Err(Error::Ownership(Ownership::CorroboratedResult))));
+ assert!(matches!(r::insert(&crate::test_support::scope(tx, 1),&new,1),Err(Error::Ownership(Ownership::CorroboratedResult))));
  new.corroborates_result=None;
  tx.execute("INSERT INTO review_unit_results (review_unit_result_id,review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,created_at) VALUES (99,12,'next',1,'no_lead_found','[]','{}',zeroblob(32),0)",[])?;
  new.corroborates_result=Some(99);
- assert!(matches!(r::insert(tx,&new,1),Err(Error::Ownership(Ownership::CorroboratedResult))));
+ assert!(matches!(r::insert(&crate::test_support::scope(tx, 1),&new,1),Err(Error::Ownership(Ownership::CorroboratedResult))));
  tx.execute_batch("INSERT INTO generation_inventory (inventory_entry_id,generation_id,path,entry_kind,disposition,created_at) VALUES (11,11,'a','tracked','excluded',0),(12,11,'b','tracked','mapped',0),(21,21,'a','tracked','excluded',0);")?;
  new.corroborates_exclusion=Some(11);
- assert!(matches!(r::insert(tx,&new,1),Err(Error::Conflict(Conflict::Corroboration))));
+ assert!(matches!(r::insert(&crate::test_support::scope(tx, 1),&new,1),Err(Error::Conflict(Conflict::Corroboration))));
  new.corroborates_result=None;
- for exclusion in [12,21] {new.corroborates_exclusion=Some(exclusion);assert!(matches!(r::insert(tx,&new,1),Err(Error::Ownership(Ownership::CorroboratedExclusion))));}
- new.corroborates_exclusion=Some(11);r::insert(tx,&new,1)?;
- r::invalidate(tx,id,&reason())?;assert!(r::list(tx,11)?.iter().any(|r|r.result_id==id && r.invalidated));
+ for exclusion in [12,21] {new.corroborates_exclusion=Some(exclusion);assert!(matches!(r::insert(&crate::test_support::scope(tx, 1),&new,1),Err(Error::Ownership(Ownership::CorroboratedExclusion))));}
+ new.corroborates_exclusion=Some(11);r::insert(&crate::test_support::scope(tx, 1),&new,1)?;
+ r::invalidate(&crate::test_support::scope(tx, 1),id,&reason())?;assert!(r::list(&crate::test_support::scope(tx, 1),11)?.iter().any(|r|r.result_id==id && r.invalidated));
  Ok(())
  })).unwrap();
 }
@@ -329,32 +485,49 @@ fn every_identity_collision_preserves_the_observation() {
 					unit_id: None,
 					identity: &identity,
 					payload: &data,
-					commit_sha: "base",
+					commit_sha: &crate::test_support::db_text("base").unwrap(),
 					priority: Priority::Normal,
 					priority_proposal: None,
 					supersedes: None,
 					created_by_job: Some(101),
 				};
 				let l::Submitted::Created(id) =
-					l::submit(tx, &new, 0).expect("create a first lead")
+					l::submit(&crate::test_support::scope(tx, 1), &new, 0)
+						.expect("create a first lead")
 				else {
 					panic!("new identity")
 				};
 				match status {
-					"deferred" => l::defer(tx, id, &reason(), Some(&reason()))?,
-					"promoted" => l::close(tx, id, &l::Closure::Promoted { finding: 11 }, 1)?,
-					"rejected" => l::close(tx, id, &l::Closure::Rejected, 1)?,
+					"deferred" => l::defer(
+						&crate::test_support::scope(tx, 1),
+						id,
+						&reason(),
+						Some(&reason()),
+					)?,
+					"promoted" => l::close(
+						&crate::test_support::scope(tx, 1),
+						id,
+						&l::Closure::Promoted { finding: 11 },
+						1,
+					)?,
+					"rejected" => {
+						l::close(&crate::test_support::scope(tx, 1), id, &l::Closure::Rejected, 1)?
+					},
 					"duplicate" => l::close(
-						tx,
+						&crate::test_support::scope(tx, 1),
 						id,
 						&l::Closure::Duplicate { lead: None, finding: Some(11) },
 						1,
 					)?,
-					"hardening" => l::close(tx, id, &l::Closure::Hardening, 1)?,
-					"stale" => l::close(tx, id, &l::Closure::Stale, 1)?,
+					"hardening" => {
+						l::close(&crate::test_support::scope(tx, 1), id, &l::Closure::Hardening, 1)?
+					},
+					"stale" => {
+						l::close(&crate::test_support::scope(tx, 1), id, &l::Closure::Stale, 1)?
+					},
 					_ => {},
 				}
-				let outcome = l::submit(tx, &new, 2)?;
+				let outcome = l::submit(&crate::test_support::scope(tx, 1), &new, 2)?;
 				match status {
 					"open" | "deferred" => assert_eq!(
 						outcome,
@@ -365,7 +538,10 @@ fn every_identity_collision_preserves_the_observation() {
 							panic!("stale identity is reusable")
 						};
 						assert_ne!(id, next);
-						assert_eq!(l::get(tx, next)?.unwrap().supersedes, Some(id));
+						assert_eq!(
+							l::get(&crate::test_support::scope(tx, 1), next)?.unwrap().supersedes,
+							Some(id)
+						);
 					},
 					_ => assert_eq!(
 						outcome,
@@ -376,7 +552,7 @@ fn every_identity_collision_preserves_the_observation() {
 						}
 					),
 				}
-				let observations = o::list(tx, id)?;
+				let observations = o::list(&crate::test_support::scope(tx, 1), id)?;
 				assert_eq!(observations.len(), usize::from(status != "stale"));
 				if let Some(observation) = observations.first() {
 					assert_eq!(observation.payload, data);
@@ -403,7 +579,7 @@ fn leads_and_observations_reject_every_wrong_scope() {
 				unit_id: None,
 				identity: &identity,
 				payload: &data,
-				commit_sha: "base",
+				commit_sha: &crate::test_support::db_text("base").unwrap(),
 				priority: Priority::Normal,
 				priority_proposal: None,
 				supersedes: None,
@@ -412,7 +588,7 @@ fn leads_and_observations_reject_every_wrong_scope() {
 			for unit in [12, 21] {
 				new.unit_id = Some(unit);
 				assert!(matches!(
-					l::submit(tx, &new, 0),
+					l::submit(&crate::test_support::scope(tx, 1), &new, 0),
 					Err(Error::Ownership(Ownership::LeadUnit))
 				));
 			}
@@ -420,21 +596,24 @@ fn leads_and_observations_reject_every_wrong_scope() {
 			for job in [102, 201] {
 				new.created_by_job = Some(job);
 				assert!(matches!(
-					l::submit(tx, &new, 0),
+					l::submit(&crate::test_support::scope(tx, 1), &new, 0),
 					Err(Error::Ownership(Ownership::LeadJob))
 				));
 			}
 			new.created_by_job = Some(101);
-			let l::Submitted::Created(id) = l::submit(tx, &new, 0)? else { panic!() };
+			let l::Submitted::Created(id) = l::submit(&crate::test_support::scope(tx, 1), &new, 0)?
+			else {
+				panic!()
+			};
 			for job in [102, 201] {
 				assert!(matches!(
 					o::insert(
-						tx,
+						&crate::test_support::scope(tx, 1),
 						&o::NewObservation {
 							lead_id: id,
 							submitted_by_job: Some(job),
 							payload: &data,
-							commit_sha: "base"
+							commit_sha: &crate::test_support::db_text("base").unwrap()
 						},
 						1
 					),
@@ -443,24 +622,43 @@ fn leads_and_observations_reject_every_wrong_scope() {
 			}
 			new.generation_id = 21;
 			new.created_by_job = Some(201);
-			let l::Submitted::Created(foreign) = l::submit(tx, &new, 0)? else { panic!() };
+			let l::Submitted::Created(foreign) =
+				l::submit(&crate::test_support::scope(tx, 2), &new, 0)?
+			else {
+				panic!()
+			};
 			new.generation_id = 11;
 			new.created_by_job = Some(101);
 			new.supersedes = Some(foreign);
 			assert!(matches!(
-				l::submit(tx, &new, 0),
+				l::submit(&crate::test_support::scope(tx, 1), &new, 0),
 				Err(Error::Ownership(Ownership::SupersededLead))
 			));
 			assert!(matches!(
-				l::close(tx, id, &l::Closure::Duplicate { lead: Some(foreign), finding: None }, 1),
+				l::close(
+					&crate::test_support::scope(tx, 1),
+					id,
+					&l::Closure::Duplicate { lead: Some(foreign), finding: None },
+					1
+				),
 				Err(Error::Ownership(Ownership::DuplicateLead))
 			));
 			assert!(matches!(
-				l::close(tx, id, &l::Closure::Duplicate { lead: None, finding: Some(21) }, 1),
+				l::close(
+					&crate::test_support::scope(tx, 1),
+					id,
+					&l::Closure::Duplicate { lead: None, finding: Some(21) },
+					1
+				),
 				Err(Error::Ownership(Ownership::DuplicateFinding))
 			));
 			assert!(matches!(
-				l::close(tx, id, &l::Closure::Promoted { finding: 21 }, 1),
+				l::close(
+					&crate::test_support::scope(tx, 1),
+					id,
+					&l::Closure::Promoted { finding: 21 },
+					1
+				),
 				Err(Error::Ownership(Ownership::PromotedFinding))
 			));
 			Ok(())
@@ -480,13 +678,13 @@ fn explicit_supersedes_requires_a_stale_closed_lead() {
 			let first = identity();
 			let data = payload();
 			let l::Submitted::Created(open) = l::submit(
-				tx,
+				&crate::test_support::scope(tx, 1),
 				&l::NewLead {
 					generation_id: 11,
 					unit_id: None,
 					identity: &first,
 					payload: &data,
-					commit_sha: "base",
+					commit_sha: &crate::test_support::db_text("base").unwrap(),
 					priority: Priority::Normal,
 					priority_proposal: None,
 					supersedes: None,
@@ -498,8 +696,8 @@ fn explicit_supersedes_requires_a_stale_closed_lead() {
 				panic!("fresh identity")
 			};
 			let other = Identity {
-				family: Identifier::new("auth-bypass").unwrap(),
-				anchor: Anchor::new("session cookie handler").unwrap(),
+				family: crate::test_support::identifier("auth-bypass").unwrap(),
+				anchor: crate::test_support::anchor("session cookie handler").unwrap(),
 				instance: None,
 			};
 			let mut new = l::NewLead {
@@ -507,32 +705,46 @@ fn explicit_supersedes_requires_a_stale_closed_lead() {
 				unit_id: None,
 				identity: &other,
 				payload: &data,
-				commit_sha: "base",
+				commit_sha: &crate::test_support::db_text("base").unwrap(),
 				priority: Priority::Normal,
 				priority_proposal: None,
 				supersedes: Some(open),
 				created_by_job: Some(101),
 			};
 			assert!(
-				matches!(l::submit(tx, &new, 1), Err(Error::Conflict(Conflict::LeadState))),
+				matches!(
+					l::submit(&crate::test_support::scope(tx, 1), &new, 1),
+					Err(Error::Conflict(Conflict::LeadState))
+				),
 				"an open lead cannot be superseded"
 			);
-			l::close(tx, open, &l::Closure::Rejected, 2)?;
+			l::close(&crate::test_support::scope(tx, 1), open, &l::Closure::Rejected, 2)?;
 			assert!(
-				matches!(l::submit(tx, &new, 3), Err(Error::Conflict(Conflict::LeadState))),
+				matches!(
+					l::submit(&crate::test_support::scope(tx, 1), &new, 3),
+					Err(Error::Conflict(Conflict::LeadState))
+				),
 				"a rejected lead cannot be superseded either"
 			);
-			let l::Submitted::Created(second) =
-				l::submit(tx, &l::NewLead { supersedes: None, ..new }, 4)?
+			let l::Submitted::Created(second) = l::submit(
+				&crate::test_support::scope(tx, 1),
+				&l::NewLead { supersedes: None, ..new },
+				4,
+			)?
 			else {
 				panic!("fresh identity")
 			};
-			l::close(tx, second, &l::Closure::Stale, 5)?;
+			l::close(&crate::test_support::scope(tx, 1), second, &l::Closure::Stale, 5)?;
 			new.supersedes = Some(second);
-			let l::Submitted::Created(successor) = l::submit(tx, &new, 6)? else {
+			let l::Submitted::Created(successor) =
+				l::submit(&crate::test_support::scope(tx, 1), &new, 6)?
+			else {
 				panic!("stale identity is reusable")
 			};
-			assert_eq!(l::get(tx, successor)?.unwrap().supersedes, Some(second));
+			assert_eq!(
+				l::get(&crate::test_support::scope(tx, 1), successor)?.unwrap().supersedes,
+				Some(second)
+			);
 			Ok(())
 		})
 	})
@@ -546,14 +758,14 @@ fn stale_close_refuses_active_jobs_and_unrelated_failures_stay_sqlite() {
 	let db = fixture();
 	db.with_conn(|c|transaction::immediate(c,|tx|{
  let identity=identity();let data=payload();
- let new=l::NewLead{generation_id:11,unit_id:None,identity:&identity,payload:&data,commit_sha:"base",priority:Priority::Normal,priority_proposal:None,supersedes:None,created_by_job:Some(101)};
- let l::Submitted::Created(id)=l::submit(tx,&new,0)? else{panic!()};
+ let new=l::NewLead{generation_id:11,unit_id:None,identity:&identity,payload:&data,commit_sha: &crate::test_support::db_text("base").unwrap(),priority:Priority::Normal,priority_proposal:None,supersedes:None,created_by_job:Some(101)};
+ let l::Submitted::Created(id)=l::submit(&crate::test_support::scope(tx, 1),&new,0)? else{panic!()};
  tx.execute("UPDATE jobs SET assigned_lead_id=?1 WHERE id=101",[id])?;
- assert!(matches!(l::close(tx,id,&l::Closure::Stale,1),Err(Error::Conflict(Conflict::LeadState))));
+ assert!(matches!(l::close(&crate::test_support::scope(tx, 1),id,&l::Closure::Stale,1),Err(Error::Conflict(Conflict::LeadState))));
  tx.execute("UPDATE jobs SET state='succeeded' WHERE id=101",[])?;
- l::close(tx,id,&l::Closure::Stale,2)?;
+ l::close(&crate::test_support::scope(tx, 1),id,&l::Closure::Stale,2)?;
  tx.execute_batch("CREATE TEMP TRIGGER fail_lead BEFORE INSERT ON leads BEGIN SELECT RAISE(ABORT,'unrelated constraint'); END;")?;
- assert!(matches!(l::submit(tx,&new,3),Err(Error::Sqlite(_))));
+ assert!(matches!(l::submit(&crate::test_support::scope(tx, 1),&new,3),Err(Error::Sqlite(_))));
  Ok(())
  })).unwrap();
 }

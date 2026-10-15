@@ -1,0 +1,4 @@
+[sandbox]
+network="allowlist"
+allowlist=["api.example","192.0.2.1"]
+

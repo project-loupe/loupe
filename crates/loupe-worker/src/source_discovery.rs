@@ -9,9 +9,51 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glob::Pattern;
-use serde::Deserialize;
+use loupe_core::text::{BoundedText, RepoPath, TextPolicy};
+use loupe_provenance::{Config, Ingress, Mark, Repo, Server, Untrusted, Unvalidated, Validate};
 
+pub use crate::ingress_text::{ScannerExcludePattern, ScannerExtension};
 use crate::llm::DEFAULT_REQUEST_TIMEOUT;
+
+/// The selected list keeps its actual source; built-in literals require no mark.
+pub enum ScannerList<P: TextPolicy> {
+	Builtin(&'static [&'static str]),
+	Configured(Vec<BoundedText<P, Config>>),
+	Leased(Vec<BoundedText<P, Server>>),
+}
+impl<P: TextPolicy> Clone for ScannerList<P> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Builtin(values) => Self::Builtin(values),
+			Self::Configured(values) => Self::Configured(values.clone()),
+			Self::Leased(values) => Self::Leased(values.clone()),
+		}
+	}
+}
+impl<P: TextPolicy> std::fmt::Debug for ScannerList<P> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let source = match self {
+			Self::Builtin(_) => "builtin",
+			Self::Configured(_) => "config",
+			Self::Leased(_) => "server",
+		};
+		write!(f, "ScannerList<{source}>([redacted])")
+	}
+}
+impl<P: TextPolicy> ScannerList<P> {
+	pub fn iter(&self) -> impl Iterator<Item = &str> {
+		let len = match self {
+			Self::Builtin(values) => values.len(),
+			Self::Configured(values) => values.len(),
+			Self::Leased(values) => values.len(),
+		};
+		(0..len).map(|index| match self {
+			Self::Builtin(values) => values[index],
+			Self::Configured(values) => values[index].expose(),
+			Self::Leased(values) => values[index].expose(),
+		})
+	}
+}
 
 /// Config knobs operators can set via the repo's `scanner_config`
 /// JSON. Defaults cover Rust, C/C++, JS/TS, Python, Go, Ruby, PHP,
@@ -19,6 +61,7 @@ use crate::llm::DEFAULT_REQUEST_TIMEOUT;
 /// build / vendor / test dirs across those ecosystems. Tighten or loosen
 /// per-repo by sending a partial JSON override (see
 /// `ScannerConfigPatch`).
+// debug-ok: Numeric scanner limits and redacted source-typed scanner lists.
 #[derive(Debug, Clone)]
 pub struct ScannerConfig {
 	pub max_concurrent_files: usize,
@@ -26,13 +69,13 @@ pub struct ScannerConfig {
 	pub per_request_timeout: Duration,
 	/// File extensions the walk will consider, lower-cased and without
 	/// the leading dot (e.g. `["rs", "cpp"]`).
-	pub include_extensions: Vec<String>,
+	pub include_extensions: ScannerList<ScannerExtension>,
 	/// Exclusion patterns that disqualify a path. Built-in patterns
 	/// use `dir:<name>` for exact path components, `file:<glob>` for
 	/// basename matches, and `dotnet-output:<name>` for .NET build
 	/// output directories. Legacy custom strings still match as path
 	/// substrings, except `/name` matches an exact component.
-	pub exclude_path_substrings: Vec<String>,
+	pub exclude_path_substrings: ScannerList<ScannerExcludePattern>,
 }
 
 impl Default for ScannerConfig {
@@ -57,14 +100,14 @@ impl Default for ScannerConfig {
 /// writes `{"include_extensions":["c","h"]}` for a C-only repo they
 /// almost always *don't* want our default Rust/JS/Python/etc.
 /// extensions silently appended.
-#[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default)]
+// debug-ok: Numeric scanner limits and redacted source-typed scanner lists.
+#[derive(Debug, Default, Clone)]
 pub struct ScannerConfigPatch {
 	pub max_concurrent_files: Option<usize>,
 	pub max_file_bytes: Option<u64>,
 	pub per_request_timeout_seconds: Option<u64>,
-	pub include_extensions: Option<Vec<String>>,
-	pub exclude_path_substrings: Option<Vec<String>>,
+	pub include_extensions: Option<ScannerList<ScannerExtension>>,
+	pub exclude_path_substrings: Option<ScannerList<ScannerExcludePattern>>,
 }
 
 impl ScannerConfig {
@@ -87,8 +130,8 @@ impl ScannerConfig {
 	}
 }
 
-fn default_extensions() -> Vec<String> {
-	[
+fn default_extensions() -> ScannerList<ScannerExtension> {
+	ScannerList::Builtin(&[
 		// Rust.
 		"rs", // C / C++ / Obj-C.
 		"c", "h", "cc", "hh", "cpp", "hpp", "cxx", "hxx", "m", "mm", // JS / TS.
@@ -101,14 +144,11 @@ fn default_extensions() -> Vec<String> {
 		"swift",  // .NET.
 		"cs", "fs", "fsi", "fsx", "vb", // Misc.
 		"dart", "ex", "exs", "rs.in",
-	]
-	.into_iter()
-	.map(String::from)
-	.collect()
+	])
 }
 
-fn default_excludes() -> Vec<String> {
-	[
+fn default_excludes() -> ScannerList<ScannerExcludePattern> {
+	ScannerList::Builtin(&[
 		// Rust / Java / general "tests" dirs and matching filename suffixes.
 		"dir:tests",
 		"dir:test",
@@ -142,10 +182,7 @@ fn default_excludes() -> Vec<String> {
 		"dir:.gradle",
 		"dir:.mypy_cache",
 		"dir:.pytest_cache",
-	]
-	.into_iter()
-	.map(String::from)
-	.collect()
+	])
 }
 
 /// Walk the worktree for production source files. Strategy:
@@ -161,24 +198,65 @@ fn default_excludes() -> Vec<String> {
 /// All walks honour the extension allowlist, exclude patterns, and
 /// per-file size cap. `.git` and any excluded directory is skipped
 /// wholesale.
-pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<PathBuf> {
-	let roots = discover_roots(workdir, cfg);
+#[cfg(any(test, fuzzing))]
+pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<DiscoveredSourcePath> {
+	walk_source_files_cancellable(workdir, cfg, &Default::default())
+}
+
+pub(crate) fn walk_source_files_cancellable(
+	workdir: &Path, cfg: &ScannerConfig, cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<DiscoveredSourcePath> {
+	if cancel.is_cancelled() {
+		return Vec::new();
+	}
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Source discovery canonicalizes the selected checkout root for containment decisions."
+	)]
+	let Ok(canonical_workdir) = workdir.canonicalize() else {
+		return Vec::new();
+	};
+	let roots = discover_roots(workdir, cfg, cancel);
 	let mut out = Vec::new();
 
 	if roots.roots.is_empty() && roots.files.is_empty() {
-		collect_from_root(workdir, cfg, &mut out);
+		collect_from_root(workdir, workdir, cfg, &mut out, cancel);
 	} else {
 		for file in roots.files {
-			collect_file(&file, cfg, &mut out);
+			if cancel.is_cancelled() {
+				return Vec::new();
+			}
+			if is_within_workdir(&file, &canonical_workdir) {
+				collect_file(workdir, &file, cfg, &mut out);
+			}
 		}
 		for root in roots.roots {
-			collect_from_root(&root, cfg, &mut out);
+			if cancel.is_cancelled() {
+				return Vec::new();
+			}
+			if is_within_workdir(&root, &canonical_workdir) {
+				collect_from_root(workdir, &root, cfg, &mut out, cancel);
+			}
 		}
 	}
 
-	out.sort();
-	out.dedup();
+	if cancel.is_cancelled() {
+		return Vec::new();
+	}
+	out.sort_by(|a, b| a.native.cmp(&b.native));
+	out.dedup_by(|a, b| a.native == b.native);
 	out
+}
+
+// WalkDir does not follow nested symlinks, but it follows a symlink used as
+// its root. Package src directories and direct build.rs files therefore need
+// this check before traversal or collection. Preserve in-workdir symlinks.
+fn is_within_workdir(path: &Path, canonical_workdir: &Path) -> bool {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Source discovery resolves a candidate once and admits it only within the canonical checkout."
+	)]
+	path.canonicalize().map(|path| path.starts_with(canonical_workdir)).unwrap_or(false)
 }
 
 #[derive(Default)]
@@ -187,11 +265,13 @@ struct DiscoveryRoots {
 	files: Vec<PathBuf>,
 }
 
-fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
+fn discover_roots(
+	workdir: &Path, cfg: &ScannerConfig, cancel: &tokio_util::sync::CancellationToken,
+) -> DiscoveryRoots {
 	let mut roots = DiscoveryRoots::default();
-	add_cargo_roots(workdir, cfg, &mut roots);
-	add_marker_roots(workdir, cfg, &mut roots);
-	add_dotnet_roots(workdir, cfg, &mut roots);
+	add_cargo_roots(workdir, cfg, &mut roots, cancel);
+	add_marker_roots(workdir, cfg, &mut roots, cancel);
+	add_dotnet_roots(workdir, cfg, &mut roots, cancel);
 	roots.roots.sort();
 	roots.roots.dedup();
 	roots.files.sort();
@@ -199,12 +279,18 @@ fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
 	roots
 }
 
-fn add_cargo_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
-	let workspace_exclude = parse_workspace(&workdir.join("Cargo.toml"))
+fn add_cargo_roots(
+	workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
+	let workspace_exclude = parse_workspace_cancellable(&workdir.join("Cargo.toml"), cancel)
 		.map(|workspace| workspace.exclude)
 		.unwrap_or_default();
 
-	for manifest in cargo_package_manifests(workdir, cfg, &workspace_exclude) {
+	for manifest in cargo_package_manifests(workdir, cfg, &workspace_exclude, cancel) {
+		if cancel.is_cancelled() {
+			return;
+		}
 		if let Some(package_dir) = manifest.parent() {
 			add_rust_package_roots(package_dir, roots);
 		}
@@ -222,62 +308,174 @@ fn add_rust_package_roots(package: &Path, roots: &mut DiscoveryRoots) {
 	}
 }
 
+// debug-ok: Every Repo exclusion pattern uses redacted BoundedText.
 #[derive(Debug, Default)]
 struct WorkspaceManifest {
-	exclude: Vec<String>,
+	exclude: Vec<BoundedText<ScannerExcludePattern, Repo>>,
 }
 
+#[cfg(any(test, fuzzing))]
 fn parse_workspace(cargo_toml: &Path) -> Option<WorkspaceManifest> {
-	let manifest = parse_manifest(cargo_toml)?;
-	let workspace = manifest.get("workspace")?;
-	let exclude = read_string_array(workspace, "exclude");
-	Some(WorkspaceManifest { exclude })
+	parse_workspace_cancellable(cargo_toml, &Default::default())
+}
+fn parse_workspace_cancellable(
+	cargo_toml: &Path, cancel: &tokio_util::sync::CancellationToken,
+) -> Option<WorkspaceManifest> {
+	let manifest = parse_manifest(cargo_toml, cancel)?;
+	manifest.exclude.map(|exclude| WorkspaceManifest { exclude })
 }
 
 fn cargo_package_manifests(
-	workdir: &Path, cfg: &ScannerConfig, workspace_exclude: &[String],
+	workdir: &Path, cfg: &ScannerConfig,
+	workspace_exclude: &[BoundedText<ScannerExcludePattern, Repo>],
+	cancel: &tokio_util::sync::CancellationToken,
 ) -> Vec<PathBuf> {
 	let mut out: Vec<PathBuf> = walkdir::WalkDir::new(workdir)
 		.into_iter()
 		.filter_entry(|entry| {
-			!is_excluded_dir(entry.path(), cfg)
+			!cancel.is_cancelled()
+				&& !is_excluded_dir(entry.path(), cfg)
 				&& !is_workspace_excluded_descendant(workdir, entry.path(), workspace_exclude)
 		})
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file() && entry.file_name() == "Cargo.toml")
 		.map(|entry| entry.into_path())
-		.filter(|manifest| manifest_has_package(manifest))
+		.filter(|manifest| manifest_has_package(manifest, cancel))
 		.collect();
 	out.sort();
 	out.dedup();
 	out
 }
 
-fn manifest_has_package(cargo_toml: &Path) -> bool {
-	let Some(manifest) = parse_manifest(cargo_toml) else {
+fn manifest_has_package(cargo_toml: &Path, cancel: &tokio_util::sync::CancellationToken) -> bool {
+	let Some(manifest) = parse_manifest(cargo_toml, cancel) else {
 		return false;
 	};
-	manifest.get("package").is_some()
+	manifest.has_package
 }
 
-fn parse_manifest(cargo_toml: &Path) -> Option<toml::Value> {
-	let text = std::fs::read_to_string(cargo_toml).ok()?;
-	toml::from_str(&text).ok()
+fn parse_manifest(
+	cargo_toml: &Path, cancel: &tokio_util::sync::CancellationToken,
+) -> Option<CargoDiscoveryManifest> {
+	use std::io::Read;
+	use std::os::unix::fs::OpenOptionsExt;
+	if cancel.is_cancelled() {
+		return None;
+	}
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Discovery opens the fixed Repo manifest once without waiting for a special-file writer."
+	)]
+	let mut file = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+		.open(cargo_toml)
+		.ok()?;
+	if !file.metadata().ok()?.is_file() {
+		return None;
+	}
+	let mut bytes = Vec::new();
+	let mut chunk = [0u8; 8192];
+	loop {
+		if cancel.is_cancelled() {
+			return None;
+		}
+		let count = match file.read(&mut chunk) {
+			Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+			other => other.ok()?,
+		};
+		if cancel.is_cancelled() {
+			return None;
+		}
+		if count == 0 {
+			break;
+		}
+		bytes.extend_from_slice(&chunk[..count]);
+	}
+	// SAFETY: original repository Cargo.toml bytes, before UTF-8/TOML parsing.
+	#[allow(unsafe_code)]
+	let bytes = Untrusted::new(bytes, unsafe { Ingress::<Repo>::new() });
+	bytes.as_bytes().validate(CargoDiscoveryManifestDecoder).ok().flatten()
 }
 
-fn read_string_array(table: &toml::Value, key: &str) -> Vec<String> {
-	table
-		.get(key)
-		.and_then(|value| value.as_array())
-		.into_iter()
-		.flatten()
-		.filter_map(|value| value.as_str())
-		.map(str::to_owned)
-		.collect()
+struct CargoDiscoveryManifest {
+	has_package: bool,
+	exclude: Option<Vec<BoundedText<ScannerExcludePattern, Repo>>>,
+	#[cfg(fuzzing)]
+	original: toml::Value,
+}
+struct CargoDiscoveryManifestDecoder;
+impl Validate<&[u8], Repo> for CargoDiscoveryManifestDecoder {
+	type Output = Option<CargoDiscoveryManifest>;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, u: Unvalidated<'view, &[u8]>, mark: Mark<'view, Repo>,
+	) -> Result<Self::Output, Self::Error> {
+		let Some(manifest) = std::str::from_utf8(u.get())
+			.ok()
+			.and_then(|text| toml::from_str::<toml::Value>(text).ok())
+		else {
+			return Ok(None);
+		};
+		let exclude = match manifest.get("workspace") {
+			None => None,
+			Some(workspace) => {
+				let values = workspace
+					.get("exclude")
+					.and_then(toml::Value::as_array)
+					.into_iter()
+					.flatten()
+					.filter_map(toml::Value::as_str);
+				let mut exclude = Vec::new();
+				for value in values {
+					let Ok(value) = BoundedText::new(&mark, value) else { return Ok(None) };
+					exclude.push(value);
+				}
+				Some(exclude)
+			},
+		};
+		Ok(Some(CargoDiscoveryManifest {
+			has_package: manifest.get("package").is_some(),
+			exclude,
+			#[cfg(fuzzing)]
+			original: manifest,
+		}))
+	}
 }
 
-fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
+/// Fuzz-only access to production manifest parsing and source selection.
+#[cfg(fuzzing)]
+pub mod fuzz_support {
+	use std::path::{Path, PathBuf};
+
+	pub fn parse_manifest(path: &Path) -> Option<toml::Value> {
+		// Fuzz-only original syntax oracle; no production generic Value exit.
+		super::parse_manifest(path, &Default::default()).map(|manifest| manifest.original)
+	}
+
+	pub fn workspace_excludes(path: &Path) -> Option<Vec<String>> {
+		super::parse_workspace(path)
+			.map(|workspace| workspace.exclude.into_iter().map(|v| v.expose().to_owned()).collect())
+	}
+
+	pub fn walk(workdir: &Path, excludes: &[String]) -> Result<Vec<PathBuf>, String> {
+		let mut cfg = super::ScannerConfig::default();
+		let values: Vec<_> =
+			cfg.exclude_path_substrings.iter().chain(excludes.iter().map(String::as_str)).collect();
+		let token = serde_json::json!({"exclude_path_substrings":values}).to_string();
+		let patch = crate::client::test_scanner_patch(&token)?
+			.ok_or_else(|| "scanner fixture omitted patch".to_owned())?;
+		cfg.apply_patch(patch);
+		Ok(super::walk_source_files(workdir, &cfg).into_iter().map(|v| v.native).collect())
+	}
+}
+
+fn matches_workspace_exclude(
+	rel: &Path, excludes: &[BoundedText<ScannerExcludePattern, Repo>],
+) -> bool {
 	excludes.iter().any(|exclude| {
+		let exclude = exclude.expose();
 		if exclude == rel.to_string_lossy().as_ref() {
 			return true;
 		}
@@ -285,7 +483,9 @@ fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
 	})
 }
 
-fn is_workspace_excluded_descendant(workdir: &Path, path: &Path, excludes: &[String]) -> bool {
+fn is_workspace_excluded_descendant(
+	workdir: &Path, path: &Path, excludes: &[BoundedText<ScannerExcludePattern, Repo>],
+) -> bool {
 	if excludes.is_empty() {
 		return false;
 	}
@@ -295,8 +495,14 @@ fn is_workspace_excluded_descendant(workdir: &Path, path: &Path, excludes: &[Str
 		.any(|candidate| matches_workspace_exclude(candidate, excludes))
 }
 
-fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
-	for marker_dir in marker_dirs(workdir, cfg, "package.json") {
+fn add_marker_roots(
+	workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
+	for marker_dir in marker_dirs(workdir, cfg, "package.json", cancel) {
+		if cancel.is_cancelled() {
+			return;
+		}
 		add_existing_dirs(
 			&marker_dir,
 			&["src", "lib", "app", "server", "client", "packages"],
@@ -305,7 +511,10 @@ fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRo
 	}
 
 	for marker in ["CMakeLists.txt", "meson.build", "Makefile", "compile_commands.json"] {
-		for marker_dir in marker_dirs(workdir, cfg, marker) {
+		for marker_dir in marker_dirs(workdir, cfg, marker, cancel) {
+			if cancel.is_cancelled() {
+				return;
+			}
 			roots.roots.push(marker_dir.clone());
 			add_existing_dirs(
 				&marker_dir,
@@ -316,29 +525,39 @@ fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRo
 	}
 }
 
-fn add_dotnet_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
+fn add_dotnet_roots(
+	workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
 	for marker_dir in
-		dotnet_marker_dirs(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"])
+		dotnet_marker_dirs(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"], cancel)
 	{
 		roots.roots.push(marker_dir);
 	}
 }
 
-fn marker_dirs(workdir: &Path, cfg: &ScannerConfig, marker: &str) -> Vec<PathBuf> {
+fn marker_dirs(
+	workdir: &Path, cfg: &ScannerConfig, marker: &str, cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<PathBuf> {
 	walkdir::WalkDir::new(workdir)
 		.max_depth(5)
 		.into_iter()
-		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_entry(|entry| !cancel.is_cancelled() && !is_excluded_dir(entry.path(), cfg))
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file() && entry.file_name() == marker)
 		.filter_map(|entry| entry.path().parent().map(Path::to_path_buf))
 		.collect()
 }
 
-fn dotnet_marker_dirs(workdir: &Path, cfg: &ScannerConfig, exts: &[&str]) -> Vec<PathBuf> {
+fn dotnet_marker_dirs(
+	workdir: &Path, cfg: &ScannerConfig, exts: &[&str],
+	cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<PathBuf> {
 	walkdir::WalkDir::new(workdir)
 		.into_iter()
-		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_entry(|entry| !cancel.is_cancelled() && !is_excluded_dir(entry.path(), cfg))
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| {
 			entry.file_type().is_file()
@@ -362,26 +581,82 @@ fn add_existing_dirs(base: &Path, names: &[&str], out: &mut Vec<PathBuf>) {
 	}
 }
 
-fn collect_from_root(root: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
+fn collect_from_root(
+	workdir: &Path, root: &Path, cfg: &ScannerConfig, out: &mut Vec<DiscoveredSourcePath>,
+	cancel: &tokio_util::sync::CancellationToken,
+) {
 	walkdir::WalkDir::new(root)
 		.into_iter()
-		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_entry(|entry| !cancel.is_cancelled() && !is_excluded_dir(entry.path(), cfg))
+		.take_while(|_| !cancel.is_cancelled())
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file())
-		.for_each(|entry| collect_file(entry.path(), cfg, out));
+		.for_each(|entry| collect_file(workdir, entry.path(), cfg, out));
 }
 
-fn collect_file(path: &Path, cfg: &ScannerConfig, out: &mut Vec<PathBuf>) {
-	if !has_allowed_extension(path, &cfg.include_extensions) {
-		return;
+fn collect_file(
+	workdir: &Path, path: &Path, cfg: &ScannerConfig, out: &mut Vec<DiscoveredSourcePath>,
+) {
+	// SAFETY: native file path from an actual walk entry or the observed
+	// package build.rs file, before file-name interpretation here.
+	#[allow(unsafe_code)]
+	let path = Untrusted::new(path.to_owned(), unsafe { Ingress::<Repo>::new() });
+	if let Some(path) = path
+		.validate(DiscoveredSourcePathDecoder { workdir, cfg })
+		.expect("infallible path selection")
+	{
+		out.push(path);
 	}
-	if is_excluded_path(path, &cfg.exclude_path_substrings) {
-		return;
+}
+
+#[derive(Clone)]
+enum SourcePathRepresentation {
+	Relative(RepoPath<Repo>),
+	UnrepresentableNative,
+}
+#[derive(Clone)]
+pub(crate) struct DiscoveredSourcePath {
+	native: PathBuf,
+	representation: SourcePathRepresentation,
+}
+struct DiscoveredSourcePathDecoder<'a> {
+	workdir: &'a Path,
+	cfg: &'a ScannerConfig,
+}
+impl Validate<PathBuf, Repo> for DiscoveredSourcePathDecoder<'_> {
+	type Output = Option<DiscoveredSourcePath>;
+	type Error = std::convert::Infallible;
+	fn validate<'view>(
+		self, u: Unvalidated<'view, PathBuf>, mark: Mark<'view, Repo>,
+	) -> Result<Self::Output, Self::Error> {
+		let path = u.get();
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Discovery uses admitted file metadata solely for the configured size limit."
+		)]
+		if !has_allowed_extension(path, &self.cfg.include_extensions)
+			|| is_excluded_path(path, &self.cfg.exclude_path_substrings)
+			|| !path.metadata().map(|m| m.len() <= self.cfg.max_file_bytes).unwrap_or(false)
+		{
+			return Ok(None);
+		}
+		let representation = path
+			.strip_prefix(self.workdir)
+			.ok()
+			.and_then(Path::to_str)
+			.and_then(|v| RepoPath::new(&mark, v).ok())
+			.map(SourcePathRepresentation::Relative)
+			.unwrap_or(SourcePathRepresentation::UnrepresentableNative);
+		Ok(Some(DiscoveredSourcePath { native: path.clone(), representation }))
 	}
-	if !path.metadata().map(|m| m.len() <= cfg.max_file_bytes).unwrap_or(false) {
-		return;
+}
+impl DiscoveredSourcePath {
+	pub(crate) fn for_prompt(&self) -> Option<&RepoPath<Repo>> {
+		match &self.representation {
+			SourcePathRepresentation::Relative(path) => Some(path),
+			SourcePathRepresentation::UnrepresentableNative => None,
+		}
 	}
-	out.push(path.to_path_buf());
 }
 
 fn is_excluded_dir(path: &Path, cfg: &ScannerConfig) -> bool {
@@ -391,7 +666,7 @@ fn is_excluded_dir(path: &Path, cfg: &ScannerConfig) -> bool {
 	cfg.exclude_path_substrings.iter().any(|pattern| matches_exclude(path, pattern))
 }
 
-fn is_excluded_path(path: &Path, excludes: &[String]) -> bool {
+fn is_excluded_path(path: &Path, excludes: &ScannerList<ScannerExcludePattern>) -> bool {
 	excludes.iter().any(|pattern| matches_exclude(path, pattern))
 }
 
@@ -429,6 +704,10 @@ fn is_dotnet_output_path(path: &Path, output_dir: &str) -> bool {
 }
 
 fn has_dotnet_project_marker(dir: &Path) -> bool {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "Discovery walks entries under the selected checkout and applies containment and exclusion admission."
+	)]
 	let Ok(entries) = std::fs::read_dir(dir) else {
 		return false;
 	};
@@ -447,7 +726,7 @@ fn has_dotnet_project_marker(dir: &Path) -> bool {
 	})
 }
 
-fn has_allowed_extension(path: &Path, exts: &[String]) -> bool {
+fn has_allowed_extension(path: &Path, exts: &ScannerList<ScannerExtension>) -> bool {
 	let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
 		return false;
 	};
@@ -468,6 +747,19 @@ mod tests {
 
 	use super::*;
 
+	#[test]
+	fn cargo_repo_excludes_reject_new_text_policy_before_discovery() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("Cargo.toml");
+		std::fs::write(&path, "[workspace]\nexclude = [\"bad\\u0001\"]\n").unwrap();
+		assert!(parse_workspace(&path).is_none(), "Repo Cargo exclude control bytes were admitted");
+		std::fs::write(&path, "[workspace]\nexclude = [\" exact \" , 7, \"exact\"]\n").unwrap();
+		assert_eq!(
+			parse_workspace(&path).unwrap().exclude.iter().map(|v| v.expose()).collect::<Vec<_>>(),
+			vec![" exact ", "exact"]
+		);
+	}
+
 	fn write_crate(root: &Path, files: &[(&str, &str)]) {
 		std::fs::create_dir_all(root).unwrap();
 		std::fs::write(
@@ -485,8 +777,68 @@ mod tests {
 		}
 	}
 
-	fn rel_names(root: &Path, files: Vec<PathBuf>) -> Vec<String> {
-		files.iter().map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned()).collect()
+	fn rel_names(root: &Path, files: Vec<DiscoveredSourcePath>) -> Vec<String> {
+		files
+			.iter()
+			.map(|p| p.native.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+			.collect()
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn rejects_build_files_symlinked_outside_workdir() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("repo");
+		let outside = tree.path().join("outside");
+		write_crate(&root, &[("src/local.rs", "fn local() {}")]);
+		std::fs::create_dir(&outside).unwrap();
+		std::fs::write(outside.join("secret.rs"), "private source").unwrap();
+		std::fs::write(outside.join("build.rs"), "private build script").unwrap();
+		std::os::unix::fs::symlink(outside.join("build.rs"), root.join("build.rs")).unwrap();
+		let files = walk_source_files(&root, &ScannerConfig::default());
+		assert!(
+			files.iter().any(|v| v.native == root.join("src/local.rs")),
+			"retain legitimate source"
+		);
+		assert!(
+			files.iter().all(|path| path.native.canonicalize().unwrap().starts_with(&root)),
+			"source discovery selected a build script outside the workdir"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn rejects_source_roots_symlinked_outside_workdir() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("repo");
+		let outside = tree.path().join("outside");
+		write_crate(&root, &[]);
+		std::fs::create_dir(&outside).unwrap();
+		std::fs::write(outside.join("secret.rs"), "private source").unwrap();
+		std::fs::remove_dir(root.join("src")).unwrap();
+		std::os::unix::fs::symlink(&outside, root.join("src")).unwrap();
+		let files = walk_source_files(&root, &ScannerConfig::default());
+		assert!(
+			files.iter().all(|path| path.native.canonicalize().unwrap().starts_with(&root)),
+			"source discovery selected a source root outside the workdir"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn retains_source_roots_and_build_files_symlinked_inside_workdir() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path();
+		write_crate(root, &[]);
+		std::fs::create_dir(root.join("internal")).unwrap();
+		std::fs::write(root.join("internal/local.rs"), "fn local() {}").unwrap();
+		std::fs::write(root.join("internal/build.rs"), "fn main() {}").unwrap();
+		std::fs::remove_dir(root.join("src")).unwrap();
+		std::os::unix::fs::symlink(root.join("internal"), root.join("src")).unwrap();
+		std::os::unix::fs::symlink(root.join("internal/build.rs"), root.join("build.rs")).unwrap();
+		let files = walk_source_files(root, &ScannerConfig::default());
+		assert!(files.iter().any(|file| file.native == root.join("src/local.rs")));
+		assert!(files.iter().any(|file| file.native == root.join("build.rs")));
 	}
 
 	#[test]
@@ -510,11 +862,94 @@ mod tests {
 	fn patch_overrides_only_the_fields_present() {
 		let mut cfg = ScannerConfig::default();
 		let original_excludes = cfg.exclude_path_substrings.clone();
-		let patch: ScannerConfigPatch =
-			serde_json::from_str(r#"{"include_extensions":["c","h"]}"#).unwrap();
+		let patch = crate::test_support::patch(r#"{"include_extensions":["c","h"]}"#);
 		cfg.apply_patch(patch);
-		assert_eq!(cfg.include_extensions, vec!["c".to_owned(), "h".to_owned()]);
-		assert_eq!(cfg.exclude_path_substrings, original_excludes);
+		assert_eq!(
+			cfg.include_extensions.iter().collect::<Vec<_>>(),
+			vec!["c".to_owned(), "h".to_owned()]
+		);
+		assert_eq!(
+			cfg.exclude_path_substrings.iter().collect::<Vec<_>>(),
+			original_excludes.iter().collect::<Vec<_>>()
+		);
+	}
+
+	#[test]
+	fn patch_preserves_exact_lists_and_accepts_zero_scalars() {
+		let extensions = vec!["RS", "cafe\u{301}", "RS", "", " rs "];
+		let excludes = vec!["dir:Tests", "cafe\u{301}", "file:[", "", "dir:Tests"];
+		let patch = crate::test_support::patch(
+			&serde_json::json!({
+				"max_concurrent_files": 0,
+				"max_file_bytes": 0,
+				"per_request_timeout_seconds": 0,
+				"include_extensions": extensions,
+				"exclude_path_substrings": excludes,
+				"future_option": {"arbitrary": [false, null, {"x": 1}]}
+			})
+			.to_string(),
+		);
+		let mut cfg = ScannerConfig::default();
+		cfg.apply_patch(patch);
+		assert_eq!(cfg.max_concurrent_files, 0);
+		assert_eq!(cfg.max_file_bytes, 0);
+		assert_eq!(cfg.per_request_timeout, Duration::ZERO);
+		assert_eq!(cfg.include_extensions.iter().collect::<Vec<_>>(), extensions);
+		assert_eq!(cfg.exclude_path_substrings.iter().collect::<Vec<_>>(), excludes);
+	}
+
+	#[test]
+	fn patch_null_fields_preserve_baseline_but_empty_lists_replace_it() {
+		let mut cfg = ScannerConfig::default();
+		let baseline = cfg.clone();
+		cfg.apply_patch(
+			crate::test_support::patch(r#"{"max_concurrent_files":null,"max_file_bytes":null,"per_request_timeout_seconds":null,"include_extensions":null,"exclude_path_substrings":null}"#),
+		);
+		assert_eq!(cfg.max_concurrent_files, baseline.max_concurrent_files);
+		assert_eq!(cfg.max_file_bytes, baseline.max_file_bytes);
+		assert_eq!(cfg.per_request_timeout, baseline.per_request_timeout);
+		assert_eq!(
+			cfg.include_extensions.iter().collect::<Vec<_>>(),
+			baseline.include_extensions.iter().collect::<Vec<_>>()
+		);
+		assert_eq!(
+			cfg.exclude_path_substrings.iter().collect::<Vec<_>>(),
+			baseline.exclude_path_substrings.iter().collect::<Vec<_>>()
+		);
+		cfg.apply_patch(crate::test_support::patch(
+			r#"{"include_extensions":[],"exclude_path_substrings":[]}"#,
+		));
+		assert!(cfg.include_extensions.iter().next().is_none());
+		assert!(cfg.exclude_path_substrings.iter().next().is_none());
+	}
+
+	#[test]
+	fn exclusion_patterns_and_extension_comparison_keep_distinct_semantics() {
+		for (path, pattern, expected) in [
+			("src/tests/helper.rs", "dir:tests", true),
+			("src/tests_extra/helper.rs", "dir:tests", false),
+			("src/Tests/helper.rs", "dir:tests", false),
+			("src/tests/helper.rs", "/tests", true),
+			("src/tests_extra/helper.rs", "/tests", false),
+			("src/tests_extra/helper.rs", "tests", true),
+			("src/tests/helper.rs", "src/tests", true),
+			("src/test_one.rs", "file:test_*.rs", true),
+			("src/test_one.rs", "test_*.rs", false),
+			("src/test_one.rs", "file:src/*", false),
+			("src/[.rs", "file:[", false),
+			("src/anything.rs", "", true),
+			("src/cafe\u{301}.rs", "caf\u{e9}", false),
+			("src/cafe\u{301}.rs", "cafe\u{301}", true),
+		] {
+			assert_eq!(matches_exclude(Path::new(path), pattern), expected, "{path}: {pattern}");
+		}
+		let extensions = ScannerList::Builtin(&["RS", "Rs.In", "E\u{301}"]);
+		assert!(has_allowed_extension(Path::new("src/main.rS"), &extensions));
+		assert!(has_allowed_extension(Path::new("src/generated.RS.IN"), &extensions));
+		assert!(has_allowed_extension(Path::new("src/main.E\u{301}"), &extensions));
+		assert!(!has_allowed_extension(Path::new("src/main.\u{c9}"), &extensions));
+		assert!(!has_allowed_extension(Path::new("src/main.rs.bak"), &extensions));
+		assert_eq!(extensions.iter().collect::<Vec<_>>(), ["RS", "Rs.In", "E\u{301}"]);
 	}
 
 	#[test]

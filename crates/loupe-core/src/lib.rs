@@ -1,20 +1,45 @@
+// Keep production safety lints separate from test-only assertions.
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::unwrap_used,
+		clippy::expect_used,
+		clippy::string_slice,
+		clippy::mem_forget,
+		clippy::dbg_macro,
+		clippy::todo,
+		clippy::unimplemented,
+		clippy::disallowed_methods
+	)
+)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 //! Shared domain types for loupe.
 //!
 //! These types are the lingua franca between `loupe-server`, `loupe-worker`,
 //! and `loupe-cli`. They deliberately know nothing about storage layout or
 //! wire framing — those concerns live in `loupe-storage` and `loupe-proto`.
 
+#[macro_use]
+mod record;
+mod pending_follow_up;
+mod scanner;
+pub use pending_follow_up::{FollowUpTrigger, PendingFollowUp, ReviewIntent};
+pub use scanner::ScannerDocument;
 pub mod canonical;
 /// Immutable recipe/behavior contract recorded on review generations and jobs.
-pub const WORKFLOW_CONTRACT_VERSION: i64 = 1;
+pub const WORKFLOW_CONTRACT_VERSION: i64 = 2;
 mod error;
 mod finding;
 mod finding_state;
 mod job;
 mod repo;
 pub mod report_limits;
+pub mod security_event;
 mod severity;
 mod state_machine;
+#[cfg(test)]
+mod test_support;
 pub mod text;
 mod verdict;
 
@@ -29,3 +54,7 @@ pub use state_machine::{
 	StateTransitionError, VerdictRollup,
 };
 pub use verdict::{Verdict, VerdictPatch};
+
+#[cfg(kani)]
+#[path = "../kani/mod.rs"]
+mod kani;

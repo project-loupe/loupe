@@ -4,7 +4,13 @@ use crate::generations;
 fn claim_fixture() -> crate::Db {
 	let db = fixture();
 	db.with_conn(|conn| {
-		crate::workers::insert(conn, "claim", crate::workers::WorkerKind::Worker, &[8; 32], 0)?;
+		crate::workers::insert(
+			conn,
+			&crate::test_support::text("claim").unwrap(),
+			crate::workers::WorkerKind::Worker,
+			&[8; 32],
+			0,
+		)?;
 		Ok(())
 	})
 	.unwrap();
@@ -19,7 +25,7 @@ fn queue(db: &crate::Db, band: Band, priority: u32, at: i64) -> i64 {
 			new.band = band;
 			new.effective_priority = priority;
 			new.eligible_at = at;
-			enqueue_phase(tx, &new, at)
+			enqueue_phase(&crate::test_support::scope(tx, 1), &new, at)
 		})
 	})
 	.unwrap()
@@ -30,7 +36,12 @@ fn take(db: &crate::Db, now: i64, policy: &ClaimPolicy) -> Option<Claimed> {
 	static NEXT: AtomicU64 = AtomicU64::new(100);
 	let mut hash = [0u8; 32];
 	hash[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-	let kinds = [JobKind::Scan, JobKind::Survey, JobKind::Drilldown, JobKind::Verify];
+	let kinds = [
+		JobKind::<loupe_provenance::Agent>::Scan,
+		JobKind::<loupe_provenance::Agent>::Survey,
+		JobKind::<loupe_provenance::Agent>::Drilldown,
+		JobKind::<loupe_provenance::Agent>::Verify,
+	];
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
 			claim_kinds(
@@ -65,8 +76,14 @@ fn public_claim_keeps_survey_and_drilldown_runtime_gated() {
 	let id = queue(&db, Band::Normal, 0, 0);
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			let kinds = [JobKind::Survey, JobKind::Drilldown, JobKind::Unknown("scan".into())];
-			assert!(claim(
+			let kinds = [
+				JobKind::<loupe_provenance::Agent>::Survey,
+				JobKind::<loupe_provenance::Agent>::Drilldown,
+				JobKind::<loupe_provenance::Agent>::Unknown(
+					crate::test_support::text("scan").unwrap(),
+				),
+			];
+			assert!(claim_raw(
 				tx,
 				&ClaimRequest {
 					worker_id: 1,
@@ -208,14 +225,18 @@ fn bootstrap_and_unpinned_surveys_skip_batches() {
 #[test]
 fn bootstrap_coverage_and_incremental_claims_preserve_completed_work() {
 	use crate::review_unit_results::{self, Disposition, NewResult};
-	use crate::source_refs::InspectedRefs;
 
 	let db = claim_fixture();
 	units(&db);
 	let bootstrap = queue(&db, Band::Normal, 0, 0);
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			generations::set_profile(tx, 11, 1, &review_tests::payload())?;
+			generations::set_profile(
+				&crate::test_support::scope(tx, 1),
+				11,
+				1,
+				&review_tests::payload(),
+			)?;
 			tx.execute("UPDATE review_generations SET activated_at=3 WHERE generation_id=11", [])?;
 			tx.execute(
 				"UPDATE jobs SET recipe=?2 WHERE id=?1",
@@ -236,12 +257,12 @@ fn bootstrap_coverage_and_incremental_claims_preserve_completed_work() {
 	let finish = |job: i64, completed: &[i64], now: i64| {
 		db.with_conn(|conn| {
 			transaction::immediate(conn, |tx| {
-				let refs = InspectedRefs::new(vec![])?;
+				let refs = crate::test_support::refs::<64>(vec![])?;
 				let payload = review_tests::payload();
 				for unit in completed {
-					review_unit_results::insert(tx, &NewResult {
+					review_unit_results::insert(&crate::test_support::scope(tx, 1), &NewResult {
 						generation_id: 11, unit_id: *unit, produced_by_job: Some(job),
-						commit_sha: "base", profile_version: 1,
+						commit_sha: &crate::test_support::db_text("base").unwrap(), profile_version: 1,
 						disposition: Disposition::NoLeadFound, inspected_refs: &refs,
 						counterevidence: None, proof_gaps: None, payload: &payload,
 						corroborates_result: None, corroborates_exclusion: None,
@@ -280,10 +301,15 @@ fn bootstrap_coverage_and_incremental_claims_preserve_completed_work() {
 	assert!(!next.resumed);
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			assert!(generations::coverage_rollup(tx, 11)?.complete());
-			let generation = generations::get(tx, 11)?.unwrap();
+			assert!(
+				generations::coverage_rollup(&crate::test_support::scope(tx, 1), 11)?.complete()
+			);
+			let generation = generations::get_raw(tx, 11)?.unwrap();
 			assert_eq!(generation.profile_version, 1);
-			assert_eq!(generation.generated_profile, Some(review_tests::payload()));
+			assert_eq!(
+				generation.generated_profile.as_ref().map(BoundedJson::expose),
+				Some(review_tests::payload().expose())
+			);
 			assert_eq!(generation.activated_at, Some(3));
 			assert_eq!(
 				tx.query_row(
@@ -410,9 +436,22 @@ fn assignments_do_not_hide_missing_coverage() {
 	assert_eq!(take(&db, 100, &ClaimPolicy::default()).unwrap().assigned_units.len(), 4);
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			assert_eq!(generations::coverage_rollup(tx, 11)?.missing_results, 6);
-			generations::set_corroboration(tx, 11, generations::Corroboration::Satisfied)?;
-			assert!(generations::set_coverage(tx, 11, generations::Coverage::Complete).is_err());
+			assert_eq!(
+				generations::coverage_rollup(&crate::test_support::scope(tx, 1), 11)?
+					.missing_results,
+				6
+			);
+			generations::set_corroboration(
+				&crate::test_support::scope(tx, 1),
+				11,
+				generations::Corroboration::Satisfied,
+			)?;
+			assert!(generations::set_coverage(
+				&crate::test_support::scope(tx, 1),
+				11,
+				generations::Coverage::Complete
+			)
+			.is_err());
 			Ok(())
 		})
 	})
@@ -430,7 +469,7 @@ fn only_current_conclusive_ordinary_evidence_excludes_units_from_batches() {
 		("UPDATE review_unit_results SET invalidated=1; INSERT INTO review_unit_results (review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,corroborates_review_unit_result_id,created_at) VALUES (1,'base',1,'no_lead_found','[]','{}',zeroblob(32),1,1)",true),
 	] {
 		let db = result_fixture();
-		db.with_conn(|c| {crate::workers::insert(c,"claim",crate::workers::WorkerKind::Worker,&[8;32],0)?;c.execute_batch(mutation)?;Ok(())}).unwrap();
+		db.with_conn(|c| {crate::workers::insert(c,&crate::test_support::text("claim").unwrap(),crate::workers::WorkerKind::Worker,&[8;32],0)?;c.execute_batch(mutation)?;Ok(())}).unwrap();
 		queue(&db,Band::Normal,0,0);
 		assert_eq!(!take(&db,100,&ClaimPolicy::default()).unwrap().assigned_units.is_empty(),expected,"{mutation}");
 	}
@@ -451,10 +490,18 @@ fn old_profile_evidence_does_not_establish_current_coverage() {
 	let db = result_fixture();
 	db.with_conn(|conn| {
 		transaction::immediate(conn, |tx| {
-			assert!(generations::coverage_rollup(tx, 11)?.complete());
-			generations::set_profile(tx, 11, 2, &review_tests::payload())?;
+			assert!(
+				generations::coverage_rollup(&crate::test_support::scope(tx, 1), 11)?.complete()
+			);
+			generations::set_profile(
+				&crate::test_support::scope(tx, 1),
+				11,
+				2,
+				&review_tests::payload(),
+			)?;
 			assert_eq!(
-				generations::coverage_rollup(tx, 11)?.missing_results,
+				generations::coverage_rollup(&crate::test_support::scope(tx, 1), 11)?
+					.missing_results,
 				1,
 				"evidence at the old profile must not cover the current profile"
 			);
@@ -470,9 +517,9 @@ fn conclusive_evidence_supersedes_follow_up_in_rollup() {
 	db.with_conn(|conn| transaction::immediate(conn, |tx| {
 		tx.execute("UPDATE review_unit_results SET disposition='needs_follow_up'", [])?;
 		tx.execute("INSERT INTO review_unit_results (review_unit_id,commit_sha,profile_version,disposition,inspected_refs,result_payload,result_digest,created_at) VALUES (1,'base',1,'no_lead_found','[]','{}',zeroblob(32),1)", [])?;
-		assert_eq!(generations::coverage_rollup(tx, 11)?.needs_follow_up, 0,
+		assert_eq!(generations::coverage_rollup(&crate::test_support::scope(tx, 1), 11)?.needs_follow_up, 0,
 			"conclusive current-profile evidence must supersede earlier follow-up");
-		assert!(generations::coverage_rollup(tx, 11)?.complete());
+		assert!(generations::coverage_rollup(&crate::test_support::scope(tx, 1), 11)?.complete());
 		Ok(())
 	})).unwrap();
 }
@@ -482,19 +529,18 @@ fn legacy_claim_order_matches_recorded_base_sequence() {
 	for accepts_verify in [true, false] {
 		let db = fixture();
 		db.with_conn(|conn| {
-			let worker = crate::workers::insert(conn, "claim", crate::workers::WorkerKind::Worker, &[8;32], 0)?;
+			let worker = crate::workers::insert(conn, &crate::test_support::text("claim").unwrap(), crate::workers::WorkerKind::Worker, &[8;32], 0)?;
 			for (i,(kind,time)) in [("verify",9),("scan",3),("scan",3),("verify",1),("scan",1),("verify",9),("scan",2),("verify",1),("scan",9),("scan",2),("verify",3),("scan",1)].iter().enumerate() {
 				conn.execute("INSERT INTO jobs (id,repo_id,kind,state,enqueued_at) VALUES (?1,1,?2,'queued',?3)", params![1001+i as i64,kind,time])?;
 			}
 			let mut sequence = Vec::new();
 			loop {
 				let hash = vec![sequence.len() as u8; 32];
-				let kinds = if accepts_verify { vec![JobKind::Scan,JobKind::Verify] } else { vec![JobKind::Scan] };
-				let claimed = transaction::immediate(conn, |tx| claim(tx,&ClaimRequest{worker_id:worker,kinds:&kinds,now:100,capability_hash:&hash,legacy_lease_seconds:600,policy:&ClaimPolicy::default()}))?;
+				let kinds = if accepts_verify { vec![JobKind::<loupe_provenance::Agent>::Scan,JobKind::<loupe_provenance::Agent>::Verify] } else { vec![JobKind::<loupe_provenance::Agent>::Scan] };
+				let claimed = transaction::immediate(conn, |tx| claim_raw(tx,&ClaimRequest{worker_id:worker,kinds:&kinds,now:100,capability_hash:&hash,legacy_lease_seconds:600,policy:&ClaimPolicy::default()}))?;
 				let Some(Claimed{job,..}) = claimed else { break };
 				sequence.push(job.id);
 			}
-			// Recorded with lease_next at main 7261a26, before replacing it.
 			let expected = if accepts_verify { vec![1004,1008,1011,1001,1006,1005,1012,1007,1010,1002,1003,1009] }
 			else { vec![1005,1012,1007,1010,1002,1003,1009] };
 			assert_eq!(sequence, expected);
@@ -507,18 +553,18 @@ fn legacy_claim_order_matches_recorded_base_sequence() {
 #[test]
 fn public_claim_never_offers_campaign_rows_to_legacy_kinds() {
 	// `verify` is a runtime kind for the legacy pipeline, but a campaign
-	// verify job needs B4's phase handlers; until then a protocol-2 worker
-	// advertising `verify:*` must never receive one.
+	// verify job has no phase handler. A protocol-2 worker advertising
+	// `verify:*` must never receive one.
 	let db = claim_fixture();
 	let verify = db
 		.with_conn(|conn| {
 			transaction::immediate(conn, |tx| {
 				let recipe = recipe();
 				let mut new = survey(&recipe);
-				new.kind = JobKind::Verify;
+				new.kind = JobKind::<loupe_provenance::Agent>::Verify;
 				new.target_finding_id = Some(11);
 				new.handoff = true;
-				enqueue_phase(tx, &new, 0)
+				enqueue_phase(&crate::test_support::scope(tx, 1), &new, 0)
 			})
 		})
 		.unwrap();
@@ -527,11 +573,14 @@ fn public_claim_never_offers_campaign_rows_to_legacy_kinds() {
 	let legacy = db
 		.with_conn(|conn| {
 			transaction::immediate(conn, |tx| {
-				claim(
+				claim_raw(
 					tx,
 					&ClaimRequest {
 						worker_id: 1,
-						kinds: &[JobKind::Scan, JobKind::Verify],
+						kinds: &[
+							JobKind::<loupe_provenance::Agent>::Scan,
+							JobKind::<loupe_provenance::Agent>::Verify,
+						],
 						now: 100,
 						capability_hash: &hash,
 						legacy_lease_seconds: 600,

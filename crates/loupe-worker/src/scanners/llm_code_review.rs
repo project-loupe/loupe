@@ -8,7 +8,7 @@
 //! `submit_finding` tool POSTs straight to
 //! `/v1/jobs/{job_id}/llm-findings`, so submissions land on the server
 //! before this scanner returns. The scanner's own return value is
-//! always an empty `Vec<Finding>` — its job is orchestration, not
+//! always an empty `Vec<Finding<loupe_provenance::Repo>>` — its job is orchestration, not
 //! emission.
 //!
 //! Why no separate validation pass: the agent owns its own validation
@@ -16,7 +16,7 @@
 //! asked to produce a regression-test PoC inline). A second worker-
 //! side parse would be a poor model of what the agent already did.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,10 +26,10 @@ pub use loupe_proto::LLM_CODE_REVIEW_SCANNER_ID as SCANNER_ID;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::prompts::{self, DISCOVERY};
+use crate::llm::prompts::{self, Prompt};
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::scanner::{ScanContext, Scanner};
-use crate::source_discovery::{walk_source_files, ScannerConfig, ScannerConfigPatch};
+use crate::source_discovery::{walk_source_files_cancellable, DiscoveredSourcePath, ScannerConfig};
 const CAPABILITIES: &[&str] = &["scan:llm"];
 
 pub struct LlmCodeReviewScanner {
@@ -74,20 +74,24 @@ impl Scanner for LlmCodeReviewScanner {
 		CAPABILITIES
 	}
 
-	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding>> {
+	async fn scan(&self, ctx: &ScanContext) -> Result<Vec<Finding<loupe_provenance::Repo>>> {
 		// Apply any per-repo overrides from the lease envelope on top
 		// of our baseline config.
 		let mut cfg = self.config.clone();
-		if !ctx.config.is_null() {
-			match serde_json::from_value::<ScannerConfigPatch>(ctx.config.clone()) {
-				Ok(patch) => cfg.apply_patch(patch),
-				Err(e) => {
-					tracing::warn!(error = %e, "ignoring scanner_config: not a ScannerConfigPatch");
-				},
-			}
+		if let Some(patch) = &ctx.config {
+			cfg.apply_patch(patch.clone());
 		}
 
-		let files = walk_source_files(&ctx.workdir, &cfg);
+		let workdir = ctx.workdir.clone();
+		let discovery_config = cfg.clone();
+		let discovery_cancel = ctx.cancel.clone();
+		let checkout_owner = ctx.sandbox_workdir.clone();
+		let files = tokio::task::spawn_blocking(move || {
+			let _checkout_owner = checkout_owner;
+			walk_source_files_cancellable(&workdir, &discovery_config, &discovery_cancel)
+		})
+		.await
+		.map_err(|_| anyhow::anyhow!("source discovery task failed"))?;
 		if files.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -97,16 +101,19 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting agent fan-out"
 		);
 
-		let errors = self
+		let (errors, skipped) = self
 			.run_all(
 				&cfg,
 				&ctx.workdir,
+				&ctx.sandbox_workdir,
 				&files,
 				ctx.repo_id,
 				ctx.job_id,
 				ctx.job_capability.clone(),
+				ctx.tool_boundary,
 				self.bkb_hint,
 				&ctx.cancel,
+				ctx.security.clone(),
 			)
 			.await;
 		// Hard-fail when every agent session errored. Without this, an
@@ -116,18 +123,20 @@ impl Scanner for LlmCodeReviewScanner {
 		// apart from "this is a clean repo." The agent producing no
 		// findings on a healthy session is a success — only backend /
 		// sandbox errors fail the scan.
-		if errors > 0 && errors == files.len() {
+		let sessions = files.len() - skipped;
+		if errors > 0 && errors == sessions {
 			anyhow::bail!(
 				"llm-code-review: every one of {n} agent sessions errored; \
 				 check worker logs for the underlying error (`RUST_LOG=loupe_worker=debug` \
 				 surfaces the per-call failures)",
-				n = files.len(),
+				n = sessions,
 			);
 		}
 		if errors > 0 {
 			tracing::warn!(
 				errored = errors,
-				total = files.len(),
+				total = sessions,
+				skipped,
 				"llm-code-review: some agent sessions errored",
 			);
 		}
@@ -142,77 +151,103 @@ impl Scanner for LlmCodeReviewScanner {
 
 impl LlmCodeReviewScanner {
 	/// Fan out one agent session per file with bounded concurrency.
-	/// Returns the count of session-level errors; per-session "no
-	/// finding" is a success (not an error).
+	/// Returns session-level errors and skipped native paths; a healthy
+	/// session producing no finding remains successful.
 	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
-		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
-		job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
-		cancel: &CancellationToken,
-	) -> usize {
+		&self, cfg: &ScannerConfig, workdir: &Path, sandbox_workdir: &crate::sandbox::SandboxPath,
+		files: &[DiscoveredSourcePath], repo_id: i64, job_id: i64,
+		job_capability: loupe_proto::JobCapability,
+		tool_boundary: crate::llm::prompt::JobToolBoundary, bkb_hint: &'static str,
+		cancel: &CancellationToken, security: Arc<crate::canary::JobSecurity>,
+	) -> (usize, usize) {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
 			if cancel.is_cancelled() {
 				break;
 			}
-			let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
+			let permit = tokio::select! {
+				biased;
+				_ = cancel.cancelled() => break,
+				permit = sem.clone().acquire_owned() => match permit {
+					Ok(permit) => permit,
+					Err(_) => break,
+				},
+			};
 			let backend = self.backend.clone();
 			let cfg_owned = cfg.clone();
 			let workdir = workdir.to_path_buf();
+			let sandbox_workdir = sandbox_workdir.clone();
 			let path = path.clone();
 			let cancel = cancel.clone();
 			let job_capability = job_capability.clone();
+			let security = security.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
 				run_one(
 					backend,
 					&workdir,
+					sandbox_workdir,
 					&path,
 					&cfg_owned,
 					repo_id,
 					job_id,
 					job_capability,
+					tool_boundary,
 					bkb_hint,
 					cancel,
+					security,
 				)
 				.await
 			}));
 		}
 
 		let mut errors = 0usize;
+		let mut skipped = 0usize;
 		for h in handles {
 			match h.await {
-				Ok(Ok(())) => {},
-				Ok(Err(())) => errors += 1,
-				Err(e) => {
-					tracing::warn!(error = %e, "agent session task panicked");
+				Ok(FileOutcome::Complete) => {},
+				Ok(FileOutcome::SkippedNative) => skipped += 1,
+				Ok(FileOutcome::Failed) => errors += 1,
+				Err(_) => {
+					tracing::warn!("agent session task panicked");
 					errors += 1;
 				},
 			}
 		}
-		errors
+		(errors, skipped)
 	}
 }
 
-/// Run one agent session against `file`. Returns `Err(())` for
-/// session-level errors (sandbox / network / CLI failure); the call
-/// counts these and fails the scan when every attempt errors. A
-/// healthy session that produced no submission still returns `Ok(())`
-/// — the agent decided there was nothing to report.
+/// Run one agent session against a representable source file. Keep skipped
+/// native paths distinct from failed and healthy sessions for scan accounting.
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
-	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
-	job_id: i64, job_capability: loupe_proto::JobCapability, bkb_hint: &'static str,
-	cancel: CancellationToken,
-) -> Result<(), ()> {
-	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
-	let prompt = prompts::render(DISCOVERY, &[("file", &rel), ("bkb_hint", bkb_hint)]);
-	tracing::info!(file = %rel, "llm-code-review: launching agent session");
+	backend: Arc<dyn LlmBackend>, workdir: &Path, sandbox_workdir: crate::sandbox::SandboxPath,
+	file: &DiscoveredSourcePath, cfg: &ScannerConfig, repo_id: i64, job_id: i64,
+	job_capability: loupe_proto::JobCapability, tool_boundary: crate::llm::prompt::JobToolBoundary,
+	bkb_hint: &'static str, cancel: CancellationToken, security: Arc<crate::canary::JobSecurity>,
+) -> FileOutcome {
+	let Some(path) = file.for_prompt() else {
+		tracing::warn!("llm-code-review: skipped unrepresentable native source path");
+		return FileOutcome::SkippedNative;
+	};
+	let prompt = match Prompt::discovery(path, bkb_hint) {
+		Ok(prompt) => prompt,
+		Err(error) => {
+			tracing::warn!(%error, "could not render discovery prompt");
+			return FileOutcome::Failed;
+		},
+	};
+	tracing::info!("llm-code-review: launching agent session");
 	let started = std::time::Instant::now();
 	let req = LlmRequest {
+		security,
+		tool_boundary,
 		prompt,
 		workdir: workdir.to_path_buf(),
+		sandbox_workdir,
 		timeout: cfg.per_request_timeout,
 		cancel,
 		repo_id: Some(repo_id),
@@ -223,18 +258,23 @@ async fn run_one(
 	match backend.run(req).await {
 		Ok(r) => {
 			tracing::debug!(
-				file = %rel,
 				elapsed_ms = started.elapsed().as_millis() as u64,
-				response_chars = r.text.chars().count(),
+				response_chars = r.text.char_count(),
 				"agent session finished",
 			);
-			Ok(())
+			FileOutcome::Complete
 		},
-		Err(e) => {
-			tracing::warn!(file = %rel, error = %e, "agent session failed");
-			Err(())
+		Err(_) => {
+			tracing::warn!("agent session failed");
+			FileOutcome::Failed
 		},
 	}
+}
+
+enum FileOutcome {
+	Complete,
+	SkippedNative,
+	Failed,
 }
 
 #[cfg(test)]
@@ -242,30 +282,160 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Arc;
 
-	use loupe_core::RepoSpec;
-	use tokio_util::sync::CancellationToken;
-
 	use super::*;
 	use crate::llm::testing::StubLlmBackend;
 
-	fn make_ctx(workdir: &Path) -> ScanContext {
-		ScanContext {
-			workdir: workdir.to_path_buf(),
-			repo_id: 1,
-			job_id: 1,
-			job_capability: loupe_proto::JobCapability::from_secret("test-capability"),
-			repo: RepoSpec {
-				host: "github.com".into(),
-				owner: "a".into(),
-				repo: "b".into(),
-				clone_url: "https://github.com/a/b.git".into(),
-				branch: None,
-			},
-			head_sha: "deadbeef".into(),
-			base_sha: None,
-			config: serde_json::Value::Null,
-			cancel: CancellationToken::new(),
+	#[tokio::test]
+	async fn cancellation_while_waiting_for_a_permit_starts_no_new_session() {
+		struct HeldBackend {
+			calls: AtomicUsize,
+			started: tokio::sync::Notify,
+			release: tokio::sync::Notify,
 		}
+		#[async_trait]
+		impl LlmBackend for HeldBackend {
+			fn id(&self) -> &'static str {
+				"held-fixture"
+			}
+			async fn run(&self, request: LlmRequest) -> Result<crate::llm::LlmResponse> {
+				if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+					self.started.notify_one();
+					self.release.notified().await;
+				}
+				StubLlmBackend::new("stub", |_| Ok(String::new())).run(request).await
+			}
+		}
+		let directory = tempfile::tempdir().unwrap();
+		write_crate(
+			directory.path(),
+			&[("src/first.rs", "fn first() {}"), ("src/second.rs", "fn second() {}")],
+		);
+		let ctx = make_ctx(directory.path());
+		let cancel = ctx.cancel.clone();
+		let backend = Arc::new(HeldBackend {
+			calls: AtomicUsize::new(0),
+			started: tokio::sync::Notify::new(),
+			release: tokio::sync::Notify::new(),
+		});
+		let scanner = LlmCodeReviewScanner::new(backend.clone())
+			.with_config(ScannerConfig { max_concurrent_files: 1, ..Default::default() });
+		let task = tokio::spawn(async move { scanner.scan(&ctx).await });
+		tokio::time::timeout(std::time::Duration::from_secs(2), backend.started.notified())
+			.await
+			.unwrap();
+		cancel.cancel();
+		backend.release.notify_one();
+		tokio::time::timeout(std::time::Duration::from_secs(2), task)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			backend.calls.load(Ordering::SeqCst),
+			1,
+			"cancellation while queued for a permit must prevent the next agent session"
+		);
+	}
+
+	async fn fifo_discovery_control(cancel_before: bool) {
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("Cargo.toml");
+		rustix::fs::mkfifoat(
+			rustix::fs::CWD,
+			&path,
+			rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+		)
+		.unwrap();
+		let ctx = make_ctx(directory.path());
+		if cancel_before {
+			ctx.cancel.cancel();
+		}
+		let calls = Arc::new(AtomicUsize::new(0));
+		let seen = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_| {
+			seen.fetch_add(1, Ordering::SeqCst);
+			Ok(String::new())
+		}));
+		// Independent cleanup releases a blocked FIFO open/read even when it
+		// stalls this single-thread Tokio runtime before timer polling.
+		let cleanup = std::thread::spawn(move || {
+			std::thread::sleep(std::time::Duration::from_millis(500));
+			let release = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+			drop(release);
+		});
+		let started = std::time::Instant::now();
+		let task = tokio::spawn(async move { LlmCodeReviewScanner::new(backend).scan(&ctx).await });
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		let runtime_responsive = started.elapsed() < std::time::Duration::from_millis(300);
+		let finished_without_writer = task.is_finished();
+		let scan = task.await.unwrap();
+		cleanup.join().unwrap();
+		scan.unwrap();
+		assert_eq!(calls.load(Ordering::SeqCst), 0);
+		assert!(
+			runtime_responsive,
+			"source discovery blocked the runtime or entered manifest I/O after cancellation"
+		);
+		assert!(finished_without_writer, "source discovery still waited for a special-file writer");
+	}
+
+	#[tokio::test]
+	async fn discovery_cancellation_precedes_manifest_io() {
+		fifo_discovery_control(true).await;
+	}
+
+	#[tokio::test]
+	async fn discovery_special_file_does_not_block_runtime() {
+		fifo_discovery_control(false).await;
+	}
+
+	#[tokio::test]
+	async fn scanner_diagnostics_omit_paths_and_backend_payloads() {
+		if !crate::test_env::in_env(
+			"scanners::llm_code_review::tests::scanner_diagnostics_omit_paths_and_backend_payloads",
+			"scanner-i8",
+			&[],
+		) {
+			return;
+		}
+		let capture = crate::test_support::LogCapture::default();
+		capture.install();
+		let directory = tempfile::tempdir().unwrap();
+		write_crate(
+			directory.path(),
+			&[
+				("src/private-source-path-sentinel.rs", "fn first() {}"),
+				("src/other.rs", "fn second() {}"),
+			],
+		);
+		let calls = Arc::new(AtomicUsize::new(0));
+		let observed = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+			if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+				Ok(String::new())
+			} else {
+				anyhow::bail!("private-backend-error-sentinel")
+			}
+		}));
+		LlmCodeReviewScanner::new(backend).scan(&make_ctx(directory.path())).await.unwrap();
+		assert_eq!(calls.load(Ordering::SeqCst), 2);
+		let logs = capture.text();
+		assert!(
+			logs.contains("agent session finished") && logs.contains("agent session failed"),
+			"capture must cover both actual backend outcomes"
+		);
+		assert_eq!(
+			(
+				logs.contains("private-source-path-sentinel"),
+				logs.contains("private-backend-error-sentinel"),
+			),
+			(false, false),
+			"neither repository source paths nor backend error payloads may enter scanner logs"
+		);
+	}
+
+	fn make_ctx(workdir: &Path) -> ScanContext {
+		crate::test_support::scan_context(workdir, "deadbeef")
 	}
 
 	fn write_crate(root: &Path, files: &[(&str, &str)]) {
@@ -285,6 +455,44 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[cfg(unix)]
+	async fn unrepresentable_native_file_is_skipped_without_masking_sibling_outcomes() {
+		use std::os::unix::ffi::OsStringExt;
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// valid sibling\n")]);
+		let native_dir =
+			tmp.path().join("src").join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
+		std::fs::create_dir(&native_dir).unwrap();
+		std::fs::write(native_dir.join("hidden.rs"), "// native name\n").unwrap();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let observed = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+			observed.fetch_add(1, Ordering::SeqCst);
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+		assert!(scanner.scan(&make_ctx(tmp.path())).await.unwrap().is_empty());
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			1,
+			"only the valid sibling may launch an agent session"
+		);
+
+		let failing = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
+			Err(anyhow::anyhow!("backend exploded"))
+		}));
+		let err = LlmCodeReviewScanner::new(failing)
+			.scan(&make_ctx(tmp.path()))
+			.await
+			.expect_err("skipped native file must not mask failure of every launched session");
+		assert!(err.to_string().contains("every one of 1 agent sessions errored"));
+
+		std::fs::remove_file(tmp.path().join("src/lib.rs")).unwrap();
+		assert!(scanner.scan(&make_ctx(tmp.path())).await.unwrap().is_empty());
+		assert_eq!(calls.load(Ordering::SeqCst), 1, "an all-skipped scan must launch no session");
+	}
+
+	#[tokio::test]
 	async fn scanner_returns_empty_findings_and_calls_backend_per_file() {
 		// Submissions go via MCP, not via the return value. The
 		// scanner-level test pins the orchestration contract: every
@@ -294,13 +502,19 @@ mod tests {
 
 		let calls = Arc::new(AtomicUsize::new(0));
 		let calls_for_stub = calls.clone();
-		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+		let ctx = make_ctx(tmp.path());
+		let expected_boundary = ctx.tool_boundary;
+		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+			assert_eq!(
+				req.tool_boundary, expected_boundary,
+				"all file invocations retain the job boundary"
+			);
 			calls_for_stub.fetch_add(1, Ordering::SeqCst);
 			Ok(String::new())
 		}));
 		let scanner = LlmCodeReviewScanner::new(backend);
 
-		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
+		let findings = scanner.scan(&ctx).await.unwrap();
 		assert!(findings.is_empty(), "scanner returns no findings — submissions go via MCP");
 		assert_eq!(
 			calls.load(Ordering::SeqCst),
@@ -339,12 +553,87 @@ mod tests {
 		}));
 		let scanner = LlmCodeReviewScanner::new(backend);
 		let mut ctx = make_ctx(tmp.path());
-		ctx.config = serde_json::json!({"include_extensions":["c"]});
+		ctx.config = Some(crate::test_support::patch(r#"{"include_extensions":["c"]}"#));
 		scanner.scan(&ctx).await.unwrap();
 		assert_eq!(
 			calls.load(Ordering::SeqCst),
 			1,
 			"ctx.config override should have caught widget.c"
 		);
+	}
+
+	#[tokio::test]
+	async fn malformed_known_patch_discards_all_overrides_but_unknown_members_do_not() {
+		let tmp = tempfile::tempdir().unwrap();
+		for name in ["one.rs", "two.rs", "only.c", "blocked.rs"] {
+			std::fs::write(tmp.path().join(name), "// source\n").unwrap();
+		}
+		let baseline = ScannerConfig {
+			include_extensions: crate::source_discovery::ScannerList::Builtin(&["rs"]),
+			exclude_path_substrings: crate::source_discovery::ScannerList::Builtin(&["blocked"]),
+			..Default::default()
+		};
+		for (patch, expected_calls) in [
+			(serde_json::Value::Null, 2),
+			(serde_json::json!({}), 2),
+			(serde_json::json!({"include_extensions": null}), 2),
+			(serde_json::json!({"include_extensions": []}), 0),
+			(serde_json::json!({"exclude_path_substrings": []}), 3),
+			(serde_json::json!({"include_extensions": ["c"], "future": {"nested": [1]}}), 1),
+			(serde_json::json!({"include_extensions": ["c"], "max_file_bytes": "bad"}), 2),
+			(serde_json::json!({"include_extensions": ["c"], "max_concurrent_files": -1}), 2),
+			(
+				serde_json::json!({"include_extensions": ["c"], "per_request_timeout_seconds": false}),
+				2,
+			),
+			(serde_json::json!({"include_extensions": ["c"], "exclude_path_substrings": [1]}), 2),
+			(
+				serde_json::json!({"include_extensions": ["c", null], "exclude_path_substrings": []}),
+				2,
+			),
+			(serde_json::json!("not a patch"), 2),
+			// The derived patch struct also accepts positional sequences.
+			(serde_json::json!([1, 4096, 1, ["c"], []]), 1),
+			(serde_json::json!([1, 4096, 1, ["c"]]), 1),
+			(serde_json::json!([1, "bad", 1, ["c"], []]), 2),
+			(serde_json::json!([1, 4096, 1, ["c"], [], "extra"]), 2),
+			// Duplicate lease keys use the last value, so an overwritten malformed
+			// member must not affect the selected patch.
+			(
+				serde_json::from_str(r#"{"include_extensions":["rs"],"include_extensions":["c"]}"#)
+					.unwrap(),
+				1,
+			),
+			(
+				serde_json::from_str(r#"{"include_extensions":7,"include_extensions":["c"]}"#)
+					.unwrap(),
+				1,
+			),
+			(
+				serde_json::from_str(r#"{"include_extensions":["c"],"include_extensions":7}"#)
+					.unwrap(),
+				2,
+			),
+			(
+				serde_json::from_str(
+					r#"{"include_extensions":["c"],"max_file_bytes":false,"max_file_bytes":4096}"#,
+				)
+				.unwrap(),
+				1,
+			),
+		] {
+			let calls = Arc::new(AtomicUsize::new(0));
+			let observed = calls.clone();
+			let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+				observed.fetch_add(1, Ordering::SeqCst);
+				Ok(String::new())
+			}));
+			let scanner = LlmCodeReviewScanner::new(backend).with_config(baseline.clone());
+			let mut ctx = make_ctx(tmp.path());
+			ctx.config = crate::client::test_scanner_patch(&patch.to_string()).unwrap();
+			let findings = scanner.scan(&ctx).await.unwrap();
+			assert!(findings.is_empty());
+			assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "patch: {:?}", ctx.config);
+		}
 	}
 }

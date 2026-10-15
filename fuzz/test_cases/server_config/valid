@@ -1,0 +1,5 @@
+[paths]
+db = "state/db"
+server_cert = "/cert.pem"
+[github_app]
+allowed_target_owners = ["example"]

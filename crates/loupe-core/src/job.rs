@@ -1,10 +1,12 @@
-use std::convert::Infallible;
 use std::fmt;
 use std::str::FromStr;
 
+use loupe_provenance::Source;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
+use crate::text::policy::JobKindName;
+use crate::text::BoundedText;
 
 /// Lifecycle state of a job in the server-side queue.
 ///
@@ -17,6 +19,7 @@ use crate::error::Error;
 ///   │                │
 ///   └── reap (attempts < max) ◄── lease_expires_at < now
 /// ```
+// debug-ok: closed job lifecycle unit variants contain no input text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -60,23 +63,32 @@ impl FromStr for JobState {
 
 /// Job kind. Future kinds remain readable after a binary rollback, but
 /// must never grant authority or be written by this binary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum JobKind {
+pub enum JobKind<S: Source> {
 	Scan,
 	Verify,
 	Survey,
 	Drilldown,
-	Unknown(String),
+	Unknown(BoundedText<JobKindName, S>),
 }
 
-impl JobKind {
+impl<S: Source> JobKind<S> {
+	/// Preserve the original marked spelling for forward-readable unknown kinds.
+	pub fn from_text(text: BoundedText<JobKindName, S>) -> Self {
+		match text.expose() {
+			"scan" => Self::Scan,
+			"verify" => Self::Verify,
+			"survey" => Self::Survey,
+			"drilldown" => Self::Drilldown,
+			_ => Self::Unknown(text),
+		}
+	}
 	pub fn as_str(&self) -> &str {
 		match self {
 			JobKind::Scan => "scan",
 			JobKind::Verify => "verify",
 			JobKind::Survey => "survey",
 			JobKind::Drilldown => "drilldown",
-			JobKind::Unknown(raw) => raw,
+			JobKind::Unknown(raw) => raw.expose(),
 		}
 	}
 
@@ -95,41 +107,56 @@ impl JobKind {
 	}
 }
 
-impl FromStr for JobKind {
-	type Err = Infallible;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"scan" => Ok(JobKind::Scan),
-			"verify" => Ok(JobKind::Verify),
-			"survey" => Ok(JobKind::Survey),
-			"drilldown" => Ok(JobKind::Drilldown),
-			other => Ok(JobKind::Unknown(other.to_owned())),
+impl<S: Source> fmt::Debug for JobKind<S> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		if self.is_known() {
+			f.write_str(self.as_str())
+		} else {
+			write!(f, "JobKind<{}>::Unknown([redacted])", S::NAME)
 		}
 	}
 }
 
-impl fmt::Display for JobKind {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(self.as_str())
-	}
-}
-
-impl Serialize for JobKind {
-	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+impl<S: Source> Serialize for JobKind<S> {
+	fn serialize<T: serde::Serializer>(&self, serializer: T) -> Result<T::Ok, T::Error> {
 		serializer.serialize_str(self.as_str())
 	}
 }
 
-impl<'de> Deserialize<'de> for JobKind {
-	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		Ok(String::deserialize(deserializer)?.parse().expect("infallible kind parser"))
+impl<S: Source> Clone for JobKind<S> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Scan => Self::Scan,
+			Self::Verify => Self::Verify,
+			Self::Survey => Self::Survey,
+			Self::Drilldown => Self::Drilldown,
+			Self::Unknown(text) => Self::Unknown(text.clone()),
+		}
+	}
+}
+impl<S: Source> PartialEq for JobKind<S> {
+	fn eq(&self, other: &Self) -> bool {
+		std::mem::discriminant(self) == std::mem::discriminant(other)
+			&& self.as_str() == other.as_str()
+	}
+}
+impl<S: Source> Eq for JobKind<S> {}
+impl<S: Source> std::hash::Hash for JobKind<S> {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		std::hash::Hash::hash(&std::mem::discriminant(self), state);
+		std::hash::Hash::hash(self.as_str(), state);
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use loupe_provenance::Agent;
+
 	use super::*;
+	type JobKind = super::JobKind<Agent>;
+	fn kind(raw: &str) -> JobKind {
+		JobKind::from_text(crate::test_support::text(raw).unwrap())
+	}
 
 	#[test]
 	fn job_state_terminality() {
@@ -164,16 +191,12 @@ mod tests {
 
 	#[test]
 	fn job_kind_round_trips_via_string() {
-		for k in [
-			JobKind::Scan,
-			JobKind::Verify,
-			JobKind::Survey,
-			JobKind::Drilldown,
-			JobKind::Unknown("future".into()),
-		] {
-			assert_eq!(k.as_str().parse::<JobKind>().unwrap(), k);
+		for k in
+			[JobKind::Scan, JobKind::Verify, JobKind::Survey, JobKind::Drilldown, kind("future")]
+		{
+			assert_eq!(kind(k.as_str()), k);
 			let json = serde_json::to_string(&k).unwrap();
-			assert_eq!(serde_json::from_str::<JobKind>(&json).unwrap(), k);
+			assert_eq!(kind(&serde_json::from_str::<String>(&json).unwrap()), k);
 			assert_eq!(serde_json::from_str::<String>(&json).unwrap(), k.as_str());
 		}
 	}
@@ -186,14 +209,14 @@ mod tests {
 		assert!(JobKind::Verify.is_known());
 		assert!(JobKind::Survey.is_phase());
 		assert!(JobKind::Drilldown.is_phase());
-		assert!(!JobKind::Unknown("scan".into()).is_known());
+		assert!(!JobKind::Unknown(crate::test_support::text("scan").unwrap()).is_known());
 	}
 
 	#[test]
 	fn unknown_states_are_rejected_but_future_kinds_stay_readable() {
 		assert!("running".parse::<JobState>().is_err());
-		let kind = "audit".parse::<JobKind>().unwrap();
-		assert_eq!(kind, JobKind::Unknown("audit".into()));
-		assert!(!kind.is_known());
+		let observed = kind("audit");
+		assert_eq!(observed, JobKind::Unknown(crate::test_support::text("audit").unwrap()));
+		assert!(!observed.is_known());
 	}
 }

@@ -1,0 +1,7 @@
+[tls]
+ca_cert="ca.pem"
+cert="cert.pem"
+key="key.pem"
+[cache]
+dir="cache"
+

@@ -36,8 +36,8 @@ impl WebState {
 	/// State with a throwaway client, for unit-testing the guards.
 	#[cfg(test)]
 	pub fn for_tests(bind: &str) -> Self {
-		let base = reqwest::Url::parse("https://127.0.0.1:8443").unwrap();
-		let client = AdminClient::from_parts(reqwest::Client::new(), base);
+		let base = "https://127.0.0.1:8443";
+		let client = crate::test_support::client(reqwest::Client::new(), base);
 		Self::new(client, Token::generate(), bind.parse().unwrap(), 5)
 	}
 }

@@ -17,23 +17,34 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+mime = "0.3"
+percent-encoding = "2.3"
+loupe-core = { version = "0.1.0", path = "../loupe-core" }
 axum = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
 loupe-proto = { version = "0.1.0", path = "../loupe-proto" }
+loupe-http = { version = "0.1.0", path = "../loupe-http" }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance", features = ["ingress"] }
+loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 rand_core = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 loupe-server = { version = "0.1.0", path = "../loupe-server" }
 loupe-storage = { version = "0.1.0", path = "../loupe-storage" }
-loupe-tls = { version = "0.1.0", path = "../loupe-tls" }
 tempfile = { workspace = true }
 
 [lints]

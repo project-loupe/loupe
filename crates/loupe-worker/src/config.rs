@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use loupe_provenance::{Config, Ingress, Untrusted};
 use serde::Deserialize;
 
 use crate::llm::claude_cli::{DEFAULT_CLAUDE_EFFORT, DEFAULT_CLAUDE_MODEL};
@@ -13,15 +14,26 @@ use crate::runner::DEFAULT_MAX_WORKDIR_BYTES;
 use crate::sandbox::{validate_network_host, SandboxNetworkConfig, SandboxNetworkMode};
 use crate::scanners::LlmScannerConfig;
 
+mod ingress;
+mod sandbox;
+pub use sandbox::{
+	ConfigNonSecret, SandboxAgentConfig, SandboxLaunchConfig, SandboxNetworkPolicy,
+	SandboxRequiredHosts,
+};
+pub mod value;
+pub use value::{ConfiguredPath, ConfiguredText, ConfiguredUrl};
+
 const DEFAULT_CACHE_DIR: &str = "/var/cache/loupe-worker";
 const DEFAULT_MAX_CACHE_GB: u64 = 40;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_MAX_CONCURRENT_FILES: usize = 8;
 const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+// debug-ok: Effective configuration contains redacted text/path owners, numeric limits and closed modes.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-	pub server_url: Option<reqwest::Url>,
+	launch_path: ConfigNonSecret,
+	pub server_url: Option<ConfiguredUrl>,
 	pub tls: TlsConfig,
 	pub cache: CacheConfig,
 	pub runtime: RuntimeConfig,
@@ -33,32 +45,37 @@ pub struct WorkerConfig {
 	pub broker: ModelBrokerLimits,
 }
 
+// debug-ok: All selected certificate paths use the redacted ConfiguredPath formatter.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
-	pub ca_cert: Option<PathBuf>,
-	pub cert: Option<PathBuf>,
-	pub key: Option<PathBuf>,
+	pub ca_cert: Option<ConfiguredPath>,
+	pub cert: Option<ConfiguredPath>,
+	pub key: Option<ConfiguredPath>,
 }
 
+// debug-ok: The configured cache path is redacted; capacity is numeric.
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
-	pub dir: PathBuf,
+	pub dir: ConfiguredPath,
 	pub max_gb: u64,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
 	pub max_workdir_bytes: u64,
 	pub disable_sandbox: bool,
 }
 
+// debug-ok: Configured level is redacted; remaining fields are boolean settings.
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
-	pub level: String,
+	pub level: ConfiguredText,
 	pub json: bool,
 	pub agent_output: bool,
 }
 
+// debug-ok: Closed agent variants and redacted model/effort configurations.
 #[derive(Debug, Clone)]
 pub struct AgentsConfig {
 	pub scan: JobAgent,
@@ -67,44 +84,47 @@ pub struct AgentsConfig {
 	pub codex: CliModelConfig,
 }
 
+// debug-ok: Every content field uses the redacted ConfiguredText formatter.
 #[derive(Debug, Clone)]
 pub struct BkbConfig {
-	pub api_url: String,
+	pub api_url: ConfiguredText,
 }
 
+// debug-ok: Effective configuration contains redacted text/path owners, numeric limits and closed modes.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerConfigOverrides {
-	pub server_url: Option<reqwest::Url>,
-	pub ca_cert: Option<PathBuf>,
-	pub cert: Option<PathBuf>,
-	pub key: Option<PathBuf>,
-	pub cache_dir: Option<PathBuf>,
+	pub server_url: Option<ConfiguredUrl>,
+	pub ca_cert: Option<ConfiguredPath>,
+	pub cert: Option<ConfiguredPath>,
+	pub key: Option<ConfiguredPath>,
+	pub cache_dir: Option<ConfiguredPath>,
 	pub max_cache_gb: Option<u64>,
 	pub max_workdir_gb: Option<u64>,
 	pub disable_sandbox: Option<bool>,
 	pub sandbox_network: Option<SandboxNetworkMode>,
-	pub sandbox_allowlist: Option<Vec<String>>,
-	pub log_level: Option<String>,
+	pub sandbox_allowlist: Option<Vec<ConfiguredText>>,
+	pub log_level: Option<ConfiguredText>,
 	pub log_json: Option<bool>,
 	pub log_agent_output: Option<bool>,
 	pub scan_agent: Option<JobAgent>,
 	pub verify_agent: Option<JobAgent>,
-	pub claude_model: Option<String>,
-	pub claude_effort: Option<String>,
-	pub codex_model: Option<String>,
-	pub codex_effort: Option<String>,
+	pub claude_model: Option<ConfiguredText>,
+	pub claude_effort: Option<ConfiguredText>,
+	pub codex_model: Option<ConfiguredText>,
+	pub codex_effort: Option<ConfiguredText>,
 	pub max_concurrent_files: Option<usize>,
 	pub max_file_bytes: Option<u64>,
 	pub per_request_timeout_seconds: Option<u64>,
-	pub bkb_api_url: Option<String>,
+	pub bkb_api_url: Option<ConfiguredText>,
 	pub broker_request_ceiling: Option<u64>,
 	pub broker_output_ceiling_bytes: Option<u64>,
 	pub broker_token_ceiling: Option<u64>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileConfig {
+struct FileConfig {
 	#[serde(default)]
 	pub server: ServerSection,
 	#[serde(default)]
@@ -127,16 +147,18 @@ pub struct FileConfig {
 	pub broker: BrokerSection,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServerSection {
+struct ServerSection {
 	#[serde(default)]
 	pub url: Option<String>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TlsSection {
+struct TlsSection {
 	#[serde(default)]
 	pub ca_cert: Option<PathBuf>,
 	#[serde(default)]
@@ -145,36 +167,40 @@ pub struct TlsSection {
 	pub key: Option<PathBuf>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CacheSection {
+struct CacheSection {
 	#[serde(default)]
 	pub dir: Option<PathBuf>,
 	#[serde(default)]
 	pub max_gb: Option<u64>,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeSection {
+struct RuntimeSection {
 	#[serde(default)]
 	pub max_workdir_gb: Option<u64>,
 	#[serde(default)]
 	pub disable_sandbox: Option<bool>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SandboxSection {
+struct SandboxSection {
 	#[serde(default)]
 	pub network: Option<SandboxNetworkMode>,
 	#[serde(default)]
 	pub allowlist: Option<Vec<String>>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LoggingSection {
+struct LoggingSection {
 	#[serde(default)]
 	pub level: Option<String>,
 	#[serde(default)]
@@ -183,9 +209,10 @@ pub struct LoggingSection {
 	pub agent_output: Option<bool>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentsSection {
+struct AgentsSection {
 	#[serde(default)]
 	pub scan: Option<JobAgent>,
 	#[serde(default)]
@@ -196,18 +223,20 @@ pub struct AgentsSection {
 	pub codex: AgentSection,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentSection {
+struct AgentSection {
 	#[serde(default)]
 	pub model: Option<String>,
 	#[serde(default)]
 	pub effort: Option<String>,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ScannerDefaultsSection {
+struct ScannerDefaultsSection {
 	#[serde(default)]
 	pub max_concurrent_files: Option<usize>,
 	#[serde(default)]
@@ -216,16 +245,18 @@ pub struct ScannerDefaultsSection {
 	pub per_request_timeout_seconds: Option<u64>,
 }
 
+// debug-ok: Private Config decoder scratch; raw Debug is used only by the cfg(fuzzing) compatibility projection.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BkbSection {
+struct BkbSection {
 	#[serde(default)]
 	pub api_url: Option<String>,
 }
 
+// debug-ok: Only numeric limits and boolean settings; no content fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BrokerSection {
+struct BrokerSection {
 	#[serde(default)]
 	pub request_ceiling: Option<u64>,
 	#[serde(default)]
@@ -235,6 +266,13 @@ pub struct BrokerSection {
 }
 
 impl WorkerConfig {
+	/// Declare only the exact supported public sandbox fields after validating
+	/// the merged configuration. Other fields have no non-secret projection.
+	pub fn sandbox_launch_config(&self) -> Result<SandboxLaunchConfig> {
+		self.validate()?;
+		Ok(sandbox::finalize(self, self.launch_path.clone()))
+	}
+
 	pub fn load(path: Option<&Path>, overrides: WorkerConfigOverrides) -> Result<Self> {
 		let mut cfg = WorkerConfig::default();
 		if let Some(path) = path {
@@ -245,22 +283,21 @@ impl WorkerConfig {
 		Ok(cfg)
 	}
 
-	fn apply_file(&mut self, file: FileConfig) -> Result<()> {
-		if let Some(v) = file.server.url {
-			self.server_url = Some(
-				v.parse::<reqwest::Url>().with_context(|| format!("parsing [server].url `{v}`"))?,
-			);
+	fn apply_file(&mut self, decoded: ingress::DecodedWorkerFileConfig) -> Result<()> {
+		let file = decoded.scalars;
+		if let Some(v) = decoded.server_url {
+			self.server_url = Some(ConfiguredUrl::parse(v).context("parsing [server].url")?);
 		}
-		if let Some(v) = file.tls.ca_cert {
+		if let Some(v) = decoded.ca_cert {
 			self.tls.ca_cert = Some(v);
 		}
-		if let Some(v) = file.tls.cert {
+		if let Some(v) = decoded.cert {
 			self.tls.cert = Some(v);
 		}
-		if let Some(v) = file.tls.key {
+		if let Some(v) = decoded.key {
 			self.tls.key = Some(v);
 		}
-		if let Some(v) = file.cache.dir {
+		if let Some(v) = decoded.cache_dir {
 			self.cache.dir = v;
 		}
 		if let Some(v) = file.cache.max_gb {
@@ -275,10 +312,10 @@ impl WorkerConfig {
 		if let Some(v) = file.sandbox.network {
 			self.sandbox.mode = v;
 		}
-		if let Some(v) = file.sandbox.allowlist {
+		if let Some(v) = decoded.allowlist {
 			self.sandbox.allowlist = v;
 		}
-		if let Some(v) = file.logging.level {
+		if let Some(v) = decoded.log_level {
 			self.logging.level = v;
 		}
 		if let Some(v) = file.logging.json {
@@ -293,16 +330,16 @@ impl WorkerConfig {
 		if let Some(v) = file.agents.verify {
 			self.agents.verify = v;
 		}
-		if let Some(v) = file.agents.claude.model {
+		if let Some(v) = decoded.claude_model {
 			self.agents.claude.model = v;
 		}
-		if let Some(v) = file.agents.claude.effort {
+		if let Some(v) = decoded.claude_effort {
 			self.agents.claude.effort = v;
 		}
-		if let Some(v) = file.agents.codex.model {
+		if let Some(v) = decoded.codex_model {
 			self.agents.codex.model = v;
 		}
-		if let Some(v) = file.agents.codex.effort {
+		if let Some(v) = decoded.codex_effort {
 			self.agents.codex.effort = v;
 		}
 		if let Some(v) = file.scanner_defaults.max_concurrent_files {
@@ -314,7 +351,7 @@ impl WorkerConfig {
 		if let Some(v) = file.scanner_defaults.per_request_timeout_seconds {
 			self.scanner_defaults.per_request_timeout = Duration::from_secs(v);
 		}
-		if let Some(v) = file.bkb.api_url {
+		if let Some(v) = decoded.bkb_api_url {
 			self.bkb.api_url = v;
 		}
 		if let Some(v) = file.broker.request_ceiling {
@@ -411,21 +448,21 @@ impl WorkerConfig {
 	}
 
 	fn validate(&self) -> Result<()> {
-		validate_nonempty("agents.claude.model", &self.agents.claude.model)?;
-		validate_nonempty("agents.codex.model", &self.agents.codex.model)?;
+		validate_nonempty("agents.claude.model", self.agents.claude.model.for_operation())?;
+		validate_nonempty("agents.codex.model", self.agents.codex.model.for_operation())?;
 		validate_effort(
 			"agents.claude.effort",
-			&self.agents.claude.effort,
+			self.agents.claude.effort.for_operation(),
 			&["low", "medium", "high", "xhigh", "max"],
 		)?;
 		validate_effort(
 			"agents.codex.effort",
-			&self.agents.codex.effort,
+			self.agents.codex.effort.for_operation(),
 			&["none", "low", "medium", "high", "xhigh"],
 		)?;
 		validate_effort(
 			"logging.level",
-			&self.logging.level,
+			self.logging.level.for_operation(),
 			&["trace", "debug", "info", "warn", "error"],
 		)?;
 		validate_nonzero("cache.max_gb", self.cache.max_gb)?;
@@ -442,16 +479,25 @@ impl WorkerConfig {
 			anyhow::bail!("sandbox.allowlist requires sandbox.network = \"allowlist\"");
 		}
 		for host in &self.sandbox.allowlist {
-			validate_network_host(host).context("validating sandbox.allowlist")?;
+			validate_network_host(host.for_operation()).context("validating sandbox.allowlist")?;
 		}
-		validate_nonempty("bkb.api_url", &self.bkb.api_url)?;
-		let bkb_url =
-			self.bkb.api_url.parse::<reqwest::Url>().context("bkb.api_url must be a valid URL")?;
+		validate_nonempty("bkb.api_url", self.bkb.api_url.for_operation())?;
+		let bkb_url = self
+			.bkb
+			.api_url
+			.for_operation()
+			.parse::<reqwest::Url>()
+			.context("bkb.api_url must be a valid URL")?;
 		let Some(bkb_host) = bkb_url.host_str() else {
 			anyhow::bail!("bkb.api_url must be an HTTP(S) URL with a host");
 		};
 		if !matches!(bkb_url.scheme(), "http" | "https") {
 			anyhow::bail!("bkb.api_url must be an HTTP(S) URL with a host");
+		}
+		// The complete BKB endpoint is deliberately published inside the
+		// sandbox. Authentication belongs in a host broker, never this field.
+		if !bkb_url.username().is_empty() || bkb_url.password().is_some() {
+			anyhow::bail!("bkb.api_url must not contain userinfo");
 		}
 		// Each sandbox launch turns this host into a network policy entry, so
 		// reject anything the policy cannot express while the worker is still
@@ -462,14 +508,104 @@ impl WorkerConfig {
 	}
 }
 
+/// Access to merge/validation without process startup, used only by fuzzing.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+	use super::*;
+	// debug-ok: Closed fieldless variants; no dynamic content.
+	#[derive(Clone, Copy, Debug)]
+	pub enum ArgumentCase {
+		Text,
+		Url,
+		Path,
+	}
+	// debug-ok: Cfg(fuzzing) synthetic observation only; raw values support independent oracle comparisons.
+	#[derive(Debug, PartialEq, Eq)]
+	pub enum ArgumentValue {
+		Text(String),
+		Url(String),
+		Path(std::ffi::OsString),
+	}
+	pub fn argument(
+		case: ArgumentCase, original: &std::ffi::OsStr,
+	) -> Result<ArgumentValue, String> {
+		use clap::builder::TypedValueParser;
+
+		use crate::config_value_parsers::{
+			ConfiguredPathParser, ConfiguredTextParser, ConfiguredUrlParser,
+		};
+		let command = clap::Command::new("worker-fixture");
+		let arg = clap::Arg::new("value");
+		match case {
+			ArgumentCase::Text => ConfiguredTextParser
+				.parse_ref(&command, Some(&arg), original)
+				.map(|v| ArgumentValue::Text(v.for_operation().to_owned())),
+			ArgumentCase::Url => ConfiguredUrlParser
+				.parse_ref(&command, Some(&arg), original)
+				.map(|v| ArgumentValue::Url(v.for_http().to_string())),
+			ArgumentCase::Path => ConfiguredPathParser
+				.parse_ref(&command, Some(&arg), original)
+				.map(|v| ArgumentValue::Path(v.for_filesystem().as_os_str().to_owned())),
+		}
+		.map_err(|error| error.to_string())
+	}
+	#[allow(unsafe_code)]
+	pub fn file_document(original: &[u8]) -> Result<FileDocument, String> {
+		// SAFETY: cfg-only original Config file fixture, before UTF-8/TOML decoding.
+		let original = Untrusted::new(original, unsafe { Ingress::<Config>::new() });
+		original
+			.validate(ingress::WorkerFileConfigDecoder)
+			.map(FileDocument)
+			.map_err(|error| error.to_string())
+	}
+	pub struct FileDocument(ingress::DecodedWorkerFileConfig);
+	impl std::fmt::Debug for FileDocument {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			f.write_str(&self.0.original_debug)
+		}
+	}
+	impl FileDocument {
+		pub fn resolved_paths(&self) -> Vec<PathBuf> {
+			[&self.0.ca_cert, &self.0.cert, &self.0.key, &self.0.cache_dir]
+				.into_iter()
+				.flatten()
+				.map(|v| v.for_filesystem().to_path_buf())
+				.collect()
+		}
+	}
+	pub fn load_document(path: &Path) -> Result<FileDocument> {
+		FileConfig::load(path).map(FileDocument)
+	}
+	pub fn merge(file: FileDocument) -> Result<WorkerConfig> {
+		let mut config = WorkerConfig::default();
+		config.apply_file(file.0)?;
+		Ok(config)
+	}
+	pub fn validate(config: &WorkerConfig) -> Result<()> {
+		config.validate()
+	}
+}
+
+fn capture_launch_path() -> ConfigNonSecret {
+	let path = std::env::var("PATH").unwrap_or_else(|_| {
+		"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+	});
+	// SAFETY: exact launch environment acquisition, before its closed public
+	// sandbox-path projection. Invalid UTF-8/missing PATH retains the fallback.
+	#[allow(unsafe_code)]
+	let original = Untrusted::new(path, unsafe { Ingress::<Config>::new() });
+	sandbox::launch_path(original)
+}
+
 impl Default for WorkerConfig {
 	fn default() -> Self {
 		let scanner_defaults = LlmScannerConfig::default();
 		Self {
+			launch_path: capture_launch_path(),
 			server_url: None,
 			tls: TlsConfig::default(),
 			cache: CacheConfig {
-				dir: PathBuf::from(DEFAULT_CACHE_DIR),
+				dir: ConfiguredPath::builtin(DEFAULT_CACHE_DIR),
 				max_gb: DEFAULT_MAX_CACHE_GB,
 			},
 			runtime: RuntimeConfig {
@@ -478,7 +614,7 @@ impl Default for WorkerConfig {
 			},
 			sandbox: SandboxNetworkConfig::default(),
 			logging: LoggingConfig {
-				level: DEFAULT_LOG_LEVEL.to_owned(),
+				level: ConfiguredText::Builtin(DEFAULT_LOG_LEVEL),
 				json: false,
 				agent_output: false,
 			},
@@ -486,12 +622,12 @@ impl Default for WorkerConfig {
 				scan: JobAgent::Auto,
 				verify: JobAgent::Auto,
 				claude: CliModelConfig {
-					model: DEFAULT_CLAUDE_MODEL.to_owned(),
-					effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
+					model: ConfiguredText::Builtin(DEFAULT_CLAUDE_MODEL),
+					effort: ConfiguredText::Builtin(DEFAULT_CLAUDE_EFFORT),
 				},
 				codex: CliModelConfig {
-					model: DEFAULT_CODEX_MODEL.to_owned(),
-					effort: DEFAULT_CODEX_EFFORT.to_owned(),
+					model: ConfiguredText::Builtin(DEFAULT_CODEX_MODEL),
+					effort: ConfiguredText::Builtin(DEFAULT_CODEX_EFFORT),
 				},
 			},
 			scanner_defaults: LlmScannerConfig {
@@ -501,32 +637,37 @@ impl Default for WorkerConfig {
 				include_extensions: scanner_defaults.include_extensions,
 				exclude_path_substrings: scanner_defaults.exclude_path_substrings,
 			},
-			bkb: BkbConfig { api_url: DEFAULT_BKB_API_URL.to_owned() },
+			bkb: BkbConfig { api_url: ConfiguredText::Builtin(DEFAULT_BKB_API_URL) },
 			broker: ModelBrokerLimits::default(),
 		}
 	}
 }
 
 impl FileConfig {
-	pub fn load(path: &Path) -> Result<Self> {
-		let raw = std::fs::read_to_string(path)
+	fn load(path: &Path) -> Result<ingress::DecodedWorkerFileConfig> {
+		#[allow(
+			clippy::disallowed_methods,
+			reason = "Worker config ingress reads the selected Config path before named TOML admission."
+		)]
+		let raw = std::fs::read(path)
 			.with_context(|| format!("reading worker config file {}", path.display()))?;
-		let mut cfg: FileConfig = toml::from_str(&raw)
-			.with_context(|| format!("parsing worker config file {}", path.display()))?;
+		// SAFETY: these are the original bytes just read from the configured
+		// worker TOML file, before UTF-8 or TOML interpretation.
+		#[allow(unsafe_code)]
+		let raw = Untrusted::new(raw, unsafe { Ingress::<Config>::new() });
+		let decoded =
+			raw.as_bytes().validate(ingress::WorkerFileConfigDecoder).map_err(|error| {
+				let operation =
+					if error.is::<std::str::Utf8Error>() { "reading" } else { "parsing" };
+				error.context(format!("{operation} worker config file {}", path.display()))
+			})?;
+		let mut cfg = decoded;
 		let base = path.parent().unwrap_or_else(|| Path::new("."));
-		cfg.tls.ca_cert = cfg.tls.ca_cert.map(|p| resolve(base, p));
-		cfg.tls.cert = cfg.tls.cert.map(|p| resolve(base, p));
-		cfg.tls.key = cfg.tls.key.map(|p| resolve(base, p));
-		cfg.cache.dir = cfg.cache.dir.map(|p| resolve(base, p));
+		cfg.ca_cert = cfg.ca_cert.map(|p| p.resolve(base));
+		cfg.cert = cfg.cert.map(|p| p.resolve(base));
+		cfg.key = cfg.key.map(|p| p.resolve(base));
+		cfg.cache_dir = cfg.cache_dir.map(|p| p.resolve(base));
 		Ok(cfg)
-	}
-}
-
-fn resolve(base: &Path, p: PathBuf) -> PathBuf {
-	if p.is_absolute() {
-		p
-	} else {
-		base.join(p)
 	}
 }
 
@@ -558,24 +699,91 @@ fn validate_nonzero(name: &str, value: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	#[allow(unsafe_code)]
+	fn launch_path_is_captured_once_when_config_is_loaded() {
+		let name = "config::tests::launch_path_is_captured_once_when_config_is_loaded";
+		if !crate::test_env::in_env(
+			name,
+			"captured-path",
+			&[("PATH", Some(std::ffi::OsStr::new("/initial/bin")))],
+		) {
+			return;
+		}
+		let config = super::WorkerConfig::load(None, Default::default()).unwrap();
+		// SAFETY: in_env runs only this synchronous test in a fresh child.
+		unsafe {
+			std::env::set_var("PATH", "/later/bin");
+		}
+		assert_eq!(
+			config.sandbox_launch_config().unwrap().path().for_sandbox(),
+			"/initial/bin",
+			"sandbox PATH must use the original config-load capture"
+		);
+	}
+
+	#[test]
+	fn declared_sandbox_config_is_exact_and_redacted() {
+		let config = super::WorkerConfig::load(None, Default::default()).unwrap();
+		let launch = config.sandbox_launch_config().unwrap();
+		assert_eq!(
+			launch.claude().model().for_sandbox(),
+			config.agents.claude.model.for_operation()
+		);
+		assert_eq!(
+			launch.claude().effort().for_sandbox(),
+			config.agents.claude.effort.for_operation()
+		);
+		assert_eq!(launch.codex().model().for_sandbox(), config.agents.codex.model.for_operation());
+		assert_eq!(
+			launch.codex().effort().for_sandbox(),
+			config.agents.codex.effort.for_operation()
+		);
+		assert_eq!(launch.bkb_api_url().for_sandbox(), config.bkb.api_url.for_operation());
+		assert_eq!(launch.network().mode(), config.sandbox.mode);
+		assert!(launch.network().allowlist().is_empty());
+		assert!(!format!("{launch:?}").contains(config.bkb.api_url.for_operation()));
+	}
+
 	use super::*;
+
+	#[test]
+	fn s3_sandbox_bkb_userinfo_is_rejected_without_echoing_it() {
+		for url in
+			["https://user:private-bkb-password@example.com/api", "https://user@example.com/api"]
+		{
+			let mut cfg = WorkerConfig::default();
+			cfg.bkb.api_url = ConfiguredText::Builtin(url);
+			let result = cfg.validate();
+			assert!(result.is_err(), "sandbox-public BKB URL must reject userinfo");
+			assert_eq!(result.unwrap_err().to_string(), "bkb.api_url must not contain userinfo");
+		}
+	}
+
+	#[test]
+	fn s3_sandbox_bkb_keeps_ordinary_public_path_and_query() {
+		let mut cfg = WorkerConfig::default();
+		cfg.bkb.api_url = ConfiguredText::Builtin("https://example.com/api/v2?format=json");
+		cfg.validate().unwrap();
+		assert_eq!(cfg.bkb.api_url.for_operation(), "https://example.com/api/v2?format=json");
+	}
 
 	#[test]
 	fn defaults_match_expected_agent_and_cache_settings() {
 		let cfg = WorkerConfig::load(None, WorkerConfigOverrides::default()).unwrap();
-		assert_eq!(cfg.cache.dir, PathBuf::from(DEFAULT_CACHE_DIR));
+		assert_eq!(cfg.cache.dir.for_filesystem(), PathBuf::from(DEFAULT_CACHE_DIR));
 		assert_eq!(cfg.cache.max_gb, 40);
 		assert_eq!(cfg.sandbox.mode, SandboxNetworkMode::Public);
 		assert!(cfg.sandbox.allowlist.is_empty());
-		assert_eq!(cfg.logging.level, "info");
+		assert_eq!(cfg.logging.level.for_operation(), "info");
 		assert_eq!(cfg.agents.scan, JobAgent::Auto);
 		assert_eq!(cfg.agents.verify, JobAgent::Auto);
-		assert_eq!(cfg.agents.claude.model, "claude-opus-4-7");
-		assert_eq!(cfg.agents.claude.effort, "max");
-		assert_eq!(cfg.agents.codex.model, "gpt-5.5");
-		assert_eq!(cfg.agents.codex.effort, "xhigh");
+		assert_eq!(cfg.agents.claude.model.for_operation(), "claude-opus-4-7");
+		assert_eq!(cfg.agents.claude.effort.for_operation(), "max");
+		assert_eq!(cfg.agents.codex.model.for_operation(), "gpt-5.5");
+		assert_eq!(cfg.agents.codex.effort.for_operation(), "xhigh");
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 2 * 1024 * 1024);
-		assert_eq!(cfg.bkb.api_url, "https://bitcoinknowledge.dev");
+		assert_eq!(cfg.bkb.api_url.for_operation(), "https://bitcoinknowledge.dev");
 		assert_eq!(cfg.broker.request_ceiling, 1_000);
 		assert_eq!(cfg.broker.output_ceiling_bytes, 32 * 1024 * 1024);
 		assert_eq!(cfg.broker.token_ceiling, None);
@@ -643,29 +851,32 @@ token_ceiling = 890
 
 		let cfg = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap();
 
-		assert_eq!(cfg.server_url.unwrap().as_str(), "https://loupe.example.com:8443/");
-		assert_eq!(cfg.tls.ca_cert.unwrap(), dir.path().join("ca.pem"));
-		assert_eq!(cfg.tls.cert.unwrap(), dir.path().join("worker.pem"));
-		assert_eq!(cfg.tls.key.unwrap(), dir.path().join("worker.key"));
-		assert_eq!(cfg.cache.dir, dir.path().join("cache"));
+		assert_eq!(cfg.server_url.unwrap().for_http().as_str(), "https://loupe.example.com:8443/");
+		assert_eq!(cfg.tls.ca_cert.as_ref().unwrap().for_filesystem(), dir.path().join("ca.pem"));
+		assert_eq!(cfg.tls.cert.as_ref().unwrap().for_filesystem(), dir.path().join("worker.pem"));
+		assert_eq!(cfg.tls.key.as_ref().unwrap().for_filesystem(), dir.path().join("worker.key"));
+		assert_eq!(cfg.cache.dir.for_filesystem(), dir.path().join("cache"));
 		assert_eq!(cfg.cache.max_gb, 7);
 		assert_eq!(cfg.runtime.max_workdir_bytes, 3 * 1_073_741_824);
 		assert!(cfg.runtime.disable_sandbox);
 		assert_eq!(cfg.sandbox.mode, SandboxNetworkMode::Allowlist);
-		assert_eq!(cfg.sandbox.allowlist, ["example.com", "203.0.113.9"]);
-		assert_eq!(cfg.logging.level, "debug");
+		assert_eq!(
+			cfg.sandbox.allowlist.iter().map(ConfiguredText::for_operation).collect::<Vec<_>>(),
+			["example.com", "203.0.113.9"]
+		);
+		assert_eq!(cfg.logging.level.for_operation(), "debug");
 		assert!(cfg.logging.json);
 		assert!(cfg.logging.agent_output);
 		assert_eq!(cfg.agents.scan, JobAgent::Codex);
 		assert_eq!(cfg.agents.verify, JobAgent::Claude);
-		assert_eq!(cfg.agents.claude.model, "claude-custom");
-		assert_eq!(cfg.agents.claude.effort, "xhigh");
-		assert_eq!(cfg.agents.codex.model, "gpt-custom");
-		assert_eq!(cfg.agents.codex.effort, "high");
+		assert_eq!(cfg.agents.claude.model.for_operation(), "claude-custom");
+		assert_eq!(cfg.agents.claude.effort.for_operation(), "xhigh");
+		assert_eq!(cfg.agents.codex.model.for_operation(), "gpt-custom");
+		assert_eq!(cfg.agents.codex.effort.for_operation(), "high");
 		assert_eq!(cfg.scanner_defaults.max_concurrent_files, 2);
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 1234);
 		assert_eq!(cfg.scanner_defaults.per_request_timeout, Duration::from_secs(99));
-		assert_eq!(cfg.bkb.api_url, "https://bkb.example.test");
+		assert_eq!(cfg.bkb.api_url.for_operation(), "https://bkb.example.test");
 		assert_eq!(cfg.broker.request_ceiling, 23);
 		assert_eq!(cfg.broker.output_ceiling_bytes, 4567);
 		assert_eq!(cfg.broker.token_ceiling, Some(890));
@@ -694,13 +905,13 @@ allowlist = ["from-file.example"]
 			WorkerConfigOverrides {
 				scan_agent: Some(JobAgent::Codex),
 				verify_agent: Some(JobAgent::Claude),
-				codex_model: Some("from-env".to_owned()),
-				codex_effort: Some("xhigh".to_owned()),
+				codex_model: Some(crate::test_support::config_text("from-env")),
+				codex_effort: Some(crate::test_support::config_text("xhigh")),
 				broker_request_ceiling: Some(42),
 				broker_output_ceiling_bytes: Some(8192),
 				broker_token_ceiling: Some(9000),
 				sandbox_network: Some(SandboxNetworkMode::Allowlist),
-				sandbox_allowlist: Some(vec!["from-env.example".to_owned()]),
+				sandbox_allowlist: Some(vec![crate::test_support::config_text("from-env.example")]),
 				..WorkerConfigOverrides::default()
 			},
 		)
@@ -708,9 +919,12 @@ allowlist = ["from-file.example"]
 
 		assert_eq!(cfg.agents.scan, JobAgent::Codex);
 		assert_eq!(cfg.agents.verify, JobAgent::Claude);
-		assert_eq!(cfg.agents.codex.model, "from-env");
-		assert_eq!(cfg.agents.codex.effort, "xhigh");
-		assert_eq!(cfg.sandbox.allowlist, ["from-env.example"]);
+		assert_eq!(cfg.agents.codex.model.for_operation(), "from-env");
+		assert_eq!(cfg.agents.codex.effort.for_operation(), "xhigh");
+		assert_eq!(
+			cfg.sandbox.allowlist.iter().map(ConfiguredText::for_operation).collect::<Vec<_>>(),
+			["from-env.example"]
+		);
 		assert_eq!(cfg.broker.request_ceiling, 42);
 		assert_eq!(cfg.broker.output_ceiling_bytes, 8192);
 		assert_eq!(cfg.broker.token_ceiling, Some(9000));
@@ -733,7 +947,7 @@ allowlist = ["from-file.example"]
 		let err = WorkerConfig::load(
 			None,
 			WorkerConfigOverrides {
-				sandbox_allowlist: Some(vec!["example.com".to_owned()]),
+				sandbox_allowlist: Some(vec![crate::test_support::config_text("example.com")]),
 				..Default::default()
 			},
 		)
@@ -762,7 +976,7 @@ allowlist = ["from-file.example"]
 				None,
 				WorkerConfigOverrides {
 					sandbox_network: Some(SandboxNetworkMode::Allowlist),
-					sandbox_allowlist: Some(vec![invalid.to_owned()]),
+					sandbox_allowlist: Some(vec![crate::test_support::config_text(invalid)]),
 					..Default::default()
 				},
 			)
@@ -785,7 +999,10 @@ allowlist = ["from-file.example"]
 	fn invalid_effort_is_rejected() {
 		let err = WorkerConfig::load(
 			None,
-			WorkerConfigOverrides { codex_effort: Some("max".to_owned()), ..Default::default() },
+			WorkerConfigOverrides {
+				codex_effort: Some(crate::test_support::config_text("max")),
+				..Default::default()
+			},
 		)
 		.unwrap_err();
 		assert!(err.to_string().contains("agents.codex.effort"), "got: {err}");
@@ -799,6 +1016,124 @@ allowlist = ["from-file.example"]
 
 		let err = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
 		let msg = format!("{err:#}");
-		assert!(msg.contains("llama") || msg.contains("scan"), "got: {msg}");
+		// The closed admission error keeps the rejected-choice category and
+		// original offset, rather than echoing the rejected config value.
+		assert!(msg.contains("unknown variant") && msg.contains("bytes "), "got: {msg}");
+	}
+
+	#[test]
+	fn model_names_and_file_paths_keep_exact_spelling() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(
+			&path,
+			"[agents.claude]\nmodel = ' Cafe\u{301}-Model '\n\
+			 [agents.codex]\nmodel = 'MiXeD%2fModel'\n\
+			 [tls]\nkey = 'keys/../Cafe\u{301}%2f.KEY'\n\
+			 [cache]\ndir = './cache:Case%2f'\n",
+		)
+		.unwrap();
+		let cfg = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap();
+		assert_eq!(cfg.agents.claude.model.for_operation(), " Cafe\u{301}-Model ");
+		assert_eq!(cfg.agents.codex.model.for_operation(), "MiXeD%2fModel");
+		assert_eq!(
+			cfg.tls.key.as_ref().unwrap().for_filesystem(),
+			dir.path().join("keys/../Cafe\u{301}%2f.KEY")
+		);
+		assert_eq!(cfg.cache.dir.for_filesystem(), dir.path().join("./cache:Case%2f"));
+	}
+
+	#[test]
+	fn file_scanner_zeros_are_rejected_unless_the_override_replaces_them() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		for field in ["max_concurrent_files", "max_file_bytes", "per_request_timeout_seconds"] {
+			std::fs::write(&path, format!("[scanner_defaults]\n{field} = 0\n")).unwrap();
+			let error =
+				WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+			assert_eq!(
+				error.to_string(),
+				format!("scanner_defaults.{field} must be greater than zero")
+			);
+			let cfg = WorkerConfig::load(
+				Some(&path),
+				WorkerConfigOverrides {
+					max_concurrent_files: Some(3),
+					max_file_bytes: Some(7),
+					per_request_timeout_seconds: Some(11),
+					..Default::default()
+				},
+			)
+			.unwrap();
+			assert_eq!(cfg.scanner_defaults.max_concurrent_files, 3);
+			assert_eq!(cfg.scanner_defaults.max_file_bytes, 7);
+			assert_eq!(cfg.scanner_defaults.per_request_timeout, Duration::from_secs(11));
+		}
+	}
+
+	#[test]
+	fn file_model_nonempty_checks_and_closed_values_do_not_trim() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		for (section, field, value) in [
+			("agents.claude", "model", " "),
+			("agents.codex", "model", ""),
+			("agents.claude", "effort", "MAX"),
+			("agents.codex", "effort", " high "),
+			("logging", "level", "Info"),
+		] {
+			std::fs::write(&path, format!("[{section}]\n{field} = '{value}'\n")).unwrap();
+			let error =
+				WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+			assert!(
+				error.to_string().starts_with(&format!("{section}.{field} must ")),
+				"{error:#}"
+			);
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn path_overrides_are_host_paths_and_keep_non_utf8_bytes() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[tls]\nkey = 'file.key'\n[cache]\ndir = 'file-cache'\n").unwrap();
+		let key = PathBuf::from(std::ffi::OsString::from_vec(b"../operator-\xff.key".to_vec()));
+		let cache = dir.path().join("absolute-cache");
+		use clap::builder::TypedValueParser;
+		let command = clap::Command::new("worker-test");
+		let parse = |path: &Path| {
+			crate::config_value_parsers::ConfiguredPathParser
+				.parse_ref(&command, None, path.as_os_str())
+				.unwrap()
+		};
+		let cfg = WorkerConfig::load(
+			Some(&path),
+			WorkerConfigOverrides {
+				key: Some(parse(&key)),
+				cache_dir: Some(parse(&cache)),
+				..Default::default()
+			},
+		)
+		.unwrap();
+		assert_eq!(
+			cfg.tls.key.unwrap().for_filesystem().as_os_str().as_bytes(),
+			key.as_os_str().as_bytes()
+		);
+		assert_eq!(cfg.cache.dir.for_filesystem(), cache);
+	}
+
+	#[test]
+	fn config_read_rejects_non_utf8_and_malformed_toml() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, b"[agents.codex]\nmodel = '\xff'\n").unwrap();
+		let error = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+		assert!(error.to_string().starts_with("reading worker config file "));
+		std::fs::write(&path, "[agents.codex\nmodel = 'valid'\n").unwrap();
+		let error = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+		assert!(error.to_string().starts_with("parsing worker config file "));
 	}
 }

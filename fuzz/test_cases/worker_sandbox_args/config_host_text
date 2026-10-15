@@ -1,0 +1,1 @@
+{"network":1,"hosts":["example.com","bad\u0000host"]}

@@ -1,0 +1,1 @@
+{"protocol_version":2,"severity":"high","title":"Valid finding title","description":"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé","file_path":"src/lib.rs","line_start":1,"line_end":2,"cwe":"CWE-20","poc_unified":"--- a/x\n+++ b/x\n@@ -1 +1 @@\n+x\n","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}

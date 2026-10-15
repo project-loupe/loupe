@@ -1,0 +1,2 @@
+[workspace]
+exclude=[" keep ","é","file:[",""]

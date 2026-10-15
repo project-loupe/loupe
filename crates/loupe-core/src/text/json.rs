@@ -1,26 +1,22 @@
 use std::fmt;
 use std::marker::PhantomData;
-use std::str::FromStr;
 
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
 use super::policy::{JsonKey, JsonLeaf};
-use super::{BoundedText, Error, Identifier, JsonPolicy, Rule};
+use super::{checked, Error, JsonPolicy, Rule};
 
+/// Private checked payload for source-retaining JSON values.
 #[derive(Clone, PartialEq, Eq)]
-pub struct BoundedJson<P: JsonPolicy> {
-	value: serde_json::Value,
+pub(crate) struct CheckedJson {
+	value: Value,
 	canonical: Vec<u8>,
 	digest: [u8; 32],
-	policy: PhantomData<P>,
 }
-impl<P: JsonPolicy> BoundedJson<P> {
-	/// Use this entry point for raw agent JSON so its byte limit is enforced
-	/// before parsing. Embedded Deserialize additionally requires a bounded
-	/// request body at the protocol boundary.
-	pub fn new(raw: &str) -> Result<Self, Error> {
+impl CheckedJson {
+	pub(crate) fn parse<P: JsonPolicy>(raw: &str) -> Result<Self, Error> {
 		if raw.len() > P::MAX_BYTES {
 			return Err(Error::new(P::FIELD, Rule::Bytes));
 		}
@@ -31,55 +27,59 @@ impl<P: JsonPolicy> BoundedJson<P> {
 				state.error.take().unwrap_or_else(|| Error::new(P::FIELD, Rule::JsonSyntax))
 			})?;
 		deserializer.end().map_err(|_| Error::new(P::FIELD, Rule::JsonSyntax))?;
-		Self::finish(value)
+		Self::finish::<P>(value)
 	}
 
-	fn finish(value: Value) -> Result<Self, Error> {
+	fn finish<P: JsonPolicy>(value: Value) -> Result<Self, Error> {
 		let canonical = crate::canonical::canonical_bytes(&value);
 		if canonical.len() > P::MAX_BYTES {
 			return Err(Error::new(P::FIELD, Rule::Bytes));
 		}
 		let digest = crate::canonical::digest(&canonical);
-		Ok(Self { value, canonical, digest, policy: PhantomData })
+		Ok(Self { value, canonical, digest })
 	}
-	pub fn expose(&self) -> &str {
-		std::str::from_utf8(&self.canonical).expect("canonical JSON is UTF-8")
+	pub(crate) fn expose(&self) -> &str {
+		#[expect(
+			clippy::expect_used,
+			reason = "the private canonical buffer is created only by JSON serialization, whose output is UTF-8"
+		)]
+		let text = std::str::from_utf8(&self.canonical).expect("canonical JSON is UTF-8");
+		text
 	}
-	pub fn canonical(&self) -> &[u8] {
+	pub(crate) fn canonical(&self) -> &[u8] {
 		&self.canonical
 	}
-	pub fn digest(&self) -> &[u8; 32] {
+	pub(crate) fn digest(&self) -> &[u8; 32] {
 		&self.digest
 	}
 }
-impl<P: JsonPolicy> fmt::Debug for BoundedJson<P> {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "BoundedJson<{}>(len={})", P::FIELD, self.canonical.len())
-	}
-}
-impl<P: JsonPolicy> FromStr for BoundedJson<P> {
-	type Err = Error;
-	fn from_str(raw: &str) -> Result<Self, Error> {
-		Self::new(raw)
-	}
-}
-impl<P: JsonPolicy> TryFrom<String> for BoundedJson<P> {
-	type Error = Error;
-	fn try_from(raw: String) -> Result<Self, Error> {
-		Self::new(&raw)
-	}
-}
-impl<P: JsonPolicy> Serialize for BoundedJson<P> {
+impl Serialize for CheckedJson {
 	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
 		self.value.serialize(s)
 	}
 }
-impl<'de, P: JsonPolicy> Deserialize<'de> for BoundedJson<P> {
-	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-		let mut state = State::<P> { nodes: 0, bytes: 0, error: None, policy: PhantomData };
-		let value = Node { state: &mut state, depth: 1 }.deserialize(d)?;
-		Self::finish(value).map_err(serde::de::Error::custom)
-	}
+
+// Exercise the serde visitor without constructing a source-bearing value.
+// The production entry point also checks the document cap before traversal.
+#[cfg(test)]
+pub(super) fn visitor_fixture<'de, P: JsonPolicy, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<String, D::Error> {
+	let mut state = State::<P> { nodes: 0, bytes: 0, error: None, policy: PhantomData };
+	let value = Node { state: &mut state, depth: 1 }.deserialize(deserializer)?;
+	let data = CheckedJson::finish::<P>(value).map_err(serde::de::Error::custom)?;
+	Ok(data.expose().to_owned())
+}
+
+#[cfg(fuzzing)]
+pub(super) fn payload_visitor_observation(raw: &str) -> Option<(String, [u8; 32])> {
+	let mut state =
+		State::<super::policy::Payload> { nodes: 0, bytes: 0, error: None, policy: PhantomData };
+	let mut decoder = serde_json::Deserializer::from_str(raw);
+	let value = Node { state: &mut state, depth: 1 }.deserialize(&mut decoder).ok()?;
+	decoder.end().ok()?;
+	let data = CheckedJson::finish::<super::policy::Payload>(value).ok()?;
+	Some((data.expose().to_owned(), *data.digest()))
 }
 
 struct State<P> {
@@ -143,9 +143,8 @@ impl<'de, P: JsonPolicy> Visitor<'de> for Node<'_, P> {
 	}
 	fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
 		self.state.charge(value.len())?;
-		let value =
-			BoundedText::<JsonLeaf>::new(value).map_err(|error| self.state.reject(error))?;
-		Ok(Value::String(value.expose().to_owned()))
+		let value = checked::text::<JsonLeaf>(value).map_err(|error| self.state.reject(error))?;
+		Ok(Value::String(value))
 	}
 	fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Value, E> {
 		self.visit_str(&value)
@@ -163,7 +162,7 @@ impl<'de, P: JsonPolicy> Visitor<'de> for Node<'_, P> {
 		let mut fields = Map::new();
 		while let Some(key) = map.next_key::<String>()? {
 			self.state.charge(key.len())?;
-			Identifier::<JsonKey>::new(&key).map_err(|error| self.state.reject(error))?;
+			checked::check_identifier::<JsonKey>(&key).map_err(|error| self.state.reject(error))?;
 			if fields.contains_key(&key) {
 				return Err(self.state.reject(Error::new(P::FIELD, Rule::JsonDuplicateKey)));
 			}

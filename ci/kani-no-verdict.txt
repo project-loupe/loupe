@@ -1,0 +1,16 @@
+# Kani harnesses that reach no verdict within the wrapper's limits
+# (timeout or the memory cap). These properties remain unproved by Kani.
+# ci/kani.sh skips them by default and reports them as SKIPPED;
+# LOUPE_KANI_ALL=1 runs them anyway. An entry that names no existing
+# harness is an error. Remove a line when its harness is made to
+# verify.
+#
+# <crate> <harness>
+loupe-core canonical_object_keys_are_sorted
+loupe-core json_string_preflight_counts_bounded_tokens
+loupe-core json_string_preflight_accepts_surrogate_pairs
+loupe-proto protocol_error_names_exact_versions
+loupe-worker argv_never_contains_a_forbidden_flag
+loupe-worker setenv_names_are_fixed_or_explicit
+loupe-worker request_policy_fixes_model_and_effort
+loupe-worker boundary_never_occurs_in_content_of_a_rendered_block

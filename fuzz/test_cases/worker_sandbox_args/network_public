@@ -1,0 +1,1 @@
+{"network":2,"required":["--"],"hosts":["--cap-add"],"program":"--","args":["--","--share-net"],"env":[[0,"--"],[1,"x y"]],"binds":[["--","--dev-bind"]]}

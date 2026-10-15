@@ -118,6 +118,8 @@ load_image_if_requested() {
 }
 
 verify_remote_image() {
+	# The image name comes from the local deployment configuration.
+	# shellcheck disable=SC2029
 	if ! ssh "$SSH_TARGET" sudo podman image exists "$IMAGE"; then
 		echo "error: image $IMAGE is not present in rootful Podman on $SSH_TARGET" >&2
 		echo "hint: load it with: podman save \"\$LOUPE_SERVER_IMAGE\" | ssh $SSH_TARGET sudo podman load" >&2
@@ -170,11 +172,13 @@ REMOTE
 
 load_image_if_requested
 if [ "$PULL_IMAGE" = "1" ]; then
+	# shellcheck disable=SC2029 # Use the locally selected image.
 	ssh "$SSH_TARGET" sudo podman pull "$IMAGE"
 fi
 verify_remote_image
 
 echo "==> Writing persistent server secret env file to $SSH_TARGET:$REMOTE_SECRET"
+# shellcheck disable=SC2016 # Expand these variables only on the remote host.
 secret_writer='
 set -euo pipefail
 secret="$1"
@@ -190,10 +194,12 @@ chmod 0600 "$tmp"
 mv "$tmp" "$secret"
 trap - EXIT
 '
+# shellcheck disable=SC2029 # remote_quote protects locally supplied arguments.
 emit_secret_env | ssh "$SSH_TARGET" \
 	"sudo bash -c $(remote_quote "$secret_writer") bash $(remote_quote "$REMOTE_SECRET") 10001"
 
 echo "==> Restarting $SERVICE_NAME"
+# shellcheck disable=SC2029 # Use the locally selected service name.
 ssh "$SSH_TARGET" sudo systemctl restart "$SERVICE_NAME"
 sleep "$START_GRACE_SECONDS"
 ssh "$SSH_TARGET" systemctl --no-pager --lines=30 status "$SERVICE_NAME"

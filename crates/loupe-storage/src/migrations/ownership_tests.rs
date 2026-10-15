@@ -8,6 +8,12 @@ fn two_projects() -> Connection {
 	conn.pragma_update(None, "foreign_keys", true).unwrap();
 	settled(&mut conn);
 	apply_pending(&mut conn).unwrap();
+	seed_two_projects(&conn);
+	conn
+}
+
+/// Reuse the concrete twelve-table fixture on an explicitly selected historical schema.
+pub(super) fn seed_two_projects(conn: &Connection) {
 	for repo in [1, 2] {
 		let id = repo + 10;
 		conn.execute("INSERT INTO review_generations
@@ -129,7 +135,6 @@ fn two_projects() -> Connection {
              pinned_commit_sha, effective_recipe, result_digest, created_at)
             VALUES (?1, ?1, 'drilldown', 'completed', 'copied title', 'commit', '{}', zeroblob(32), 100)", [id]).unwrap();
 	}
-	conn
 }
 
 fn rejects(conn: &Connection, sql: &str, code: i32) {

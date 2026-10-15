@@ -414,8 +414,7 @@ async function loadRepos() {
   syncRepoSelect();
 }
 
-/** Refresh the GitHub App status. A failure (for instance a server that
- *  predates the route) must not take the whole repos view down with it:
+/** Refresh the GitHub App status. A failure must not take the whole repos view down:
  *  fall back to "no app" and report the error, but let the caller carry
  *  on loading repos. */
 async function loadGithubApp() {
@@ -601,9 +600,8 @@ async function loadJobsNow() {
     return "/api/jobs?" + params.toString();
   };
 
-  // Three requests, not five: the server's state filter takes a set, so
-  // the whole "finished" group is one query. Each hit on the server
-  // serializes on its single database connection, so fewer is better.
+  // One set-valued state filter covers the whole "finished" group, reducing
+  // contention on the server's shared database connection.
   const [queued, leased, finished] = await Promise.all([
     api("GET", query("queued")),
     api("GET", query("leased")),

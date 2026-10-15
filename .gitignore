@@ -5,6 +5,7 @@ Cargo.lock.bak
 /LOUPE.md
 
 # Local config & state
+.local/
 .env
 .env.*
 !.env.example
@@ -15,6 +16,10 @@ Cargo.lock.bak
 *.crt
 *.p12
 *.pfx
+
+# Deliberately public credentials used only by parser tests.
+!fuzz/fixtures/tls-ca.pem
+!fuzz/fixtures/tls-key.pem
 
 # SQLite databases used during development / smoke tests
 *.sqlite

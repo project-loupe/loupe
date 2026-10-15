@@ -8,7 +8,8 @@ use crate::auth::AuthedWorker;
 #[derive(Serialize)]
 pub struct WhoamiResponse {
 	pub worker_id: i64,
-	pub name: String,
+	pub name:
+		loupe_core::text::BoundedText<loupe_core::text::policy::WorkerName, loupe_provenance::Db>,
 	pub kind: &'static str,
 }
 
@@ -19,6 +20,6 @@ pub async fn get(Extension(authed): Extension<AuthedWorker>) -> (StatusCode, Jso
 		WorkerKind::Admin => "admin",
 		WorkerKind::Worker => "worker",
 	};
-	let resp = WhoamiResponse { worker_id: authed.id(), name: authed.worker.name.clone(), kind };
+	let resp = WhoamiResponse { worker_id: authed.id(), name: authed.name().to_owned(), kind };
 	(StatusCode::OK, Json(resp))
 }

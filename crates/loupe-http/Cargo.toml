@@ -1,0 +1,25 @@
+[package]
+name = "loupe-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Bounded HTTP response transport for Loupe clients."
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures-util = { workspace = true }
+loupe-provenance = { version = "0.1.0", path = "../loupe-provenance" }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

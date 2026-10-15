@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{"query":"11111111111111111111111111111111"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{"query":"later safe query"}}}

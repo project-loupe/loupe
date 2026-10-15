@@ -1,0 +1,6 @@
+event: start
+data: {"usage":{"input_tokens":10}}
+
+data: {"response":{"usage":{"output_tokens":20}}}
+data: [DONE]
+

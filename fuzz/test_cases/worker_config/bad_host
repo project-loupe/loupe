@@ -1,0 +1,4 @@
+[sandbox]
+network="allowlist"
+allowlist=["a;test"]
+

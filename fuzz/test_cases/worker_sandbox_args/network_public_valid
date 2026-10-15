@@ -1,0 +1,1 @@
+{"network":2,"hosts":[],"required":["api.example.com","--cap-add"],"program":"/usr/bin/tool","args":["--"],"env":[[0,"--clearenv"]],"binds":[["--","--unshare-net"]]}

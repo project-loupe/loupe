@@ -8,7 +8,12 @@ use serde_json::Value;
 /// Sort object keys recursively while preserving array order and serde_json's
 /// number rendering. This does not validate or normalize untrusted text.
 pub fn canonical_bytes(value: &Value) -> Vec<u8> {
-	serde_json::to_vec(&Ordered(value)).expect("JSON values serialize infallibly")
+	#[expect(
+		clippy::expect_used,
+		reason = "Ordered serializes only JSON values and string keys into a Vec; neither custom serializers nor failing writers are accepted"
+	)]
+	let bytes = serde_json::to_vec(&Ordered(value)).expect("JSON values serialize infallibly");
+	bytes
 }
 
 /// BLAKE3-256 of already canonicalized payloads (or other domain-separated bytes).
@@ -18,11 +23,16 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
 
 struct Ordered<'a>(&'a Value);
 
+/// The object-ordering decision, shared by recursive serialization and proofs.
+pub(crate) fn ordered_fields(fields: &serde_json::Map<String, Value>) -> BTreeMap<&String, &Value> {
+	fields.iter().collect()
+}
+
 impl Serialize for Ordered<'_> {
 	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 		match self.0 {
 			Value::Object(fields) => serializer.collect_map(
-				fields.iter().map(|(key, value)| (key, Ordered(value))).collect::<BTreeMap<_, _>>(),
+				ordered_fields(fields).into_iter().map(|(key, value)| (key, Ordered(value))),
 			),
 			Value::Array(values) => serializer.collect_seq(values.iter().map(Ordered)),
 			value => value.serialize(serializer),
@@ -61,6 +71,16 @@ mod tests {
 				canonical_bytes(&serde_json::from_str(b).unwrap())
 			);
 		}
+	}
+
+	#[test]
+	fn floating_point_retransmission_keeps_its_canonical_digest() {
+		// This value requires float_roundtrip to survive serialization unchanged.
+		let value: Value = serde_json::from_str("-9223372036855078478").unwrap();
+		let first = canonical_bytes(&value);
+		let replay: Value = serde_json::from_slice(&first).unwrap();
+		assert_eq!(canonical_bytes(&replay), first, "canonical float bytes changed on replay");
+		assert_eq!(digest(&canonical_bytes(&replay)), digest(&first));
 	}
 
 	#[test]

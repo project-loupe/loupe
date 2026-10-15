@@ -1,0 +1,1 @@
+{"protocol_version":2,"severity":"high","t\u0069tle":"a\"b\\c","description":"line\r\n\tCafe\u0301","file_path":"src/a.rs","line_start":1,"line_end":1,"poc_unified":"","fingerprint":"fp"}

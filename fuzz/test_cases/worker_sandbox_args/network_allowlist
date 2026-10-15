@@ -1,0 +1,1 @@
+{"network":1,"required":["api.example"],"hosts":["docs.example"],"program":"/bin/tool","args":["--version"]}
