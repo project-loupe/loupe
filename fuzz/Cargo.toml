@@ -39,6 +39,7 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 subtle = { version = "2", default-features = false }
 unicode-general-category = { version = "1.1", default-features = false }
 unicode-normalization = { version = "0.1.25", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 # Structure-aware inputs for typed, stateful targets (see README,
 # "Dependencies"). Fuzz workspace only; never a product dependency.
 arbitrary = { version = "1", features = ["derive"] }

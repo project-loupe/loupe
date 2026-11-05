@@ -3,8 +3,14 @@ use loupe_server::reporters::email;
 use serde::Deserialize;
 
 use crate::server_common;
-use crate::server_report_github::reference_field;
 use crate::utils::test_logger;
+
+/// Independent wire reference for one fenced plain-text field.
+fn reference_field(label: &str, value: &str, language: &str) -> String {
+	let longest = value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+	let fence = "`".repeat(3.max(longest + 1));
+	format!("- {label}:\n{fence}{language}\n{value}\n{fence}\n\n")
+}
 
 #[derive(Deserialize)]
 struct Input {

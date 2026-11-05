@@ -290,7 +290,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	let jobs = common::jobs(&db, repo_id);
 	let reviewed_sha = jobs[0].head_sha.as_ref().unwrap().expose();
 	assert!(
-		issue_body.contains(&format!("- reviewed revision:\n```\n{reviewed_sha}\n```")),
+		issue_body.contains(&format!("**Reviewed revision:** `{reviewed_sha}`")),
 		"issue body: {issue_body}"
 	);
 

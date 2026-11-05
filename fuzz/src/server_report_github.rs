@@ -35,59 +35,84 @@ pub fn escapes_fences(body: &str, payload: &str) -> bool {
 	})
 }
 
-/// Independent wire reference: split into backtick-only substrings rather than
-/// using the renderer's scanner, accounting state or destination constructors.
-pub(super) fn reference_field(label: &str, value: &str, language: &str) -> String {
-	let longest = value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
-	let fence = "`".repeat(3.max(longest + 1));
-	format!("- {label}:\n{fence}{language}\n{value}\n{fence}\n\n")
+/// Independent report oracle over pulldown-cmark, never the renderer's helpers.
+/// Agent text outside code may only be words GitHub cannot link after parsing.
+fn assert_inert(body: &str) {
+	use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+	let mut links = 0;
+	let mut in_link = false;
+	let mut in_block = false;
+	let mut headings = 0;
+	for event in Parser::new_ext(body, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS) {
+		match event {
+			Event::Start(Tag::Link { dest_url, .. }) => {
+				assert_eq!(&*dest_url, "https://github.com/project-loupe/loupe");
+				links += 1;
+				in_link = true;
+			},
+			Event::End(TagEnd::Link) => in_link = false,
+			Event::Start(Tag::CodeBlock(_)) => in_block = true,
+			Event::End(TagEnd::CodeBlock) => in_block = false,
+			Event::Start(Tag::Heading { .. }) => headings += 1,
+			Event::Start(
+				Tag::Image { .. }
+				| Tag::BlockQuote(_)
+				| Tag::Table(_)
+				| Tag::List(_)
+				| Tag::HtmlBlock,
+			)
+			| Event::Rule
+			| Event::Html(_)
+			| Event::InlineHtml(_)
+			| Event::TaskListMarker(_) => panic!("agent text became active markup"),
+			Event::Text(text) if !in_link && !in_block => {
+				for word in text.split_whitespace().filter(|word| !word.starts_with("LUP-")) {
+					let hex = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+					// GitHub links a commit prefix bounded by any non-alphanumeric, so
+					// check each run between punctuation, not only the whole word.
+					let commit_like = hex
+						.split(|c: char| !c.is_ascii_alphanumeric())
+						.any(|run| run.len() >= 7 && run.bytes().all(|b| b.is_ascii_hexdigit()));
+					assert!(
+						!word.contains(|c: char| c.is_ascii_digit()
+							|| matches!(c, '@' | '#' | '/' | '<' | '>' | '[' | ']' | '\\' | '`'))
+							&& !word.starts_with(':')
+							&& !word.to_ascii_lowercase().starts_with("www.")
+							&& !commit_like,
+						"GitHub-active token outside code"
+					);
+				}
+			},
+			_ => {},
+		}
+	}
+	assert_eq!(links, 1, "only the host footer may link");
+	assert!((3..=5).contains(&headings), "only trusted headings may exist");
 }
 
-fn reference_body(finding: &Finding<Agent>) -> String {
-	let mut pieces = vec!["## Finding LUP-1\n\n".to_owned()];
-	for (label, value) in [
-		("repository owner", "example"),
-		("repository", "repo"),
-		("clone URL", "https://github.com/example/repo.git"),
-		("reviewed revision", "reviewed-sha"),
-		("title", finding.title.expose()),
-	] {
-		pieces.push(reference_field(label, value, ""));
-	}
-	pieces.push(format!("- severity: {}\n", finding.severity));
-	if let Some(path) = &finding.file_path {
-		let mut value = path.expose().to_owned();
-		if let Some(start) = finding.line_start {
-			value.push_str(&format!(":{start}"));
-			if let Some(end) = finding.line_end.filter(|end| *end != start) {
-				value.push_str(&format!("-{end}"));
-			}
+/// Code a diff attachment is guaranteed to render as, byte for byte.
+fn contains_literal_diff(body: &str, diff: &str) -> bool {
+	use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+	let mut block = None::<String>;
+	for event in Parser::new(body) {
+		match event {
+			Event::Start(Tag::CodeBlock(_)) => block = Some(String::new()),
+			Event::Text(text) => {
+				if let Some(block) = &mut block {
+					block.push_str(&text);
+				}
+			},
+			Event::End(TagEnd::CodeBlock) => {
+				let rendered = block.take().unwrap_or_default();
+				let normalized = diff.replace("\r\n", "\n").replace('\r', "\n");
+				if rendered.replace("\r\n", "\n").replace('\r', "\n") == format!("{normalized}\n") {
+					return true;
+				}
+			},
+			_ => {},
 		}
-		let longest = value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
-		let fence = "`".repeat(3.max(longest + 1));
-		// CommonMark removes one pair of surrounding spaces from nonblank code.
-		let padded = value.starts_with('`')
-			|| value.ends_with('`')
-			|| (value.starts_with(' ') && value.ends_with(' ') && !value.trim().is_empty());
-		let pad = if padded { " " } else { "" };
-		pieces.push(format!("- location: {fence}{pad}{value}{pad}{fence}\n"));
 	}
-	if let Some(cwe) = &finding.cwe {
-		pieces.push(reference_field("cwe", cwe.expose(), ""));
-	}
-	pieces.push(reference_field("fingerprint", finding.fingerprint.expose(), ""));
-	pieces.push("## Description\n\n".into());
-	pieces.push(reference_field("description", finding.description.expose(), ""));
-	if let Some(poc) = &finding.poc_unified {
-		pieces.push("## Proof of Concept\n\n".into());
-		pieces.push(reference_field("proof of concept", poc.expose(), "diff"));
-	}
-	if let Some(patch) = &finding.patch_unified {
-		pieces.push("## Suggested Fix\n\n".into());
-		pieces.push(reference_field("suggested fix", patch.expose(), "diff"));
-	}
-	pieces.push("_This finding was discovered by [Project Loupe](https://github.com/project-loupe/loupe)._\n".into());
-	pieces.concat()
+	false
 }
 
 fn rendered(finding: &Finding<Agent>) -> Result<String, String> {
@@ -115,18 +140,39 @@ pub fn do_test(data: &[u8]) {
 		assert!(title.ends_with("..."));
 		assert!(compact.starts_with(title.trim_end_matches('.')));
 	}
-	let expected = reference_body(&finding);
-	let body = rendered(&finding);
-	let admitted = expected.chars().count() <= 65_536 && expected.len() <= 262_144;
-	assert_eq!(body.is_ok(), admitted, "complete GitHub body admission differs");
-	assert_eq!(
-		github::validate_body(&expected).is_ok(),
-		expected.chars().count() <= 65_536,
-		"GitHub body admission must count characters"
-	);
-	match body {
-		Ok(body) => assert_eq!(body, expected, "original report data must stay in literal fields"),
-		Err(error) => assert_eq!(error, "GitHub issue body exceeds 65536 characters or 262144 bytes including framing; shorten the report and retry"),
+	let raw_chars = [
+		Some(finding.title.expose()),
+		Some(finding.description.expose()),
+		finding.cwe.as_ref().map(|value| value.expose()),
+		finding.file_path.as_ref().map(|value| value.expose()),
+		finding.poc_unified.as_ref().map(|value| value.expose()),
+		finding.patch_unified.as_ref().map(|value| value.expose()),
+		Some(finding.fingerprint.expose()),
+	]
+	.into_iter()
+	.flatten()
+	.map(|value| value.chars().count())
+	.sum::<usize>();
+	match rendered(&finding) {
+		Ok(body) => {
+			assert!(body.chars().count() <= 65_536 && body.len() <= 262_144);
+			assert!(github::validate_body(&body).is_ok());
+			assert_inert(&body);
+			let poc = finding.poc_unified.as_ref().map(|value| value.expose());
+			let patch = finding.patch_unified.as_ref().map(|value| value.expose());
+			for diff in [poc, patch].into_iter().flatten() {
+				assert!(contains_literal_diff(&body, diff), "diff must stay literal");
+			}
+		},
+		Err(error) => {
+			assert_eq!(error, "GitHub issue body exceeds 65536 characters or 262144 bytes including framing; shorten the report and retry");
+			// Each char costs a bounded amount of framing, so small reports
+			// are never rejected: a token is at worst a padded span of itself.
+			assert!(
+				raw_chars.saturating_mul(6).saturating_add(1024) > 65_536,
+				"small report rejected"
+			);
+		},
 	}
 }
 
@@ -177,16 +223,9 @@ mod tests {
 			);
 			let finding = server_common::finding(companion)
 				.unwrap_or_else(|| panic!("companion must reach the real renderer"));
-			let expected = reference_body(&finding);
-			assert!(expected.contains(finding.description.expose()));
 			let body = rendered(&finding);
 			if oversized {
-				assert!(
-					expected.chars().count() > 65_536,
-					"oversize payload must reach body admission"
-				);
 				assert!(body.is_err(), "oversize input must not produce a partial report");
-				assert!(github::validate_body(&expected).is_err());
 			} else {
 				let body = body.unwrap_or_else(|error| panic!("admitted literal report: {error}"));
 				let poc = finding

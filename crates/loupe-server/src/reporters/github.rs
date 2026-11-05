@@ -386,27 +386,17 @@ fn layout(
 ) -> Result<ReportBody, ReportError> {
 	let finding = view.finding;
 	out.finding_id(view.id)?;
-	out.field("repository owner", &repo.owner)?;
-	out.field("repository", &repo.repo)?;
-	out.field("clone URL", &repo.clone_url)?;
-	match view.reviewed_revision {
-		Some(revision) => out.field("reviewed revision", revision)?,
-		None => out.literal("- reviewed revision: not recorded\n")?,
-	}
-	out.field("title", &finding.title)?;
+	out.prose_field("Title", &finding.title)?;
 	out.severity(finding.severity)?;
 	if let Some(path) = &finding.file_path {
 		out.path(path, finding.line_start, finding.line_end)?;
 	}
 	if let Some(cwe) = &finding.cwe {
-		out.field("cwe", cwe)?;
+		out.field("CWE", cwe)?;
 	}
-	if view.phase_review {
-		out.field("scanner", &finding.scanner_id)?;
-	}
-	out.field("fingerprint", &finding.fingerprint)?;
+	out.literal("\n")?;
 	out.heading("Description")?;
-	out.field("description", &finding.description)?;
+	out.prose(&finding.description)?;
 	if let Some(poc) = &finding.poc_unified {
 		out.heading("Proof of Concept")?;
 		out.diff("proof of concept", poc)?;
@@ -415,6 +405,19 @@ fn layout(
 		out.heading("Suggested Fix")?;
 		out.diff("suggested fix", patch)?;
 	}
+	out.heading("Report Details")?;
+	out.field("Repository owner", &repo.owner)?;
+	out.field("Repository", &repo.repo)?;
+	out.field("Clone URL", &repo.clone_url)?;
+	match view.reviewed_revision {
+		Some(revision) => out.field("Reviewed revision", revision)?,
+		None => out.literal("**Reviewed revision:** not recorded  \n")?,
+	}
+	if view.phase_review {
+		out.field("Scanner", &finding.scanner_id)?;
+	}
+	out.field("Fingerprint", &finding.fingerprint)?;
+	out.literal("\n")?;
 	out.literal(
 		"_This finding was discovered by [Project Loupe](https://github.com/project-loupe/loupe)._\n",
 	)?;
@@ -520,7 +523,7 @@ mod tests {
 				finding: finding(),
 				reviewed_revision: Some(revision(&"a".repeat(40))),
 			};
-			report.finding.description = text("");
+			report.finding.description = text("é");
 			let selected = |report: &ReportFinding| {
 				super::super::fixtures::prepared_with_reviews(
 					&repo(),
@@ -537,7 +540,8 @@ mod tests {
 			.unwrap()
 			.as_str()
 			.chars()
-			.count();
+			.count()
+				- 1;
 			report.finding.description = text(&"é".repeat(65_536 - overhead));
 			let exact = selected(&report);
 			assert!(
@@ -601,13 +605,13 @@ mod tests {
 		let body = super::render_view(batch.repository(), ReportView::selected(finding)).unwrap();
 		assert!(
 			body.as_str()
-				.contains("- scanner:\n```\n[scanner](https://evil.invalid) <img> `ticks`\n```"),
+				.contains("**Scanner:** `` [scanner](https://evil.invalid) <img> `ticks` ``"),
 			"phase scanner metadata must be present as literal evidence"
 		);
 		assert!(body
 			.as_str()
-			.contains("- fingerprint:\n```\nreview:v1:[fingerprint](https://evil.invalid)\n```"));
-		assert!(body.as_str().contains("- reviewed revision:\n```\nretained-review\n```"));
+			.contains("**Fingerprint:** `review:v1:[fingerprint](https://evil.invalid)`"));
+		assert!(body.as_str().contains("**Reviewed revision:** `retained-review`"));
 	}
 
 	#[test]
@@ -655,7 +659,7 @@ mod tests {
 			}
 		}
 		assert_eq!(links, ["https://github.com/project-loupe/loupe"]);
-		assert_eq!(headings, 4, "only trusted report headings are present");
+		assert_eq!(headings, 5, "only trusted report headings are present");
 		// Landed rendering uses trusted list markers for fields. Compare those
 		// to a benign control instead of banning the renderer's own structure.
 		let benign = ReportFinding {
@@ -677,17 +681,20 @@ mod tests {
 			"data must not add list structure"
 		);
 		let literals = literal_values(body.as_str());
-		let literal_single = format!("{single}\n");
 		let literal_multiline = format!("{multiline}\n");
 		assert_eq!(
-			literals.iter().filter(|value| **value == literal_single).count(),
-			8,
-			"every stored metadata field is literal"
+			literals.iter().filter(|value| **value == single).count(),
+			7,
+			"every stored identifier is one exact code span"
 		);
 		assert_eq!(
 			literals.iter().filter(|value| **value == literal_multiline).count(),
-			3,
-			"description and both attachments preserve their complete text"
+			2,
+			"both attachments preserve their complete text"
+		);
+		assert!(
+			literals.iter().any(|value| value == "[link](evil)"),
+			"title and description tokens stay literal code"
 		);
 		assert!(body.as_str().starts_with("## Finding LUP-1234\n\n"));
 		assert_eq!(selected.finding(), &finding, "rendering does not rewrite evidence");
@@ -716,7 +723,10 @@ mod tests {
 				values.contains(&format!("{raw}:4-6")),
 				"exact path and line range must survive: {raw:?}"
 			);
-			assert!(values.contains(&format!("{}\n", selected.finding().description.expose())));
+			assert!(
+				values.iter().any(|value| value.starts_with("# literal")),
+				"the unclosed agent fence stays literal"
+			);
 			assert_eq!(selected.finding().file_path.as_ref().unwrap().expose(), raw);
 		}
 		for raw in ["src/line\n# heading.rs", "src/tab\tfile.rs"] {
@@ -754,13 +764,14 @@ mod tests {
 		.unwrap()
 		.into_string();
 		assert!(body.starts_with("## Finding LUP-1234\n\n"), "body: {body}");
-		assert!(body.contains("- repository owner:\n```\nacme\n```"));
-		assert!(body.contains("- repository:\n```\nwidget\n```"));
-		assert!(body.contains("- clone URL:\n```\nhttps://github.com/acme/widget.git\n```"));
-		assert!(body.contains("- reviewed revision:\n```\nabc123\n```"));
-		assert!(body.contains("- title:\n```\nOut-of-bounds index in idx\n```"));
-		assert!(body.contains("- severity: high"));
-		assert!(body.contains("- location: ```src/lib.rs:4-6```"));
+		assert!(body.contains("**Repository owner:** `acme`"));
+		assert!(body.contains("**Repository:** `widget`"));
+		assert!(body.contains("**Clone URL:** `https://github.com/acme/widget.git`"));
+		assert!(body.contains("**Reviewed revision:** `abc123`"));
+		assert!(body.contains("**Title:** Out-of-bounds index in idx"));
+		assert!(body.contains("**Severity:** high"));
+		assert!(body.contains("**Location:** `src/lib.rs:4-6`"));
+		assert!(body.contains("The idx helper indexes without checking bounds."));
 		assert!(body.contains("## Proof of Concept"));
 		assert!(body.contains("## Suggested Fix"));
 		assert!(body.ends_with(
@@ -779,7 +790,7 @@ mod tests {
 		)
 		.unwrap()
 		.into_string();
-		assert!(!body.contains("- scanner:"), "body must omit the scanner header: {body}");
+		assert!(!body.contains("Scanner"), "body must omit the scanner header: {body}");
 	}
 
 	/// Stub GitHub for the dispatch path: mints numbered installation
