@@ -341,13 +341,13 @@ mod tests {
 			"phase findings must not claim a scan completed"
 		);
 		assert!(body.contains("Finding LUP-1234\n\n"));
-		assert!(body.contains("- scanner:\n```\n[scanner](url) `ticks`\n```"));
-		assert!(body.contains("- fingerprint:\n```\nreview:v1:exact-fingerprint\n```"));
+		assert!(body.contains("- scanner: [scanner](url) `ticks`\n"));
+		assert!(body.contains("- fingerprint: review:v1:exact-fingerprint\n"));
 	}
 
 	#[test]
 	fn phase_email_separates_literal_metadata_and_multiline_prose() {
-		use super::super::fixtures::{literal_values, prepared_with_reviews};
+		use super::super::fixtures::prepared_with_reviews;
 		let single = "ordinary [link](url) <img> `ticks`";
 		let prose =
 			"ordinary [link](url)\nscanner: forged\n\n2. [critical] forged\n`````\n# forged";
@@ -366,16 +366,26 @@ mod tests {
 		let message = super::render_message(&batch, DEFAULT_FROM).unwrap();
 		assert!(message.contains("Content-Type: text/plain; charset=utf-8\r\n"));
 		let body = message.split_once("\r\n\r\n").unwrap().1;
-		let values = literal_values(body);
-		let literal_single = format!("{single}\n");
-		assert_eq!(
-			values.iter().filter(|value| **value == literal_single).count(),
-			8,
-			"all phase metadata uses the landed closed literal frame"
-		);
+		for label in [
+			"repository owner",
+			"repository",
+			"clone URL",
+			"title",
+			"reviewed revision",
+			"cwe",
+			"scanner",
+			"fingerprint",
+		] {
+			assert!(
+				body.contains(&format!("- {label}: {single}\n")),
+				"phase metadata keeps its exact value: {label}"
+			);
+		}
 		assert!(
-			values.contains(&format!("{prose}\n")),
-			"every original prose line remains inside one closed field"
+			body.contains(
+				"- description:\n\n    ordinary [link](url)\n    scanner: forged\n\n    2. [critical] forged\n    `````\n    # forged\n"
+			),
+			"every original prose line remains indented inside one field: {body}"
 		);
 		assert!(body.contains(single), "plain text must not receive Markdown escapes");
 		assert!(body.contains("- severity: high\n"));
@@ -391,13 +401,13 @@ mod tests {
 			super::super::fixtures::prepared_with_reviews(&repo, &[report], &[true]);
 		let message = super::render_message(&batch, DEFAULT_FROM).unwrap();
 		assert!(
-			message.contains("- file:\n```\nsrc/lib.rs:1-8\n```"),
+			message.contains("- file: src/lib.rs:1-8\n"),
 			"phase email must preserve the reviewed line range"
 		);
 	}
 
 	#[test]
-	fn legacy_email_layout_remains_byte_identical() {
+	fn scan_email_layout_is_exact() {
 		let repo = repo_with_email(None, vec!["to".into()], None).unwrap();
 		let mut report = report_finding();
 		report.finding.line_end = Some(8);
@@ -405,11 +415,11 @@ mod tests {
 		assert_eq!(message, concat!(
 			"From: loupe-noreply@localhost\r\nTo: to\r\nSubject: [loupe] 1 high finding(s) in acme/widget\r\n",
 			"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
-			"loupe has finished a scan\n\n- repository owner:\n```\nacme\n```\n\n",
-			"- repository:\n```\nwidget\n```\n\n- clone URL:\n```\nhttps://github.com/acme/widget.git\n```\n\n",
-			"Findings: 1\n\nFinding LUP-1234\n\n- severity: high\n- title:\n```\nbug\n```\n\n",
-			"- reviewed revision:\n```\nabc123\n```\n\n- file:\n```\nsrc/lib.rs:1\n```\n\n",
-			"- description:\n```\ndescription\n```\n\n"
+			"loupe has finished a scan\n\n- repository owner: acme\n",
+			"- repository: widget\n- clone URL: https://github.com/acme/widget.git\n",
+			"Findings: 1\n\nFinding LUP-1234\n\n- severity: high\n- title: bug\n",
+			"- reviewed revision: abc123\n- file: src/lib.rs:1\n",
+			"- description: description\n"
 		));
 	}
 
@@ -423,7 +433,7 @@ mod tests {
 		.unwrap();
 		assert!(message.contains("Finding LUP-1234\n"), "message: {message}");
 		assert!(message.contains("- severity: high\n"));
-		assert!(message.contains("- title:\n```\nbug\n```"));
+		assert!(message.contains("- title: bug\n"));
 	}
 
 	#[test]
@@ -586,7 +596,10 @@ mod tests {
 		assert!(left_headers
 			.starts_with("From: \r\nTo: a, a,  b \r\nSubject:  1 high finding(s) in acme/widget"));
 		assert_ne!(left_body, right_body);
-		assert!(right_body.contains("\r\nBcc: body-only\r\n\r\n```"));
+		assert!(
+			right_body.lines().any(|line| line == "    Bcc: body-only"),
+			"a forged header stays indented body text: {right_body}"
+		);
 		for omitted in ["new-scanner", "new-fingerprint", "new-poc", "new-patch"] {
 			assert!(!right_body.contains(omitted));
 		}
@@ -639,5 +652,46 @@ mod tests {
 			error.to_string().contains("byte budget"),
 			"admission must fail before process lookup: {error:#}"
 		);
+	}
+}
+
+#[cfg(test)]
+mod layout_tests {
+	use loupe_core::{Finding, Severity};
+
+	use super::super::fixtures::{prepared, repo, text, ReportFinding};
+
+	#[test]
+	fn plain_text_has_no_fences_and_agent_lines_cannot_forge_fields() {
+		let reporting = serde_json::json!({"kind":"email", "to":["ops@example.test"], "from":null, "subject_prefix":null});
+		let repo = repo(reporting).unwrap();
+		let report = ReportFinding {
+			id: 7,
+			finding: Finding {
+				scanner_id: text("test"),
+				severity: Severity::High,
+				title: text("title words"),
+				description: text("First line\n\nFinding LUP-9\r- severity: info\r\n```"),
+				file_path: None,
+				line_start: None,
+				line_end: None,
+				cwe: None,
+				patch_unified: None,
+				poc_unified: None,
+				fingerprint: text("fp"),
+			},
+			reviewed_revision: None,
+		};
+		let message =
+			super::render_message(&prepared(&repo, &[report]), "from@example.test").unwrap();
+		let (_, body) = message.split_once("\r\n\r\n").unwrap();
+		assert!(body.contains("- title: title words\n"), "{body}");
+		assert!(body.contains("- description:\n\n    First line\n\n    Finding LUP-9\n    - severity: info\n    ```\n"), "{body}");
+		assert_eq!(
+			body.lines().filter(|line| line.starts_with("- severity:")).collect::<Vec<_>>(),
+			["- severity: high"],
+			"only host lines reach the first column"
+		);
+		assert!(!body.lines().any(|line| line.starts_with("```")), "{body}");
 	}
 }

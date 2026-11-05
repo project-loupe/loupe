@@ -372,18 +372,27 @@ impl ReportBuilder {
 			sink("\n\n");
 		})
 	}
+	/// Plain text has no markup to contain. Agent lines are indented so none can
+	/// pass as a host field, which all start in the first column.
 	fn plain_field(&mut self, label: &'static str, value: &str) -> Result<(), ReportError> {
-		let width = fence_width(value).ok_or_else(|| self.error())?;
 		self.emit(|sink| {
 			sink("- ");
 			sink(label);
-			sink(":\n");
-			fence(width, sink);
+			if !value.contains(['\r', '\n']) {
+				sink(": ");
+				sink(value);
+				sink("\n");
+				return;
+			}
+			sink(":\n\n");
+			for line in lines(value) {
+				if !line.is_empty() {
+					sink("    ");
+					sink(line);
+				}
+				sink("\n");
+			}
 			sink("\n");
-			sink(value);
-			sink("\n");
-			fence(width, sink);
-			sink("\n\n");
 		})
 	}
 	pub fn path<S: Source>(
@@ -396,16 +405,7 @@ impl ReportBuilder {
 		};
 		let located = format!("{}{suffix}", path.expose());
 		if !self.markdown {
-			let width = fence_width(&located).ok_or_else(|| self.error())?;
-			return self.emit(|sink| {
-				sink("- file:\n");
-				fence(width, sink);
-				sink("\n");
-				sink(&located);
-				sink("\n");
-				fence(width, sink);
-				sink("\n\n");
-			});
+			return self.plain_field("file", &located);
 		}
 		self.emit(|sink| {
 			sink("**Location:** ");

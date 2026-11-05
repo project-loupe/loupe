@@ -579,7 +579,8 @@ words therefore stay plain only when a letter-based allowlist admits them, and
 every other token becomes inline code. Rendered prose normalizes whitespace; the
 stored finding keeps the exact bytes. Complete
 issue bodies, including their framing, must fit 65,536 Unicode scalars and
-262,144 bytes. Email uses a fixed host layout and selected stored settings
+262,144 bytes. Email indents multi-line agent text so it cannot pose as a host field, and
+uses a fixed host layout and selected stored settings
 for headers; finding text belongs in the body. Each complete header line is
 limited to 8,192 bytes, the header section to 65,536 bytes and the complete
 message to 16 MiB. Rejected output is not truncated into a different report.

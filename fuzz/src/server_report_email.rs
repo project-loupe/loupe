@@ -5,11 +5,21 @@ use serde::Deserialize;
 use crate::server_common;
 use crate::utils::test_logger;
 
-/// Independent wire reference for one fenced plain-text field.
-fn reference_field(label: &str, value: &str, language: &str) -> String {
-	let longest = value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
-	let fence = "`".repeat(3.max(longest + 1));
-	format!("- {label}:\n{fence}{language}\n{value}\n{fence}\n\n")
+/// Independent wire reference for one indented plain-text field.
+fn reference_field(label: &str, value: &str) -> String {
+	if !value.contains(['\r', '\n']) {
+		return format!("- {label}: {value}\n");
+	}
+	let mut out = format!("- {label}:\n\n");
+	for line in value.split("\r\n").flat_map(|part| part.split(['\r', '\n'])) {
+		if !line.is_empty() {
+			out.push_str("    ");
+			out.push_str(line);
+		}
+		out.push('\n');
+	}
+	out.push('\n');
+	out
 }
 
 #[derive(Deserialize)]
@@ -64,23 +74,23 @@ pub fn do_test(data: &[u8]) {
 		("repository", "repo"),
 		("clone URL", "https://github.com/example/repo.git"),
 	] {
-		content.push_str(&reference_field(label, value, ""));
+		content.push_str(&reference_field(label, value));
 	}
 	content
 		.push_str(&format!("Findings: 1\n\nFinding LUP-1\n\n- severity: {}\n", finding.severity));
-	content.push_str(&reference_field("title", finding.title.expose(), ""));
-	content.push_str(&reference_field("reviewed revision", "reviewed-sha", ""));
+	content.push_str(&reference_field("title", finding.title.expose()));
+	content.push_str(&reference_field("reviewed revision", "reviewed-sha"));
 	if let Some(path) = &finding.file_path {
 		let path = match finding.line_start {
 			Some(line) => format!("{}:{line}", path.expose()),
 			None => path.expose().to_owned(),
 		};
-		content.push_str(&reference_field("file", &path, ""));
+		content.push_str(&reference_field("file", &path));
 	}
 	if let Some(cwe) = &finding.cwe {
-		content.push_str(&reference_field("cwe", cwe.expose(), ""));
+		content.push_str(&reference_field("cwe", cwe.expose()));
 	}
-	content.push_str(&reference_field("description", finding.description.expose(), ""));
+	content.push_str(&reference_field("description", finding.description.expose()));
 	let message = email::fuzz_render_message(&batch);
 	let within_budget = expected.split("\r\n").all(|line| line.len() + 2 <= 8192)
 		&& expected.len() + 2 <= 65_536
@@ -91,7 +101,7 @@ pub fn do_test(data: &[u8]) {
 		panic!("email header boundary missing")
 	};
 	assert_eq!(headers, expected, "finding content escaped into email headers");
-	assert_eq!(body, content, "original finding bytes must survive inside literal fields");
+	assert_eq!(body, content, "finding text must survive in indented fields");
 	assert!(message.len() <= 16 * 1024 * 1024);
 }
 

@@ -15,6 +15,7 @@
 - Add attempt-bound checkout preparation, resumable lossless manifests and immutable review-profile publication; retain durable deferrals for unsupported successor work.
 - Admit pending work by risk at claim time, protect urgent and mandatory verification capacity, and commit validated lease responses with their assignments and one-time charges. Preserve unfinished evidence through retries, cancellation and exhausted budgets.
 - Render GitHub reports as readable prose that wraps, keeping agent text inert with inline code instead of per-field code blocks.
+- Remove code fences from plain-text email reports and indent multi-line agent text.
 - Retain canonical verification evidence and render phase reports literally after commit; preserve operator delivery recovery without redispatching terminal replay.
 - Allow explicit quiescent reset of incompatible derived generations without dropping canonical findings, mandatory verification intent or replay history.
 
