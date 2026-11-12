@@ -19,6 +19,7 @@ pub mod core_inventory_manifest;
 pub mod core_json_string;
 pub mod core_review_candidates;
 pub mod core_review_payload;
+pub mod core_review_priority;
 pub mod core_state_machine;
 pub mod core_text_bounded;
 pub mod core_text_exact;

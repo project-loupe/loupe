@@ -8,6 +8,7 @@ void core_inventory_manifest_run(const unsigned char* data, size_t data_len);
 void core_json_string_run(const unsigned char* data, size_t data_len);
 void core_review_candidates_run(const unsigned char* data, size_t data_len);
 void core_review_payload_run(const unsigned char* data, size_t data_len);
+void core_review_priority_run(const unsigned char* data, size_t data_len);
 void core_state_machine_run(const unsigned char* data, size_t data_len);
 void core_text_bounded_run(const unsigned char* data, size_t data_len);
 void core_text_exact_run(const unsigned char* data, size_t data_len);
