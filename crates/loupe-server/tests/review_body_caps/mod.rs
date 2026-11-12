@@ -1,6 +1,6 @@
 //! Per-route body caps through the real router: a body of exactly the cap
 //! reaches the decoder, one byte more is refused before any decoding.
-use loupe_server::review::http::{is_control_route, is_phase_route};
+use loupe_server::review::http::{CONTROL_ROUTES, PHASE_ROUTES};
 use loupe_server::routes::{
 	review_compatibility as compat, review_context as context, review_drilldown as drilldown,
 	review_evidence as evidence, review_host as host, review_inventory as inventory,
@@ -219,12 +219,12 @@ async fn every_review_route_enforces_its_body_and_response_caps() {
 		rows,
 		"every review route in router.rs needs exactly one cap row, in router order"
 	);
+	let mut capped = rows.clone();
+	capped.sort_unstable();
+	let mut classed: Vec<&str> = PHASE_ROUTES.iter().chain(CONTROL_ROUTES).copied().collect();
+	classed.sort_unstable();
+	assert_eq!(capped, classed, "cap rows must equal the phase/control route classes");
 	for row in &table {
-		assert!(
-			is_phase_route(row.path) || is_control_route(row.path),
-			"{}: review route outside the phase/control transport",
-			row.path
-		);
 		assert_eq!(row.configured_response, row.response, "{}: response cap", row.path);
 		let f = fixture();
 		match row.request {
