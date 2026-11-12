@@ -6,6 +6,9 @@
 //! use loupe_provenance::{Agent, Worker};
 //! let _: ReviewUnitRequest<Agent, Worker> = serde_json::from_str("{}").unwrap();
 //! ```
+//! ```compile_fail,E0277
+//! let _: loupe_proto::review_units::ReviewUnitRequest<loupe_provenance::Operator, loupe_provenance::Operator> = serde_json::from_str("{}").unwrap();
+//! ```
 use loupe_core::canonical;
 use loupe_core::text::policy::{Argument, ClientKey, Objective, Reason, Title};
 use loupe_core::text::{BoundedText, Identifier, SourceRef};

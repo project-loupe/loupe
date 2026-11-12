@@ -34,6 +34,11 @@ pub struct UnitMapping {
 /// use loupe_provenance::Worker;
 /// let _: InventoryDispositionRequest<Worker> = serde_json::from_str("{}").unwrap();
 /// ```
+/// ```compile_fail,E0277
+/// use loupe_proto::review_inventory::InventoryDispositionRequest;
+/// use loupe_provenance::Operator;
+/// let _: InventoryDispositionRequest<Operator> = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Serialize)]
 #[serde(bound(serialize = ""))]
 pub struct InventoryDispositionRequest<S: Source> {

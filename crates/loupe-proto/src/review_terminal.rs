@@ -10,6 +10,9 @@
 //! use loupe_provenance::Db;
 //! let _: SurveyReceipt<Db> = serde_json::from_str("{}").unwrap();
 //! ```
+//! ```compile_fail,E0277
+//! let _: loupe_proto::review_terminal::FinalizeSurveyRequest<loupe_provenance::Operator> = serde_json::from_str("{}").unwrap();
+//! ```
 use loupe_core::review_metadata::{ReviewCommit, ReviewDigest};
 use loupe_core::review_payload::{
 	ContinuationClass, SurveyTerminalReason, SurveyTerminalV1, SurveyTerminalV1Decoder, Version1,

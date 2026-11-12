@@ -5,6 +5,9 @@
 //! ```compile_fail,E0277
 //! let _:loupe_proto::review_drilldown::DrilldownReceipt<loupe_provenance::Db>=serde_json::from_str("{}").unwrap();
 //! ```
+//! ```compile_fail,E0277
+//! let _: loupe_proto::review_drilldown::FinalizeDrilldownRequest<loupe_provenance::Operator> = serde_json::from_str("{}").unwrap();
+//! ```
 use loupe_core::review_payload::{DrilldownTerminalV1, DrilldownTerminalV1Decoder, Version1};
 use loupe_provenance::{Agent, Source, Unvalidated, ValidateCarrying, Worker};
 use serde::{Deserialize, Serialize};
