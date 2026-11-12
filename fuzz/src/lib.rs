@@ -35,6 +35,7 @@ pub mod server_report_email;
 pub mod server_report_github;
 pub mod server_request_parsers;
 pub mod smoke;
+pub mod storage_admission_policy;
 pub mod storage_identity;
 pub mod storage_policy_snapshot;
 pub mod storage_scope_sequence;

@@ -35,6 +35,7 @@ GEN_TEST server_report_email
 GEN_TEST server_report_github
 GEN_TEST server_request_parsers
 GEN_TEST smoke
+GEN_TEST storage_admission_policy
 GEN_TEST storage_identity
 GEN_TEST storage_policy_snapshot
 GEN_TEST storage_scope_sequence
