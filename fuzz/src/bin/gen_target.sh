@@ -32,6 +32,7 @@ GEN_TEST proto_dto
 GEN_TEST proto_review_evidence
 GEN_TEST proto_review_inventory
 GEN_TEST proto_review_lifecycle
+GEN_TEST proto_review_terminal
 GEN_TEST proto_review_units
 GEN_TEST proto_version
 GEN_TEST server_capability_header

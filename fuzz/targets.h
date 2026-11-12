@@ -19,6 +19,7 @@ void proto_dto_run(const unsigned char* data, size_t data_len);
 void proto_review_evidence_run(const unsigned char* data, size_t data_len);
 void proto_review_inventory_run(const unsigned char* data, size_t data_len);
 void proto_review_lifecycle_run(const unsigned char* data, size_t data_len);
+void proto_review_terminal_run(const unsigned char* data, size_t data_len);
 void proto_review_units_run(const unsigned char* data, size_t data_len);
 void proto_version_run(const unsigned char* data, size_t data_len);
 void server_capability_header_run(const unsigned char* data, size_t data_len);

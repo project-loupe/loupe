@@ -217,6 +217,69 @@ pub(crate) fn review_id(
 	Some((loupe_proto::review_lease::ReviewId::try_from(raw).ok()?, raw))
 }
 
+/// A terminal finalize request is `{"protocol_version", "payload"}` around one
+/// `core_review_payload` kind. Free mode decodes `rest`; sized mode wraps a
+/// schema-valid payload of about the requested size, which must be accepted
+/// iff it fits `payload_cap`. Accepted requests run the request oracles.
+pub(crate) fn terminal<T: Serialize + PartialEq + Debug>(
+	decode: &dyn Fn(&[u8]) -> Option<T>, kind: u8, caps: (usize, usize), sized: bool, rest: &[u8],
+) {
+	let (payload_cap, request_cap) = caps;
+	let envelope = |target: u32| {
+		let payload = crate::core_review_payload::sized_value(kind, target)
+			.unwrap_or_else(|| panic!("payload kind"));
+		let size = render(&payload).len();
+		(
+			render(&json!({"protocol_version": loupe_proto::PROTOCOL_VERSION, "payload": payload})),
+			size,
+		)
+	};
+	let baseline =
+		format!("{:?}", decode(&envelope(0).0).unwrap_or_else(|| panic!("terminal seed")));
+	let oracle = Request {
+		decode,
+		versions: &[("protocol_version", u64::from(loupe_proto::PROTOCOL_VERSION)), ("version", 1)],
+		baseline: &baseline,
+		exact_debug: true,
+		open: &closed,
+	};
+	if !sized {
+		if oracle.check(rest).is_some() {
+			assert!(rest.len() <= request_cap, "terminal request above its byte cap");
+		}
+		return;
+	}
+	let Some(target) = crate::utils::input::ByteSource::new(rest).u32() else { return };
+	let (raw, size) = envelope(target);
+	assert_eq!(oracle.check(&raw).is_some(), size <= payload_cap, "sized payload of {size} bytes");
+}
+
+/// `bytes` input bytes as lowercase hex, e.g. a commit (20) or digest (32).
+pub(crate) fn hex(input: &mut crate::utils::input::ByteSource<'_>, bytes: usize) -> Option<String> {
+	Some(input.take(bytes)?.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// A receipt's server-owned commit and digest, labelled with the fixed fuzz
+/// source; responses are generic over their metadata source.
+pub(crate) fn receipt_metadata(
+	input: &mut crate::utils::input::ByteSource<'_>,
+) -> Option<(
+	loupe_core::review_metadata::ReviewCommit<loupe_provenance::Agent>,
+	loupe_core::review_metadata::ReviewDigest<loupe_provenance::Agent>,
+	String,
+	String,
+)> {
+	let commit_len = if input.u8()? & 1 == 0 { 20 } else { 32 };
+	let commit = hex(input, commit_len)?;
+	let digest = hex(input, 32)?;
+	Some((
+		crate::fixtures::identifier(&commit).unwrap_or_else(|_| panic!("hex commit is admitted")),
+		crate::fixtures::identifier(&digest).unwrap_or_else(|_| panic!("hex digest is admitted")),
+		commit,
+		digest,
+	))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
