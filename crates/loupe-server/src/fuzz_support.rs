@@ -6,7 +6,9 @@ pub use crate::ingress::transport_fuzz::{collect_operator, Collection};
 mod router_fixture;
 pub use router_fixture::{leased_heartbeat, request_route, RequestCase, RequestObservation};
 
-pub use crate::ingress::jobs::fuzz::{worker_request, worker_value, WorkerRequest, WorkerValue};
+pub use crate::ingress::jobs::fuzz::{
+	review_request, worker_request, worker_value, ReviewDecoder, WorkerRequest, WorkerValue,
+};
 pub use crate::ingress::query::fuzz::{job_query, operator_search, worker_search};
 pub use crate::ingress::registry::fuzz::{
 	operator_request, operator_value, OperatorRequest, OperatorValue,
