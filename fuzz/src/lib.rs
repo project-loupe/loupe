@@ -15,6 +15,7 @@ pub mod cli_ingress_response;
 pub mod cli_render;
 mod cli_response_oracle;
 pub mod core_canonical;
+pub mod core_inventory_manifest;
 pub mod core_json_string;
 pub mod core_review_candidates;
 pub mod core_state_machine;

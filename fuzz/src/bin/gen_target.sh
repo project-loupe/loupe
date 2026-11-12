@@ -17,6 +17,7 @@ GEN_TEST cli_config_input
 GEN_TEST cli_ingress_response
 GEN_TEST cli_render
 GEN_TEST core_canonical
+GEN_TEST core_inventory_manifest
 GEN_TEST core_json_string
 GEN_TEST core_review_candidates
 GEN_TEST core_state_machine

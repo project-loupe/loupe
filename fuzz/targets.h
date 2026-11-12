@@ -4,6 +4,7 @@ void cli_config_input_run(const unsigned char* data, size_t data_len);
 void cli_ingress_response_run(const unsigned char* data, size_t data_len);
 void cli_render_run(const unsigned char* data, size_t data_len);
 void core_canonical_run(const unsigned char* data, size_t data_len);
+void core_inventory_manifest_run(const unsigned char* data, size_t data_len);
 void core_json_string_run(const unsigned char* data, size_t data_len);
 void core_review_candidates_run(const unsigned char* data, size_t data_len);
 void core_state_machine_run(const unsigned char* data, size_t data_len);
