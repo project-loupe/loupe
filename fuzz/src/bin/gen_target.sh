@@ -18,6 +18,7 @@ GEN_TEST cli_ingress_response
 GEN_TEST cli_render
 GEN_TEST core_canonical
 GEN_TEST core_json_string
+GEN_TEST core_review_candidates
 GEN_TEST core_state_machine
 GEN_TEST core_text_bounded
 GEN_TEST core_text_exact

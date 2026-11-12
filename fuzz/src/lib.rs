@@ -16,6 +16,7 @@ pub mod cli_render;
 mod cli_response_oracle;
 pub mod core_canonical;
 pub mod core_json_string;
+pub mod core_review_candidates;
 pub mod core_state_machine;
 pub mod core_text_bounded;
 pub mod core_text_exact;
