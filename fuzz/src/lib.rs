@@ -36,6 +36,7 @@ pub mod server_ingress_requests;
 pub mod server_ingress_transport;
 pub mod server_report_email;
 pub mod server_report_github;
+pub mod server_review_authority;
 pub mod server_request_parsers;
 pub mod smoke;
 pub mod storage_admission_policy;

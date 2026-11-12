@@ -23,6 +23,7 @@ void server_ingress_requests_run(const unsigned char* data, size_t data_len);
 void server_ingress_transport_run(const unsigned char* data, size_t data_len);
 void server_report_email_run(const unsigned char* data, size_t data_len);
 void server_report_github_run(const unsigned char* data, size_t data_len);
+void server_review_authority_run(const unsigned char* data, size_t data_len);
 void server_request_parsers_run(const unsigned char* data, size_t data_len);
 void smoke_run(const unsigned char* data, size_t data_len);
 void storage_admission_policy_run(const unsigned char* data, size_t data_len);

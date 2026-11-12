@@ -36,6 +36,7 @@ GEN_TEST server_ingress_requests
 GEN_TEST server_ingress_transport
 GEN_TEST server_report_email
 GEN_TEST server_report_github
+GEN_TEST server_review_authority
 GEN_TEST server_request_parsers
 GEN_TEST smoke
 GEN_TEST storage_admission_policy

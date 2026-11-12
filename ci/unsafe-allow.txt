@@ -114,3 +114,4 @@ fuzz/src/storage_admission_policy.rs fuzz entry point: the C entry point takes a
 fuzz/src/core_review_candidates.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_inventory_manifest.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_review_payload.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/server_review_authority.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
