@@ -63,3 +63,8 @@ pub use crate::reporters::ingress_fuzz::{
 pub fn legacy_clone_url(url: &str) -> Option<(String, String, String)> {
 	crate::routes::repos::parse_github_clone_url(url)
 }
+
+pub use crate::review::authority::support::{
+	supported as review_recipe_supported, Access, CampaignRecipe, GenerationFacts, GenerationState,
+	RecipeKind, SupportFacts,
+};

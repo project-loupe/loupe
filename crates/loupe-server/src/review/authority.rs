@@ -60,38 +60,94 @@ impl Recipe {
 	fn bootstrap(&self) -> bool {
 		matches!(self, Self::Survey { recipe: SurveyRecipe::Bootstrap, .. })
 	}
+	fn kind(&self) -> support::RecipeKind {
+		use support::RecipeKind as K;
+		match self {
+			Self::Survey { recipe: SurveyRecipe::Bootstrap, .. } => K::Bootstrap,
+			Self::Survey { recipe: SurveyRecipe::Coverage, .. } => K::Coverage,
+			Self::Survey { recipe: SurveyRecipe::Incremental, .. } => K::Incremental,
+			Self::Survey { recipe: SurveyRecipe::Reconciliation, .. } => K::Reconciliation,
+			Self::Survey { recipe: SurveyRecipe::Corroboration, .. } => K::Corroboration,
+			Self::Drilldown { .. } => K::Drilldown,
+			Self::Verify { .. } => K::Verify,
+		}
+	}
 	fn supported(&self, context: &stored::Context, access: Access) -> bool {
-		if !matches!(context.campaign_recipe.as_str(), "bootstrap" | "incremental") {
+		let facts = support::SupportFacts {
+			campaign: context.campaign_recipe,
+			generation: context.generation.as_ref().map(|generation| support::GenerationFacts {
+				state: generation.state,
+				predecessor_present: generation.predecessor.is_some(),
+				commits_equal: generation.commit == context.target_commit,
+			}),
+			head_present: context.head_sha.is_some(),
+			access,
+		};
+		support::supported(self.kind(), facts)
+	}
+}
+
+/// Recipe support decided over closed facts, parsed once from stored context.
+pub(crate) mod support {
+	pub use loupe_storage::campaigns::Recipe as CampaignRecipe;
+	pub use loupe_storage::generations::State as GenerationState;
+	pub use loupe_storage::review_authority::Access;
+
+	// debug-ok: recipe kinds are closed server policy choices.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub enum RecipeKind {
+		Bootstrap,
+		Coverage,
+		Incremental,
+		Reconciliation,
+		Corroboration,
+		Drilldown,
+		Verify,
+	}
+
+	// debug-ok: closed states and booleans only, no stored text.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub struct GenerationFacts {
+		pub state: GenerationState,
+		pub predecessor_present: bool,
+		pub commits_equal: bool,
+	}
+
+	// debug-ok: closed variants and booleans only, no stored text.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub struct SupportFacts {
+		pub campaign: CampaignRecipe,
+		pub generation: Option<GenerationFacts>,
+		pub head_present: bool,
+		pub access: Access,
+	}
+
+	pub fn supported(recipe: RecipeKind, facts: SupportFacts) -> bool {
+		if !matches!(facts.campaign, CampaignRecipe::Bootstrap | CampaignRecipe::Incremental) {
 			return false;
 		}
-		let Some(generation) = &context.generation else {
-			return access == Access::Checkout
-				&& context.head_sha.is_none()
-				&& match self {
-					Self::Survey { recipe: SurveyRecipe::Bootstrap, .. } => {
-						context.campaign_recipe == loupe_storage::campaigns::Recipe::Bootstrap
-					},
-					Self::Survey { recipe: SurveyRecipe::Incremental, .. } => {
-						context.campaign_recipe == loupe_storage::campaigns::Recipe::Incremental
-					},
+		let Some(generation) = facts.generation else {
+			return facts.access == Access::Checkout
+				&& !facts.head_present
+				&& match recipe {
+					RecipeKind::Bootstrap => facts.campaign == CampaignRecipe::Bootstrap,
+					RecipeKind::Incremental => facts.campaign == CampaignRecipe::Incremental,
 					_ => false,
 				};
 		};
-		if generation.commit != context.target_commit {
+		if !generation.commits_equal {
 			return false;
 		}
-		let active = generation.state == loupe_storage::generations::State::Active;
-		let bootstrap = generation.state == loupe_storage::generations::State::Building
-			&& generation.predecessor.is_none()
-			&& context.campaign_recipe == loupe_storage::campaigns::Recipe::Bootstrap;
-		match self {
-			Self::Survey { recipe: SurveyRecipe::Bootstrap, .. } => bootstrap,
-			Self::Survey { recipe: SurveyRecipe::Coverage, .. } => active,
-			Self::Survey { recipe: SurveyRecipe::Incremental, .. } => {
-				active && context.campaign_recipe == loupe_storage::campaigns::Recipe::Incremental
-			},
-			Self::Survey { .. } => false,
-			Self::Drilldown { .. } | Self::Verify { .. } => active || bootstrap,
+		let active = generation.state == GenerationState::Active;
+		let bootstrap = generation.state == GenerationState::Building
+			&& !generation.predecessor_present
+			&& facts.campaign == CampaignRecipe::Bootstrap;
+		match recipe {
+			RecipeKind::Bootstrap => bootstrap,
+			RecipeKind::Coverage => active,
+			RecipeKind::Incremental => active && facts.campaign == CampaignRecipe::Incremental,
+			RecipeKind::Reconciliation | RecipeKind::Corroboration => false,
+			RecipeKind::Drilldown | RecipeKind::Verify => active || bootstrap,
 		}
 	}
 }
