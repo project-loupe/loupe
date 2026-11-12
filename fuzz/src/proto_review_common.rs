@@ -259,6 +259,48 @@ pub(crate) fn hex(input: &mut crate::utils::input::ByteSource<'_>, bytes: usize)
 	Some(input.take(bytes)?.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+pub(crate) fn continuation(
+	input: &mut crate::utils::input::ByteSource<'_>,
+) -> Option<(loupe_proto::review_terminal::ContinuationSummary, Value)> {
+	use loupe_core::review_payload::ContinuationClass as Class;
+	use loupe_proto::review_terminal::{ContinuationBlockReason as Reason, ContinuationSummary};
+	let choice = input.u8()?;
+	let revision = u64::from(input.u32()?);
+	let sequence = u64::from(input.u32()?);
+	let (class, class_name) = match choice % 4 {
+		0 => (Class::SourceAnalysisRemaining, "source_analysis_remaining"),
+		1 => (Class::AwaitingProofInfrastructure, "awaiting_proof_infrastructure"),
+		2 => (Class::ExternalDependency, "external_dependency"),
+		_ => (Class::RequiresSuccessor, "requires_successor"),
+	};
+	if choice & 0x80 == 0 {
+		let not_before = i64::from(input.u32()? as i32);
+		let value = ContinuationSummary::Pending {
+			class,
+			revision,
+			logical_sequence: sequence,
+			not_before,
+		};
+		return Some((
+			value,
+			json!({"state": "pending", "class": class_name, "revision": revision,
+				"logical_sequence": sequence, "not_before": not_before}),
+		));
+	}
+	let (reason, reason_name) = match (choice >> 2) % 3 {
+		0 => (Reason::AwaitingProofInfrastructure, "awaiting_proof_infrastructure"),
+		1 => (Reason::ExternalDependency, "external_dependency"),
+		_ => (Reason::RequiresSuccessor, "requires_successor"),
+	};
+	let value =
+		ContinuationSummary::Blocked { class, revision, logical_sequence: sequence, reason };
+	Some((
+		value,
+		json!({"state": "blocked", "class": class_name, "revision": revision,
+			"logical_sequence": sequence, "reason": reason_name}),
+	))
+}
+
 /// A receipt's server-owned commit and digest, labelled with the fixed fuzz
 /// source; responses are generic over their metadata source.
 pub(crate) fn receipt_metadata(

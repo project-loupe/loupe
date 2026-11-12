@@ -29,11 +29,13 @@ GEN_TEST core_text_ident
 GEN_TEST core_text_json
 GEN_TEST core_text_repo_path
 GEN_TEST proto_dto
+GEN_TEST proto_review_drilldown
 GEN_TEST proto_review_evidence
 GEN_TEST proto_review_inventory
 GEN_TEST proto_review_lifecycle
 GEN_TEST proto_review_terminal
 GEN_TEST proto_review_units
+GEN_TEST proto_review_verification
 GEN_TEST proto_version
 GEN_TEST server_capability_header
 GEN_TEST server_config
