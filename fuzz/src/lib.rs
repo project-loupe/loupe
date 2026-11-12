@@ -28,6 +28,7 @@ pub mod core_text_json;
 pub mod core_text_repo_path;
 mod fixtures;
 pub mod proto_dto;
+pub mod proto_review_api;
 mod proto_review_common;
 pub mod proto_review_drilldown;
 pub mod proto_review_evidence;

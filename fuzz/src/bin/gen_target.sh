@@ -29,6 +29,7 @@ GEN_TEST core_text_ident
 GEN_TEST core_text_json
 GEN_TEST core_text_repo_path
 GEN_TEST proto_dto
+GEN_TEST proto_review_api
 GEN_TEST proto_review_drilldown
 GEN_TEST proto_review_evidence
 GEN_TEST proto_review_inventory
