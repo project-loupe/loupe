@@ -69,6 +69,7 @@ impl<T: Serialize + PartialEq + Debug> Request<'_, T> {
 			);
 		});
 		self.versions_closed(&rendered);
+		self.objects_only(&rendered);
 
 		let debug = format!("{value:?}");
 		if self.exact_debug {
@@ -88,6 +89,28 @@ impl<T: Serialize + PartialEq + Debug> Request<'_, T> {
 			})
 			.collect();
 		(self.open)(&keys)
+	}
+
+	/// serde's derived structs also accept a sequence of field values; every
+	/// closed object must be refused in that array form.
+	fn objects_only(&self, rendered: &Value) {
+		let mut objects = 0;
+		each_object(rendered, &mut Vec::new(), &mut |path| {
+			if objects == MAX_MUTATED_OBJECTS || self.inside_open(path) {
+				return;
+			}
+			objects += 1;
+			let mut mutated = rendered.clone();
+			let fields = object_at(&mut mutated, path);
+			let sequence =
+				Value::Array(std::mem::take(fields).into_iter().map(|(_, v)| v).collect());
+			*value_at(&mut mutated, path) = sequence;
+			assert!(
+				(self.decode)(&render(&mutated)).is_none(),
+				"array form of an object accepted at depth {}",
+				path.len()
+			);
+		});
 	}
 
 	fn versions_closed(&self, rendered: &Value) {
@@ -187,6 +210,10 @@ pub(crate) fn each_object(value: &Value, path: &mut Vec<Step>, visit: &mut impl 
 }
 
 pub(crate) fn object_at<'a>(value: &'a mut Value, path: &[Step]) -> &'a mut Map<String, Value> {
+	value_at(value, path).as_object_mut().unwrap_or_else(|| panic!("visited path is an object"))
+}
+
+fn value_at<'a>(value: &'a mut Value, path: &[Step]) -> &'a mut Value {
 	let mut current = value;
 	for step in path {
 		current = match step {
@@ -195,7 +222,7 @@ pub(crate) fn object_at<'a>(value: &'a mut Value, path: &[Step]) -> &'a mut Map<
 		}
 		.unwrap_or_else(|| panic!("visited path exists"));
 	}
-	current.as_object_mut().unwrap_or_else(|| panic!("visited path is an object"))
+	current
 }
 
 /// Serialize-only response oracle: production serialization equals the

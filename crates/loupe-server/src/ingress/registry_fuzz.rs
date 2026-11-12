@@ -77,6 +77,17 @@ fn original(bytes: &[u8]) -> Untrusted<&[u8], Operator> {
 	Untrusted::new(bytes, unsafe { Ingress::<Operator>::new() })
 }
 
+/// The generation-reset route's own decoder over synthetic original Operator
+/// bytes; the HTTP status of a refusal is the only error observation.
+pub fn reset_generation(
+	bytes: &[u8],
+) -> Result<loupe_proto::review_compatibility::ResetGenerationRequest, u16> {
+	use axum::response::IntoResponse;
+	original(bytes)
+		.validate(crate::ingress::review_compatibility::ResetDecoder)
+		.map_err(|error| error.into_response().status().as_u16())
+}
+
 fn secret(secret: &Secret<String>) -> &str {
 	assert_eq!(format!("{secret:?}"), "[redacted]");
 	assert_eq!(format!("{secret}"), "[redacted]");

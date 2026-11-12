@@ -11,7 +11,7 @@ pub use crate::ingress::jobs::fuzz::{
 };
 pub use crate::ingress::query::fuzz::{job_query, operator_search, worker_search};
 pub use crate::ingress::registry::fuzz::{
-	operator_request, operator_value, OperatorRequest, OperatorValue,
+	operator_request, operator_value, reset_generation, OperatorRequest, OperatorValue,
 };
 
 pub type Decoded = Result<serde_json::Value, (u16, String)>;

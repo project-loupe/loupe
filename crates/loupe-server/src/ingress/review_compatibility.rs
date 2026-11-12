@@ -56,7 +56,7 @@ pub(crate) async fn reset(request: Request) -> Result<ResetGenerationRequest> {
 	Untrusted::new(bytes, token).as_bytes().validate(ResetDecoder)
 }
 
-struct ResetDecoder;
+pub(crate) struct ResetDecoder;
 impl Validate<&[u8], Operator> for ResetDecoder {
 	type Output = ResetGenerationRequest;
 	type Error = ApiError;

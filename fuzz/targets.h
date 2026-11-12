@@ -17,6 +17,7 @@ void core_text_json_run(const unsigned char* data, size_t data_len);
 void core_text_repo_path_run(const unsigned char* data, size_t data_len);
 void proto_dto_run(const unsigned char* data, size_t data_len);
 void proto_review_api_run(const unsigned char* data, size_t data_len);
+void proto_review_compatibility_run(const unsigned char* data, size_t data_len);
 void proto_review_drilldown_run(const unsigned char* data, size_t data_len);
 void proto_review_evidence_run(const unsigned char* data, size_t data_len);
 void proto_review_inventory_run(const unsigned char* data, size_t data_len);
