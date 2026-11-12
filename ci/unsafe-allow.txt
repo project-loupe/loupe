@@ -118,3 +118,4 @@ fuzz/src/server_review_authority.rs fuzz entry point: the C entry point takes a 
 fuzz/src/core_review_priority.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_lifecycle.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_inventory.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_units.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

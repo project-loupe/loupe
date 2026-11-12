@@ -31,6 +31,7 @@ pub mod proto_dto;
 mod proto_review_common;
 pub mod proto_review_inventory;
 pub mod proto_review_lifecycle;
+pub mod proto_review_units;
 pub mod proto_version;
 pub mod server_capability_header;
 mod server_common;
