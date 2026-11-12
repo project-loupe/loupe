@@ -33,6 +33,7 @@ mod proto_review_common;
 pub mod proto_review_drilldown;
 pub mod proto_review_evidence;
 pub mod proto_review_inventory;
+pub mod proto_review_lease;
 pub mod proto_review_lifecycle;
 pub mod proto_review_terminal;
 pub mod proto_review_units;

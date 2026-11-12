@@ -33,6 +33,7 @@ GEN_TEST proto_review_api
 GEN_TEST proto_review_drilldown
 GEN_TEST proto_review_evidence
 GEN_TEST proto_review_inventory
+GEN_TEST proto_review_lease
 GEN_TEST proto_review_lifecycle
 GEN_TEST proto_review_terminal
 GEN_TEST proto_review_units

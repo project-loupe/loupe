@@ -124,3 +124,4 @@ fuzz/src/proto_review_terminal.rs fuzz entry point: the C entry point takes a ra
 fuzz/src/proto_review_drilldown.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_verification.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_api.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_lease.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

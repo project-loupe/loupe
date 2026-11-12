@@ -20,6 +20,7 @@ void proto_review_api_run(const unsigned char* data, size_t data_len);
 void proto_review_drilldown_run(const unsigned char* data, size_t data_len);
 void proto_review_evidence_run(const unsigned char* data, size_t data_len);
 void proto_review_inventory_run(const unsigned char* data, size_t data_len);
+void proto_review_lease_run(const unsigned char* data, size_t data_len);
 void proto_review_lifecycle_run(const unsigned char* data, size_t data_len);
 void proto_review_terminal_run(const unsigned char* data, size_t data_len);
 void proto_review_units_run(const unsigned char* data, size_t data_len);
