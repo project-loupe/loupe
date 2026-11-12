@@ -29,6 +29,7 @@ pub mod core_text_repo_path;
 mod fixtures;
 pub mod proto_dto;
 mod proto_review_common;
+pub mod proto_review_inventory;
 pub mod proto_review_lifecycle;
 pub mod proto_version;
 pub mod server_capability_header;
