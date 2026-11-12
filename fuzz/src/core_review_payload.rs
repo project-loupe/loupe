@@ -146,6 +146,24 @@ fn accepted<T: Payload>(payload: &T, expected: &str) {
 	);
 }
 
+/// A schema-valid payload of one kind (the selector order of this target)
+/// shrunk towards `target` canonical bytes, for the request-envelope targets.
+pub(crate) fn sized_value(kind: u8, target: u32) -> Option<Value> {
+	let mut value = match kind {
+		0 => finding_evidence(),
+		1 => promotion(),
+		2 => survey(),
+		3 => drilldown(),
+		4 => verification(),
+		5 => lead_evidence(),
+		6 => unit_result(),
+		_ => return None,
+	};
+	let maximum = canonical_len(&value);
+	shrink_to(&mut value, maximum.saturating_sub(target as usize));
+	Some(value)
+}
+
 fn canonical_len(value: &Value) -> usize {
 	let mut out = Vec::new();
 	crate::core_canonical::write_json(value, &mut out, false);
