@@ -48,6 +48,9 @@ mod survey_terminal;
 #[path = "review_evidence/mod.rs"]
 mod evidence_checkpoints;
 
+#[path = "review_body_caps/mod.rs"]
+mod body_caps;
+
 #[path = "review_compatibility/mod.rs"]
 mod compatibility;
 

@@ -1,13 +1,13 @@
 //! Shared-route lifecycle tests use actual worker/admin middleware.
 use super::*;
 
-fn v2(f: &Fixture) {
+pub(super) fn v2(f: &Fixture) {
 	f.offline.external_corruption(|conn| {
 		let policy=ReviewPolicy::default().snapshot_v2().unwrap().canonical_bytes().unwrap();
 		conn.execute("UPDATE review_campaigns SET effective_policy=?2,effective_policy_digest=?3 WHERE campaign_id=?1",params![f.campaign,std::str::from_utf8(&policy).unwrap(),loupe_core::canonical::digest(&policy).as_slice()])?;Ok(())
 	}).unwrap();
 }
-fn admin(f: &Fixture) -> PeerCert {
+pub(super) fn admin(f: &Fixture) -> PeerCert {
 	let bundle = f.state.ca.mint_client("lifecycle-admin").unwrap();
 	let peer = PeerCert(
 		CertificateDer::pem_slice_iter(bundle.cert_pem.as_bytes()).next().unwrap().unwrap(),
