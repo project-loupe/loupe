@@ -171,6 +171,7 @@ pub fn with_transaction<T, E: From<Error>>(
 
 /// Strict server recipe policy runs on the original stored text, only after
 /// storage checks live identity and context. Control never decodes that context.
+#[doc = include_str!("authority_scope.md")]
 pub fn authorize<'scope, 'tx>(
 	tx: &'scope mut stored::PhaseTransaction<'tx>, phase: Phase, access: Access,
 ) -> Result<Option<stored::PhaseScope<'scope, 'scope>>> {
