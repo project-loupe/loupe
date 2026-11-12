@@ -13,7 +13,7 @@
 //! ) -> Result<(), ReportError> {
 //!     let mut out = ReportBuilder::github();
 //!     out.heading("Description")?;
-//!     out.field("description", value)?;
+//!     out.prose(value)?;
 //!     out.path(path, Some(1), Some(2))?;
 //!     let _ = out.render()?;
 //!     Ok(())
@@ -22,6 +22,10 @@
 //! ```compile_fail,E0308
 //! use loupe_server::reporters::render::ReportBuilder;
 //! let _ = ReportBuilder::github().field("description", "raw text");
+//! ```
+//! ```compile_fail,E0308
+//! use loupe_server::reporters::render::ReportBuilder;
+//! let _ = ReportBuilder::github().prose("raw text");
 //! ```
 //! ```compile_fail,E0308
 //! use loupe_server::reporters::render::ReportBuilder;
@@ -279,43 +283,117 @@ impl ReportBuilder {
 		}
 		Ok(())
 	}
+	/// Write one measured sequence of pieces. The walk runs twice so nothing is
+	/// allocated for a body that its destination budget would reject.
+	fn emit(&mut self, walk: impl Fn(&mut dyn FnMut(&str))) -> Result<(), ReportError> {
+		let mut measure = Some(Measure::ascii(0));
+		walk(&mut |piece| {
+			measure = measure.and_then(|total| total.add(Measure::text(piece)));
+		});
+		self.account(measure)?;
+		if let Some(out) = &mut self.out {
+			walk(&mut |piece| out.push_str(piece));
+		}
+		Ok(())
+	}
+	/// A labelled metadata line. In Markdown the whole value is inline code,
+	/// which GitHub's post-parse reference and mention linking leaves alone.
 	pub fn field<P: TextPolicy, S: Source>(
 		&mut self, label: &'static str, value: &BoundedText<P, S>,
 	) -> Result<(), ReportError> {
-		self.block(label, value.expose(), "", "")
+		let value = value.expose();
+		if !self.markdown {
+			return self.plain_field(label, value);
+		}
+		self.emit(|sink| {
+			sink("**");
+			sink(label);
+			sink(":** ");
+			let mut first = true;
+			for line in lines(value).filter(|line| !line.is_empty()) {
+				if !first {
+					sink(" ");
+				}
+				first = false;
+				code_span(line, sink);
+			}
+			sink("  \n");
+		})
 	}
+	/// A labelled single-line value read as prose rather than as an identifier.
+	pub fn prose_field<P: TextPolicy, S: Source>(
+		&mut self, label: &'static str, value: &BoundedText<P, S>,
+	) -> Result<(), ReportError> {
+		let value = value.expose();
+		if !self.markdown {
+			return self.plain_field(label, value);
+		}
+		self.emit(|sink| {
+			sink("**");
+			sink(label);
+			sink(":** ");
+			let mut first = true;
+			for line in lines(value) {
+				if !first && !line.trim().is_empty() {
+					sink(" ");
+				}
+				first &= line.trim().is_empty();
+				inline_prose(line, sink);
+			}
+			sink("  \n");
+		})
+	}
+	/// Agent text as readable paragraphs: only allowlisted words stay
+	/// plain. Plain-text destinations indent it instead.
+	pub fn prose<P: TextPolicy, S: Source>(
+		&mut self, value: &BoundedText<P, S>,
+	) -> Result<(), ReportError> {
+		let value = value.expose();
+		if !self.markdown {
+			return self.plain_field("description", value);
+		}
+		self.emit(|sink| block_prose(value, sink))
+	}
+	/// A diff in a fence longer than every backtick run it contains.
 	pub(super) fn diff<P: TextPolicy, S: Source>(
 		&mut self, label: &'static str, value: &BoundedText<P, S>,
 	) -> Result<(), ReportError> {
-		self.block(label, value.expose(), "", "diff")
-	}
-	fn block(
-		&mut self, label: &'static str, value: &str, suffix: &str, language: &'static str,
-	) -> Result<(), ReportError> {
-		let width = fence_width(value).ok_or_else(|| self.error())?;
-		let framing =
-			width.checked_mul(2).and_then(|n| n.checked_add(8)).ok_or_else(|| self.error())?;
-		self.account(
-			Measure::text(label)
-				.add(Measure::text(value))
-				.and_then(|n| n.add(Measure::text(suffix)))
-				.and_then(|n| n.add(Measure::text(language)))
-				.and_then(|n| n.add(Measure::ascii(framing))),
-		)?;
-		if let Some(out) = &mut self.out {
-			out.push_str("- ");
-			out.push_str(label);
-			out.push_str(":\n");
-			out.extend(std::iter::repeat_n('`', width));
-			out.push_str(language);
-			out.push('\n');
-			out.push_str(value);
-			out.push_str(suffix);
-			out.push('\n');
-			out.extend(std::iter::repeat_n('`', width));
-			out.push_str("\n\n");
+		let value = value.expose();
+		if !self.markdown {
+			return self.plain_field(label, value);
 		}
-		Ok(())
+		let width = fence_width(value).ok_or_else(|| self.error())?;
+		self.emit(|sink| {
+			fence(width, sink);
+			sink("diff\n");
+			sink(value);
+			sink("\n");
+			fence(width, sink);
+			sink("\n\n");
+		})
+	}
+	/// Plain text has no markup to contain. Agent lines are indented so none can
+	/// pass as a host field, which all start in the first column.
+	fn plain_field(&mut self, label: &'static str, value: &str) -> Result<(), ReportError> {
+		self.emit(|sink| {
+			sink("- ");
+			sink(label);
+			if !value.contains(['\r', '\n']) {
+				sink(": ");
+				sink(value);
+				sink("\n");
+				return;
+			}
+			sink(":\n\n");
+			for line in lines(value) {
+				if !line.is_empty() {
+					sink("    ");
+					sink(line);
+				}
+				sink("\n");
+			}
+			sink("\n");
+		})
 	}
 	pub fn path<S: Source>(
 		&mut self, path: &RepoPath<S>, start: Option<u32>, end: Option<u32>,
@@ -325,41 +403,15 @@ impl ReportBuilder {
 			(Some(start), _) => format!(":{start}"),
 			_ => String::new(),
 		};
-		let value = path.expose();
+		let located = format!("{}{suffix}", path.expose());
 		if !self.markdown {
-			return self.block("file", value, &suffix, "");
+			return self.plain_field("file", &located);
 		}
-		let width = fence_width(value).ok_or_else(|| self.error())?;
-		let edge_tick = value.starts_with('`') || (suffix.is_empty() && value.ends_with('`'));
-		let edge_spaces = suffix.is_empty()
-			&& value.starts_with(' ')
-			&& value.ends_with(' ')
-			&& value.bytes().any(|b| b != b' ');
-		let padding = edge_tick || edge_spaces;
-		let framing = width
-			.checked_mul(2)
-			.and_then(|n| n.checked_add(13 + usize::from(padding) * 2))
-			.ok_or_else(|| self.error())?;
-		self.account(
-			Measure::text(value)
-				.add(Measure::text(&suffix))
-				.and_then(|n| n.add(Measure::ascii(framing))),
-		)?;
-		if let Some(out) = &mut self.out {
-			out.push_str("- location: ");
-			out.extend(std::iter::repeat_n('`', width));
-			if padding {
-				out.push(' ');
-			}
-			out.push_str(value);
-			out.push_str(&suffix);
-			if padding {
-				out.push(' ');
-			}
-			out.extend(std::iter::repeat_n('`', width));
-			out.push('\n');
-		}
-		Ok(())
+		self.emit(|sink| {
+			sink("**Location:** ");
+			code_span(&located, sink);
+			sink("  \n");
+		})
 	}
 	pub(super) fn finding_id(&mut self, id: i64) -> Result<(), ReportError> {
 		let value = loupe_core::format_finding_id(id);
@@ -375,8 +427,11 @@ impl ReportBuilder {
 		Ok(())
 	}
 	pub(super) fn severity(&mut self, severity: Severity) -> Result<(), ReportError> {
-		self.literal("- severity: ")?;
+		self.literal(if self.markdown { "**Severity:** " } else { "- severity: " })?;
 		self.literal(severity.as_str())?;
+		if self.markdown {
+			self.literal("  ")?;
+		}
 		self.literal("\n")
 	}
 	pub(super) fn count(&mut self, count: usize) -> Result<(), ReportError> {
@@ -411,6 +466,226 @@ fn fence_width(value: &str) -> Option<usize> {
 	Some(longest.checked_add(1)?.max(3))
 }
 
+fn fence(width: usize, sink: &mut dyn FnMut(&str)) {
+	for _ in 0..width {
+		sink("`");
+	}
+}
+
+/// Agent line endings, including bare carriage returns, which CommonMark and
+/// mail clients both treat as line breaks.
+fn lines(value: &str) -> impl Iterator<Item = &str> {
+	value.split("\r\n").flat_map(|part| part.split(['\n', '\r']))
+}
+
+/// Inline code that cannot end early and keeps its exact edge characters.
+fn code_span(value: &str, sink: &mut dyn FnMut(&str)) {
+	let longest = value.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+	let edge_tick = value.starts_with('`') || value.ends_with('`');
+	let edge_spaces =
+		value.starts_with(' ') && value.ends_with(' ') && value.bytes().any(|b| b != b' ');
+	let padding = if edge_tick || edge_spaces { " " } else { "" };
+	fence(longest + 1, sink);
+	sink(padding);
+	sink(value);
+	sink(padding);
+	fence(longest + 1, sink);
+}
+
+const LEADING_PUNCTUATION: [char; 6] = ['(', '"', '\'', '“', '‘', '¡'];
+const TRAILING_PUNCTUATION: [char; 11] = [',', '.', ';', ':', '!', '?', ')', '"', '\'', '”', '’'];
+
+/// The fail-closed allowlist for text outside code: letters with light
+/// punctuation. Anything else may be a mention, reference, commit, autolink,
+/// emoji or Markdown, whichever forms GitHub supports today, so it stays code.
+fn is_plain_word(word: &str) -> bool {
+	if matches!(word, "—" | "–") {
+		return true;
+	}
+	let core = word.trim_start_matches(LEADING_PUNCTUATION).trim_end_matches(TRAILING_PUNCTUATION);
+	// GitHub links a commit prefix bounded by any non-alphanumeric, so a hex
+	// run joined to other letters by `-` or an apostrophe still counts.
+	let looks_like_commit = core
+		.split(|ch: char| !ch.is_ascii_alphanumeric())
+		.any(|run| run.len() >= 7 && run.bytes().all(|b| b.is_ascii_hexdigit()));
+	if core.is_empty() || looks_like_commit {
+		return false;
+	}
+	let mut previous_letter = false;
+	for ch in core.chars() {
+		if ch.is_alphabetic() {
+			previous_letter = true;
+		} else if matches!(ch, '-' | '\'' | '’') && previous_letter {
+			previous_letter = false;
+		} else {
+			return false;
+		}
+	}
+	previous_letter
+}
+
+/// An agent-written code span at the start of `text`, with trailing punctuation.
+/// Returns its contents, that punctuation and the remaining text.
+fn agent_span(text: &str) -> Option<(&str, &str, &str)> {
+	let width = text.bytes().take_while(|b| *b == b'`').count();
+	let body = text.get(width..)?;
+	let mut cursor = 0;
+	while let Some(next) = body.get(cursor..)?.find('`') {
+		let start = cursor + next;
+		let tail = body.get(start..)?;
+		let run = tail.bytes().take_while(|b| *b == b'`').count();
+		if run == width {
+			let inner = body.get(..start)?;
+			let after = tail.get(run..)?;
+			let word_end = after.find(char::is_whitespace).unwrap_or(after.len());
+			let (punctuation, rest) = after.split_at(word_end);
+			if inner.trim().is_empty()
+				|| !punctuation.chars().all(|ch| TRAILING_PUNCTUATION.contains(&ch))
+			{
+				return None;
+			}
+			let inner = match inner.strip_prefix(' ').and_then(|s| s.strip_suffix(' ')) {
+				Some(stripped) if !stripped.is_empty() => stripped,
+				_ => inner,
+			};
+			return Some((inner, punctuation, rest));
+		}
+		cursor = start + run;
+	}
+	None
+}
+
+/// One line of words. Whitespace splitting happens first, so every token is
+/// decided alone and no token can combine with a neighbour into markup.
+fn inline_prose(line: &str, sink: &mut dyn FnMut(&str)) {
+	let mut rest = line.trim();
+	let mut first = true;
+	while !rest.is_empty() {
+		if !first {
+			sink(" ");
+		}
+		first = false;
+		if let Some((inner, punctuation, after)) =
+			rest.starts_with('`').then(|| agent_span(rest)).flatten()
+		{
+			code_span(inner, sink);
+			sink(punctuation);
+			rest = after.trim_start();
+			continue;
+		}
+		let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+		let (word, after) = rest.split_at(end);
+		if is_plain_word(word) {
+			sink(word);
+		} else {
+			code_span(word, sink);
+		}
+		rest = after.trim_start();
+	}
+}
+
+/// The fence an agent line opens: at most three spaces, then at least three
+/// of one marker, as in CommonMark.
+fn agent_fence(line: &str) -> Option<(char, usize)> {
+	let trimmed = line.trim_start_matches(' ');
+	if line.len() - trimmed.len() > 3 {
+		return None;
+	}
+	let marker = trimmed.chars().next().filter(|ch| matches!(ch, '`' | '~'))?;
+	let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+	let info = trimmed.trim_start_matches(marker);
+	(width >= 3 && (marker == '~' || !info.contains('`'))).then_some((marker, width))
+}
+
+fn closes_fence(line: &str, marker: char, width: usize) -> bool {
+	let trimmed = line.trim();
+	line.len() - line.trim_start_matches(' ').len() <= 3
+		&& trimmed.chars().count() >= width
+		&& trimmed.chars().all(|ch| ch == marker)
+}
+
+fn is_indented(line: &str) -> bool {
+	line.starts_with("    ") || line.starts_with('\t')
+}
+
+fn literal_block(block: &[&str], sink: &mut dyn FnMut(&str)) {
+	let longest =
+		block.iter().flat_map(|line| line.split(|ch| ch != '`')).map(str::len).max().unwrap_or(0);
+	let width = (longest + 1).max(3);
+	fence(width, sink);
+	sink("\n");
+	for line in block {
+		sink(line);
+		sink("\n");
+	}
+	fence(width, sink);
+}
+
+/// Paragraphs of [`inline_prose`], with bullets as plain characters so agent
+/// text adds no list structure. Fenced and indented snippets, where whitespace
+/// carries meaning, become literal blocks with their own adaptive fences.
+fn block_prose(value: &str, sink: &mut dyn FnMut(&str)) {
+	let all: Vec<&str> = lines(value).collect();
+	let mut index = 0;
+	let mut wrote = false;
+	let mut in_paragraph = false;
+	while let Some(&line) = all.get(index) {
+		if line.trim().is_empty() {
+			in_paragraph = false;
+			index += 1;
+			continue;
+		}
+		let opened = agent_fence(line);
+		let snippet = if let Some((marker, width)) = opened {
+			let body = all.get(index + 1..).unwrap_or_default();
+			let end = body
+				.iter()
+				.position(|line| closes_fence(line, marker, width))
+				.unwrap_or(body.len());
+			index = index.saturating_add(end).saturating_add(2);
+			Some(body.get(..end).unwrap_or_default())
+		} else if is_indented(line) {
+			let start = index;
+			let mut end = index;
+			while let Some(&next) = all.get(index) {
+				if is_indented(next) {
+					end = index + 1;
+				} else if !next.trim().is_empty() {
+					break;
+				}
+				index += 1;
+			}
+			Some(all.get(start..end).unwrap_or_default())
+		} else {
+			None
+		};
+		if wrote && !(in_paragraph && snippet.is_none()) {
+			sink("\n\n");
+		} else if wrote {
+			sink("\n");
+		}
+		wrote = true;
+		if let Some(block) = snippet {
+			in_paragraph = false;
+			literal_block(block, sink);
+			continue;
+		}
+		in_paragraph = true;
+		index += 1;
+		let trimmed = line.trim();
+		match trimmed.strip_prefix(['-', '*', '+']).filter(|rest| rest.starts_with(' ')) {
+			Some(item) => {
+				sink("• ");
+				inline_prose(item, sink);
+			},
+			None => inline_prose(trimmed, sink),
+		}
+	}
+	if wrote {
+		sink("\n\n");
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use loupe_core::text::policy::FindingDescription;
@@ -421,8 +696,8 @@ mod tests {
 	#[test]
 	fn admission_counts_unicode_and_framing_before_allocating_output() {
 		let mut empty = ReportBuilder::github();
-		empty.field("description", &text::<FindingDescription>("")).unwrap();
-		let overhead = empty.render().unwrap().as_str().chars().count();
+		empty.field("description", &text::<FindingDescription>("💣")).unwrap();
+		let overhead = empty.render().unwrap().as_str().chars().count() - 1;
 		let exact = text::<FindingDescription>(&"💣".repeat(GITHUB_SCALARS - overhead));
 		let mut out = ReportBuilder::github();
 		out.field("description", &exact).unwrap();

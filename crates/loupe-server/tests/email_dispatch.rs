@@ -164,7 +164,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	let jobs = common::jobs(&db, repo_id);
 	let reviewed_sha = jobs[0].head_sha.as_ref().unwrap().expose();
 	assert!(
-		captured.contains(&format!("- reviewed revision:\n```\n{reviewed_sha}\n```")),
+		captured.contains(&format!("- reviewed revision: {reviewed_sha}\n")),
 		"captured: {captured}"
 	);
 

@@ -471,7 +471,7 @@ Promotion creates canonical mandatory verification intent even when admission
 is unavailable. Execution failure, exhausted budgets and missing infrastructure
 never become security verdicts. A newly confirmed transition reports only after
 commit; replay does not redeliver, and existing admin report retry handles the
-commit-before-dispatch gap. Phase reports render accepted prose literally.
+commit-before-dispatch gap. Phase reports render accepted prose inertly.
 
 The explicit quiescent admin reset discards only an incompatible rebuildable
 generation graph. Findings/evidence/reports, job audit/replay history and
@@ -571,11 +571,16 @@ and is explicitly listed as no verdict; runtime and fuzz evidence are not a
 substitute proof. CLI terminal rendering separately escapes control characters.
 Searching for formatting sites is an audit aid, not proof of sink safety.
 
-Report builders accept labelled fields and paths. GitHub descriptions and
-diffs use backtick fences longer than every run in the input; paths use
-literal code spans, so a path cannot create a link or HTML element. Complete
+Report builders accept labelled fields and paths. GitHub diffs and agent
+snippets use backtick fences longer than every run in the input; identifiers
+and paths use literal code spans. GitHub links mentions, references and commits
+after Markdown parsing, so escaping cannot contain prose. Description and title
+words therefore stay plain only when a letter-based allowlist admits them, and
+every other token becomes inline code. Rendered prose normalizes whitespace; the
+stored finding keeps the exact bytes. Complete
 issue bodies, including their framing, must fit 65,536 Unicode scalars and
-262,144 bytes. Email uses a fixed host layout and selected stored settings
+262,144 bytes. Email indents multi-line agent text so it cannot pose as a host field, and
+uses a fixed host layout and selected stored settings
 for headers; finding text belongs in the body. Each complete header line is
 limited to 8,192 bytes, the header section to 65,536 bytes and the complete
 message to 16 MiB. Rejected output is not truncated into a different report.

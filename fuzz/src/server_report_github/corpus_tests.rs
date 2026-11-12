@@ -35,8 +35,8 @@ fn canonical_injection_corpus_is_literal_in_both_report_destinations() {
 		assert_eq!(finding.description.expose().as_bytes(), raw.as_bytes());
 		let body =
 			rendered(&finding).unwrap_or_else(|error| panic!("corpus renderer {name}: {error}"));
-		assert!(body.contains(&raw), "original corpus bytes missing: {name}");
-		assert!(!escapes_fences(&body, &raw), "corpus payload must be literal: {name}");
+		assert_inert(&body);
+		assert!(contains_literal_diff(&body, &raw), "corpus diff must be literal: {name}");
 		do_test(&bytes);
 		let email = serde_json::to_vec(&serde_json::json!({
 			"from":"loupe@example.test", "to":["operator@example.test"],
