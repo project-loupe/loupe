@@ -22,7 +22,7 @@ mod decode;
 pub use decode::ReviewUnitRequestDecoder;
 
 // debug-ok: closed advisory priority labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorityBand {
 	Urgent,
@@ -30,6 +30,7 @@ pub enum PriorityBand {
 	Normal,
 	Background,
 }
+loupe_core::closed_string_enum!(PriorityBand { Urgent, High, Normal, Background });
 
 #[derive(Serialize)]
 #[serde(bound(serialize = ""))]

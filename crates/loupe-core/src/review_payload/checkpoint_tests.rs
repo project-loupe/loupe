@@ -218,3 +218,47 @@ fn unit_result_decoder_accepts_its_distinct_sixty_four_reference_budget() {
 		assert_eq!(parsed.inspected_refs.len(), count);
 	}
 }
+
+#[test]
+fn closed_values_decode_only_from_json_strings() {
+	assert!(parse_lead(&lead().to_string()).is_ok());
+	for (field, word) in [("impact", "high"), ("access", "remote"), ("reachability", "traced")] {
+		let mut map_form = lead();
+		map_form["priority_proposal"][field] = json!({ word: null });
+		assert!(parse_lead(&map_form.to_string()).is_err(), "{field} accepted a map encoding");
+	}
+	for (field, word) in [("format", "loupe.unit_result"), ("disposition", "no_lead_found")] {
+		let mut map_form = result();
+		map_form[field] = json!({ word: null });
+		assert!(parse_result(&map_form.to_string()).is_err(), "{field} accepted a map encoding");
+	}
+	let survey = |reason: Value| {
+		let raw = json!({"version":1,"terminal_reason":reason}).to_string();
+		marked::fixture(&raw, |raw, mark| SurveyTerminalV1::<Agent>::from_json(mark, raw))
+	};
+	assert!(survey(json!("partial")).is_ok());
+	assert!(survey(json!({"partial":null})).is_err(), "terminal_reason accepted a map encoding");
+	let duplicate = json!({"disposition":"duplicate","version":1,
+		"target":{"kind":"lead","id":4},"rationale":"same sink"});
+	let drilldown = |raw: &str| {
+		marked::fixture(raw, |raw, mark| DrilldownTerminalV1::<Agent>::from_json(mark, raw))
+	};
+	assert!(drilldown(&duplicate.to_string()).is_ok(), "object-valued fields stay objects");
+}
+
+#[test]
+fn shared_severity_decodes_only_from_a_json_string_in_evidence() {
+	let promotion = |severity: Value| {
+		let mut value = json!({"version":1,"severity":"high","title":"t","description":"d",
+			"identity_family":"auth-bypass","identity_anchor":"token boundary",
+			"evidence":{"version":1,"l2_argument":{"attacker_source":"a","control":"c","sink":"s",
+				"reachable_path":"p","trust_boundary":"b"},
+				"material_locations":[{"role":"sink","file":"src/lib.rs"}],
+				"counterevidence":"n","assumptions_gaps":"n","confidence":"low"}});
+		value["severity"] = severity;
+		let raw = value.to_string();
+		marked::fixture(&raw, |raw, mark| PromotionV1::<Agent>::from_json(mark, raw))
+	};
+	assert!(promotion(json!("high")).is_ok());
+	assert!(promotion(json!({"high":null})).is_err(), "severity accepted a map encoding");
+}

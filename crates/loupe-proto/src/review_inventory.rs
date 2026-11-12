@@ -11,7 +11,7 @@ use crate::review_api::ReviewProtocol;
 use crate::review_lease::{LeaseList, ReviewId};
 
 // debug-ok: closed inventory disposition, never content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
 	Mapped,
@@ -19,6 +19,7 @@ pub enum Disposition {
 	Excluded,
 	Unresolved,
 }
+loupe_core::closed_string_enum!(Disposition { Mapped, Context, Excluded, Unresolved });
 
 // debug-ok: numeric unit identity and assignment epoch only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

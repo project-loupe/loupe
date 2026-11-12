@@ -132,9 +132,10 @@ async fn review_advertisements_are_closed_and_bounded_at_worker_ingress() {
 		),
 		("null", StatusCode::UNPROCESSABLE_ENTITY),
 		("{}", StatusCode::UNPROCESSABLE_ENTITY),
-		// The existing closed enum's serde visitor classifies a numeric
-		// variant as syntax, unlike a string naming an unknown variant.
-		("[1]", StatusCode::BAD_REQUEST),
+		// Closed capabilities are strings only; any other value is the
+		// wrong type, including the map form of a known capability.
+		("[1]", StatusCode::UNPROCESSABLE_ENTITY),
+		(r#"[{"review:verify:v1":null}]"#, StatusCode::UNPROCESSABLE_ENTITY),
 	] {
 		let request = format!(
 			r#"{{"protocol_version":{PROTOCOL_VERSION},"capabilities":[],"review_capabilities":{review_capabilities}}}"#

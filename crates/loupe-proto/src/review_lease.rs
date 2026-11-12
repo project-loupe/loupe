@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 /// Phase advertisement is deliberately independent of legacy `verify:*` tags.
 // debug-ok: closed protocol scalars or collections delegate to redacted values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ReviewCapability {
 	#[serde(rename = "review:survey:v1")]
 	Survey,
@@ -39,6 +39,7 @@ pub enum ReviewCapability {
 	#[serde(rename = "review:verify:v1")]
 	Verify,
 }
+loupe_core::closed_string_enum!(ReviewCapability { Survey, Drilldown, Verify });
 
 /// Positive SQLite identifiers, not opaque agent-selected ownership fields.
 // debug-ok: closed protocol scalars or collections delegate to redacted values.
@@ -365,6 +366,22 @@ review_enum_impls!(ReviewSurveyContext {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn worker_closed_values_decode_only_from_json_strings() {
+		use crate::review_inventory::Disposition;
+		use crate::review_lifecycle::FailedOutcome;
+		use crate::review_units::PriorityBand;
+		fn strict<T: serde::de::DeserializeOwned>(word: &str) {
+			assert!(serde_json::from_value::<T>(json!(word)).is_ok(), "{word} must decode");
+			assert!(serde_json::from_value::<T>(json!({ word: null })).is_err(), "{word} map form");
+			assert!(serde_json::from_str::<T>(&format!("{{\"{word}\":null}}")).is_err());
+		}
+		strict::<ReviewCapability>("review:verify:v1");
+		strict::<FailedOutcome>("failed");
+		strict::<Disposition>("excluded");
+		strict::<PriorityBand>("urgent");
+	}
+
 	use loupe_provenance::{Agent, Server};
 	use serde_json::{json, Value};
 

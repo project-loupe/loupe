@@ -12,11 +12,12 @@ use crate::review_api::{ReviewApiDecodeError as Error, ReviewProtocol};
 use crate::review_lease::ReviewId;
 
 // debug-ok: closed protocol and execution states, no input text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailedOutcome {
 	Failed,
 }
+loupe_core::closed_string_enum!(FailedOutcome { Failed });
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PhaseFailureRequest {
 	pub protocol_version: ReviewProtocol,
