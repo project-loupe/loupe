@@ -348,3 +348,225 @@ fn terminal_replay_returns_sealed_result_only() {
 	kani::cover!(matches!(result, Ok(Err(Reject::WrongDigest))), "divergent digest");
 	kani::cover!(matches!(result, Ok(Err(Reject::Denied))), "unbound identity denied");
 }
+
+fn policy_v2() -> crate::admission_policy::CampaignPolicyV2 {
+	crate::admission_policy::CampaignPolicyV2 {
+		version: kani::any(),
+		survey_units_per_job: kani::any(),
+		survey_deadline_seconds: kani::any(),
+		survey_submit_margin_seconds: kani::any(),
+		drilldown_deadline_seconds: kani::any(),
+		drilldown_submit_margin_seconds: kani::any(),
+		verify_deadline_seconds: kani::any(),
+		verify_submit_margin_seconds: kani::any(),
+		max_attempts: kani::any(),
+		retry_backoff_base_seconds: kani::any(),
+		retry_backoff_cap_seconds: kani::any(),
+		campaign_deadline_seconds: kani::any(),
+		campaign_max_jobs: kani::any(),
+		survey_token_budget: kani::any(),
+		drilldown_token_budget: kani::any(),
+		verify_token_budget: kani::any(),
+		max_units_per_survey: kani::any(),
+		max_leads_per_survey: kani::any(),
+		max_sibling_leads_per_drilldown: kani::any(),
+		campaign_urgent_reserve: kani::any(),
+		campaign_verification_reserve: kani::any(),
+		priority_policy_version: kani::any(),
+	}
+}
+
+fn phase_is_usable(deadline: i64, margin: i64, budget: Option<u64>, campaign: i64) -> bool {
+	deadline > 0
+		&& margin >= 0
+		&& margin < deadline
+		&& campaign >= deadline
+		&& budget.is_none_or(|tokens| tokens > 0 && tokens <= i64::MAX as u64)
+}
+
+// Bound: version, priority version, survey units, attempts, backoff base and
+// cap, campaign_max_jobs, both reserves and the three per-phase list caps
+// range over their full types, negative i64 values included. The nine phase
+// deadline, margin, token-budget and campaign-deadline fields are fixed at
+// the accepted defaults: with them symbolic too the proof timed out at 600s,
+// and they feed only the shared execution-policy phase check. The oracle
+// restates the storage contract independently of validate(): general
+// capacity is not stored, so the two reserves and the derived general pool
+// partition campaign_max_jobs with at least one general job (contract
+// example: 64 = 4 urgent + 4 verification + 56 general). Sums are in i128,
+// so the oracle cannot overflow where the code must not.
+// Unwind 4: the three-phase loop in validate() plus termination; it also cuts
+// drop glue of storage error variants never built on these paths.
+// invariant: I6
+#[kani::proof]
+#[kani::unwind(4)]
+fn policy_validate_rejects_inconsistent_limits() {
+	let defaults = crate::admission_policy::CampaignPolicyV2::default();
+	let policy = crate::admission_policy::CampaignPolicyV2 {
+		survey_deadline_seconds: defaults.survey_deadline_seconds,
+		survey_submit_margin_seconds: defaults.survey_submit_margin_seconds,
+		drilldown_deadline_seconds: defaults.drilldown_deadline_seconds,
+		drilldown_submit_margin_seconds: defaults.drilldown_submit_margin_seconds,
+		verify_deadline_seconds: defaults.verify_deadline_seconds,
+		verify_submit_margin_seconds: defaults.verify_submit_margin_seconds,
+		campaign_deadline_seconds: defaults.campaign_deadline_seconds,
+		survey_token_budget: defaults.survey_token_budget,
+		drilldown_token_budget: defaults.drilldown_token_budget,
+		verify_token_budget: defaults.verify_token_budget,
+		..policy_v2()
+	};
+	let accepted = policy.validate().is_ok();
+	let urgent = i128::from(policy.campaign_urgent_reserve);
+	let verification = i128::from(policy.campaign_verification_reserve);
+	let total = i128::from(policy.campaign_max_jobs);
+	let capacity = urgent >= 0 && verification >= 0 && urgent + verification < total;
+	let other = policy.version == 2
+		&& policy.priority_policy_version == 1
+		&& (1..=32).contains(&policy.survey_units_per_job)
+		&& policy.max_attempts > 0
+		&& policy.retry_backoff_base_seconds >= 1
+		&& policy.retry_backoff_base_seconds <= policy.retry_backoff_cap_seconds
+		&& policy.max_units_per_survey > 0
+		&& policy.max_leads_per_survey > 0
+		&& policy.max_sibling_leads_per_drilldown > 0
+		&& phase_is_usable(
+			policy.survey_deadline_seconds,
+			policy.survey_submit_margin_seconds,
+			policy.survey_token_budget,
+			policy.campaign_deadline_seconds,
+		)
+		&& phase_is_usable(
+			policy.drilldown_deadline_seconds,
+			policy.drilldown_submit_margin_seconds,
+			policy.drilldown_token_budget,
+			policy.campaign_deadline_seconds,
+		)
+		&& phase_is_usable(
+			policy.verify_deadline_seconds,
+			policy.verify_submit_margin_seconds,
+			policy.verify_token_budget,
+			policy.campaign_deadline_seconds,
+		);
+	assert_eq!(accepted, capacity && other);
+	let general = policy.general_capacity();
+	assert_eq!(general.is_ok(), accepted);
+	if let Ok(general) = general {
+		assert!(general >= 1);
+		assert_eq!(i128::from(general) + urgent + verification, total);
+	}
+	kani::cover!(accepted && urgent + verification + 1 == total, "single general job accepted");
+	kani::cover!(
+		other && urgent >= 0 && verification >= 0 && urgent + verification == total,
+		"reserves taking every job rejected"
+	);
+	kani::cover!(
+		other && urgent + verification > i128::from(i64::MAX),
+		"overflowing reserve sum rejected"
+	);
+	kani::cover!(other && !capacity && urgent < 0, "negative reserve rejected");
+}
+
+// Bound: retry_backoff_base_seconds and retry_backoff_cap_seconds range over
+// every pair validate() accepts (1 <= base <= cap, full i64); attempts and
+// sequences are all u32/u64 and now is all i64. The other fields stay at the
+// accepted defaults because the delay functions read only base and cap, and
+// validate() is what logical_delay re-runs. Two ordered arguments per call
+// establish monotonicity. checked_pow loops over the exponent's 32 bits;
+// unwind 34 covers it plus one.
+// invariant: I6
+#[kani::proof]
+#[kani::unwind(34)]
+fn retry_and_logical_delays_never_overflow() {
+	let mut policy = crate::admission_policy::CampaignPolicyV2::default();
+	policy.retry_backoff_base_seconds = kani::any();
+	policy.retry_backoff_cap_seconds = kani::any();
+	kani::assume(policy.validate().is_ok());
+	let base = policy.retry_backoff_base_seconds;
+	let cap = policy.retry_backoff_cap_seconds;
+
+	let first: u32 = kani::any();
+	let second: u32 = kani::any();
+	kani::assume(first <= second);
+	let (early, late) = (policy.retry_delay(first), policy.retry_delay(second));
+	assert!(base <= early && early <= late && late <= cap);
+
+	let sequence: u64 = kani::any();
+	let later: u64 = kani::any();
+	kani::assume(sequence <= later);
+	let delay = policy.logical_delay(sequence);
+	assert_eq!(delay.is_err(), sequence == 0);
+	if let Ok(delay) = delay {
+		let Ok(later_delay) = policy.logical_delay(later) else { panic!("later sequence refused") };
+		assert!(base <= delay && delay <= later_delay && later_delay <= cap);
+		let now: i64 = kani::any();
+		let not_before = policy.logical_not_before(now, sequence);
+		match now.checked_add(delay) {
+			Some(sum) => assert_eq!(not_before.as_ref().ok(), Some(&sum)),
+			None => assert!(not_before.is_err()),
+		}
+		kani::cover!(not_before.is_err(), "not_before refuses instead of wrapping");
+		kani::cover!(delay == cap && sequence > 1, "logical delay saturates at the cap");
+	}
+	kani::cover!(early < late, "retry delay grows");
+	kani::cover!(late == cap && second == u32::MAX, "retry delay saturates at the cap");
+	kani::cover!(sequence == 0, "sequence zero is refused");
+}
+
+// Bound: all 4 impacts x 3 access levels x 2 reachabilities x 2 boundary flags
+// x 2 support flags, i.e. the whole input domain. The oracle is the contract's
+// priority policy 1 table written out independently: urgent needs high or
+// critical impact, remote access, traced reachability and a cited boundary;
+// high needs high or critical impact and tracing; low impact is background;
+// unsupported structure falls back to normal with score zero.
+// invariant: I6
+// ci: fast
+#[kani::proof]
+fn classify_priority_is_total() {
+	use loupe_core::review_priority::{Access, Impact, Reachability};
+
+	use crate::scheduler::Band;
+	let impact_choice: u8 = kani::any();
+	let access_choice: u8 = kani::any();
+	kani::assume(impact_choice < 4 && access_choice < 3);
+	let impact =
+		[Impact::Low, Impact::Medium, Impact::High, Impact::Critical][impact_choice as usize];
+	let access = [Access::Privileged, Access::Local, Access::Remote][access_choice as usize];
+	let traced: bool = kani::any();
+	let reachability = if traced { Reachability::Traced } else { Reachability::Plausible };
+	let boundary: bool = kani::any();
+	let supported: bool = kani::any();
+	let priority = crate::admission_policy::classify_priority(
+		impact,
+		access,
+		reachability,
+		boundary,
+		supported,
+	);
+	let severe = impact_choice >= 2;
+	let (band, score) = if !supported {
+		(Band::Normal, 0)
+	} else {
+		let band = if severe && access_choice == 2 && traced && boundary {
+			Band::Urgent
+		} else if severe && traced {
+			Band::High
+		} else if impact_choice == 0 {
+			Band::Background
+		} else {
+			Band::Normal
+		};
+		let score = 100 * u32::from(impact_choice)
+			+ 50 * u32::from(access_choice)
+			+ if traced { 100 } else { 0 }
+			+ if boundary { 50 } else { 0 };
+		(band, score)
+	};
+	assert_eq!(priority.band, band);
+	assert_eq!(priority.score, score);
+	assert!(priority.score <= 550);
+	kani::cover!(priority.band == Band::Urgent && priority.score == 550, "maximum urgent");
+	kani::cover!(priority.band == Band::High, "high band");
+	kani::cover!(priority.band == Band::Background, "background band");
+	kani::cover!(priority.band == Band::Normal && supported, "supported normal band");
+	kani::cover!(!supported && severe && traced && boundary, "unsupported urgent shape falls back");
+}
