@@ -422,7 +422,12 @@ macro_rules! phase_decoder {
 					$(#[serde(borrow)] $field: &'a RawValue),*
 				}
 				let wire: Wire<'_> = serde_json::from_str(raw.get())?;
-				Ok($lease { provenance: wire.provenance, $($field: $admit(u, wire.$field)?),* })
+				let lease = $lease { provenance: wire.provenance, $($field: $admit(u, wire.$field)?),* };
+				crate::objects_only(
+					raw.get().as_bytes(),
+					lease,
+					Error::Invalid("lease object in sequence form"),
+				)
 			}
 		}
 		impl ValidateCarrying<&[u8], Server> for $decoder {

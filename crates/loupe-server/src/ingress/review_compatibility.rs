@@ -66,7 +66,11 @@ impl Validate<&[u8], Operator> for ResetDecoder {
 		if input.get().len() > LIMIT {
 			return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"));
 		}
-		serde_json::from_slice(input.get()).map_err(ApiError::invalid)
+		let value: ResetGenerationRequest =
+			serde_json::from_slice(input.get()).map_err(ApiError::invalid)?;
+		loupe_core::json_objects::objects_only(input.get(), &value)
+			.map_err(|_| ApiError::invalid("request object in sequence form"))?;
+		Ok(value)
 	}
 }
 
@@ -89,8 +93,9 @@ mod tests {
 			br#"{"protocol_version":3,"protocol_version":3}"#.as_slice(),
 			br#"{"protocol_version":3,"actor":"FORGED"}"#,
 			br#"{"protocol_version":2}"#,
+			b"[3]",
 		] {
-			assert!(decode(raw).is_err());
+			assert!(decode(raw).is_err(), "{}", String::from_utf8_lossy(raw));
 		}
 	}
 }

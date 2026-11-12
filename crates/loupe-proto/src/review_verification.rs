@@ -105,7 +105,9 @@ impl ValidateCarrying<&[u8], Worker> for FinalizeVerificationRequestDecoder {
 			.ok_or(InvalidTerminal)?
 			.validate(VerificationTerminalV1Decoder)
 			.map_err(|_| InvalidTerminal)?;
-		Ok(FinalizeVerificationRequest { protocol_version: wire.protocol_version, payload })
+		let value =
+			FinalizeVerificationRequest { protocol_version: wire.protocol_version, payload };
+		crate::objects_only(input.get(), value, InvalidTerminal)
 	}
 }
 #[cfg(test)]

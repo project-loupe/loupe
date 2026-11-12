@@ -87,11 +87,12 @@ impl Validate<&[u8], Worker> for PhaseFailureRequestDecoder {
 				BoundedText::new(&mark, &decoded)
 			})
 			.transpose()?;
-		Ok(PhaseFailureRequest {
+		let value = PhaseFailureRequest {
 			protocol_version: wire.protocol_version,
 			outcome: wire.outcome,
 			error,
-		})
+		};
+		crate::objects_only(input.get(), value, crate::review_api::NOT_OBJECT)
 	}
 }
 pub struct PhaseHeartbeatRequestDecoder;
@@ -104,7 +105,8 @@ impl Validate<&[u8], Worker> for PhaseHeartbeatRequestDecoder {
 		if input.get().len() > 8192 {
 			return Err(Error::Invalid("phase control request too large"));
 		}
-		Ok(serde_json::from_slice(input.get())?)
+		let value: PhaseHeartbeatRequest = serde_json::from_slice(input.get())?;
+		crate::objects_only(input.get(), value, crate::review_api::NOT_OBJECT)
 	}
 }
 #[cfg(test)]

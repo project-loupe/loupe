@@ -44,6 +44,8 @@ mod secret_serde;
 mod version;
 
 #[cfg(test)]
+mod array_form_tests;
+#[cfg(test)]
 #[path = "../tests/support/fixtures.rs"]
 mod test_support;
 
@@ -58,6 +60,12 @@ pub use job_io::{
 };
 pub use lease::{JobCapability, LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse};
 pub use loupe_core::ScannerDocument;
+
+/// Admits a decoded request only if its original bytes spelled each of its
+/// objects as a JSON object, not as serde's sequence form.
+fn objects_only<T: serde::Serialize, E>(raw: &[u8], value: T, error: E) -> Result<T, E> {
+	loupe_core::json_objects::objects_only(raw, &value).map(|()| value).map_err(|_| error)
+}
 pub use registry::{
 	GithubAppResponse, GithubAppSummary, GithubReportingAuth, ListReposResponse,
 	RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse,

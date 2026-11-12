@@ -137,11 +137,19 @@ macro_rules! request_decoder {
 					ClientKey::MAX_LEN,
 					ClientKey::MAX_LEN,
 				)?;
-				Ok($request {
+				let value = $request {
 					protocol_version: wire.protocol_version,
 					$key: Identifier::new(&u.mark(), &key)?,
 					$payload: content(&u, wire.$payload, $content)?,
-				})
+				};
+				crate::objects_only(
+					u.get(),
+					value,
+					Error::Invalid {
+						field: "review_evidence_request",
+						rule: "request object in sequence form",
+					},
+				)
 			}
 		}
 	};

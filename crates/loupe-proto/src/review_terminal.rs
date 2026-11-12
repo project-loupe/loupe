@@ -131,7 +131,8 @@ impl ValidateCarrying<&[u8], Worker> for FinalizeSurveyRequestDecoder {
 			.ok_or(InvalidTerminal)?
 			.validate(SurveyTerminalV1Decoder)
 			.map_err(|_| InvalidTerminal)?;
-		Ok(FinalizeSurveyRequest { protocol_version: wire.protocol_version, payload })
+		let value = FinalizeSurveyRequest { protocol_version: wire.protocol_version, payload };
+		crate::objects_only(input.get(), value, InvalidTerminal)
 	}
 }
 

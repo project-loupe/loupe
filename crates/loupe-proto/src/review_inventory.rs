@@ -142,7 +142,7 @@ impl Validate<&[u8], Worker> for InventoryDispositionRequestDecoder {
 			mappings: wire.mappings,
 		};
 		value.validate().map_err(Error::Invalid)?;
-		Ok(value)
+		crate::objects_only(u.get(), value, crate::review_api::NOT_OBJECT)
 	}
 }
 #[cfg(test)]

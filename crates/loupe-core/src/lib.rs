@@ -29,6 +29,7 @@ pub use scanner::ScannerDocument;
 pub mod canonical;
 pub mod closed_string;
 pub mod inventory_manifest;
+pub mod json_objects;
 pub mod review_candidates;
 pub mod review_metadata;
 pub mod review_payload;

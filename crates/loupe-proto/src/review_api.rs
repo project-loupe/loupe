@@ -314,6 +314,8 @@ fn identifier<P: IdentPolicy>(
 	Ok(Identifier::new(mark, &text)?)
 }
 
+pub(crate) const NOT_OBJECT: Error = Error::Invalid("request object in sequence form");
+
 pub struct PinTargetRequestDecoder;
 impl Validate<&[u8], Worker> for PinTargetRequestDecoder {
 	type Output = PinTargetRequest<Worker>;
@@ -329,10 +331,11 @@ impl Validate<&[u8], Worker> for PinTargetRequestDecoder {
 			commit_sha: &'a RawValue,
 		}
 		let wire: Wire<'_> = serde_json::from_slice(u.get())?;
-		Ok(PinTargetRequest {
+		let value = PinTargetRequest {
 			protocol_version: wire.protocol_version,
 			commit_sha: identifier(&mark, wire.commit_sha)?,
-		})
+		};
+		crate::objects_only(u.get(), value, NOT_OBJECT)
 	}
 }
 
@@ -378,14 +381,15 @@ impl Validate<&[u8], Worker> for InventoryBatchRequestDecoder {
 				})
 			})
 			.collect::<Result<_, Error>>()?;
-		Ok(InventoryBatchRequest {
+		let value = InventoryBatchRequest {
 			protocol_version: wire.protocol_version,
 			format_version: wire.format_version,
 			expected_entry_count: wire.expected_entry_count,
 			expected_digest: identifier(&mark, wire.expected_digest)?,
 			start_position: wire.start_position,
 			entries: LeaseList::new(entries).map_err(Error::Invalid)?,
-		})
+		};
+		crate::objects_only(u.get(), value, NOT_OBJECT)
 	}
 }
 
@@ -402,7 +406,8 @@ impl Validate<&[u8], Worker> for SealInventoryRequestDecoder {
 			protocol_version: ReviewProtocol,
 		}
 		let wire: Wire = serde_json::from_slice(u.get())?;
-		Ok(SealInventoryRequest { protocol_version: wire.protocol_version })
+		let value = SealInventoryRequest { protocol_version: wire.protocol_version };
+		crate::objects_only(u.get(), value, NOT_OBJECT)
 	}
 }
 
@@ -443,10 +448,11 @@ impl ValidateCarrying<&[u8], Worker> for PublishProfileRequestDecoder {
 			profile: &'a RawValue,
 		}
 		let wire: Wire<'_> = serde_json::from_slice(u.get())?;
-		Ok(PublishProfileRequest {
+		let value = PublishProfileRequest {
 			protocol_version: wire.protocol_version,
 			profile: profile_content(&u, wire.profile)?,
-		})
+		};
+		crate::objects_only(u.get(), value, NOT_OBJECT)
 	}
 }
 

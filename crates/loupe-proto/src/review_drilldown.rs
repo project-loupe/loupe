@@ -112,7 +112,8 @@ impl ValidateCarrying<&[u8], Worker> for FinalizeDrilldownRequestDecoder {
 			.ok_or(InvalidTerminal)?
 			.validate(DrilldownTerminalV1Decoder)
 			.map_err(|_| InvalidTerminal)?;
-		Ok(FinalizeDrilldownRequest { protocol_version: wire.protocol_version, payload })
+		let value = FinalizeDrilldownRequest { protocol_version: wire.protocol_version, payload };
+		crate::objects_only(input.get(), value, InvalidTerminal)
 	}
 }
 #[cfg(test)]
