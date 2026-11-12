@@ -8,7 +8,7 @@ use super::{collect_operator_body_limited, RequestBuffer};
 use crate::auth::AuthedWorker;
 use crate::review::http::{self, ApiError, Result};
 
-const LIMIT: usize = 8192;
+pub(crate) const LIMIT: usize = 8192;
 
 pub(crate) async fn reset(request: Request) -> Result<ResetGenerationRequest> {
 	http::require_version(request.headers())?;

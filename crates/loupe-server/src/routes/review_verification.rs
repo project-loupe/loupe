@@ -16,6 +16,9 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError, Result};
 use crate::AppState;
 
+pub const REQUEST_CAP: usize = 512 * 1024;
+pub const RESPONSE_CAP: usize = 16 * 1024;
+
 fn reply(value: VerificationReceipt) -> Result<wire::VerificationTerminalResponse<Db>> {
 	let summary = value.summary;
 	Ok(wire::VerificationTerminalResponse {
@@ -66,7 +69,7 @@ fn finish(
 	evidence: &VerificationTerminalV1<Agent>,
 ) -> Result<(Response, Option<Dispatch>)> {
 	let mut dispatch = None;
-	let response = http::transaction(&state.db, worker, headers, job, 16 * 1024, |tx| {
+	let response = http::transaction(&state.db, worker, headers, job, RESPONSE_CAP, |tx| {
 		let value = tx
 			.finalize_verification(evidence, state.require_approval_default, |context| {
 				authority::policy(Phase::Verify, Access::Domain, context)
@@ -87,7 +90,7 @@ pub async fn finalize(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> Result<Response> {
-	let body = http::body(&headers, body, 512 * 1024)?;
+	let body = http::body(&headers, body, REQUEST_CAP)?;
 	let request = body
 		.0
 		.as_bytes()

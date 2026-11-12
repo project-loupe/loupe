@@ -16,6 +16,10 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError};
 use crate::AppState;
 
+/// Context GETs accept no body at all; see `http::no_body`.
+pub const LIMITS_RESPONSE_CAP: usize = 8192;
+pub const CANDIDATES_RESPONSE_CAP: usize = 64 * 1024;
+
 pub async fn limits(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, uri: Uri, body: WorkerBody,
@@ -24,7 +28,7 @@ pub async fn limits(
 	if uri.query().is_some_and(|query| !query.is_empty()) {
 		return Err(ApiError::invalid("limits has no query parameters"));
 	}
-	http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, LIMITS_RESPONSE_CAP, |tx| {
 		for phase in [Phase::Survey, Phase::Drilldown, Phase::Verify] {
 			if let Some(scope) = authority::authorize(tx, phase, Access::Checkout)? {
 				return Ok(limits_response(scope.limits_snapshot()?));
@@ -67,7 +71,7 @@ pub async fn candidates(
 ) -> http::Result<Response> {
 	http::no_body(&headers, body)?;
 	let query = crate::ingress::review_context::candidates(&worker, &uri)?;
-	http::transaction(&state.db, &worker, &headers, job, 64 * 1024, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, CANDIDATES_RESPONSE_CAP, |tx| {
 		for phase in [Phase::Survey, Phase::Drilldown] {
 			if let Some(scope) = authority::authorize(tx, phase, Access::Domain)? {
 				return Ok(CandidatesResponse {

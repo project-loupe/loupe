@@ -17,6 +17,9 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError, Result};
 use crate::AppState;
 
+pub const REQUEST_CAP: usize = 128 * 1024;
+pub const RESPONSE_CAP: usize = 16 * 1024;
+
 fn reply(value: SurveyFinalization) -> Result<SurveyTerminalResponse<Db>> {
 	Ok(SurveyTerminalResponse {
 		protocol_version: ReviewProtocol,
@@ -57,13 +60,13 @@ pub async fn finalize(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> Result<Response> {
-	let body = http::body(&headers, body, 128 * 1024)?;
+	let body = http::body(&headers, body, REQUEST_CAP)?;
 	let request = body
 		.0
 		.as_bytes()
 		.validate_carrying(FinalizeSurveyRequestDecoder)
 		.map_err(ApiError::invalid)?;
-	let response = http::transaction(&state.db, &worker, &headers, job, 16 * 1024, |tx| {
+	let response = http::transaction(&state.db, &worker, &headers, job, RESPONSE_CAP, |tx| {
 		let snapshot = tx
 			.finalize_survey(&request.payload, |context| {
 				authority::policy(Phase::Survey, Access::Domain, context)

@@ -18,6 +18,12 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError};
 use crate::AppState;
 
+/// Shared by `leads` and `sibling-leads`.
+pub const LEAD_REQUEST_CAP: usize = 256 * 1024;
+pub const LEAD_RESPONSE_CAP: usize = 8192;
+pub const RESULT_REQUEST_CAP: usize = 256 * 1024;
+pub const RESULT_RESPONSE_CAP: usize = 8192;
+
 pub async fn submit_lead(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
@@ -34,14 +40,14 @@ async fn submit(
 	state: AppState, job: i64, worker: AuthedWorker, headers: HeaderMap, body: WorkerBody,
 	phase: Phase,
 ) -> http::Result<Response> {
-	let body = http::body(&headers, body, 256 * 1024)?;
+	let body = http::body(&headers, body, LEAD_REQUEST_CAP)?;
 	let request = body
 		.0
 		.as_bytes()
 		.validate_carrying(LeadCheckpointRequestDecoder)
 		.map_err(ApiError::invalid)?;
 	let digest = request.digest().map_err(ApiError::invalid)?;
-	let response = http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
+	let response = http::transaction(&state.db, &worker, &headers, job, LEAD_RESPONSE_CAP, |tx| {
 		let scope =
 			authority::authorize(tx, phase, Access::Domain)?.ok_or_else(ApiError::denied)?;
 		let submission = LeadCheckpoint {
@@ -85,29 +91,30 @@ pub async fn submit_unit_result(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> http::Result<Response> {
-	let body = http::body(&headers, body, 256 * 1024)?;
+	let body = http::body(&headers, body, RESULT_REQUEST_CAP)?;
 	let request = body
 		.0
 		.as_bytes()
 		.validate_carrying(UnitResultCheckpointRequestDecoder)
 		.map_err(ApiError::invalid)?;
 	let digest = request.digest().map_err(ApiError::invalid)?;
-	let response = http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
-		let scope = authority::authorize(tx, Phase::Survey, Access::Domain)?
-			.ok_or_else(ApiError::denied)?;
-		let receipt = scope.submit_unit_result_checkpoint(&UnitResultCheckpoint {
-			key: &request.client_result_key,
-			digest: &digest,
-			result: &request.result,
+	let response =
+		http::transaction(&state.db, &worker, &headers, job, RESULT_RESPONSE_CAP, |tx| {
+			let scope = authority::authorize(tx, Phase::Survey, Access::Domain)?
+				.ok_or_else(ApiError::denied)?;
+			let receipt = scope.submit_unit_result_checkpoint(&UnitResultCheckpoint {
+				key: &request.client_result_key,
+				digest: &digest,
+				result: &request.result,
+			})?;
+			Ok(wire::UnitResultCheckpointResponse {
+				protocol_version: ReviewProtocol,
+				result_id: receipt.result_id.try_into().map_err(ApiError::invalid)?,
+				review_unit_id: receipt.review_unit_id.try_into().map_err(ApiError::invalid)?,
+				assignment_epoch: receipt.assignment_epoch,
+				disposition: receipt.disposition,
+			})
 		})?;
-		Ok(wire::UnitResultCheckpointResponse {
-			protocol_version: ReviewProtocol,
-			result_id: receipt.result_id.try_into().map_err(ApiError::invalid)?,
-			review_unit_id: receipt.review_unit_id.try_into().map_err(ApiError::invalid)?,
-			assignment_epoch: receipt.assignment_epoch,
-			disposition: receipt.disposition,
-		})
-	})?;
 	state.job_arrived.notify_one();
 	Ok(response)
 }

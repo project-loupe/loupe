@@ -21,6 +21,15 @@ use crate::review::envelope;
 use crate::review::http::{self, ApiError, Result};
 use crate::AppState;
 
+pub const PIN_TARGET_REQUEST_CAP: usize = 2 * 1024;
+pub const PIN_TARGET_RESPONSE_CAP: usize = 4 * 1024 * 1024;
+pub const INVENTORY_BATCH_REQUEST_CAP: usize = 2 * 1024 * 1024;
+pub const INVENTORY_BATCH_RESPONSE_CAP: usize = 8 * 1024;
+pub const SEAL_INVENTORY_REQUEST_CAP: usize = 2 * 1024;
+pub const SEAL_INVENTORY_RESPONSE_CAP: usize = 8 * 1024;
+pub const PUBLISH_PROFILE_REQUEST_CAP: usize = 256 * 1024;
+pub const PUBLISH_PROFILE_RESPONSE_CAP: usize = 4 * 1024;
+
 fn progress(manifest: host_preparation::Manifest) -> ManifestProgress<Db> {
 	ManifestProgress {
 		protocol_version: ReviewProtocol,
@@ -58,10 +67,10 @@ pub async fn pin_target(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> Result<Response> {
-	let body = http::body(&headers, body, 2 * 1024)?;
+	let body = http::body(&headers, body, PIN_TARGET_REQUEST_CAP)?;
 	let request = body.0.as_bytes().validate(PinTargetRequestDecoder).map_err(ApiError::invalid)?;
 	let digest = pin_digest(&request)?;
-	http::transaction(&state.db, &worker, &headers, job, 4 * 1024 * 1024, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, PIN_TARGET_RESPONSE_CAP, |tx| {
 		match tx.replay_pin_target(&request.commit_sha, &digest)? {
 			PinReplay::Receipt { receipt, commit } => return deferred(&receipt, commit),
 			PinReplay::Reject(Reject::WrongDigest) => {
@@ -80,7 +89,7 @@ pub async fn inventory_batch(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> Result<Response> {
-	let body = http::body(&headers, body, 2 * 1024 * 1024)?;
+	let body = http::body(&headers, body, INVENTORY_BATCH_REQUEST_CAP)?;
 	let request =
 		body.0.as_bytes().validate(InventoryBatchRequestDecoder).map_err(ApiError::invalid)?;
 	let digest: Vec<u8> = request
@@ -104,7 +113,7 @@ pub async fn inventory_batch(
 		.iter()
 		.map(|entry| entry.to_manifest().map_err(ApiError::invalid))
 		.collect::<Result<Vec<_>>>()?;
-	http::transaction(&state.db, &worker, &headers, job, 8 * 1024, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, INVENTORY_BATCH_RESPONSE_CAP, |tx| {
 		let scope = authority::authorize(tx, Phase::Survey, Access::PreparedHost)?
 			.ok_or_else(ApiError::denied)?;
 		scope.declare_manifest(request.expected_entry_count, &digest)?;
@@ -116,9 +125,9 @@ pub async fn seal_inventory(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> Result<Response> {
-	let body = http::body(&headers, body, 2 * 1024)?;
+	let body = http::body(&headers, body, SEAL_INVENTORY_REQUEST_CAP)?;
 	body.0.as_bytes().validate(SealInventoryRequestDecoder).map_err(ApiError::invalid)?;
-	http::transaction(&state.db, &worker, &headers, job, 8 * 1024, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, SEAL_INVENTORY_RESPONSE_CAP, |tx| {
 		let scope = authority::authorize(tx, Phase::Survey, Access::PreparedHost)?
 			.ok_or_else(ApiError::denied)?;
 		Ok(progress(scope.seal_manifest()?))
@@ -129,13 +138,13 @@ pub async fn publish_profile(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> Result<Response> {
-	let body = http::body(&headers, body, 256 * 1024)?;
+	let body = http::body(&headers, body, PUBLISH_PROFILE_REQUEST_CAP)?;
 	let request = body
 		.0
 		.as_bytes()
 		.validate_carrying(PublishProfileRequestDecoder)
 		.map_err(ApiError::invalid)?;
-	http::transaction(&state.db, &worker, &headers, job, 4 * 1024, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, PUBLISH_PROFILE_RESPONSE_CAP, |tx| {
 		let scope = authority::authorize(tx, Phase::Survey, Access::PreparedHost)?
 			.ok_or_else(ApiError::denied)?;
 		let profile = scope.publish_profile(&request.profile)?;
