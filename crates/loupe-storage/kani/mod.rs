@@ -288,3 +288,63 @@ fn replay_decision_is_exact() {
 		"long stored digest conflicts"
 	);
 }
+
+// Bound: Symbolic capability well-formedness, binding result, 32-byte stored
+// and requested digests, and failure of either read. The receipt is an opaque
+// symbolic id, so identity of the returned value proves it is the loaded one.
+// No loops besides the fixed 32-byte comparison.
+// invariant: I5
+// ci: fast
+#[kani::proof]
+#[kani::unwind(33)]
+fn terminal_replay_returns_sealed_result_only() {
+	use crate::terminal_receipt::{replay_decision, Reject};
+	let well_formed: bool = kani::any();
+	let bound: bool = kani::any();
+	let bound_fails: bool = kani::any();
+	let load_fails: bool = kani::any();
+	let stored: (u64, [u8; 32]) = (kani::any(), kani::any());
+	let requested: [u8; 32] = kani::any();
+	let mut bound_calls = 0u8;
+	let mut loads = 0u8;
+	let result = replay_decision(
+		well_formed,
+		|| {
+			bound_calls += 1;
+			if bound_fails {
+				Err(crate::Error::Conflict(crate::Conflict::TerminalReceipt))
+			} else {
+				Ok(bound)
+			}
+		},
+		|| {
+			loads += 1;
+			if load_fails {
+				Err(crate::Error::Conflict(crate::Conflict::TerminalReceipt))
+			} else {
+				Ok(stored)
+			}
+		},
+		|receipt: &(u64, [u8; 32])| receipt.1.as_slice(),
+		&requested,
+	);
+	assert!(loads <= 1 && bound_calls <= 1);
+	if loads == 1 {
+		assert!(well_formed && bound && !bound_fails);
+	}
+	match result {
+		Ok(Ok(receipt)) => {
+			assert!(well_formed && bound && !bound_fails && !load_fails);
+			assert_eq!(receipt, stored);
+			assert_eq!(stored.1, requested);
+		},
+		Ok(Err(Reject::Denied)) => assert!(!well_formed || !bound),
+		Ok(Err(Reject::WrongDigest)) => {
+			assert!(well_formed && bound && !load_fails && stored.1 != requested)
+		},
+		Err(_) => assert!(bound_fails || load_fails),
+	}
+	kani::cover!(matches!(result, Ok(Ok(_))), "sealed receipt replayed");
+	kani::cover!(matches!(result, Ok(Err(Reject::WrongDigest))), "divergent digest");
+	kani::cover!(matches!(result, Ok(Err(Reject::Denied))), "unbound identity denied");
+}
