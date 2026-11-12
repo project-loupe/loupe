@@ -14,3 +14,4 @@ loupe-worker argv_never_contains_a_forbidden_flag
 loupe-worker setenv_names_are_fixed_or_explicit
 loupe-worker request_policy_fixes_model_and_effort
 loupe-worker boundary_never_occurs_in_content_of_a_rendered_block
+loupe-core review_metadata_identifiers_never_panic
