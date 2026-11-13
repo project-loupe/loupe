@@ -664,3 +664,20 @@ fn terminal_binding_is_checked_before_receipt_decoding() {
 // The original checkpoint replay-before-fresh-check and mutation rollback case
 // now belongs to storage's private transaction tests: server authority has no
 // SQL/RepoScope escape with which to mutate domain rows.
+
+#[test]
+fn pre_generation_support_needs_headless_checkout_of_the_campaign_recipe() {
+	use support::{supported, CampaignRecipe, RecipeKind, SupportFacts};
+	let facts = |access, head_present| SupportFacts {
+		campaign: CampaignRecipe::Bootstrap,
+		generation: None,
+		head_present,
+		access,
+	};
+	assert!(supported(RecipeKind::Bootstrap, facts(Access::Checkout, false)));
+	assert!(!supported(RecipeKind::Incremental, facts(Access::Checkout, false)));
+	assert!(!supported(RecipeKind::Bootstrap, facts(Access::Checkout, true)));
+	for access in [Access::LeaseControl, Access::PreparedHost, Access::Domain] {
+		assert!(!supported(RecipeKind::Bootstrap, facts(access, false)), "{access:?}");
+	}
+}

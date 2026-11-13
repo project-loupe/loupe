@@ -5,6 +5,9 @@
 //! ```compile_fail,E0277
 //! let _:loupe_proto::review_verification::VerificationReceipt<loupe_provenance::Db>=serde_json::from_str("{}").unwrap();
 //! ```
+//! ```compile_fail,E0277
+//! let _: loupe_proto::review_verification::FinalizeVerificationRequest<loupe_provenance::Operator> = serde_json::from_str("{}").unwrap();
+//! ```
 use loupe_core::review_payload::{VerificationTerminalV1, VerificationTerminalV1Decoder, Version1};
 use loupe_provenance::{Agent, Source, Unvalidated, ValidateCarrying, Worker};
 use serde::{Deserialize, Serialize};
@@ -102,7 +105,9 @@ impl ValidateCarrying<&[u8], Worker> for FinalizeVerificationRequestDecoder {
 			.ok_or(InvalidTerminal)?
 			.validate(VerificationTerminalV1Decoder)
 			.map_err(|_| InvalidTerminal)?;
-		Ok(FinalizeVerificationRequest { protocol_version: wire.protocol_version, payload })
+		let value =
+			FinalizeVerificationRequest { protocol_version: wire.protocol_version, payload };
+		crate::objects_only(input.get(), value, InvalidTerminal)
 	}
 }
 #[cfg(test)]

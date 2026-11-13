@@ -100,3 +100,67 @@ fn protocol_error_names_exact_versions() {
 		"three distinct version fields"
 	);
 }
+
+// Bound: every i64.
+// invariant: I6
+// ci: fast
+#[kani::proof]
+fn review_id_rejects_non_positive_values() {
+	use crate::review_lease::ReviewId;
+	let raw: i64 = kani::any();
+	let id = ReviewId::try_from(raw);
+	assert_eq!(id.is_ok(), raw > 0);
+	if let Ok(id) = id {
+		assert_eq!(i64::from(id), raw);
+	}
+	kani::cover!(raw == 1 && id.is_ok(), "smallest id accepted");
+	kani::cover!(raw == 0 && id.is_err(), "zero id refused");
+	kani::cover!(raw == i64::MIN && id.is_err(), "most negative id refused");
+}
+
+// Bound: ReviewCommit and ReviewDigest admission
+// predicates over every length 0..=65 of a lowercase-hex filler with one
+// arbitrary ASCII byte at an arbitrary position: 40 is the SHA-1 commit, 64
+// the SHA-256 commit and the digest, 65 the first overlong input, and the
+// single byte reaches every per-byte accept/reject case. Fully symbolic
+// content timed out at 600s (attempts: arbitrary UTF-8, ASCII through
+// from_utf8, ASCII pushed into a String), and so did this single-byte domain
+// (listed in ci/kani-no-verdict.txt); ReviewId is proved separately by
+// review_id_rejects_non_positive_values. Multi-byte content is the fuzz
+// targets'. The marked constructors need a Mark, which this crate cannot mint
+// outside tests (forbid(unsafe_code)); review_metadata_identifiers_never_panic
+// in loupe-core covers the constructor path. Unwind 67 covers the 65-byte
+// loops plus termination.
+// invariant: I6
+#[kani::proof]
+#[kani::unwind(67)]
+fn review_id_and_commit_newtypes_never_panic() {
+	use loupe_core::text::IdentPolicy;
+
+	use crate::review_lease::{CommitPolicy, DigestPolicy};
+	let len: usize = kani::any();
+	let position: usize = kani::any();
+	let byte: u8 = kani::any();
+	kani::assume(len <= 65 && byte.is_ascii());
+	let mut bytes = [b'a'; 65];
+	if position < len {
+		bytes[position] = byte;
+	}
+	let mut owned = String::with_capacity(bytes.len());
+	for byte in &bytes[..len] {
+		owned.push(char::from(*byte));
+	}
+	let text = owned.as_str();
+	let hex = position >= len || byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+	let commit = CommitPolicy::accepts(text);
+	let digest = DigestPolicy::accepts(text);
+	assert_eq!(commit, (len == 40 || len == 64) && hex);
+	assert_eq!(digest, len == 64 && hex);
+	kani::cover!(commit && len == 40, "SHA-1 commit accepted");
+	kani::cover!(commit && digest, "64-hex commit and digest accepted");
+	kani::cover!(
+		!digest && len == 64 && byte == b'A' && position < len,
+		"uppercase digest refused"
+	);
+	kani::cover!(!commit && len == 65, "overlong commit refused");
+}

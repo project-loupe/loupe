@@ -16,11 +16,14 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError};
 use crate::AppState;
 
+pub const REQUEST_CAP: usize = MAX_REQUEST_BYTES;
+pub const RESPONSE_CAP: usize = 8192;
+
 pub async fn submit(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> http::Result<Response> {
-	let body = http::body(&headers, body, MAX_REQUEST_BYTES)?;
+	let body = http::body(&headers, body, REQUEST_CAP)?;
 	let request = body
 		.0
 		.as_bytes()
@@ -45,7 +48,7 @@ pub async fn submit(
 		Disposition::Excluded => inventory::Disposition::Excluded,
 		Disposition::Unresolved => inventory::Disposition::Unresolved,
 	};
-	http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, RESPONSE_CAP, |tx| {
 		let scope = authority::authorize(tx, Phase::Survey, Access::Domain)?
 			.ok_or_else(ApiError::denied)?;
 		let receipt = scope.submit_inventory_disposition(&stored::Submission {

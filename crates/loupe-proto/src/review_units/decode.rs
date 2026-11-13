@@ -125,6 +125,6 @@ impl ValidateCarrying<&[u8], Worker> for ReviewUnitRequestDecoder {
 			semantic_context: optional(&u, wire.semantic_context)?,
 		};
 		request.validate().map_err(invalid)?;
-		Ok(request)
+		crate::objects_only(u.get(), request, invalid("request object in sequence form"))
 	}
 }

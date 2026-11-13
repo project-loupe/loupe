@@ -14,11 +14,14 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError};
 use crate::AppState;
 
+pub const REQUEST_CAP: usize = 256 * 1024;
+pub const RESPONSE_CAP: usize = 8192;
+
 pub async fn submit(
 	State(state): State<AppState>, Path(job): Path<i64>,
 	Extension(worker): Extension<AuthedWorker>, headers: HeaderMap, body: WorkerBody,
 ) -> http::Result<Response> {
-	let body = http::body(&headers, body, 256 * 1024)?;
+	let body = http::body(&headers, body, REQUEST_CAP)?;
 	let request =
 		body.0.as_bytes().validate_carrying(ReviewUnitRequestDecoder).map_err(ApiError::invalid)?;
 	let digest = request.digest().map_err(ApiError::invalid)?;
@@ -34,7 +37,7 @@ pub async fn submit(
 		PriorityBand::Normal => Priority::Normal,
 		PriorityBand::Background => Priority::Background,
 	};
-	http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, RESPONSE_CAP, |tx| {
 		let scope = authority::authorize(tx, Phase::Survey, Access::Domain)?
 			.ok_or_else(ApiError::denied)?;
 		let receipt = scope.submit_review_unit(&UnitProposal {

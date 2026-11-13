@@ -45,7 +45,7 @@ pub fn do_test(data: &[u8]) {
 
 // Serialize containers explicitly instead of using production's Serialize
 // wrapper. Primitive spelling deliberately follows the serde_json contract.
-fn write_json(value: &Value, output: &mut Vec<u8>, reverse_and_space: bool) {
+pub(crate) fn write_json(value: &Value, output: &mut Vec<u8>, reverse_and_space: bool) {
 	match value {
 		Value::Object(fields) => {
 			let mut fields: Vec<_> = fields.iter().collect();

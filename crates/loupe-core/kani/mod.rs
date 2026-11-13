@@ -491,3 +491,146 @@ fn json_string_preflight_accepts_surrogate_pairs() {
 	);
 	kani::cover!(high == 0xdbff && low == 0xdfff && max_bytes == 3, "last scalar exceeds byte cap");
 }
+
+// Bound: every usize canonical length against SurveyTerminalV1::MAX_BYTES.
+// Canonical length goes through serde_json, so no closed formula is
+// attempted: this is the monotonicity fallback (accepted iff length <= 32 KiB,
+// so accepted lengths are downward closed), proved on the shared check that
+// SurveyTerminalV1::canonical_bytes calls, plus the type's binding to
+// SURVEY_TERMINAL_MAX_BYTES. Driving the real method with rendering stubbed
+// timed out at 600s in serde_json's map construction, so exact lengths of
+// real renderings belong to the core_review_payload fuzz target.
+// Unwind 17 bounds the 15-byte field-label comparison plus termination.
+// invariant: I6
+// ci: fast
+#[kani::proof]
+#[kani::unwind(17)]
+fn survey_terminal_aggregate_cap_is_exact() {
+	use crate::review_payload::{
+		within_aggregate_cap, Error, SurveyTerminalV1, SURVEY_TERMINAL_MAX_BYTES,
+	};
+	assert_eq!(SURVEY_TERMINAL_MAX_BYTES, 32 * 1024);
+	assert_eq!(SurveyTerminalV1::<loupe_provenance::Agent>::MAX_BYTES, SURVEY_TERMINAL_MAX_BYTES);
+	let len: usize = kani::any();
+	let shorter: usize = kani::any();
+	kani::assume(shorter <= len);
+	let result = within_aggregate_cap("survey_terminal", SURVEY_TERMINAL_MAX_BYTES, len);
+	assert_eq!(result.is_ok(), len <= SURVEY_TERMINAL_MAX_BYTES);
+	if result.is_ok() {
+		assert!(within_aggregate_cap("survey_terminal", SURVEY_TERMINAL_MAX_BYTES, shorter).is_ok());
+	}
+	if let Err(error) = &result {
+		assert!(matches!(
+			error,
+			Error::Bytes { field: "survey_terminal", max_bytes }
+				if *max_bytes == SURVEY_TERMINAL_MAX_BYTES
+		));
+	}
+	kani::cover!(result.is_ok() && len == SURVEY_TERMINAL_MAX_BYTES, "exact cap accepted");
+	kani::cover!(result.is_err() && len == SURVEY_TERMINAL_MAX_BYTES + 1, "cap + 1 refused");
+	kani::cover!(result.is_err() && len == usize::MAX, "largest length refused");
+}
+
+// Bound: every usize canonical length against each of the four evidence
+// payload types' MAX_BYTES (FindingEvidenceV1, PromotionV1,
+// DrilldownTerminalV1, VerificationTerminalV1). Their values all carry
+// labelled text and cannot be built without a Mark here, so this proves the
+// shared cap check the canonical_bytes macro calls, plus the binding of each
+// type to EVIDENCE_MAX_BYTES; monotonicity fallback as above, with exact
+// rendered lengths owned by the core_review_payload fuzz target.
+// Unwind 10 bounds the eight-byte field-label comparison plus termination.
+// invariant: I6
+// ci: fast
+#[kani::proof]
+#[kani::unwind(10)]
+fn evidence_aggregate_cap_is_exact() {
+	use crate::review_payload::{
+		within_aggregate_cap, DrilldownTerminalV1, Error, FindingEvidenceV1, PromotionV1,
+		VerificationTerminalV1, EVIDENCE_MAX_BYTES,
+	};
+	type A = loupe_provenance::Agent;
+	assert_eq!(EVIDENCE_MAX_BYTES, 128 * 1024);
+	let caps = [
+		FindingEvidenceV1::<A>::MAX_BYTES,
+		PromotionV1::<A>::MAX_BYTES,
+		DrilldownTerminalV1::<A>::MAX_BYTES,
+		VerificationTerminalV1::<A>::MAX_BYTES,
+	];
+	assert!(caps.iter().all(|cap| *cap == EVIDENCE_MAX_BYTES));
+	let len: usize = kani::any();
+	let shorter: usize = kani::any();
+	kani::assume(shorter <= len);
+	let result = within_aggregate_cap("evidence", EVIDENCE_MAX_BYTES, len);
+	assert_eq!(result.is_ok(), len <= EVIDENCE_MAX_BYTES);
+	if result.is_ok() {
+		assert!(within_aggregate_cap("evidence", EVIDENCE_MAX_BYTES, shorter).is_ok());
+	}
+	if let Err(error) = &result {
+		assert!(matches!(
+			error,
+			Error::Bytes { field: "evidence", max_bytes } if *max_bytes == EVIDENCE_MAX_BYTES
+		));
+	}
+	kani::cover!(result.is_ok() && len == EVIDENCE_MAX_BYTES, "exact cap accepted");
+	kani::cover!(result.is_err() && len == EVIDENCE_MAX_BYTES + 1, "cap + 1 refused");
+	kani::cover!(result.is_err() && len == usize::MAX, "largest length refused");
+}
+
+// Bound: every u32. Version1 is the only version field type on the typed
+// evidence schemas, so a value other than 1 must never decode as version 1.
+// invariant: I6
+// ci: fast
+#[kani::proof]
+fn version1_rejects_every_other_value() {
+	use crate::review_payload::Version1;
+	let value: u32 = kani::any();
+	let result = Version1::try_from(value);
+	assert_eq!(result.is_ok(), value == 1);
+	if let Ok(version) = result {
+		assert_eq!(u32::from(version), 1);
+	}
+	kani::cover!(value == 1 && result.is_ok(), "version one accepted");
+	kani::cover!(value == 0 && result.is_err(), "zero refused");
+	kani::cover!(value == 2 && result.is_err(), "next version refused");
+	kani::cover!(value == u32::MAX && result.is_err(), "largest value refused");
+}
+
+// Bound: the full ReviewCommit and ReviewDigest admission path
+// (checked::identifier: exact byte cap, character filter, policy predicate,
+// whitespace rule) over every length 0..=65 of a lowercase-hex filler with one
+// arbitrary ASCII byte at an arbitrary position, so whitespace, control and
+// non-hex bytes are reached at every place. Fully symbolic content timed out
+// at 600s (three attempts, as for the proto harness), and so did this
+// single-byte domain (listed in ci/kani-no-verdict.txt); multi-byte content
+// is the fuzz targets'. A marked constructor only adds a phantom label to this
+// result. Unwind 67 covers the 65-byte loops plus termination.
+// invariant: I6
+#[kani::proof]
+#[kani::unwind(67)]
+fn review_metadata_identifiers_never_panic() {
+	use crate::review_metadata::{CommitPolicy, DigestPolicy};
+	let len: usize = kani::any();
+	let position: usize = kani::any();
+	let byte: u8 = kani::any();
+	kani::assume(len <= 65 && byte.is_ascii());
+	let mut bytes = [b'a'; 65];
+	if position < len {
+		bytes[position] = byte;
+	}
+	let mut owned = String::with_capacity(bytes.len());
+	for byte in &bytes[..len] {
+		owned.push(char::from(*byte));
+	}
+	let text = owned.as_str();
+	let hex = position >= len || byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+	let commit = crate::text::checked::identifier::<CommitPolicy>(text);
+	let digest = crate::text::checked::identifier::<DigestPolicy>(text);
+	assert_eq!(commit.is_ok(), (len == 40 || len == 64) && hex);
+	assert_eq!(digest.is_ok(), len == 64 && hex);
+	if let Ok(stored) = &commit {
+		assert_eq!(stored.as_bytes(), &bytes[..len]);
+	}
+	kani::cover!(commit.is_ok() && len == 40, "SHA-1 commit accepted");
+	kani::cover!(digest.is_ok(), "digest accepted");
+	kani::cover!(commit.is_err() && len == 65, "overlong commit refused");
+}

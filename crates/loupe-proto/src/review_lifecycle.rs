@@ -12,11 +12,12 @@ use crate::review_api::{ReviewApiDecodeError as Error, ReviewProtocol};
 use crate::review_lease::ReviewId;
 
 // debug-ok: closed protocol and execution states, no input text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailedOutcome {
 	Failed,
 }
+loupe_core::closed_string_enum!(FailedOutcome { Failed });
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PhaseFailureRequest {
 	pub protocol_version: ReviewProtocol,
@@ -86,11 +87,12 @@ impl Validate<&[u8], Worker> for PhaseFailureRequestDecoder {
 				BoundedText::new(&mark, &decoded)
 			})
 			.transpose()?;
-		Ok(PhaseFailureRequest {
+		let value = PhaseFailureRequest {
 			protocol_version: wire.protocol_version,
 			outcome: wire.outcome,
 			error,
-		})
+		};
+		crate::objects_only(input.get(), value, crate::review_api::NOT_OBJECT)
 	}
 }
 pub struct PhaseHeartbeatRequestDecoder;
@@ -103,7 +105,8 @@ impl Validate<&[u8], Worker> for PhaseHeartbeatRequestDecoder {
 		if input.get().len() > 8192 {
 			return Err(Error::Invalid("phase control request too large"));
 		}
-		Ok(serde_json::from_slice(input.get())?)
+		let value: PhaseHeartbeatRequest = serde_json::from_slice(input.get())?;
+		crate::objects_only(input.get(), value, crate::review_api::NOT_OBJECT)
 	}
 }
 #[cfg(test)]

@@ -18,6 +18,8 @@
 - Remove code fences from plain-text email reports and indent multi-line agent text.
 - Retain canonical verification evidence and render phase reports literally after commit; preserve operator delivery recovery without redispatching terminal replay.
 - Allow explicit quiescent reset of incompatible derived generations without dropping canonical findings, mandatory verification intent or replay history.
+- Reject non-string encodings of closed review evidence values.
+- Reject the array form of review phase request, phase lease and generation reset objects.
 
 ## v0.1 — 2026-09-07
 

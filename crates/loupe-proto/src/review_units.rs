@@ -6,6 +6,9 @@
 //! use loupe_provenance::{Agent, Worker};
 //! let _: ReviewUnitRequest<Agent, Worker> = serde_json::from_str("{}").unwrap();
 //! ```
+//! ```compile_fail,E0277
+//! let _: loupe_proto::review_units::ReviewUnitRequest<loupe_provenance::Operator, loupe_provenance::Operator> = serde_json::from_str("{}").unwrap();
+//! ```
 use loupe_core::canonical;
 use loupe_core::text::policy::{Argument, ClientKey, Objective, Reason, Title};
 use loupe_core::text::{BoundedText, Identifier, SourceRef};
@@ -19,7 +22,7 @@ mod decode;
 pub use decode::ReviewUnitRequestDecoder;
 
 // debug-ok: closed advisory priority labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorityBand {
 	Urgent,
@@ -27,6 +30,7 @@ pub enum PriorityBand {
 	Normal,
 	Background,
 }
+loupe_core::closed_string_enum!(PriorityBand { Urgent, High, Normal, Background });
 
 #[derive(Serialize)]
 #[serde(bound(serialize = ""))]

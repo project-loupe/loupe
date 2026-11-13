@@ -65,6 +65,68 @@ fn original(bytes: &[u8]) -> Untrusted<&[u8], Worker> {
 	Untrusted::new(bytes, unsafe { Ingress::<Worker>::new() })
 }
 
+mod review_sealed {
+	pub trait Sealed {}
+}
+
+/// The closed set of phase request decoders the review routes apply to their
+/// original Worker body. Sealing keeps this fixture from admitting any other
+/// validator, so it grants no Worker or Agent label beyond those routes.
+pub trait ReviewDecoder: review_sealed::Sealed {
+	type Output;
+	type Error;
+	#[doc(hidden)]
+	fn decode_original(self, input: Untrusted<&[u8], Worker>) -> Result<Self::Output, Self::Error>;
+}
+
+macro_rules! review_decoders {
+	($method:ident: $($decoder:ty => $output:ty, $error:ty;)+) => {$(
+		impl review_sealed::Sealed for $decoder {}
+		impl ReviewDecoder for $decoder {
+			type Output = $output;
+			type Error = $error;
+			fn decode_original(self, input: Untrusted<&[u8], Worker>) -> Result<$output, $error> {
+				input.$method(self)
+			}
+		}
+	)+};
+}
+use loupe_proto::review_api::{self as api, ReviewApiDecodeError as ApiError};
+use loupe_proto::{
+	review_drilldown as drilldown, review_evidence as evidence, review_inventory as inventory,
+	review_lifecycle as lifecycle, review_terminal as terminal, review_units as units,
+	review_verification as verification,
+};
+review_decoders!(validate:
+	api::PinTargetRequestDecoder => api::PinTargetRequest<Worker>, ApiError;
+	api::InventoryBatchRequestDecoder => api::InventoryBatchRequest<Worker>, ApiError;
+	api::SealInventoryRequestDecoder => api::SealInventoryRequest, ApiError;
+	inventory::InventoryDispositionRequestDecoder =>
+		inventory::InventoryDispositionRequest<Worker>, ApiError;
+	lifecycle::PhaseFailureRequestDecoder => lifecycle::PhaseFailureRequest, ApiError;
+	lifecycle::PhaseHeartbeatRequestDecoder => lifecycle::PhaseHeartbeatRequest, ApiError;
+);
+review_decoders!(validate_carrying:
+	api::PublishProfileRequestDecoder => api::PublishProfileRequest<Agent>, ApiError;
+	units::ReviewUnitRequestDecoder =>
+		units::ReviewUnitRequest<Agent, Worker>, loupe_core::review_payload::Error;
+	evidence::LeadCheckpointRequestDecoder =>
+		evidence::LeadCheckpointRequest, loupe_core::review_payload::Error;
+	evidence::UnitResultCheckpointRequestDecoder =>
+		evidence::UnitResultCheckpointRequest, loupe_core::review_payload::Error;
+	terminal::FinalizeSurveyRequestDecoder =>
+		terminal::FinalizeSurveyRequest<Agent>, terminal::InvalidTerminal;
+	drilldown::FinalizeDrilldownRequestDecoder =>
+		drilldown::FinalizeDrilldownRequest<Agent>, drilldown::InvalidTerminal;
+	verification::FinalizeVerificationRequestDecoder =>
+		verification::FinalizeVerificationRequest<Agent>, verification::InvalidTerminal;
+);
+
+/// Decode synthetic original Worker bytes with one of the phase routes' decoders.
+pub fn review_request<D: ReviewDecoder>(decoder: D, bytes: &[u8]) -> Result<D::Output, D::Error> {
+	decoder.decode_original(original(bytes))
+}
+
 fn finding(finding: &Finding<Agent>) -> Value {
 	json!({
 		"scanner_id": finding.scanner_id.expose(), "severity": finding.severity,

@@ -1,8 +1,9 @@
 //! Fixed Server schema/output/field/carry oracles. Bytes 0/1 select operation
 //! and raw (0), ledger (1), field-boundary (2), or body-boundary (3) recipe.
 //! Lease differential/ledger coverage is Scan/Verify only. Recognized phase
-//! leases still exercise production and closed-error/log checks; an independent
-//! phase schema and original-byte carry oracle remains an S3b follow-up.
+//! leases still exercise production and closed-error/log checks; their schema
+//! and round-trip oracles are in `proto_review_lease`. An original-byte carry
+//! oracle for phase leases remains open.
 pub(crate) mod oracle;
 
 use loupe_worker::client::fuzz_support::{self, HostCase, ResponseCase};

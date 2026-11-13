@@ -110,3 +110,19 @@ crates/loupe-storage/src/ingress/refs.rs cfg-only synthetic original column fixt
 crates/loupe-storage/src/test_support.rs private fixed Agent/Db/Config/Repo fixtures and synthetic Operator authority for DAO and scope controls
 fuzz/src/fixtures.rs private fixed Agent synthetic input fixture for concrete policy and constructor fuzz controls
 crates/loupe-server/kani/mod.rs Kani-only fixed synthetic Db fixture retains the known-spelling Unknown route control through actual bounded validation
+fuzz/src/storage_admission_policy.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/core_review_candidates.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/core_inventory_manifest.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/core_review_payload.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/server_review_authority.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/core_review_priority.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_lifecycle.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_inventory.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_units.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_evidence.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_terminal.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_drilldown.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_verification.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_api.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_lease.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_compatibility.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

@@ -19,6 +19,14 @@ use crate::review::authority::{self, Access, Phase};
 use crate::review::http::{self, ApiError};
 use crate::AppState;
 
+/// Caps of the phase transport; legacy jobs keep the shared-route limits.
+pub const COMPLETE_REQUEST_CAP: usize = 8192;
+pub const COMPLETE_RESPONSE_CAP: usize = 8192;
+pub const HEARTBEAT_REQUEST_CAP: usize = 8192;
+pub const HEARTBEAT_RESPONSE_CAP: usize = 8192;
+/// Cancellation never reads the body on the phase path.
+pub const CANCEL_RESPONSE_CAP: usize = 8192;
+
 fn now() -> i64 {
 	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 		as i64
@@ -53,26 +61,27 @@ async fn failure(
 	let body = WorkerBody::from_request(request, &state)
 		.await
 		.map_err(|(status, _)| ApiError::new(status, "invalid_request"))?;
-	let body = http::body(&headers, body, 8192)?;
+	let body = http::body(&headers, body, COMPLETE_REQUEST_CAP)?;
 	let request =
 		body.0.as_bytes().validate(PhaseFailureRequestDecoder).map_err(ApiError::invalid)?;
-	let response = http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
-		let scope =
-			authority::authorize(tx, phase, Access::LeaseControl)?.ok_or_else(ApiError::denied)?;
-		let outcome = scope.retry_failure(request.error.as_ref())?;
-		let (state, eligible_at) = match outcome {
-			scheduler::RetryOutcome::Failed => (PhaseControlState::Failed, None),
-			scheduler::RetryOutcome::Requeued { eligible_at } => {
-				(PhaseControlState::Queued, Some(eligible_at))
-			},
-		};
-		Ok(PhaseControlResponse {
-			protocol_version: ReviewProtocol,
-			job_id: job.try_into().map_err(ApiError::invalid)?,
-			state,
-			eligible_at,
-		})
-	})?;
+	let response =
+		http::transaction(&state.db, &worker, &headers, job, COMPLETE_RESPONSE_CAP, |tx| {
+			let scope = authority::authorize(tx, phase, Access::LeaseControl)?
+				.ok_or_else(ApiError::denied)?;
+			let outcome = scope.retry_failure(request.error.as_ref())?;
+			let (state, eligible_at) = match outcome {
+				scheduler::RetryOutcome::Failed => (PhaseControlState::Failed, None),
+				scheduler::RetryOutcome::Requeued { eligible_at } => {
+					(PhaseControlState::Queued, Some(eligible_at))
+				},
+			};
+			Ok(PhaseControlResponse {
+				protocol_version: ReviewProtocol,
+				job_id: job.try_into().map_err(ApiError::invalid)?,
+				state,
+				eligible_at,
+			})
+		})?;
 	state.job_arrived.notify_waiters();
 	Ok(response)
 }
@@ -95,9 +104,9 @@ async fn phase_heartbeat(
 	let body = WorkerBody::from_request(request, &state)
 		.await
 		.map_err(|(status, _)| ApiError::new(status, "invalid_request"))?;
-	let body = http::body(&headers, body, 8192)?;
+	let body = http::body(&headers, body, HEARTBEAT_REQUEST_CAP)?;
 	body.0.as_bytes().validate(PhaseHeartbeatRequestDecoder).map_err(ApiError::invalid)?;
-	http::transaction(&state.db, &worker, &headers, job, 8192, |tx| {
+	http::transaction(&state.db, &worker, &headers, job, HEARTBEAT_RESPONSE_CAP, |tx| {
 		let scope =
 			authority::authorize(tx, phase, Access::LeaseControl)?.ok_or_else(ApiError::denied)?;
 		let lease_expires_at = scope.heartbeat(
@@ -128,7 +137,7 @@ pub async fn cancel(
 						state: PhaseControlState::Cancelled,
 						eligible_at: None,
 					},
-					8192,
+					CANCEL_RESPONSE_CAP,
 				)
 			})
 			.transpose()?;

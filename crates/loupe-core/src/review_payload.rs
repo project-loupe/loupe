@@ -81,7 +81,7 @@ impl From<Version1> for u32 {
 }
 
 // debug-ok: closed scalar protocol value contains no untrusted text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocationRole {
 	RootControl,
@@ -90,15 +90,17 @@ pub enum LocationRole {
 	Sink,
 	Implementation,
 }
+crate::closed_string_enum!(LocationRole { RootControl, EntryPoint, Wrapper, Sink, Implementation });
 
 // debug-ok: closed scalar protocol value contains no untrusted text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
 	Low,
 	Medium,
 	High,
 }
+crate::closed_string_enum!(Confidence { Low, Medium, High });
 
 // Private wire schemas retain original JSON tokens; labelled values have no
 // Deserialize implementation. Each field is constructed under the caller's
@@ -331,13 +333,14 @@ impl<S: Source> PromotionV1<S> {
 	}
 }
 // debug-ok: closed scalar protocol value contains no untrusted text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SurveyTerminalReason {
 	Completed,
 	Partial,
 	Deferred,
 }
+crate::closed_string_enum!(SurveyTerminalReason { Completed, Partial, Deferred });
 
 checked_struct!(SurveyTerminalV1, "SurveyTerminalV1", canonical_bytes {
 	version: Version1,
@@ -354,7 +357,7 @@ impl<S: Source> SurveyTerminalV1<S> {
 }
 /// A classification for later server policy, never a scheduling command.
 // debug-ok: closed scalar protocol value contains no untrusted text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinuationClass {
 	SourceAnalysisRemaining,
@@ -362,6 +365,12 @@ pub enum ContinuationClass {
 	ExternalDependency,
 	RequiresSuccessor,
 }
+crate::closed_string_enum!(ContinuationClass {
+	SourceAnalysisRemaining,
+	AwaitingProofInfrastructure,
+	ExternalDependency,
+	RequiresSuccessor
+});
 
 // debug-ok: duplicate target has only a closed kind and numeric ID.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -476,16 +485,18 @@ impl<S: Source> DrilldownTerminalV1<S> {
 	}
 }
 // debug-ok: closed scalar protocol value contains no untrusted text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PreProofRung {
 	L2,
 }
+crate::closed_string_enum!(PreProofRung { L2 });
 // debug-ok: closed scalar protocol value contains no untrusted text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreProofApplicability {
 	NotApplicable,
 }
+crate::closed_string_enum!(PreProofApplicability { NotApplicable });
 
 checked_enum!(VerificationTerminalV1, "VerificationTerminalV1", "verdict", canonical_bytes {
 	Verified {
@@ -552,6 +563,16 @@ impl<S: Source> VerificationTerminalV1<S> {
 		Ok(())
 	}
 }
+/// The aggregate cap on a payload's canonical byte count.
+pub(crate) fn within_aggregate_cap(
+	field: &'static str, max_bytes: usize, len: usize,
+) -> Result<(), Error> {
+	if len > max_bytes {
+		return Err(Error::Bytes { field, max_bytes });
+	}
+	Ok(())
+}
+
 // Concrete payload methods share only rendering. No open-ended validation
 // registry or generic JSON policy can reinterpret their field semantics.
 macro_rules! canonical_payload {
@@ -564,9 +585,7 @@ macro_rules! canonical_payload {
 				// through this type's aggregate-checking Serialize implementation.
 				let value = self.serialize_fields(serde_json::value::Serializer)?;
 				let bytes = canonical::canonical_bytes(&value);
-				if bytes.len() > Self::MAX_BYTES {
-					return Err(Error::Bytes { field: $field, max_bytes: Self::MAX_BYTES });
-				}
+				within_aggregate_cap($field, Self::MAX_BYTES, bytes.len())?;
 				Ok(bytes)
 			}
 			pub fn digest(&self) -> Result<[u8; 32], Error> {

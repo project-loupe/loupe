@@ -11,7 +11,7 @@ use crate::review_api::ReviewProtocol;
 use crate::review_lease::{LeaseList, ReviewId};
 
 // debug-ok: closed inventory disposition, never content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
 	Mapped,
@@ -19,6 +19,7 @@ pub enum Disposition {
 	Excluded,
 	Unresolved,
 }
+loupe_core::closed_string_enum!(Disposition { Mapped, Context, Excluded, Unresolved });
 
 // debug-ok: numeric unit identity and assignment epoch only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,11 @@ pub struct UnitMapping {
 /// use loupe_proto::review_inventory::InventoryDispositionRequest;
 /// use loupe_provenance::Worker;
 /// let _: InventoryDispositionRequest<Worker> = serde_json::from_str("{}").unwrap();
+/// ```
+/// ```compile_fail,E0277
+/// use loupe_proto::review_inventory::InventoryDispositionRequest;
+/// use loupe_provenance::Operator;
+/// let _: InventoryDispositionRequest<Operator> = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Serialize)]
 #[serde(bound(serialize = ""))]
@@ -136,7 +142,7 @@ impl Validate<&[u8], Worker> for InventoryDispositionRequestDecoder {
 			mappings: wire.mappings,
 		};
 		value.validate().map_err(Error::Invalid)?;
-		Ok(value)
+		crate::objects_only(u.get(), value, crate::review_api::NOT_OBJECT)
 	}
 }
 #[cfg(test)]

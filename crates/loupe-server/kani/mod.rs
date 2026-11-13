@@ -196,3 +196,79 @@ fn request_body_length_admission_is_exact() {
 	kani::cover!(sum > usize::MAX as u128 && admitted.is_none(), "arithmetic overflow refused");
 	kani::cover!(used > BODY_CAP && incoming == 0 && admitted.is_none(), "invalid start refused");
 }
+
+fn pick<T: Copy, const N: usize>(items: [T; N]) -> T {
+	let index: usize = kani::any();
+	kani::assume(index < N);
+	items[index]
+}
+
+// Bound: The whole closed domain, enumerated symbolically without loops:
+// 7 recipe kinds, 4 campaign recipes, no generation or one of 3 states with
+// predecessor and commit-equality flags, head presence and 4 access purposes.
+// The decision takes only these closed values, so this is exhaustive.
+// The oracle is the B4 authority contract's "Supported recipes" table.
+// invariant: I1
+// ci: fast
+#[kani::proof]
+fn recipe_support_matches_spec() {
+	use crate::review::authority::support::{
+		supported, Access, CampaignRecipe as C, GenerationFacts, GenerationState as G,
+		RecipeKind as R, SupportFacts,
+	};
+	let recipe = pick([
+		R::Bootstrap,
+		R::Coverage,
+		R::Incremental,
+		R::Reconciliation,
+		R::Corroboration,
+		R::Drilldown,
+		R::Verify,
+	]);
+	let generation = if kani::any() {
+		Some(GenerationFacts {
+			state: pick([G::Building, G::Active, G::Retired]),
+			predecessor_present: kani::any(),
+			commits_equal: kani::any(),
+		})
+	} else {
+		None
+	};
+	let facts = SupportFacts {
+		campaign: pick([C::Bootstrap, C::Incremental, C::Reconciliation, C::Corroboration]),
+		generation,
+		head_present: kani::any(),
+		access: pick([
+			Access::LeaseControl,
+			Access::Checkout,
+			Access::PreparedHost,
+			Access::Domain,
+		]),
+	};
+	let unpinned_checkout =
+		generation.is_none() && facts.access == Access::Checkout && !facts.head_present;
+	let same_active = generation.is_some_and(|g| g.commits_equal && g.state == G::Active);
+	let initial_building = generation
+		.is_some_and(|g| g.commits_equal && g.state == G::Building && !g.predecessor_present);
+	let ordinary_campaign = matches!(facts.campaign, C::Bootstrap | C::Incremental);
+	let child = matches!(recipe, R::Drilldown | R::Verify);
+	let rows = [
+		recipe == R::Bootstrap && facts.campaign == C::Bootstrap && unpinned_checkout,
+		recipe == R::Bootstrap && facts.campaign == C::Bootstrap && initial_building,
+		recipe == R::Coverage && ordinary_campaign && same_active,
+		recipe == R::Incremental && facts.campaign == C::Incremental && unpinned_checkout,
+		recipe == R::Incremental && facts.campaign == C::Incremental && same_active,
+		child && ordinary_campaign && same_active,
+		child && facts.campaign == C::Bootstrap && initial_building,
+	];
+	let actual = supported(recipe, facts);
+	assert_eq!(actual, rows.iter().any(|row| *row));
+	kani::cover!(rows[0], "bootstrap unpinned checkout");
+	kani::cover!(rows[1], "bootstrap initial building generation");
+	kani::cover!(rows[2], "coverage on active generation");
+	kani::cover!(rows[3], "incremental unpinned checkout");
+	kani::cover!(rows[4], "incremental on same-commit active generation");
+	kani::cover!(rows[5], "child on active generation");
+	kani::cover!(rows[6], "child on initial bootstrap building generation");
+	kani::cover!(!actual, "denied context");
+}

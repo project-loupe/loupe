@@ -34,23 +34,33 @@ macro_rules! scalar {
 }
 scalar!(
 	Version1,
+	DuplicateTarget,
+	i64,
+	u32,
 	LocationRole,
 	Confidence,
 	SurveyTerminalReason,
 	ContinuationClass,
-	DuplicateTarget,
 	PreProofRung,
 	PreProofApplicability,
-	crate::Severity,
 	super::LeadEvidenceFormat,
 	super::UnitResultFormat,
 	super::UnitResultDisposition,
 	crate::review_priority::Impact,
 	crate::review_priority::Access,
 	crate::review_priority::Reachability,
-	i64,
-	u32
 );
+
+// Severity is shared with legacy findings and keeps its derived serde shape;
+// typed evidence still admits it only as a string.
+impl<S: Source> Field<S> for crate::Severity {
+	fn decode(_: &Mark<'_, S>, raw: Option<&RawValue>) -> Result<Self, Error> {
+		let mut json = serde_json::Deserializer::from_str(required(raw)?.get());
+		let text = crate::closed_string::string(&mut json)?;
+		json.end()?;
+		Ok(Self::deserialize(serde::de::value::StrDeserializer::<serde_json::Error>::new(&text))?)
+	}
+}
 
 impl<S: Source, P: TextPolicy> Field<S> for BoundedText<P, S> {
 	fn decode(mark: &Mark<'_, S>, raw: Option<&RawValue>) -> Result<Self, Error> {

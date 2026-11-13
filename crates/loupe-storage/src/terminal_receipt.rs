@@ -144,33 +144,53 @@ pub(crate) fn replay_terminal(
 	tx: &Connection, identity: crate::jobs::LeaseIdentity<'_>,
 	phase: crate::review_authority::Phase, digest: &[u8; 32],
 ) -> Result<Replayed> {
-	if identity.capability_hash.len() != 32 {
-		return Ok(Replayed::Reject(Reject::Denied));
-	}
-	let bound: bool = tx.query_row(
-		"SELECT EXISTS(SELECT 1 FROM jobs j JOIN workers w ON w.id=j.worker_id
+	replay_decision(
+		identity.capability_hash.len() == 32,
+		|| {
+			Ok(tx.query_row(
+				"SELECT EXISTS(SELECT 1 FROM jobs j JOIN workers w ON w.id=j.worker_id
 		 JOIN job_terminal_receipts r ON r.job_id=j.id
 		 WHERE j.id=?1 AND j.worker_id=?2 AND w.kind='worker' AND w.revoked_at IS NULL
 		 AND j.kind=?3 AND j.campaign_id IS NOT NULL AND r.phase=?3
 		 AND r.finishing_capability_hash=?4 AND j.state IN ('succeeded','failed','cancelled'))",
-		params![
-			identity.job_id,
-			identity.worker_id,
-			phase.job_kind().as_str(),
-			identity.capability_hash
-		],
-		|row| row.get(0),
-	)?;
-	if !bound {
-		return Ok(Replayed::Reject(Reject::Denied));
+				params![
+					identity.job_id,
+					identity.worker_id,
+					phase.job_kind().as_str(),
+					identity.capability_hash
+				],
+				|row| row.get(0),
+			)?)
+		},
+		|| {
+			Ok(tx.query_row(
+				&format!("SELECT {COLUMNS} FROM job_terminal_receipts WHERE job_id=?1"),
+				[identity.job_id],
+				row,
+			)?)
+		},
+		|receipt: &Receipt| receipt.result_digest.as_slice(),
+		digest,
+	)
+	.map(|replayed| match replayed {
+		Ok(receipt) => Replayed::Receipt(Box::new(receipt)),
+		Err(reject) => Replayed::Reject(reject),
+	})
+}
+
+/// Pure replay decision over the binding facts. Its only success value is
+/// the loaded receipt, unchanged; it has no path to a state transition.
+/// The receipt is loaded only after the finishing identity is bound.
+pub(crate) fn replay_decision<R>(
+	capability_well_formed: bool, bound: impl FnOnce() -> Result<bool>,
+	load: impl FnOnce() -> Result<R>, stored_digest: impl Fn(&R) -> &[u8], digest: &[u8; 32],
+) -> Result<std::result::Result<R, Reject>> {
+	if !capability_well_formed || !bound()? {
+		return Ok(Err(Reject::Denied));
 	}
-	let receipt = tx.query_row(
-		&format!("SELECT {COLUMNS} FROM job_terminal_receipts WHERE job_id=?1"),
-		[identity.job_id],
-		row,
-	)?;
-	if receipt.result_digest != digest {
-		return Ok(Replayed::Reject(Reject::WrongDigest));
+	let receipt = load()?;
+	if stored_digest(&receipt) != digest {
+		return Ok(Err(Reject::WrongDigest));
 	}
-	Ok(Replayed::Receipt(Box::new(receipt)))
+	Ok(Ok(receipt))
 }

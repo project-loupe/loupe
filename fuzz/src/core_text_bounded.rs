@@ -60,7 +60,7 @@ fn normalize(raw: &str) -> String {
 	folded.nfc().collect()
 }
 
-fn check<P: TextPolicy>(raw: &str) {
+pub(crate) fn check<P: TextPolicy>(raw: &str) {
 	let result = crate::fixtures::text::<P>(raw);
 	// The documented raw admission budget is separate from normalized limits.
 	// Check it before allocating the oracle's normalized representation too.

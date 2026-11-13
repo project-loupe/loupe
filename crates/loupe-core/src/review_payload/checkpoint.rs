@@ -4,17 +4,19 @@ use super::*;
 use crate::review_priority::{Access, Impact, Reachability};
 
 // debug-ok: closed checkpoint schema vocabulary contains no caller text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum LeadEvidenceFormat {
 	#[serde(rename = "loupe.lead_evidence")]
 	V1,
 }
+crate::closed_string_enum!(LeadEvidenceFormat { V1 });
 // debug-ok: closed checkpoint schema vocabulary contains no caller text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum UnitResultFormat {
 	#[serde(rename = "loupe.unit_result")]
 	V1,
 }
+crate::closed_string_enum!(UnitResultFormat { V1 });
 
 checked_struct!(PriorityProposal, "PriorityProposal" {
 	impact: Impact,
@@ -92,7 +94,7 @@ impl<S: Source> LeadEvidenceV1<S> {
 }
 
 // debug-ok: closed checkpoint schema vocabulary contains no caller text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitResultDisposition {
 	LeadCreated,
@@ -100,6 +102,12 @@ pub enum UnitResultDisposition {
 	NotApplicable,
 	NeedsFollowUp,
 }
+crate::closed_string_enum!(UnitResultDisposition {
+	LeadCreated,
+	NoLeadFound,
+	NotApplicable,
+	NeedsFollowUp
+});
 impl UnitResultDisposition {
 	pub fn as_str(self) -> &'static str {
 		match self {

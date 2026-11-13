@@ -11,6 +11,9 @@ use crate::auth::AuthedWorker;
 use crate::review::http::{self, ApiError};
 use crate::AppState;
 
+pub const RESET_REQUEST_CAP: usize = crate::ingress::review_compatibility::LIMIT;
+pub const RESET_RESPONSE_CAP: usize = 4096;
+
 pub async fn reset(
 	State(state): State<AppState>, Path(generation): Path<i64>,
 	Extension(admin): Extension<AuthedWorker>, request: Request,
@@ -32,7 +35,7 @@ pub async fn reset(
 					leads_removed: summary.leads_removed,
 					verification_intents_blocked: summary.verification_intents_blocked,
 				},
-				4096,
+				RESET_RESPONSE_CAP,
 			)
 		},
 	)

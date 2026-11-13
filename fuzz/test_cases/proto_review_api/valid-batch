@@ -1,0 +1,1 @@
+{"protocol_version":3,"format_version":1,"expected_entry_count":2,"expected_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","start_position":0,"entries":[{"raw_path_hex":"61","git_mode":33188,"object_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"raw_path_hex":"612f62","git_mode":40960,"object_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}

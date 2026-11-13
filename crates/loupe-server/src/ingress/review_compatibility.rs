@@ -8,7 +8,7 @@ use super::{collect_operator_body_limited, RequestBuffer};
 use crate::auth::AuthedWorker;
 use crate::review::http::{self, ApiError, Result};
 
-const LIMIT: usize = 8192;
+pub(crate) const LIMIT: usize = 8192;
 
 pub(crate) async fn reset(request: Request) -> Result<ResetGenerationRequest> {
 	http::require_version(request.headers())?;
@@ -56,7 +56,7 @@ pub(crate) async fn reset(request: Request) -> Result<ResetGenerationRequest> {
 	Untrusted::new(bytes, token).as_bytes().validate(ResetDecoder)
 }
 
-struct ResetDecoder;
+pub(crate) struct ResetDecoder;
 impl Validate<&[u8], Operator> for ResetDecoder {
 	type Output = ResetGenerationRequest;
 	type Error = ApiError;
@@ -66,7 +66,11 @@ impl Validate<&[u8], Operator> for ResetDecoder {
 		if input.get().len() > LIMIT {
 			return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"));
 		}
-		serde_json::from_slice(input.get()).map_err(ApiError::invalid)
+		let value: ResetGenerationRequest =
+			serde_json::from_slice(input.get()).map_err(ApiError::invalid)?;
+		loupe_core::json_objects::objects_only(input.get(), &value)
+			.map_err(|_| ApiError::invalid("request object in sequence form"))?;
+		Ok(value)
 	}
 }
 
@@ -89,8 +93,9 @@ mod tests {
 			br#"{"protocol_version":3,"protocol_version":3}"#.as_slice(),
 			br#"{"protocol_version":3,"actor":"FORGED"}"#,
 			br#"{"protocol_version":2}"#,
+			b"[3]",
 		] {
-			assert!(decode(raw).is_err());
+			assert!(decode(raw).is_err(), "{}", String::from_utf8_lossy(raw));
 		}
 	}
 }

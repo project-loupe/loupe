@@ -111,6 +111,32 @@ pub fn require_version(headers: &HeaderMap) -> Result<()> {
 	Ok(())
 }
 
+/// Matched paths served by the review phase transport. `is_phase_route`
+/// mirrors this list as a `matches!` so the per-request middleware check
+/// stays a compiled string switch; a unit test keeps the two in sync.
+pub const PHASE_ROUTES: &[&str] = &[
+	"/v1/jobs/{id}/pin-target",
+	"/v1/jobs/{id}/inventory-batches",
+	"/v1/jobs/{id}/seal-inventory",
+	"/v1/jobs/{id}/publish-profile",
+	"/v1/jobs/{id}/inventory-dispositions",
+	"/v1/jobs/{id}/review-units",
+	"/v1/jobs/{id}/leads",
+	"/v1/jobs/{id}/sibling-leads",
+	"/v1/jobs/{id}/review-unit-results",
+	"/v1/jobs/{id}/finalize-survey",
+	"/v1/jobs/{id}/finalize-drilldown",
+	"/v1/jobs/{id}/finalize-verification",
+	"/v1/jobs/{id}/limits",
+	"/v1/jobs/{id}/lead-candidates",
+	"/v1/review-generations/{id}/reset",
+];
+
+/// Matched paths served by the job control transport; mirrored by
+/// `is_control_route`.
+pub const CONTROL_ROUTES: &[&str] =
+	&["/v1/jobs/{id}/complete", "/v1/jobs/{id}/heartbeat", "/v1/jobs/{id}/cancel"];
+
 /// Use the registered matched path, not arbitrary URI suffixes. The outer
 /// boundary must include role middleware and extractor rejections too.
 pub fn is_phase_route(path: &str) -> bool {
@@ -402,6 +428,20 @@ mod tests {
 				message.as_bytes(),
 				"lease boundary must preserve the exact closed request diagnostic"
 			);
+		}
+	}
+
+	#[test]
+	fn predicates_match_route_lists() {
+		let probes = PHASE_ROUTES.iter().chain(CONTROL_ROUTES).copied().chain([
+			"/v1/jobs/lease",
+			"/v1/jobs/{id}",
+			"/v1/jobs/{id}/leads/x",
+			"",
+		]);
+		for path in probes {
+			assert_eq!(is_phase_route(path), PHASE_ROUTES.contains(&path), "{path}: phase");
+			assert_eq!(is_control_route(path), CONTROL_ROUTES.contains(&path), "{path}: control");
 		}
 	}
 
