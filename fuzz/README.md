@@ -292,18 +292,32 @@ Implemented targets (each corpus includes valid and malformed inputs):
 
 | Target | Assertions |
 |---|---|
-| `cli_render` | Control escaping, exact visible text, intentional ANSI styling, row/column integrity and extreme timestamps |
 | `cli_config_input` | Actual twelve native Clap callbacks; independent exact text admission, closed default without mint, native path bytes, uncapped PEM/PAT input and live PAT sharing/export/formatter observations |
 | `cli_ingress_response` | Actual thirteen response decoders plus discard; independent old DTO schema and field policies, original-token append ledger, Agent versus Server typed observations, reporting depth/tags, exact optional/positional/credential outputs |
+| `cli_render` | Control escaping, exact visible text, intentional ANSI styling, row/column integrity and extreme timestamps |
 | `core_canonical` | Independent sorted serialization, reordered/whitespace-equivalent JSON, idempotence, bounded output and BLAKE3 digest |
+| `core_inventory_manifest` | Inventory manifest admission: independent path/entry policy, limits, duplicate rejection and canonical bytes |
+| `core_json_string` | Original JSON string tokens versus serde, exact decoded bytes, byte/scalar limits and error order, borrowed/owned output and fixed diagnostics |
+| `core_review_candidates` | Review candidate decoding and ordering against an independent admission model and caps |
+| `core_review_payload` | All seven typed evidence/terminal payloads: decode, canonical round trip, field and aggregate byte caps, sized acceptance exactly at each cap |
+| `core_review_priority` | Impact/access/reachability through the agent evidence decoder: string-only closed spellings, map/null forms refused |
 | `core_state_machine` | Independent adjacency/precedence tables, terminal exits only through documented operator retries; SQL permutation/scope invariant covered in storage tests |
 | `core_text_bounded` | All ten policies: exact admission, raw/normalized caps, NFC, character categories, whitespace and metadata-only diagnostics |
-| `core_json_string` | Original JSON string tokens versus serde, exact decoded bytes, byte/scalar limits and error order, borrowed/owned output and fixed diagnostics |
 | `core_text_exact` | All 17 source-aware exact policies: independent admission, decoded caps, unchanged UTF-8/wire bytes, named policy combinations and redacted diagnostics |
 | `core_text_ident` | Four policies: independent byte recognizers, length/spacing limits, exact spelling and metadata-only diagnostics |
 | `core_text_json` | Duplicate-preserving reference tree, depth/node/byte budgets, composed key/leaf rules, entry-point equivalence and redaction |
 | `core_text_repo_path` | Strict path invariants and independent legacy DTO/MCP acceptance, preserving documented disagreements |
 | `proto_dto` | All 36 public DTO types and enum variants, field-preserving round trips, capability redaction and independent LLM submission admission |
+| `proto_review_api` | Pin, inventory batch, seal and profile request decoders plus control responses against independent JSON: canonical re-decode, unknown fields, version pins, array form |
+| `proto_review_compatibility` | Generation reset decoder: exact `{"protocol_version":3}` admission; array form refused |
+| `proto_review_drilldown` | Drilldown terminal request decoder and receipt response; shared request oracle and sized payloads |
+| `proto_review_evidence` | Lead and unit-result checkpoint decoders; shared request oracle and evidence byte caps |
+| `proto_review_inventory` | Inventory disposition decoder; shared request oracle |
+| `proto_review_lease` | Worker phase-lease validator for survey, drilldown and verify payloads; closed worker errors, carried-text-free Debug |
+| `proto_review_lifecycle` | Phase failure and heartbeat decoders; shared request oracle |
+| `proto_review_terminal` | Survey terminal decoder and receipt response; sized payloads at the 32 KiB cap |
+| `proto_review_units` | Review unit decoder; shared request oracle |
+| `proto_review_verification` | Verification terminal decoder and receipt response; shared request oracle |
 | `proto_version` | Inclusive protocol windows, inverted-window rejection and exact mismatch fields and diagnostics |
 | `server_capability_header` | Exact header-text/length admission, unchanged hash bytes and closed denial diagnostics |
 | `server_config` | Actual file loader; independent owner policy and budget admission, exact owner/path spelling, closed error chains and compact owner-cap controls |
@@ -313,13 +327,16 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `server_report_email` | Independent header admission, literal body fields, finding-content isolation, header budgets and complete-message byte cap |
 | `server_report_github` | Title normalization, scalar/byte budgets, exact literal framing and containment of finding text and paths |
 | `server_request_parsers` | Protocol headers, state/kind filters, legacy clone URLs and exact FTS stripping/token admission |
-| `storage_source_refs` | Independent path admission, 32/64-item limits, raw and canonical byte budgets, preserved path bytes, aggregate Debug redaction |
+| `server_review_authority` | Closed recipe-support decision over the whole fact domain against an independent authority table |
+| `storage_admission_policy` | Campaign policy V2 admission, reserve capacity rule, delays and the priority band/score table against independent oracles |
 | `storage_identity` | Independent anchor recognition, equivalent spelling, metadata-only diagnostics, explicit identity framing and reference BLAKE3 |
 | `storage_policy_snapshot` | Independent campaign-policy admission, capped retry arithmetic, phase mapping and redacted conflict errors |
 | `storage_scope_sequence` | Real scope and report operations against an independent row-incarnation model; lease expiry, cross-repository/database rejection, rollback, reused IDs and atomic delivery failure |
+| `storage_source_refs` | Independent path admission, 32/64-item limits, raw and canonical byte budgets, preserved path bytes, aggregate Debug redaction |
 | `tls_fingerprint` | Exact SHA-256 of arbitrary DER bytes and repeatability |
 | `tls_input` | Actual guarded file/base64/argument owners, exact bytes, UTF-8 admission, fixed errors and redacted formatting |
 | `tls_pem` | Certificate/key/root parsing, successful CA reload, direct-loader controls and shared reqwest admission against its previous constructor |
+| `web_api` | Actual browser guards, no upstream call on rejected headers, JSON-enclosed diagnostics and bounded responses |
 | `worker_broker_policy` | Actual Sandbox request owner, both provider policies, independent denial precedence, exact rewritten output and request headers |
 | `worker_broker_usage` | Actual Provider chunk admission, capture and counters; independent JSON/SSE accounting, reservation overflow and response header filtering |
 | `worker_canary_observe` | Original raw bytes and every valid quoted scalar run; independent serde scalar decoding, duplicate fields, malformed neighbors and exact Unicode bytes |
@@ -339,7 +356,6 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_sandbox_args` | Exact namespace/safety flags, supervisor framing, explicit environment names and bind operands, including flag-shaped values |
 | `worker_server_response` | Actual clients over chunked HTTP, independent private-decoder admission, exact byte budget and bounded errors |
 | `worker_source_discovery` | Actual Repo manifest/glob/exclusion parsing, independent exclusion admission, native names, containment and exact filtered fixture selection |
-| `web_api` | Actual browser guards, no upstream call on rejected headers, JSON-enclosed diagnostics and bounded responses |
 
 `storage_source_refs` takes one policy byte (even: 32 items, odd: 64),
 followed by JSON reference bytes. Inputs up to 128 KiB exercise both sides of
@@ -590,9 +606,7 @@ labelled logging/Debug, canary scanning and citation checks. The report
 The retained JSON-span helper has no current
 production caller and is not evidence about the active MCP verdict path.
 
-After B4 actually lands, S1 items 30–35 add the ten `proto_review_<module>`
-DTO targets; `core_review_payload`, inventory-manifest, candidate and priority
-targets; `storage_admission_policy`; `server_review_authority`; and router
-body-cap integration tests. Existing review storage/schema modules do not
-mean that this phase ingress or its targets have landed. Artifact-export
-coverage gets an owner when Stage C introduces that boundary.
+Review route request and response caps are pinned per route by
+`crates/loupe-server/tests/review_body_caps`, which also checks the cap
+table against the mounted routes and the phase/control route classes.
+Artifact-export coverage gets an owner when Stage C introduces that boundary.
