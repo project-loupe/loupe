@@ -634,6 +634,67 @@ fn child_subjects_are_exact_phase_and_repository_bound() {
 	}
 }
 
+#[test]
+fn child_jobs_require_their_own_owned_subject() {
+	for (phase, lead, finding, expected) in [
+		(Phase::Drilldown, Some(31), None, true),
+		(Phase::Drilldown, Some(41), None, false),
+		(Phase::Drilldown, None, Some(51), false),
+		(Phase::Verify, None, Some(51), true),
+		(Phase::Verify, None, Some(61), false),
+		(Phase::Verify, Some(31), None, false),
+	] {
+		let db = fixture();
+		mutate(&db,"INSERT INTO leads(lead_id,generation_id,identity_family,identity_anchor,identity_fingerprint,anchored_payload,anchored_digest,commit_sha,created_at)
+		 VALUES(31,11,'family','anchor',zeroblob(32),'{}',zeroblob(32),'base',0),(41,21,'family','anchor',zeroblob(32),'{}',zeroblob(32),'foreign',0);
+		 INSERT INTO findings(id,repo_id,job_id,scanner_id,severity,title,description,fingerprint,created_at,report_identity)
+		 VALUES(51,1,101,'test','high','title','description','a',0,x'11111111111111111111111111111111'),(61,2,101,'test','high','title','description','b',0,x'22222222222222222222222222222222');");
+		db.with_conn(|conn| {
+			conn.execute(
+				"UPDATE jobs SET kind=?1,assigned_lead_id=?2,target_finding_id=?3 WHERE id=101",
+				params![phase.job_kind().as_str(), lead, finding],
+			)?;
+			Ok(())
+		})
+		.unwrap();
+		for access in [Access::Checkout, Access::PreparedHost, Access::Domain] {
+			assert_eq!(
+				allowed(&db, identity(), phase, access, 100),
+				expected,
+				"{phase:?} lead={lead:?} finding={finding:?} {access:?}"
+			);
+		}
+	}
+}
+
+#[test]
+fn prepared_head_must_be_an_oid_matching_target_and_generation() {
+	const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const UPPER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+	for (head, target, generation) in [(SHA, OTHER, SHA), (SHA, SHA, OTHER), (UPPER, UPPER, UPPER)]
+	{
+		let db = fixture();
+		assert!(allowed(&db, identity(), Phase::Survey, Access::PreparedHost, 100));
+		db.with_conn(|conn| {
+			conn.execute("UPDATE jobs SET head_sha=?1 WHERE id=101", [head])?;
+			conn.execute("UPDATE review_campaigns SET target_commit_sha=?1", [target])?;
+			conn.execute(
+				"UPDATE review_generations SET generation_commit_sha=?1 WHERE generation_id=11",
+				[generation],
+			)?;
+			Ok(())
+		})
+		.unwrap();
+		assert!(allowed(&db, identity(), Phase::Survey, Access::Checkout, 100));
+		for access in [Access::PreparedHost, Access::Domain] {
+			assert!(
+				!allowed(&db, identity(), Phase::Survey, access, 100),
+				"head={head} target={target} generation={generation} {access:?}"
+			);
+		}
+	}
+}
+
 // debug-ok: test callback errors contain only two closed categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallbackError {
