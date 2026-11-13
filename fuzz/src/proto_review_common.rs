@@ -349,6 +349,51 @@ pub(crate) fn receipt_metadata(
 	))
 }
 
+/// The ids and metadata every terminal receipt starts with, read in a fixed
+/// order, alongside their independently rendered JSON values.
+pub(crate) struct ReceiptHeader {
+	pub receipt_id: loupe_proto::review_lease::ReviewId,
+	pub job_id: loupe_proto::review_lease::ReviewId,
+	pub commit_sha: loupe_core::review_metadata::ReviewCommit<loupe_provenance::Agent>,
+	pub result_digest: loupe_core::review_metadata::ReviewDigest<loupe_provenance::Agent>,
+	pub rendered: RenderedReceipt,
+}
+
+pub(crate) struct RenderedReceipt(Map<String, Value>);
+
+pub(crate) fn receipt_header(
+	input: &mut crate::utils::input::ByteSource<'_>,
+) -> Option<ReceiptHeader> {
+	let (receipt_id, raw_receipt) = review_id(input)?;
+	let (job_id, raw_job) = review_id(input)?;
+	let (commit_sha, result_digest, raw_commit, raw_digest) = receipt_metadata(input)?;
+	let Value::Object(rendered) = json!({"receipt_id": raw_receipt, "job_id": raw_job,
+		"commit_sha": raw_commit, "result_digest": raw_digest})
+	else {
+		unreachable!()
+	};
+	Some(ReceiptHeader {
+		receipt_id,
+		job_id,
+		commit_sha,
+		result_digest,
+		rendered: RenderedReceipt(rendered),
+	})
+}
+
+impl RenderedReceipt {
+	/// The expected terminal response: this header plus the receipt's
+	/// remaining `fields`, under the protocol version.
+	pub(crate) fn response(self, fields: Value) -> Value {
+		let Value::Object(fields) = fields else { panic!("receipt fields must be an object") };
+		let mut receipt = self.0;
+		for (key, value) in fields {
+			assert!(receipt.insert(key, value).is_none(), "receipt field rendered twice");
+		}
+		json!({"protocol_version": loupe_proto::PROTOCOL_VERSION, "receipt": receipt})
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

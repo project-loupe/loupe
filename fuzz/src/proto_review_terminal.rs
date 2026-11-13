@@ -13,7 +13,7 @@ use loupe_provenance::Agent;
 use loupe_server::fuzz_support::review_request;
 use serde_json::json;
 
-use crate::proto_review_common::{assert_response, receipt_metadata, review_id, terminal};
+use crate::proto_review_common::{assert_response, receipt_header, terminal};
 use crate::utils::input::ByteSource;
 use crate::utils::test_logger;
 
@@ -33,9 +33,7 @@ pub fn do_test(data: &[u8]) {
 }
 
 fn response(input: &mut ByteSource<'_>) {
-	let Some((receipt_id, raw_receipt)) = review_id(input) else { return };
-	let Some((job_id, raw_job)) = review_id(input) else { return };
-	let Some((commit, digest, raw_commit, raw_digest)) = receipt_metadata(input) else { return };
+	let Some(header) = receipt_header(input) else { return };
 	let Some(choice) = input.u8() else { return };
 	let mut counts = [0_u64; 5];
 	for count in &mut counts {
@@ -56,10 +54,10 @@ fn response(input: &mut ByteSource<'_>) {
 	let value = SurveyTerminalResponse {
 		protocol_version: loupe_proto::review_api::ReviewProtocol,
 		receipt: SurveyReceipt {
-			receipt_id,
-			job_id,
-			commit_sha: commit,
-			result_digest: digest,
+			receipt_id: header.receipt_id,
+			job_id: header.job_id,
+			commit_sha: header.commit_sha,
+			result_digest: header.result_digest,
 			terminal_reason: reason,
 			summary: SurveySummary {
 				version: Version1,
@@ -75,13 +73,11 @@ fn response(input: &mut ByteSource<'_>) {
 	};
 	assert_response(
 		&value,
-		json!({"protocol_version": loupe_proto::PROTOCOL_VERSION, "receipt": {
-			"receipt_id": raw_receipt, "job_id": raw_job, "commit_sha": raw_commit,
-			"result_digest": raw_digest, "terminal_reason": reason_name,
+		header.rendered.response(json!({"terminal_reason": reason_name,
 			"summary": {"version": 1, "coverage": coverage_name,
 				"corroboration_satisfied": corroborated, "missing_results": counts[0],
 				"needs_follow_up": counts[1], "unresolved_inventory": counts[2],
-				"follow_up_batches": counts[3], "follow_up_units": counts[4]}}}),
+				"follow_up_batches": counts[3], "follow_up_units": counts[4]}})),
 	);
 }
 

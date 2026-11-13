@@ -14,7 +14,7 @@ use loupe_server::fuzz_support::review_request;
 use serde_json::json;
 
 use crate::proto_review_common::{
-	assert_response, continuation, receipt_metadata, review_id, terminal,
+	assert_response, continuation, receipt_header, review_id, terminal,
 };
 use crate::utils::input::ByteSource;
 use crate::utils::test_logger;
@@ -33,9 +33,7 @@ pub fn do_test(data: &[u8]) {
 }
 
 fn response(input: &mut ByteSource<'_>) {
-	let Some((receipt_id, raw_receipt)) = review_id(input) else { return };
-	let Some((job_id, raw_job)) = review_id(input) else { return };
-	let Some((commit, digest, raw_commit, raw_digest)) = receipt_metadata(input) else { return };
+	let Some(header) = receipt_header(input) else { return };
 	let Some((lead_id, raw_lead)) = review_id(input) else { return };
 	let Some(choice) = input.u8() else { return };
 	let disposition = match choice % 5 {
@@ -60,10 +58,10 @@ fn response(input: &mut ByteSource<'_>) {
 	let value = DrilldownTerminalResponse {
 		protocol_version: loupe_proto::review_api::ReviewProtocol,
 		receipt: DrilldownReceipt {
-			receipt_id,
-			job_id,
-			commit_sha: commit,
-			result_digest: digest,
+			receipt_id: header.receipt_id,
+			job_id: header.job_id,
+			commit_sha: header.commit_sha,
+			result_digest: header.result_digest,
 			summary: DrilldownSummary {
 				version: Version1,
 				lead_id,
@@ -73,12 +71,7 @@ fn response(input: &mut ByteSource<'_>) {
 			},
 		},
 	};
-	assert_response(
-		&value,
-		json!({"protocol_version": loupe_proto::PROTOCOL_VERSION, "receipt": {
-			"receipt_id": raw_receipt, "job_id": raw_job, "commit_sha": raw_commit,
-			"result_digest": raw_digest, "summary": summary}}),
-	);
+	assert_response(&value, header.rendered.response(json!({"summary": summary})));
 }
 
 pub fn proto_review_drilldown_test<Out: test_logger::Output>(data: &[u8], _out: Out) {
