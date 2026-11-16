@@ -24,6 +24,8 @@ pub mod model_broker;
 pub mod model_proxy;
 pub mod prompt;
 pub mod prompts;
+#[cfg(any(test, feature = "test-support"))]
+mod scripted_mcp;
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -964,6 +966,7 @@ pub mod testing {
 	use anyhow::Result;
 	use async_trait::async_trait;
 
+	pub use super::scripted_mcp::{ScriptedAgent, ScriptedMcpBackend, ToolResult};
 	use super::{LlmBackend, LlmRequest, LlmResponse};
 
 	type AsyncStubFn = Arc<
