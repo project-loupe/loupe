@@ -16,6 +16,7 @@ pub(crate) enum SurveyTool {
 }
 
 impl SurveyTool {
+	#[cfg(any(test, kani))]
 	pub(crate) const ALL: [Self; 8] = [
 		Self::JobLimits,
 		Self::PublishProfile,
@@ -48,7 +49,7 @@ impl SurveyTool {
 /// Which survey recipe family the attempt runs.
 // debug-ok: closed recipe class only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecipeClass {
+pub enum RecipeClass {
 	Bootstrap,
 	Ordinary,
 }

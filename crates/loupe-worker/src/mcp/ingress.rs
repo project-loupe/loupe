@@ -38,10 +38,6 @@ pub(super) struct McpRequestDecoder {
 }
 /// Which tool names a session can decode. A name from the other catalog is
 /// an unknown tool.
-#[cfg_attr(
-	not(any(test, fuzzing)),
-	expect(dead_code, reason = "no session serves the survey catalog yet")
-)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Catalog {
 	Legacy,
@@ -161,10 +157,6 @@ impl ToolName {
 	}
 }
 
-#[cfg_attr(
-	not(any(test, fuzzing)),
-	expect(dead_code, reason = "no session serves the survey catalog yet")
-)]
 pub(super) enum Arguments {
 	Query(DecodedQueryArgs),
 	Get(i64),

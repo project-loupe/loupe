@@ -32,7 +32,7 @@ mod limits;
 pub mod llm;
 pub mod mcp;
 pub mod repo_cache;
-pub(crate) mod review;
+pub mod review;
 pub mod runner;
 pub mod sandbox;
 mod sandbox_network;

@@ -523,6 +523,7 @@ mod tests {
 				cancel: CancellationToken::new(),
 				repo_id: None,
 				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+				survey: None,
 				job_capability: None,
 			})
 			.await;
@@ -718,6 +719,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		};
 
@@ -793,6 +795,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
@@ -833,6 +836,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		};
 

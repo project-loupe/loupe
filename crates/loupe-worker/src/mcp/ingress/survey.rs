@@ -22,29 +22,17 @@ use loupe_proto::review_units::{PriorityBand, ReviewUnitRequest};
 
 use super::*;
 
-#[cfg_attr(
-	not(any(test, fuzzing)),
-	expect(dead_code, reason = "no session serves the survey catalog yet")
-)]
 pub(in crate::mcp) struct LeadArgs {
 	pub(in crate::mcp) key: Identifier<ClientKey, Agent>,
 	/// Paired with its assignment epoch by the host before submission.
 	pub(in crate::mcp) review_unit_id: Option<ReviewId>,
 	pub(in crate::mcp) evidence: LeadEvidenceV1<Agent>,
 }
-#[cfg_attr(
-	not(any(test, fuzzing)),
-	expect(dead_code, reason = "no session serves the survey catalog yet")
-)]
 pub(in crate::mcp) struct UnitResultArgs {
 	pub(in crate::mcp) key: Identifier<ClientKey, Agent>,
 	/// `assignment_epoch` is 0 until the host supplies the unit's epoch.
 	pub(in crate::mcp) result: UnitResultPayloadV1<Agent>,
 }
-#[cfg_attr(
-	not(any(test, fuzzing)),
-	expect(dead_code, reason = "no session serves the survey catalog yet")
-)]
 pub(in crate::mcp) struct DispositionArgs {
 	pub(in crate::mcp) key: Identifier<ClientKey, Agent>,
 	pub(in crate::mcp) path: RepoPath<Agent>,

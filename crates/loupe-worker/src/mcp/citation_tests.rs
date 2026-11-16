@@ -81,6 +81,7 @@ async fn quoted_submission(quote: &str) -> (usize, Value) {
 			repo_id: 1,
 			mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(42) },
 			workdir: workdir.path().to_owned(),
+			survey: None,
 		},
 		input.as_bytes(),
 		&mut output,

@@ -153,7 +153,7 @@ impl<'a> PromptBuilder<'a> {
 		self.payload_bytes = bytes;
 		Ok(())
 	}
-	// This serializer is private. Only the three closed projections below can
+	// This serializer is private. Only the closed projections below can
 	// reach it; callers cannot apply a source label to arbitrary Serialize/Value.
 	fn projection(
 		&mut self, field: &'static str, value: &impl Serialize,
@@ -185,6 +185,11 @@ impl<'a> PromptBuilder<'a> {
 		&mut self, repo_id: i64, findings: &[loupe_proto::FindingSummary<Agent, Server>],
 	) -> Result<(), PromptError> {
 		self.projection("findings", &PriorFindings { repo_id, findings })
+	}
+	pub(crate) fn lead_candidates(
+		&mut self, candidates: &[loupe_core::review_candidates::Candidate<Agent, Server>],
+	) -> Result<(), PromptError> {
+		self.projection("candidates", &candidates)
 	}
 	pub fn render(self) -> Result<Prompt, PromptError> {
 		self.render_with(|| {

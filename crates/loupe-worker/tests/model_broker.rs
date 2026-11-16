@@ -131,6 +131,7 @@ async fn claude_reaches_fake_upstream_only_through_the_broker() {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		})
 		.await
@@ -260,6 +261,7 @@ exec /usr/bin/curl --silent --show-error --fail-with-body -X POST "${base_url}/r
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		})
 		.await
@@ -344,6 +346,7 @@ async fn selected_claude_cli_reaches_the_messages_contract() {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		})
 		.await;
@@ -419,6 +422,7 @@ async fn selected_codex_cli_reaches_the_responses_contract() {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		})
 		.await;
@@ -512,6 +516,7 @@ async fn selected_claude_cli_completes_a_local_response_with_the_exact_prompt() 
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		})
 		.await;
@@ -748,6 +753,7 @@ async fn codex_cli_commands_and_mcp_with_daybreak(
 			cancel: CancellationToken::new(),
 			repo_id: Some(7),
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: Some(loupe_proto::JobCapability::from_secret("host-job-capability")),
 		})
 		.await;

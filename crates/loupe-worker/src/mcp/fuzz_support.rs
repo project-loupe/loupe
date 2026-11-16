@@ -39,6 +39,12 @@ impl FuzzSession {
 				finding_id: 1,
 				inner: tokio::sync::Mutex::default(),
 			}),
+			mode: if verify {
+				McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
+			} else {
+				McpMode::LegacyDiscovery { job_id: Some(1) }
+			},
+			survey: None,
 		}))
 	}
 

@@ -209,6 +209,9 @@ pub struct LlmRequest {
 	/// the job (and, for verification, finding) it attributes
 	/// submissions to.
 	pub mcp_mode: crate::mcp::McpMode,
+	/// Survey host state shared with the broker; required exactly when
+	/// `mcp_mode` is a survey mode, and outlives the MCP connection.
+	pub survey: Option<Arc<crate::review::session::SurveySession>>,
 	/// Opaque authority for the exact active lease. It remains in the
 	/// trusted host broker and is never passed to the agent process.
 	pub job_capability: Option<JobCapability>,
@@ -598,6 +601,7 @@ mod tests {
 			cancel: tokio_util::sync::CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
 			job_capability: None,
 		};
 		assert!(
