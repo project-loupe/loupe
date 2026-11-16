@@ -547,3 +547,50 @@ fn phase_retry_stays_within_tries_deadline_and_retryable_statuses() {
 	kani::cover!(finished && tries == 1, "a first failure is final");
 	kani::cover!(tries == MAX_TRIES, "the try limit is reached");
 }
+
+// Every tool, recipe and attempt state: the domain is 8 x 2 x 2 x 2 x 2, so
+// the harness is exhaustive without loops.
+#[cfg(kani)]
+#[kani::proof]
+fn survey_gate_seals_waits_for_the_profile_and_soft_stops_exactly() {
+	use crate::review::gate::{admit, Admission, Denial, RecipeClass, SurveyTool};
+	let tool = SurveyTool::ALL[usize::from(kani::any::<u8>() % 8)];
+	let recipe = if kani::any() { RecipeClass::Bootstrap } else { RecipeClass::Ordinary };
+	let published: bool = kani::any();
+	let late: bool = kani::any();
+	let sealed: bool = kani::any();
+	let admission = admit(tool, recipe, published, late, sealed);
+	let allowed = admission == Admission::Allow;
+	// No write after a sealed receipt: only limits and a finalize replay.
+	if sealed {
+		assert_eq!(allowed, matches!(tool, SurveyTool::JobLimits | SurveyTool::Finalize));
+	}
+	// No profile-dependent call before publication on bootstrap.
+	if recipe == RecipeClass::Bootstrap && !published && tool.needs_profile() {
+		assert!(!allowed);
+	}
+	if tool == SurveyTool::PublishProfile && allowed {
+		assert!(recipe == RecipeClass::Bootstrap && !published && !sealed);
+	}
+	// Passing submit_by denies exactly the inquiry-opening tools, with the
+	// fixed soft-stop reason, and changes nothing else.
+	let early = admit(tool, recipe, published, false, sealed);
+	let late_admission = admit(tool, recipe, published, true, sealed);
+	if early == Admission::Allow && late_admission != Admission::Allow {
+		assert!(tool.opens_inquiry());
+		assert_eq!(late_admission, Admission::Deny(Denial::SoftStop));
+	}
+	if early == Admission::Allow && tool.opens_inquiry() {
+		assert_eq!(late_admission, Admission::Deny(Denial::SoftStop));
+	}
+	if !tool.opens_inquiry() {
+		assert_eq!(early, late_admission);
+	}
+	kani::cover!(sealed && tool == SurveyTool::Finalize && allowed, "finalize replay after seal");
+	kani::cover!(
+		!sealed && recipe == RecipeClass::Bootstrap && !published && tool == SurveyTool::Lead,
+		"bootstrap lead before publication"
+	);
+	kani::cover!(late && admission == Admission::Deny(Denial::SoftStop), "soft stop denial");
+	kani::cover!(late && tool == SurveyTool::Lead && allowed, "lead stays open after submit_by");
+}
