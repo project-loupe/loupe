@@ -172,6 +172,16 @@ impl Runner {
 		self
 	}
 
+	#[allow(dead_code, reason = "the survey handler runs prepared attempts")]
+	pub(crate) fn client(&self) -> &ServerClient {
+		&self.client
+	}
+
+	#[allow(dead_code, reason = "the survey handler runs prepared attempts")]
+	pub(crate) fn cache(&self) -> &Arc<RepoCache> {
+		&self.cache
+	}
+
 	/// Fail a job whose checkout exceeds the per-job workdir size cap.
 	pub(crate) fn enforce_workdir_cap(&self, workdir_size: u64) -> Result<()> {
 		if workdir_size > self.max_workdir_bytes {
@@ -440,7 +450,7 @@ pub(crate) struct CommitObservation<'a> {
 
 /// The commit `sha` in the bare clone at `bare`, unavailable to `decoder`
 /// except as a `Repo` observation. Blocking.
-#[allow(dead_code, reason = "survey preparation consumes the inventory")]
+#[allow(dead_code, reason = "the survey handler runs prepared attempts")]
 pub(crate) fn observe_commit<V, T>(
 	bare: &Path, sha: &str, decoder: V,
 ) -> Result<T, crate::review::inventory::InventoryError>

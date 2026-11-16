@@ -95,6 +95,29 @@ impl ServerClient {
 	pub(crate) async fn lease_for_runner(
 		&self, capabilities: Vec<&'static str>, wait_seconds: u32,
 	) -> Result<LeaseReceipt> {
+		self.lease_with(capabilities, Default::default(), wait_seconds).await
+	}
+
+	/// Claim a survey lease, for tests that drive survey preparation before
+	/// the runner advertises the phase.
+	#[cfg(feature = "test-support")]
+	pub async fn lease_survey_for_tests(
+		&self, wait_seconds: u32,
+	) -> Result<LeaseResponse<Agent, Server>> {
+		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
+		let review =
+			LeaseList::new(vec![ReviewCapability::Survey]).map_err(|error| anyhow!(error))?;
+		Ok(self.lease_with(Vec::new(), review, wait_seconds).await?.response)
+	}
+
+	async fn lease_with(
+		&self, capabilities: Vec<&'static str>,
+		review_capabilities: loupe_proto::review_lease::LeaseList<
+			loupe_proto::review_lease::ReviewCapability,
+			3,
+		>,
+		wait_seconds: u32,
+	) -> Result<LeaseReceipt> {
 		let url = self.url("/v1/jobs/lease");
 		// Scanner capabilities are closed static declarations, not Config input.
 		#[derive(serde::Serialize)]
@@ -110,7 +133,7 @@ impl ServerClient {
 		let req = BuiltinLeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities,
-			review_capabilities: Default::default(),
+			review_capabilities,
 			wait_seconds,
 		};
 		#[allow(
