@@ -19,6 +19,7 @@ use reqwest::Url;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 mod ingress;
+mod phase;
 #[cfg(fuzzing)]
 pub use ingress::fuzz_support;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub(crate) use ingress::fuzz_support;
 pub(crate) use ingress::fuzz_support::lease_fixture as test_lease;
 #[cfg(any(test, fuzzing))]
 pub(crate) use ingress::fuzz_support::scanner_patch_fixture as test_scanner_patch;
+pub use phase::{PhaseError, PhaseJob};
 
 /// Named authentication handoff: Bytes keeps this shared secret owner alive
 /// through header clones. HTTP/TLS encoding and kernel copies are not covered

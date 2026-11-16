@@ -127,3 +127,11 @@ pub fn server_response(bytes: &[u8]) -> Untrusted<&[u8], loupe_provenance::Serve
 	// SAFETY: integration tests only; the bytes come from the in-process router.
 	Untrusted::new(bytes, unsafe { Ingress::<loupe_provenance::Server>::new() })
 }
+
+/// Authored request bytes as Worker input, for building typed requests the
+/// worker's phase client then sends to the actual router.
+#[allow(unsafe_code)]
+pub fn worker_request(bytes: &[u8]) -> Untrusted<&[u8], loupe_provenance::Worker> {
+	// SAFETY: integration tests only; the bytes are authored fixtures.
+	Untrusted::new(bytes, unsafe { Ingress::<loupe_provenance::Worker>::new() })
+}

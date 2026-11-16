@@ -105,7 +105,7 @@ crates/loupe-server/src/config/input.rs actual native path/hostname/PEM parser c
 crates/loupe-server/src/ingress/router_fuzz.rs cfg-only synthetic Operator registration fixture enters the actual named decoder
 crates/loupe-server/src/reporters/fixtures.rs private unit fixture mints Agent for historical report content; Db values use actual SQLite reads
 crates/loupe-server/src/test_support.rs private unit fixtures mint fixed Agent/Operator/Worker for synthetic original messages
-crates/loupe-server/tests/common/marked.rs integration-only fixed Agent/Repo/Operator fixtures and explicit synthetic Operator authority for authored setup; Server labels the in-process router's own response bytes
+crates/loupe-server/tests/common/marked.rs integration-only fixed Agent/Repo/Operator fixtures, authored Worker request fixtures and explicit synthetic Operator authority for authored setup; Server labels the in-process router's own response bytes
 crates/loupe-storage/src/ingress/refs.rs cfg-only synthetic original column fixture mints Db then calls actual stored-reference validator
 crates/loupe-storage/src/test_support.rs private fixed Agent/Db/Config/Repo fixtures and synthetic Operator authority for DAO and scope controls
 fuzz/src/fixtures.rs private fixed Agent synthetic input fixture for concrete policy and constructor fuzz controls
