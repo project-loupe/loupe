@@ -13,8 +13,7 @@ use loupe_core::security_event::Operation;
 use loupe_core::text::policy::RevisionText;
 use loupe_core::text::BoundedText;
 use loupe_proto::{
-	CompleteOutcome, FindingsBatch, JobCapability, LeaseEnvelope, LeasePayload, LeaseResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	CompleteOutcome, JobCapability, LeaseEnvelope, LeasePayload, LeaseResponse, PROTOCOL_VERSION,
 };
 use loupe_provenance::{Agent, Ingress, Repo, Server, Untrusted};
 use tokio_util::sync::CancellationToken;
@@ -22,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use crate::client::ServerClient;
 use crate::host_outcome::{CheckoutFailure, HostVerifyReason, ReviewedRevisionFact};
 use crate::repo_cache::{RepoCache, RepoKey};
-use crate::scanner::{ScanContext, Scanner, VerifyContext};
+use crate::scanner::Scanner;
+#[cfg(test)]
+use crate::scanner::{ScanContext, VerifyContext};
+mod legacy;
 mod repo_ingress;
 #[cfg(fuzzing)]
 pub use repo_ingress::fuzz_support as fuzz_repo;
@@ -66,7 +68,7 @@ impl CheckedOutWorktree {
 
 #[derive(serde::Serialize)]
 #[serde(untagged)]
-enum CompletionRevision {
+pub(crate) enum CompletionRevision {
 	CheckedOut(BoundedText<RevisionText, Repo>),
 	Reviewed(BoundedText<RevisionText, Server>),
 }
@@ -87,6 +89,49 @@ pub(crate) struct RunnerCompletion {
 	head_sha: Option<CompletionRevision>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	error: Option<CompletionDiagnostic>,
+}
+
+/// A lease's repository in the bare cache, pinned against eviction
+/// while a job uses it.
+pub(crate) struct LeaseRepo {
+	cache: Arc<RepoCache>,
+	key: RepoKey,
+	clone_url: BoundedText<loupe_core::text::policy::CloneUrl, Server>,
+	github_pat: Option<Arc<loupe_provenance::Secret<String>>>,
+	ensured: crate::repo_cache::EnsuredRepo,
+}
+
+impl LeaseRepo {
+	/// Refresh (or clone) the lease's repository into the cache.
+	pub(crate) async fn ensure(
+		cache: &Arc<RepoCache>, repo: &loupe_core::RepoSpec<Server>,
+		github_pat: Option<loupe_provenance::Secret<String>>,
+	) -> Result<Self> {
+		let key = RepoKey::new(repo.host.expose(), repo.owner.expose(), repo.repo.expose())?;
+		let clone_url = repo.clone_url.clone();
+		let github_pat = github_pat.map(Arc::new);
+		let ensured = cache.ensure_repo(&key, clone_url.expose(), github_pat.as_ref()).await?;
+		Ok(Self { cache: cache.clone(), key, clone_url, github_pat, ensured })
+	}
+
+	/// Path of the bare cache clone.
+	pub(crate) fn path(&self) -> &Path {
+		&self.ensured.path
+	}
+
+	/// Discard the cached clone and clone it afresh. The current pin is
+	/// released first so the cache may replace the entry.
+	pub(crate) async fn reclone(self) -> Result<Self> {
+		let Self { cache, key, clone_url, github_pat, ensured } = self;
+		drop(ensured);
+		let ensured = cache.reclone_repo(&key, clone_url.expose(), github_pat.as_ref()).await?;
+		Ok(Self { cache, key, clone_url, github_pat, ensured })
+	}
+
+	/// Hand the cache pin to a worktree checked out from this clone.
+	pub(crate) fn pin(self, worktree: CheckedOutWorktree) -> CheckedOutWorktree {
+		worktree.pinned(self.ensured._pin)
+	}
 }
 
 pub struct Runner {
@@ -125,6 +170,17 @@ impl Runner {
 	pub fn with_max_workdir_bytes(mut self, bytes: u64) -> Self {
 		self.max_workdir_bytes = bytes;
 		self
+	}
+
+	/// Fail a job whose checkout exceeds the per-job workdir size cap.
+	pub(crate) fn enforce_workdir_cap(&self, workdir_size: u64) -> Result<()> {
+		if workdir_size > self.max_workdir_bytes {
+			anyhow::bail!(
+				"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
+				self.max_workdir_bytes
+			);
+		}
+		Ok(())
 	}
 
 	/// Run one iteration: long-poll for a job and, if one arrives, run
@@ -264,272 +320,29 @@ impl Runner {
 		}
 	}
 
+	/// Dispatch one lease to the handler for its payload.
 	async fn execute(
 		&self, env: LeaseEnvelope<Agent, Server>, reviewed_revision: ReviewedRevisionFact,
 		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 		cancel: CancellationToken, security: Arc<crate::canary::JobSecurity>,
 	) -> Result<Option<CompletionRevision>> {
 		anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-		// An unexpected server response must not fetch repository contents.
-		if matches!(
-			&env.payload,
-			LeasePayload::ReviewSurvey(_)
-				| LeasePayload::ReviewDrilldown(_)
-				| LeasePayload::ReviewVerify(_)
-		) {
-			anyhow::bail!("review lease arrived but phase execution is not enabled");
-		}
-		let tool_boundary = crate::llm::prompt::JobToolBoundary::new()?;
-		let key =
-			RepoKey::new(env.repo.host.expose(), env.repo.owner.expose(), env.repo.repo.expose())?;
-		let clone_url = env.repo.clone_url.clone();
-		let github_pat = env.github_pat.map(Arc::new);
-		let mut ensured =
-			self.cache.ensure_repo(&key, env.repo.clone_url.expose(), github_pat.as_ref()).await?;
-		// `ensured` (and its pin) lives until the end of this fn; the
-		// repo cache won't evict the bare clone while the worktree
-		// alternate is still in use.
-
-		match env.payload {
+		match &env.payload {
 			LeasePayload::ReviewSurvey(_)
 			| LeasePayload::ReviewDrilldown(_)
-			| LeasePayload::ReviewVerify(_) => {
-				unreachable!("review payloads are rejected before repository access")
-			},
-			LeasePayload::Verify { finding_id, finding, reviewed_sha: _ } => {
-				let ReviewedRevisionFact::Available(revision) = reviewed_revision else {
-					self.submit_revision_unavailable_verdict(
-						env.job_id,
-						&env.job_capability,
-						finding_id,
-						HostVerifyReason::MissingReviewedRevision,
-						&security,
-						&cancel,
-					)
-					.await?;
-					return Ok(None);
-				};
-				// The lease decoder retains the Server mark through this operational view.
-				let reviewed_sha = revision.clone().into_revision();
-				let (workdir, head_sha) =
-					match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
-						Ok(ok) => ok,
-						Err(first_error) => {
-							tracing::warn!(
-								job_id = env.job_id,
-								finding_id,
-								error = %first_error,
-								"verify revision missing from refreshed cache; re-cloning",
-							);
-							drop(ensured);
-							ensured = self
-								.cache
-								.reclone_repo(&key, clone_url.expose(), github_pat.as_ref())
-								.await?;
-							match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
-								Ok(ok) => ok,
-								Err(second_error) => {
-									self.submit_revision_unavailable_verdict(
-										env.job_id,
-										&env.job_capability,
-										finding_id,
-										HostVerifyReason::ReviewedRevisionUnavailable {
-											revision,
-											failure: second_error
-												.downcast_ref::<CheckoutFailure>()
-												.copied()
-												.unwrap_or(CheckoutFailure::Task),
-										},
-										&security,
-										&cancel,
-									)
-									.await?;
-									return Ok(Some(CompletionRevision::Reviewed(reviewed_sha)));
-								},
-							}
-						},
-					};
-				let workdir = workdir.pinned(ensured._pin);
-				let workdir_size = crate::repo_cache::dir_size(workdir.path());
-				if workdir_size > self.max_workdir_bytes {
-					anyhow::bail!(
-						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
-						self.max_workdir_bytes
-					);
-				}
-				let vctx = VerifyContext {
-					sandbox_workdir: workdir.sandbox_path(),
-					security: security.clone(),
-					tool_boundary,
-					workdir: workdir.path().to_path_buf(),
-					repo: env.repo.clone(),
-					repo_id: env.repo_id,
-					job_id: env.job_id,
-					job_capability: env.job_capability.clone(),
-					finding_id,
-					finding: *finding,
-					config: scanner_patch,
-					cancel: cancel.clone(),
-				};
-				// The server filters leases by advertised capabilities. This worker
-				// selects the first scanner with any verify:* tag, without per-tag matching.
-				let verifier = self
-					.scanners
-					.iter()
-					.find(|s| s.capabilities().iter().any(|c| c.starts_with("verify:")))
-					.ok_or_else(|| {
-						anyhow::anyhow!(
-							"verify lease arrived but worker advertises no verify:* scanner"
-						)
-					})?;
-				anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-				let outcome = verifier.verify(&vctx).await?;
-				security.admit(Operation::SubmitVerdict)?;
-				anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-				match outcome {
-					crate::VerifyOutcome::Host(reason) => {
-						security
-							.run(
-								Operation::SubmitVerdict,
-								self.client.submit_host_verdict(
-									env.job_id,
-									&env.job_capability,
-									reason,
-								),
-							)
-							.await?;
-					},
-					crate::VerifyOutcome::Verdict(verdict) => {
-						tracing::info!(
-							job_id = env.job_id,
-							finding_id,
-							verifier = verifier.id(),
-							"submitting verdict (in-process verifier)"
-						);
-						security
-							.run(
-								Operation::SubmitVerdict,
-								self.client.submit_verdict(
-									env.job_id,
-									&env.job_capability,
-									&VerdictSubmission {
-										protocol_version: PROTOCOL_VERSION,
-										verdict,
-									},
-								),
-							)
-							.await?;
-					},
-					crate::VerifyOutcome::Submitted => {
-						// MCP-driven verifier already POSTed via the MCP
-						// child's session-end flush. POSTing again from
-						// here would land a duplicate verification row;
-						// the runner stays out of the way.
-						tracing::info!(
-							job_id = env.job_id,
-							finding_id,
-							verifier = verifier.id(),
-							"verifier submitted verdict via MCP (runner skipping POST)"
-						);
-					},
-				}
-				Ok(Some(CompletionRevision::CheckedOut(head_sha)))
-			},
-			LeasePayload::Scan { since_sha } => {
-				tracing::info!(job_id = env.job_id, "checking out worktree");
-				let (workdir, head_sha) = match checkout_latest(
-					&ensured.path,
-					env.head_branch.as_ref().map(|v| v.expose()),
-				)
-				.await
-				{
-					Ok(ok) => ok,
-					Err(first_error) => {
-						tracing::warn!(
-							job_id = env.job_id,
-							error = %first_error,
-							"scan checkout failed from refreshed cache; re-cloning",
-						);
-						drop(ensured);
-						ensured = self
-							.cache
-							.reclone_repo(&key, clone_url.expose(), github_pat.as_ref())
-							.await?;
-						checkout_latest(&ensured.path, env.head_branch.as_ref().map(|v| v.expose()))
-							.await?
-					},
-				};
-				let workdir = workdir.pinned(ensured._pin);
-				let workdir_size = crate::repo_cache::dir_size(workdir.path());
-				tracing::info!(job_id = env.job_id, workdir_bytes = workdir_size, "worktree ready");
-				if workdir_size > self.max_workdir_bytes {
-					anyhow::bail!(
-						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
-						self.max_workdir_bytes
-					);
-				}
-				let ctx = ScanContext {
-					sandbox_workdir: workdir.sandbox_path(),
-					security: security.clone(),
-					tool_boundary,
-					workdir: workdir.path().to_path_buf(),
-					repo: env.repo.clone(),
-					repo_id: env.repo_id,
-					job_id: env.job_id,
-					job_capability: env.job_capability.clone(),
-					head_sha: head_sha.clone(),
-					base_sha: since_sha,
-					config: scanner_patch,
-					cancel: cancel.clone(),
-				};
-
-				let mut all = Vec::new();
-				for s in &self.scanners {
-					security.admit(Operation::SubmitFindings)?;
-					anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-					tracing::info!(job_id = env.job_id, scanner = s.id(), "running scanner");
-					let result = s.scan(&ctx).await;
-					security.admit(Operation::SubmitFindings)?;
-					anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-					match result {
-						Ok(mut findings) => {
-							// `returned_count` is the number of findings the
-							// scanner handed back for the runner to batch-POST
-							// to `/v1/jobs/{id}/findings` below. It's NOT the
-							// total submission count for the job — agent-driven
-							// scanners (e.g. `llm-code-review`) submit
-							// mid-session via the MCP `submit_finding` tool and
-							// always return an empty `Vec`, so a zero here only
-							// means "nothing was added to the batch." Check the
-							// server's findings table for the actual emission
-							// count when an agent scanner runs.
-							tracing::info!(
-								job_id = env.job_id,
-								scanner = s.id(),
-								returned_count = findings.len(),
-								"scanner finished",
-							);
-							all.append(&mut findings);
-						},
-						Err(_) => {
-							tracing::warn!(scanner = s.id(), "scanner failed");
-							anyhow::bail!("scanner failed");
-						},
-					}
-				}
-				anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-				if !all.is_empty() {
-					let batch = FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all };
-					security
-						.run(
-							Operation::SubmitFindings,
-							self.client.submit_findings(env.job_id, &env.job_capability, &batch),
-						)
-						.await?;
-				}
-				Ok(Some(CompletionRevision::CheckedOut(head_sha)))
+			| LeasePayload::ReviewVerify(_) => self.execute_review(env),
+			LeasePayload::Scan { .. } | LeasePayload::Verify { .. } => {
+				legacy::run(self, env, reviewed_revision, scanner_patch, cancel, security).await
 			},
 		}
+	}
+
+	/// Review phase leases fail closed: an unexpected server response
+	/// must not fetch repository contents.
+	fn execute_review(
+		&self, _env: LeaseEnvelope<Agent, Server>,
+	) -> Result<Option<CompletionRevision>> {
+		anyhow::bail!("review lease arrived but phase execution is not enabled");
 	}
 
 	async fn submit_revision_unavailable_verdict(
