@@ -12,6 +12,7 @@ fn decode_fixture(request: &Request) -> Result<ingress::DecodedRequest> {
 		.as_bytes()
 		.validate_carrying(ingress::McpRequestDecoder {
 			protocol_version: LOUPE_MCP_PROTOCOL_VERSION,
+			catalog: ingress::Catalog::Legacy,
 		})?
 		.expect("fixture is not blank"))
 }

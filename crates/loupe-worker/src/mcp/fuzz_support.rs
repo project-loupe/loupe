@@ -1,7 +1,10 @@
 //! Test-only access to the real MCP request loop and filesystem validators.
 //! The fuzz harness supplies an HTTP stub and a worktree with `fuzz-git`.
 
-pub use super::ingress::fuzz_support::{observe_records, RecordObservation, RequestObservation};
+pub use super::ingress::fuzz_support::{
+	observe_records, observe_survey_record, RecordObservation, RequestObservation,
+	SurveyObservation,
+};
 pub use super::repo_ingress::fuzz_support::{observe_repo, RepoCase, RepoObservation};
 use super::*;
 

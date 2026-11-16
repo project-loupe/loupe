@@ -73,6 +73,7 @@ GEN_TEST worker_inventory_chunks
 GEN_TEST worker_mcp_ingress
 GEN_TEST worker_mcp_rpc
 GEN_TEST worker_mcp_submission
+GEN_TEST worker_mcp_survey_ingress
 GEN_TEST worker_network_host
 GEN_TEST worker_network_parsers
 GEN_TEST worker_prompt_render

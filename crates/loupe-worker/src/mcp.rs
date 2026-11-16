@@ -67,6 +67,8 @@ const SERVER_NAME: &str = "loupe-mcp";
 const SERVER_VERSION: &str = "0.1.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const LEGACY_LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
+#[cfg(any(test, fuzzing))]
+const SURVEY_LOUPE_MCP_PROTOCOL_VERSION: u16 = 2;
 #[cfg(test)]
 const LOUPE_MCP_PROTOCOL_VERSION: u16 = LEGACY_LOUPE_MCP_PROTOCOL_VERSION;
 
@@ -91,6 +93,12 @@ impl McpMode {
 			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => {
 				LEGACY_LOUPE_MCP_PROTOCOL_VERSION
 			},
+		}
+	}
+
+	const fn catalog(self) -> ingress::Catalog {
+		match self {
+			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => ingress::Catalog::Legacy,
 		}
 	}
 
@@ -369,6 +377,7 @@ where
 		let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
 		let request = match record.as_bytes().validate_carrying(ingress::McpRequestDecoder {
 			protocol_version: session.mode().loupe_protocol_version(),
+			catalog: session.mode().catalog(),
 		}) {
 			Ok(Some(r)) => r,
 			Ok(None) => continue,
@@ -834,6 +843,7 @@ async fn handle_decoded_tool_call(
 					ingress::Arguments::ValidatePatch(diff) => {
 						validate_diff(&session.workdir, AgentDiff::Patch(&diff)).await
 					},
+					_ => Err(anyhow::anyhow!("tool is not available in this session")),
 				},
 			}
 		})
@@ -1489,6 +1499,8 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod survey_ingress_tests;
 
 #[cfg(test)]
 mod prompt_baseline_tests;

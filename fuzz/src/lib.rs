@@ -77,6 +77,7 @@ pub mod worker_inventory_chunks;
 pub mod worker_mcp_ingress;
 pub mod worker_mcp_rpc;
 pub mod worker_mcp_submission;
+pub mod worker_mcp_survey_ingress;
 pub mod worker_network_host;
 pub mod worker_network_parsers;
 pub mod worker_prompt_render;
