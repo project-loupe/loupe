@@ -226,7 +226,7 @@ async fn lease(
 async fn run(f: &Fixture) -> Result<Preparation, PrepareError> {
 	let env = lease(f).await;
 	let security = loupe_worker::canary::JobSecurity::new(Default::default(), vec![]).unwrap();
-	prepare(&f.runner, env, &security).await
+	prepare(&f.runner, env, &security, &tokio_util::sync::CancellationToken::new()).await
 }
 
 fn ready(preparation: Result<Preparation, PrepareError>) -> Box<PreparedSurvey> {
@@ -288,7 +288,11 @@ async fn fresh_bootstrap_uploads_odd_modes_and_raw_paths_the_server_seals() {
 	));
 	assert_eq!(prepared.commit.expose(), head);
 	assert_eq!(prepared.generation.commit_sha.expose(), head);
-	assert!(prepared.needs_profile && prepared.profile.is_none() && prepared.assignments.is_none());
+	assert!(
+		!prepared.profile_published()
+			&& prepared.profile.is_none()
+			&& prepared.assignments.is_none()
+	);
 	assert_eq!(prepared.attempt.get(), 1);
 	assert_eq!(prepared.phase_limits.new_units.remaining, prepared.limits.new_unit_limit);
 	assert!(prepared.worktree.path().join("z.rs").is_file());
@@ -308,7 +312,9 @@ async fn retried_bootstrap_resumes_from_the_received_prefix() {
 	let env = lease(&f).await;
 	let (job_id, capability) = (env.job_id, env.job_capability.clone());
 	let security = loupe_worker::canary::JobSecurity::new(Default::default(), vec![]).unwrap();
-	let error = prepare(&f.runner, env, &security).await.unwrap_err();
+	let error = prepare(&f.runner, env, &security, &tokio_util::sync::CancellationToken::new())
+		.await
+		.unwrap_err();
 	assert!(matches!(error, PrepareError::Phase(PhaseError::Status { status: 403 })), "{error}");
 	assert_eq!(
 		f.log.take(),
@@ -352,7 +358,7 @@ async fn retried_bootstrap_with_a_sealed_manifest_skips_the_upload() {
 	f.log.take();
 	let prepared = ready(run(&f).await);
 	assert_eq!(prepared.attempt.get(), 2);
-	assert!(prepared.needs_profile);
+	assert!(!prepared.profile_published());
 	assert_eq!(
 		routes(&f.log.take()),
 		["pin-target", "inventory-batches", "limits"],
@@ -394,7 +400,7 @@ async fn ordinary_survey_after_activation_receives_profile_and_assignments() {
 	let prepared = ready(run(&f).await);
 	assert_eq!(prepared.recipe, SurveyRecipe::Ordinary(OrdinarySurveyRecipe::Coverage));
 	assert_eq!(prepared.commit.expose(), head);
-	assert!(!prepared.needs_profile);
+	assert!(prepared.profile_published());
 	let profile = prepared.profile.as_ref().expect("frozen profile");
 	assert_eq!(serde_json::to_value(&profile.profile).unwrap(), json!({"scope":"fixture"}));
 	let assigned: Vec<i64> = prepared
@@ -453,7 +459,9 @@ async fn expired_lease_fails_before_repository_access() {
 	let loupe_proto::LeasePayload::ReviewSurvey(lease) = &mut env.payload else { panic!("survey") };
 	lease.provenance.limits.hard_deadline_at = now() - 1;
 	let security = loupe_worker::canary::JobSecurity::new(Default::default(), vec![]).unwrap();
-	let error = prepare(&f.runner, env, &security).await.unwrap_err();
+	let error = prepare(&f.runner, env, &security, &tokio_util::sync::CancellationToken::new())
+		.await
+		.unwrap_err();
 	assert!(matches!(error, PrepareError::HardDeadline));
 	assert!(f.log.take().is_empty());
 	assert_eq!(std::fs::read_dir(f._cache.path()).unwrap().count(), 0, "no clone");

@@ -104,10 +104,17 @@ impl ServerClient {
 	pub async fn lease_survey_for_tests(
 		&self, wait_seconds: u32,
 	) -> Result<LeaseResponse<Agent, Server>> {
+		Ok(self.lease_survey_receipt_for_tests(wait_seconds).await?.response)
+	}
+
+	#[cfg(feature = "test-support")]
+	pub(crate) async fn lease_survey_receipt_for_tests(
+		&self, wait_seconds: u32,
+	) -> Result<LeaseReceipt> {
 		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
 		let review =
 			LeaseList::new(vec![ReviewCapability::Survey]).map_err(|error| anyhow!(error))?;
-		Ok(self.lease_with(Vec::new(), review, wait_seconds).await?.response)
+		self.lease_with(Vec::new(), review, wait_seconds).await
 	}
 
 	async fn lease_with(

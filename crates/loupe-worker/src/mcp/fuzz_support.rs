@@ -104,9 +104,12 @@ pub fn validate_finding(workdir: &Path, args: &Value) -> Result<()> {
 }
 
 pub fn catalogue(verify: bool) -> Value {
-	tool_catalog(if verify {
-		McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
-	} else {
-		McpMode::LegacyDiscovery { job_id: Some(1) }
-	})
+	tool_catalog(
+		if verify {
+			McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
+		} else {
+			McpMode::LegacyDiscovery { job_id: Some(1) }
+		},
+		None,
+	)
 }

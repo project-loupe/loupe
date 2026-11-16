@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use loupe_core::security_event::Operation;
@@ -141,6 +141,9 @@ pub struct Runner {
 	capabilities: Vec<&'static str>,
 	max_workdir_bytes: u64,
 	credential_watches: Vec<crate::llm::model_broker::CredentialWatch>,
+	/// The agent that runs survey leases; without one they fail closed.
+	survey_backend: Option<Arc<dyn crate::llm::LlmBackend>>,
+	survey_clock: crate::review::session::Clock,
 }
 
 impl Runner {
@@ -156,7 +159,26 @@ impl Runner {
 			capabilities,
 			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 			credential_watches: Vec::new(),
+			survey_backend: None,
+			survey_clock: Arc::new(std::time::SystemTime::now),
 		}
+	}
+
+	/// Run survey leases with `backend`.
+	pub fn with_survey_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.survey_backend = Some(backend);
+		self
+	}
+
+	pub(crate) fn survey_clock(&self) -> &crate::review::session::Clock {
+		&self.survey_clock
+	}
+
+	/// Replace the clock survey sessions read their deadlines against.
+	#[cfg(any(test, feature = "test-support"))]
+	pub fn with_survey_clock(mut self, clock: crate::review::session::Clock) -> Self {
+		self.survey_clock = clock;
+		self
 	}
 	pub fn with_credential_watches(
 		mut self, watches: Vec<crate::llm::model_broker::CredentialWatch>,
@@ -172,12 +194,10 @@ impl Runner {
 		self
 	}
 
-	#[allow(dead_code, reason = "the survey handler runs prepared attempts")]
 	pub(crate) fn client(&self) -> &ServerClient {
 		&self.client
 	}
 
-	#[allow(dead_code, reason = "the survey handler runs prepared attempts")]
 	pub(crate) fn cache(&self) -> &Arc<RepoCache> {
 		&self.cache
 	}
@@ -199,6 +219,21 @@ impl Runner {
 	pub async fn step(&self, cancel: &CancellationToken) -> Result<bool> {
 		let receipt =
 			self.client.lease_for_runner(self.capabilities.clone(), LEASE_WAIT_SECONDS).await?;
+		match receipt.response {
+			LeaseResponse::Empty { .. } => Ok(false),
+			LeaseResponse::Lease(env) => {
+				self.run_lease(*env, receipt.reviewed_revision, receipt.scanner_patch, cancel)
+					.await?;
+				Ok(true)
+			},
+		}
+	}
+
+	/// Like [`Self::step`], but claims only survey leases, for tests that run
+	/// surveys before the runner advertises the phase.
+	#[cfg(feature = "test-support")]
+	pub async fn step_survey_for_tests(&self, cancel: &CancellationToken) -> Result<bool> {
+		let receipt = self.client.lease_survey_receipt_for_tests(LEASE_WAIT_SECONDS).await?;
 		match receipt.response {
 			LeaseResponse::Empty { .. } => Ok(false),
 			LeaseResponse::Lease(env) => {
@@ -244,7 +279,17 @@ impl Runner {
 			},
 			self.credential_watches.clone(),
 		)?;
-		let heartbeat = self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone());
+		let (heartbeat, phase_heartbeat) = match self.survey_hard_deadline(&env) {
+			Some(deadline) => {
+				let phase = PhaseHeartbeat::new(scan_cancel.child_token());
+				let task =
+					self.spawn_phase_heartbeat(job_id, job_capability.clone(), deadline, &phase);
+				(task, Some(phase))
+			},
+			None => {
+				(self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone()), None)
+			},
+		};
 		let execution_cancel = scan_cancel.child_token();
 		let task_cancel = execution_cancel.clone();
 		let quarantine_cancel = security.cancellation();
@@ -263,6 +308,7 @@ impl Runner {
 				scanner_patch,
 				execution_cancel.clone(),
 				security.clone(),
+				phase_heartbeat,
 			)
 			.await;
 		// Heartbeat cleanup cancels this token even after a healthy execution.
@@ -273,6 +319,11 @@ impl Runner {
 		scan_cancel.cancel();
 		let _ = heartbeat.await;
 		let _ = cancellation.await;
+		let outcome = match outcome {
+			Ok(Executed::Reported) => return Ok(()),
+			Ok(Executed::Legacy(head_sha)) => Ok(head_sha),
+			Err(error) => Err(error),
+		};
 		let outcome = if security.is_quarantined() {
 			Err(crate::canary::JobQuarantined.into())
 		} else if execution_cancelled || cancel.is_cancelled() {
@@ -335,15 +386,39 @@ impl Runner {
 		&self, env: LeaseEnvelope<Agent, Server>, reviewed_revision: ReviewedRevisionFact,
 		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 		cancel: CancellationToken, security: Arc<crate::canary::JobSecurity>,
-	) -> Result<Option<CompletionRevision>> {
+		heartbeat: Option<PhaseHeartbeat>,
+	) -> Result<Executed> {
 		anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-		match &env.payload {
-			LeasePayload::ReviewSurvey(_)
-			| LeasePayload::ReviewDrilldown(_)
-			| LeasePayload::ReviewVerify(_) => self.execute_review(env),
-			LeasePayload::Scan { .. } | LeasePayload::Verify { .. } => {
-				legacy::run(self, env, reviewed_revision, scanner_patch, cancel, security).await
+		match (&env.payload, &self.survey_backend, heartbeat) {
+			(LeasePayload::ReviewSurvey(lease), Some(backend), Some(heartbeat)) => {
+				let limits = lease.provenance.limits.clone();
+				crate::review::survey::run(
+					self, backend, env, &limits, cancel, security, heartbeat,
+				)
+				.await;
+				Ok(Executed::Reported)
 			},
+			(
+				LeasePayload::ReviewSurvey(_)
+				| LeasePayload::ReviewDrilldown(_)
+				| LeasePayload::ReviewVerify(_),
+				..,
+			) => self.execute_review(env).map(Executed::Legacy),
+			(LeasePayload::Scan { .. } | LeasePayload::Verify { .. }, ..) => {
+				legacy::run(self, env, reviewed_revision, scanner_patch, cancel, security)
+					.await
+					.map(Executed::Legacy)
+			},
+		}
+	}
+
+	/// The hard deadline of a survey lease this runner executes.
+	fn survey_hard_deadline(&self, env: &LeaseEnvelope<Agent, Server>) -> Option<SystemTime> {
+		match (&env.payload, &self.survey_backend) {
+			(LeasePayload::ReviewSurvey(lease), Some(_)) => {
+				Some(crate::review::prepare::at(lease.provenance.limits.hard_deadline_at))
+			},
+			_ => None,
 		}
 	}
 
@@ -374,6 +449,38 @@ impl Runner {
 			.await
 	}
 
+	/// The phase lease heartbeat. Its response only feeds the log; the
+	/// survey handler learns of lost authority from its own calls.
+	fn spawn_phase_heartbeat(
+		&self, job_id: i64, job_capability: JobCapability, deadline: SystemTime,
+		heartbeat: &PhaseHeartbeat,
+	) -> tokio::task::JoinHandle<()> {
+		let client = self.client.clone();
+		let cancel = heartbeat.stop.clone();
+		let stopped = heartbeat.stopped.clone();
+		tokio::spawn(async move {
+			let _stopped = stopped.drop_guard();
+			let job = crate::client::PhaseJob { job_id, capability: &job_capability, deadline };
+			loop {
+				tokio::select! {
+					biased;
+					_ = cancel.cancelled() => return,
+					result = async {
+						tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+						client.phase_heartbeat(&job).await
+					} => match result {
+						Ok(response) => tracing::debug!(
+							job_id,
+							lease_expires_at = response.lease_expires_at,
+							"phase heartbeat"
+						),
+						Err(_) => tracing::warn!(job_id, "phase heartbeat failed"),
+					},
+				}
+			}
+		})
+	}
+
 	fn spawn_heartbeat(
 		&self, job_id: i64, job_capability: JobCapability, cancel: CancellationToken,
 	) -> tokio::task::JoinHandle<()> {
@@ -395,6 +502,14 @@ impl Runner {
 			}
 		})
 	}
+}
+
+/// How `execute` ended a lease that did not fail.
+pub(crate) enum Executed {
+	/// The legacy handler finished; the runner sends its completion.
+	Legacy(Option<CompletionRevision>),
+	/// A phase handler already sent the job's terminal call, if any.
+	Reported,
 }
 
 /// Produce a fresh worktree from the bare clone at `bare` checked out
@@ -450,7 +565,6 @@ pub(crate) struct CommitObservation<'a> {
 
 /// The commit `sha` in the bare clone at `bare`, unavailable to `decoder`
 /// except as a `Repo` observation. Blocking.
-#[allow(dead_code, reason = "the survey handler runs prepared attempts")]
 pub(crate) fn observe_commit<V, T>(
 	bare: &Path, sha: &str, decoder: V,
 ) -> Result<T, crate::review::inventory::InventoryError>
@@ -547,6 +661,38 @@ async fn checkout(
 		.await
 		.map_err(|_| CheckoutFailure::Task)??;
 	Ok((CheckedOutWorktree { directory: Arc::new(tmp), pin: None }, head_sha))
+}
+
+/// Control over a phase lease's heartbeat task, which the survey handler
+/// stops before its terminal call.
+pub(crate) struct PhaseHeartbeat {
+	stop: CancellationToken,
+	stopped: CancellationToken,
+}
+
+impl PhaseHeartbeat {
+	fn new(stop: CancellationToken) -> Self {
+		Self { stop, stopped: CancellationToken::new() }
+	}
+
+	/// A handle with no heartbeat task behind it.
+	#[cfg(test)]
+	fn idle() -> Self {
+		let heartbeat = Self::new(CancellationToken::new());
+		heartbeat.stopped.cancel();
+		heartbeat
+	}
+
+	/// The token that stops the heartbeat without waiting for it.
+	pub(crate) fn stop_token(&self) -> CancellationToken {
+		self.stop.clone()
+	}
+
+	/// Stop the heartbeat and wait until no heartbeat request is in flight.
+	pub(crate) async fn stop(&self) {
+		self.stop.cancel();
+		self.stopped.cancelled().await;
+	}
 }
 
 #[cfg(test)]
@@ -858,6 +1004,7 @@ mod tests {
 					receipt.scanner_patch,
 					CancellationToken::new(),
 					security,
+					None,
 				)
 				.await
 				.err()
@@ -880,6 +1027,117 @@ mod tests {
 		);
 		stop.cancel();
 		server.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_survey_backend_leaves_other_review_leases_failing_closed() {
+		use axum::body::Bytes;
+		use axum::extract::Json;
+		use loupe_proto::PROTOCOL_VERSION_HEADER;
+		use serde_json::json;
+
+		let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+		let record = seen.clone();
+		let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
+			let record = record.clone();
+			async move {
+				let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+				record.lock().unwrap().push((uri.path().to_owned(), body));
+				(
+					[(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())],
+					Json(
+						json!({"protocol_version":3,"job_id":1,"state":"queued","eligible_at":null}),
+					),
+				)
+			}
+		});
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+		let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		let tmp = tempfile::tempdir().unwrap();
+		let cache_path = tmp.path().join("cache");
+		let cache = Arc::new(RepoCache::new(cache_path.clone(), 1024, None).unwrap());
+		let client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
+		let backend = crate::llm::testing::StubLlmBackend::new("never-run", |_| {
+			panic!("an unsupported review lease reached the survey agent")
+		});
+		let runner = Runner::new(client, cache, Vec::new()).with_survey_backend(Arc::new(backend));
+		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
+			"limits":{"soft_deadline_at":100,"submit_by":100,"hard_deadline_at":200,
+			"token_budget":null,"new_unit_limit":32,"lead_limit":16,"sibling_limit":4}});
+		let generation = json!({"generation_id":3,"commit_sha":"a".repeat(40)});
+		let profile = json!({"profile_version":1,"profile_digest":"b".repeat(64),"profile":{"purpose":"test"}});
+		let lead = json!({"lead_id":4,"producer_commit_sha":"a".repeat(40),
+			"identity_family":"memory-safety","identity_anchor":"request allocation",
+			"hypothesis":"Unbounded allocation","source_refs":[{"path":"src/lib.rs"}],
+			"next_proof_step":"Trace allocation","counterevidence":"Authentication",
+			"proof_gaps":"No reproducer"});
+		let evidence = json!({"version":1,"l2_argument":{"attacker_source":"Remote request",
+			"control":"Request length","sink":"Allocation","reachable_path":"Handler calls allocator",
+			"trust_boundary":"Request to memory"},"material_locations":[{"role":"sink","file":"src/lib.rs"}],
+			"counterevidence":"Authentication precedes allocation",
+			"assumptions_gaps":"Authenticated attacker","confidence":"medium"});
+		let finding = json!({"finding_id":4,"reviewed_commit_sha":"a".repeat(40),"severity":"high",
+			"title":"Unbounded allocation","description":"Requests allocate without a limit",
+			"identity_family":"memory-safety","identity_anchor":"request allocation","evidence":evidence});
+		let cases = [
+			(
+				json!({"kind":"review_verify","provenance":provenance,"generation":generation,
+				"profile":profile,"finding":finding}),
+				false,
+			),
+			(
+				json!({"kind":"review_drilldown","provenance":provenance,"generation":generation,
+				"profile":profile,"lead":lead}),
+				false,
+			),
+			(
+				json!({"kind":"review_survey","provenance":provenance,"context":{
+				"recipe":"corroboration","generation":generation,"assignments":[]}}),
+				true,
+			),
+		];
+		for (payload, survey) in cases {
+			let lease = json!({"kind":"lease","protocol_version":PROTOCOL_VERSION,
+				"job_id":1,"job_capability":"test-capability","repo_id":1,
+				"repo":{"host":"invalid.test","owner":"test","repo":"test",
+					"clone_url":format!("file://{}/missing",tmp.path().display())},
+				"head_branch":null,"lease_expires_at":200,"scanner_config":null,"payload":payload});
+			let receipt = crate::client::test_lease(lease.to_string().as_bytes());
+			let LeaseResponse::Lease(env) = receipt.response else { panic!("lease fixture") };
+			let security = crate::canary::JobSecurity::new(Default::default(), vec![]).unwrap();
+			let executed = runner
+				.execute(
+					*env,
+					receipt.reviewed_revision,
+					receipt.scanner_patch,
+					CancellationToken::new(),
+					security,
+					Some(PhaseHeartbeat::idle()),
+				)
+				.await;
+			let requests = std::mem::take(&mut *seen.lock().unwrap());
+			if survey {
+				assert!(matches!(executed, Ok(Executed::Reported)), "corroboration is reported");
+				assert_eq!(
+					requests,
+					[(
+						"/v1/jobs/1/complete".to_owned(),
+						json!({"protocol_version":3,"outcome":"failed",
+							"error":"survey recipe unsupported"})
+					)]
+				);
+			} else {
+				assert_eq!(
+					executed.err().map(|error| error.to_string()).as_deref(),
+					Some("review lease arrived but phase execution is not enabled")
+				);
+				assert!(requests.is_empty(), "{requests:?}");
+			}
+			let cached = std::fs::read_dir(&cache_path).unwrap().count();
+			assert_eq!(cached, 0, "an unsupported review lease touched the repository cache");
+		}
+		server.abort();
 	}
 
 	struct NeverRunReviewScanner;

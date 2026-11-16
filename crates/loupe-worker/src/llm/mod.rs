@@ -542,6 +542,41 @@ pub fn build_verifier_backend(
 	}
 }
 
+/// Build the survey [`LlmBackend`] as the verifier's is built: `auto` prefers
+/// Codex, then Claude. `auto` with neither ready yields `None`, and the
+/// worker then runs no surveys.
+pub fn build_survey_backend(
+	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
+	codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,
+	runtime: BackendRuntimeConfig,
+) -> Result<Option<Arc<dyn LlmBackend>>> {
+	let BackendRuntimeConfig { network, launch, log_agent_output, model_broker } = runtime;
+	let codex = match selection {
+		JobAgent::Auto if codex_ready => true,
+		JobAgent::Auto if claude_ready => false,
+		JobAgent::Auto => {
+			tracing::info!("no survey agent ready; survey leases are not run");
+			return Ok(None);
+		},
+		JobAgent::Claude => {
+			require_agent_ready("survey", JobAgent::Claude, claude_ready)?;
+			false
+		},
+		JobAgent::Codex => {
+			require_agent_ready("survey", JobAgent::Codex, codex_ready)?;
+			true
+		},
+	};
+	let backend = if codex {
+		tracing::info!("survey backend: codex");
+		build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker, launch)?
+	} else {
+		tracing::info!("survey backend: claude");
+		build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker, launch)?
+	};
+	Ok(Some(backend))
+}
+
 fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<()> {
 	if !ready {
 		anyhow::bail!(
@@ -889,6 +924,43 @@ mod tests {
 			Err(e) => e,
 		};
 		assert!(err.to_string().contains("no authenticated verifier backend"));
+	}
+
+	#[test]
+	fn survey_backend_follows_the_verifier_selection() {
+		let codex = crate::test_support::sandbox_agent(
+			true,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
+		);
+		let claude = crate::test_support::sandbox_agent(
+			false,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("max"),
+			},
+		);
+		let build = |selection, claude_ready, codex_ready| {
+			build_survey_backend(
+				None,
+				selection,
+				claude_ready,
+				codex_ready,
+				codex.clone(),
+				claude.clone(),
+				BackendRuntimeConfig::default(),
+			)
+			.map(|backend| backend.map(|backend| backend.id()))
+		};
+		assert_eq!(build(JobAgent::Auto, true, true).unwrap(), Some("codex-cli"));
+		assert_eq!(build(JobAgent::Auto, true, false).unwrap(), Some("claude-cli"));
+		assert_eq!(build(JobAgent::Auto, false, false).unwrap(), None);
+		assert_eq!(build(JobAgent::Claude, true, true).unwrap(), Some("claude-cli"));
+		assert_eq!(build(JobAgent::Codex, false, true).unwrap(), Some("codex-cli"));
+		let error = build(JobAgent::Codex, true, false).unwrap_err();
+		assert!(error.to_string().contains("survey agent `codex`"), "{error}");
 	}
 
 	#[test]

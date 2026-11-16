@@ -2,7 +2,8 @@
 
 use serde_json::{json, Value};
 
-use super::{add_tool_protocol_version, SurveyRecipe, SURVEY_LOUPE_MCP_PROTOCOL_VERSION};
+use super::{add_tool_protocol_version, SURVEY_LOUPE_MCP_PROTOCOL_VERSION};
+use crate::review::session::SurveySession;
 
 const KEY_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 
@@ -28,13 +29,13 @@ fn ids(max: usize) -> Value {
 	json!({"type":"array","maxItems":max,"items":{"type":"integer","minimum":1}})
 }
 
-pub(super) fn tools(recipe: SurveyRecipe) -> Value {
+pub(super) fn tools(survey: &SurveySession) -> Value {
 	let mut tools = vec![json!({
 		"name": "get_job_limits",
 		"description": "Read this survey's deadlines and remaining review-unit and lead capacity.",
 		"inputSchema": {"type":"object","properties":{}},
 	})];
-	if recipe == (SurveyRecipe::Bootstrap { profile_published: false }) {
+	if survey.lists_publish_profile() {
 		tools.push(json!({
 			"name": "publish_profile",
 			"description":

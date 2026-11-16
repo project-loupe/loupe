@@ -43,26 +43,61 @@ fn refuse(text: impl Into<String>) -> anyhow::Error {
 const UNKNOWN_UNIT: &str =
 	"review_unit_id is not a unit assigned to or proposed by this survey; use an id from the job context or a propose_review_unit result";
 
-/// The fixed text for a failed phase call, chosen by its closed error code.
-fn phase_error(survey: &SurveySession, error: &PhaseError) -> String {
-	let text = match error {
+const AUTHORITY_LOST: &str = "this survey attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session";
+const REFERENCE_REFUSED: &str = "the server refused a referenced unit, lead or path for this job; check the ids you used — units must be ones this job proposed or was assigned";
+const UNREACHABLE: &str = "the server could not be reached after retries; retry later with the SAME client key and identical content";
+const STATE_REFUSED: &str = "the server rejected the request in the survey's current state";
+const INVALID: &str =
+	"the server rejected the request as invalid; check the arguments against the tool schema";
+const EXHAUSTED: &str = "capacity for this kind of checkpoint is exhausted; record what remains elsewhere and call finalize_survey";
+
+fn forbidden(error: &PhaseError) -> bool {
+	matches!(error, PhaseError::Rejected { status: 403, .. } | PhaseError::Status { status: 403 })
+}
+
+/// The fixed text for a failed phase call. The server answers 403 both
+/// for lost authority and for a reference outside the job's scope, so a
+/// 403 is told apart by reading `/limits` under the same capability.
+async fn phase_error(
+	client: &ServerClient, survey: &SurveySession, tool: SurveyTool, error: PhaseError,
+) -> String {
+	if forbidden(&error) {
+		if tool == SurveyTool::JobLimits {
+			survey.record_authority_lost();
+			return AUTHORITY_LOST.to_owned();
+		}
+		return match client.limits(&survey.phase_job()).await {
+			Ok(limits) => {
+				survey.record_limits(&limits);
+				REFERENCE_REFUSED
+			},
+			Err(probe) if forbidden(&probe) => {
+				survey.record_authority_lost();
+				AUTHORITY_LOST
+			},
+			Err(_) => UNREACHABLE,
+		}
+		.to_owned();
+	}
+	let text = match &error {
 		PhaseError::Rejected { code, current_revision, .. } => match code {
 			ReviewErrorCode::CheckpointConflict => {
 				"this client key was already used with different content; resend the identical content to replay it, or use a new key for new content"
 			},
 			ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit => {
-				"capacity for this kind of checkpoint is exhausted; record what remains elsewhere and call finalize_survey"
+				survey.record_exhausted(tool);
+				EXHAUSTED
 			},
 			ReviewErrorCode::Denied => {
 				survey.record_authority_lost();
-				"this survey attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session"
+				AUTHORITY_LOST
 			},
 			ReviewErrorCode::InventoryRevisionConflict => {
-				return match current_revision {
+				return match current_revision.and_then(|revision| u64::try_from(revision).ok()) {
 					Some(revision) => format!(
 						"inventory entry conflict: the entry changed and is now at revision {revision}; re-check whether your disposition still applies before submitting it again"
 					),
-					None => "inventory entry conflict: the entry changed since it was last read; re-check whether your disposition still applies before submitting it again".to_owned(),
+					None => "inventory entry conflict: the host cannot recover this entry's current revision; leave this entry and continue with the others".to_owned(),
 				};
 			},
 			ReviewErrorCode::TerminalConflict => {
@@ -72,23 +107,42 @@ fn phase_error(survey: &SurveySession, error: &PhaseError) -> String {
 				"a different result for this review unit already exists"
 			},
 			ReviewErrorCode::NotFound => "the referenced object does not exist for this survey",
-			ReviewErrorCode::InvalidRequest | ReviewErrorCode::RequestTooLarge => {
-				"the server rejected the request as invalid; check the arguments against the tool schema"
-			},
-			ReviewErrorCode::InternalError => {
-				"the server could not complete the request after retries; retry later with the SAME client key and identical content"
-			},
-			_ => "the server rejected the request in the survey's current state",
+			ReviewErrorCode::InvalidRequest
+			| ReviewErrorCode::RequestTooLarge
+			| ReviewErrorCode::ContentType
+			| ReviewErrorCode::ContentEncoding
+			| ReviewErrorCode::MethodNotAllowed => INVALID,
+			ReviewErrorCode::InternalError
+			| ReviewErrorCode::ResponseTooLarge
+			| ReviewErrorCode::Unauthenticated
+			| ReviewErrorCode::RequestFailed => UNREACHABLE,
+			ReviewErrorCode::CheckoutConflict
+			| ReviewErrorCode::CompatibilityKeyConflict
+			| ReviewErrorCode::CompatibilityPolicy
+			| ReviewErrorCode::FindingIdentityConflict
+			| ReviewErrorCode::IncompatibleReviewState
+			| ReviewErrorCode::InvalidLimits
+			| ReviewErrorCode::RevalidationRequired
+			| ReviewErrorCode::StateConflict
+			| ReviewErrorCode::Other => STATE_REFUSED,
 		},
 		PhaseError::Timeout
 		| PhaseError::Connection
 		| PhaseError::Status { .. }
 		| PhaseError::Response(_)
-		| PhaseError::Decode(_) => {
-			"the server could not be reached after retries; retry later with the SAME client key and identical content"
-		},
+		| PhaseError::Decode(_) => UNREACHABLE,
 	};
 	text.to_owned()
+}
+
+/// A phase call's result, with a failure turned into fixed model text.
+async fn settle<T>(
+	client: &ServerClient, survey: &SurveySession, tool: SurveyTool, result: Result<T, PhaseError>,
+) -> Result<T> {
+	match result {
+		Ok(value) => Ok(value),
+		Err(error) => Err(refuse(phase_error(client, survey, tool, error).await)),
+	}
 }
 
 pub(super) async fn dispatch(
@@ -102,21 +156,22 @@ pub(super) async fn dispatch(
 	session.security.admit(operation(tool))?;
 	let client = &session.client;
 	let job = survey.phase_job();
-	let failed = |error: PhaseError| refuse(phase_error(survey, &error));
 	match arguments {
 		ingress::Arguments::JobLimits => {
-			let limits = client.limits(&job).await.map_err(failed)?;
+			let limits = settle(client, survey, tool, client.limits(&job).await).await?;
 			survey.record_limits(&limits);
 			Ok(serde_json::to_string(&limits).context("encoding limits")?)
 		},
 		ingress::Arguments::PublishProfile(profile) => {
 			let request = PublishProfileRequest { protocol_version: ReviewProtocol, profile };
-			let published = client.publish_profile(&job, &request).await.map_err(failed)?;
+			let published =
+				settle(client, survey, tool, client.publish_profile(&job, &request).await).await?;
 			survey.record_profile_published();
 			Ok(format!("profile published as version {}", published.profile_version))
 		},
 		ingress::Arguments::ProposeUnit(request) => {
-			let response = client.review_unit(&job, &request).await.map_err(failed)?;
+			let response =
+				settle(client, survey, tool, client.review_unit(&job, &request).await).await?;
 			let id = i64::from(response.review_unit_id);
 			survey.record_unit(id, response.assignment_epoch);
 			Ok(format!("review unit accepted: review_unit_id={id}"))
@@ -134,9 +189,9 @@ pub(super) async fn dispatch(
 				client_lead_key: args.key,
 				evidence,
 			};
-			let response = client.lead(&job, &request).await.map_err(failed)?;
+			let response = settle(client, survey, tool, client.lead(&job, &request).await).await?;
 			if response.outcome == LeadOutcome::Created {
-				survey.record_lead_created();
+				survey.record_lead_created(i64::from(response.lead_id));
 			}
 			let outcome = match response.outcome {
 				LeadOutcome::Created => "created",
@@ -155,7 +210,8 @@ pub(super) async fn dispatch(
 				client_result_key: args.key,
 				result,
 			};
-			let response = client.unit_result(&job, &request).await.map_err(failed)?;
+			let response =
+				settle(client, survey, tool, client.unit_result(&job, &request).await).await?;
 			Ok(format!(
 				"review unit result recorded: result_id={} review_unit_id={}",
 				i64::from(response.result_id),
@@ -197,12 +253,13 @@ pub(super) async fn dispatch(
 					{
 						survey.record_revision(&path, revision);
 					}
-					Err(failed(error))
+					Err(refuse(phase_error(client, survey, tool, error).await))
 				},
 			}
 		},
 		ingress::Arguments::Candidates(query) => {
-			let response = client.lead_candidates(&job, &query).await.map_err(failed)?;
+			let response =
+				settle(client, survey, tool, client.lead_candidates(&job, &query).await).await?;
 			let rendered = (|| {
 				let mut builder =
 					crate::llm::prompt::PromptBuilder::new("").mode(session.data_mode);
@@ -222,7 +279,8 @@ pub(super) async fn dispatch(
 		ingress::Arguments::Finalize(payload) => {
 			let request =
 				FinalizeSurveyRequest { protocol_version: ReviewProtocol, payload: *payload };
-			let response = client.finalize_survey(&job, &request).await.map_err(failed)?;
+			let response =
+				settle(client, survey, tool, client.finalize_survey(&job, &request).await).await?;
 			let receipt_id = i64::from(response.receipt.receipt_id);
 			survey.seal(response);
 			Ok(format!(

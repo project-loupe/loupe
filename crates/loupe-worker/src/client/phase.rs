@@ -21,7 +21,8 @@ use loupe_proto::review_inventory::{
 	InventoryDispositionRequest, InventoryDispositionResponse, InventoryDispositionResponseDecoder,
 };
 use loupe_proto::review_lifecycle::{
-	PhaseControlResponse, PhaseControlResponseDecoder, PhaseFailureRequest, PhaseHeartbeatRequest,
+	FailedOutcome, PhaseControlResponse, PhaseControlResponseDecoder, PhaseFailureRequest,
+	PhaseHeartbeatRequest,
 };
 use loupe_proto::review_terminal::{
 	FinalizeSurveyRequest, SurveyTerminalResponse, SurveyTerminalResponseDecoder,
@@ -155,6 +156,26 @@ impl ServerClient {
 		&self, job: &PhaseJob<'_>, req: &PhaseFailureRequest<S>,
 	) -> Result<PhaseControlResponse, PhaseError> {
 		let body = self.post_phase(job, "complete", req).await?;
+		Ok(body.as_bytes().validate(PhaseControlResponseDecoder)?)
+	}
+
+	/// Report a failed phase attempt with a reason from the host's closed
+	/// vocabulary.
+	pub(crate) async fn phase_failure_reason(
+		&self, job: &PhaseJob<'_>, reason: crate::review::survey::FailureReason,
+	) -> Result<PhaseControlResponse, PhaseError> {
+		#[derive(serde::Serialize)]
+		struct HostFailure {
+			protocol_version: ReviewProtocol,
+			outcome: FailedOutcome,
+			error: &'static str,
+		}
+		let req = HostFailure {
+			protocol_version: ReviewProtocol,
+			outcome: FailedOutcome::Failed,
+			error: reason.text(),
+		};
+		let body = self.post_phase(job, "complete", &req).await?;
 		Ok(body.as_bytes().validate(PhaseControlResponseDecoder)?)
 	}
 

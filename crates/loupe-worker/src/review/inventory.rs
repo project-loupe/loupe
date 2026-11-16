@@ -145,6 +145,10 @@ impl Validate<CommitObservation<'_>, Repo> for InventoryDecoder {
 		let mut raw = Vec::new();
 		walk(observation.repo, &tree, &mut Vec::new(), &mut raw)?;
 		raw.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+		// A tree object naming one path twice is malformed, whatever its size.
+		if raw.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+			return Err(InventoryError::Tree);
+		}
 
 		let mut hasher = ManifestHasher::new(&commit_hex, raw.len() as u64)
 			.map_err(|_| InventoryError::TooLarge)?;

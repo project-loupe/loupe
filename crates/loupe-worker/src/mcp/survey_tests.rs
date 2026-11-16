@@ -144,6 +144,14 @@ struct Fixture {
 	context: McpSessionContext,
 }
 
+/// The catalog a fixture's session serves.
+// debug-ok: test-only selector without agent text.
+#[derive(Debug, Clone, Copy)]
+enum SurveyRecipe {
+	Bootstrap { profile_published: bool },
+	Ordinary,
+}
+
 async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 	let server = FakePhase::start().await;
 	let now = SystemTime::now();
@@ -163,6 +171,7 @@ async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 			hard_deadline: now + Duration::from_secs(1200),
 			assignments,
 			limits: None,
+			cancel: tokio_util::sync::CancellationToken::new(),
 		},
 		Arc::new(move || SystemTime::now() + offset),
 	));
@@ -172,7 +181,7 @@ async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 		client: server.client(),
 		job_capability: JobCapability::from_secret("survey-capability"),
 		repo_id: 1,
-		mode: McpMode::Survey(recipe),
+		mode: McpMode::Survey,
 		workdir: PathBuf::from("/nonexistent"),
 		survey: Some(survey.clone()),
 	};
@@ -350,6 +359,7 @@ async fn server_errors_reach_the_model_as_fixed_text() {
 	fixture.server.reply("/leads", 409, error_body("checkpoint_conflict", None));
 	fixture.server.reply("/leads", 409, error_body("checkpoint_limit", None));
 	fixture.server.reply("/leads", 403, error_body("denied", None));
+	fixture.server.reply("/limits", 403, error_body("denied", None));
 	fixture.server.reply("/review-units", 409, conflict);
 	let responses = run(
 		fixture.context,
@@ -554,4 +564,88 @@ async fn the_broker_fails_closed_when_mode_and_survey_state_disagree() {
 	let mut context = fixture.context;
 	context.mode = McpMode::LegacyDiscovery { job_id: Some(7) };
 	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
+}
+
+#[tokio::test]
+async fn a_refused_reference_is_told_apart_from_lost_authority() {
+	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
+	fixture.server.reply("/leads", 403, error_body("denied", None));
+	fixture.server.reply("/limits", 200, limits_body(3, 4));
+	fixture.server.reply("/leads", 403, "not an envelope");
+	fixture.server.reply("/limits", 200, limits_body(3, 4));
+	let responses = run(
+		fixture.context,
+		&[
+			call(1, "submit_lead", lead_arguments("lead-1")),
+			call(2, "submit_lead", lead_arguments("lead-2")),
+		],
+	)
+	.await;
+	for response in &responses {
+		assert!(is_error(response));
+		assert!(text(response).contains("refused a referenced unit"), "{}", text(response));
+		assert!(text(response).contains("review units remaining: 3; leads remaining: 4"));
+	}
+	assert!(!fixture.survey.authority_lost());
+	let routes: Vec<_> = fixture
+		.server
+		.seen()
+		.iter()
+		.map(|s| s.head.split(' ').nth(1).unwrap().to_owned())
+		.collect();
+	assert_eq!(
+		routes,
+		["/v1/jobs/7/leads", "/v1/jobs/7/limits", "/v1/jobs/7/leads", "/v1/jobs/7/limits"]
+	);
+}
+
+#[tokio::test]
+async fn an_unrecoverable_revision_conflict_says_to_leave_the_entry() {
+	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
+	fixture.server.reply(
+		"/inventory-dispositions",
+		409,
+		error_body("inventory_revision_conflict", Some(-1)),
+	);
+	let responses = run(
+		fixture.context,
+		&[call(
+			1,
+			"submit_inventory_disposition",
+			json!({"client_inventory_disposition_key": "d-1", "path": "src/lib.rs",
+				"disposition": "mapped", "mapped_review_unit_ids": [5]}),
+		)],
+	)
+	.await;
+	assert!(is_error(&responses[0]));
+	assert!(text(&responses[0]).contains("leave this entry"), "{}", text(&responses[0]));
+	assert_eq!(fixture.survey.revision("src/lib.rs"), 0);
+}
+
+#[tokio::test]
+async fn capacity_counts_new_leads_once_and_follows_quota_refusals() {
+	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
+	fixture.server.reply("/limits", 200, limits_body(30, 12));
+	let created = json!({"protocol_version":3,"lead_id":4,"outcome":"created",
+		"observation_id":null,"accepted_priority":{"band":"urgent","score":90}})
+	.to_string();
+	fixture.server.reply("/leads", 200, created.clone());
+	fixture.server.reply("/leads", 200, created);
+	fixture.server.reply("/leads", 409, error_body("checkpoint_limit", None));
+	fixture.server.reply("/review-units", 409, error_body("checkpoint_limit", None));
+	let responses = run(
+		fixture.context,
+		&[
+			call(1, "get_job_limits", json!({})),
+			call(2, "submit_lead", lead_arguments("lead-1")),
+			call(3, "submit_lead", lead_arguments("lead-1")),
+			call(4, "submit_lead", lead_arguments("lead-2")),
+			call(5, "propose_review_unit", unit_arguments()),
+		],
+	)
+	.await;
+	let status = |index: usize| text(&responses[index]).lines().last().unwrap().to_owned();
+	assert!(status(2).contains("review units remaining: 30; leads remaining: 11"), "{}", status(2));
+	assert!(status(3).contains("review units remaining: 30; leads remaining: 0"), "{}", status(3));
+	assert!(status(4).contains("review units remaining: 0; leads remaining: 0"), "{}", status(4));
 }

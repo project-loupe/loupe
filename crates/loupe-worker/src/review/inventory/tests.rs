@@ -137,6 +137,15 @@ fn unrepresentable_entries_fail_closed_without_path_text() {
 }
 
 #[test]
+fn a_tree_with_duplicate_paths_is_malformed_not_too_large() {
+	let f = Fixture::new();
+	let blob = f.blob(b"x");
+	let root = raw_tree(&f.repo, &[("100644", b"a", blob), ("100644", b"a", blob)]);
+	let commit = commit(&f.repo, root);
+	assert_eq!(inventory(&f, &commit).err(), Some(InventoryError::Tree));
+}
+
+#[test]
 fn empty_tree_is_one_empty_batch() {
 	let f = Fixture::new();
 	let root = raw_tree(&f.repo, &[]);

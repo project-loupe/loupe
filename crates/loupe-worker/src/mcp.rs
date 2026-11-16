@@ -82,21 +82,10 @@ pub enum McpMode {
 	/// Verification of one finding: `submit_verdict`, `submit_patch`
 	/// and `validate_patch` replace the discovery submission tools.
 	LegacyVerify { job_id: i64, finding_id: i64 },
-	/// Survey phase catalog (Loupe MCP protocol 2). The job and its host
-	/// state travel separately as a shared `SurveySession`.
-	Survey(SurveyRecipe),
-}
-
-/// Which survey catalog a session serves.
-// debug-ok: closed recipe and a host flag only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurveyRecipe {
-	/// `profile_published` is the generation's state at session start;
-	/// `publish_profile` is listed only while it is false.
-	Bootstrap {
-		profile_published: bool,
-	},
-	Ordinary,
+	/// Survey phase catalog (Loupe MCP protocol 2). The job, its host
+	/// state and the catalog's shape travel separately as a shared
+	/// `SurveySession`.
+	Survey,
 }
 
 impl McpMode {
@@ -107,14 +96,14 @@ impl McpMode {
 			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => {
 				LEGACY_LOUPE_MCP_PROTOCOL_VERSION
 			},
-			Self::Survey(_) => SURVEY_LOUPE_MCP_PROTOCOL_VERSION,
+			Self::Survey => SURVEY_LOUPE_MCP_PROTOCOL_VERSION,
 		}
 	}
 
 	const fn catalog(self) -> ingress::Catalog {
 		match self {
 			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => ingress::Catalog::Legacy,
-			Self::Survey(_) => ingress::Catalog::Survey,
+			Self::Survey => ingress::Catalog::Survey,
 		}
 	}
 
@@ -122,13 +111,13 @@ impl McpMode {
 		match self {
 			Self::LegacyDiscovery { job_id } => job_id,
 			Self::LegacyVerify { job_id, .. } => Some(job_id),
-			Self::Survey(_) => None,
+			Self::Survey => None,
 		}
 	}
 
 	pub const fn finding_id(self) -> Option<i64> {
 		match self {
-			Self::LegacyDiscovery { .. } | Self::Survey(_) => None,
+			Self::LegacyDiscovery { .. } | Self::Survey => None,
 			Self::LegacyVerify { finding_id, .. } => Some(finding_id),
 		}
 	}
@@ -348,7 +337,7 @@ pub struct McpSessionContext {
 pub(crate) fn survey_state_matches(
 	mode: McpMode, survey: Option<&Arc<crate::review::session::SurveySession>>,
 ) -> Result<()> {
-	if matches!(mode, McpMode::Survey(_)) != survey.is_some() {
+	if matches!(mode, McpMode::Survey) != survey.is_some() {
 		anyhow::bail!("MCP mode and survey session state disagree");
 	}
 	Ok(())
@@ -489,7 +478,7 @@ async fn handle_decoded_request(
 		ingress::Method::List => Response::ok(
 			id,
 			json!({
-				"tools": tool_catalog(session.mode),
+				"tools": tool_catalog(session.mode, session.survey.as_deref()),
 				"_meta": mode_meta(session.mode),
 			}),
 		),
@@ -533,11 +522,13 @@ fn mode_meta(mode: McpMode) -> Value {
 /// `query_prior_findings` and `get_finding_by_id` stay in both
 /// modes — they're read-only and useful for the verifier to
 /// cross-check the bug it's verifying against the repo's history.
-fn tool_catalog(mode: McpMode) -> Value {
-	match mode {
-		McpMode::LegacyDiscovery { job_id } => legacy_tool_catalog(job_id.is_some(), false),
-		McpMode::LegacyVerify { .. } => legacy_tool_catalog(true, true),
-		McpMode::Survey(recipe) => survey_catalog::tools(recipe),
+fn tool_catalog(mode: McpMode, survey: Option<&crate::review::session::SurveySession>) -> Value {
+	match (mode, survey) {
+		(McpMode::LegacyDiscovery { job_id }, _) => legacy_tool_catalog(job_id.is_some(), false),
+		(McpMode::LegacyVerify { .. }, _) => legacy_tool_catalog(true, true),
+		(McpMode::Survey, Some(survey)) => survey_catalog::tools(survey),
+		// `run_stream_server` refuses a survey mode without its session.
+		(McpMode::Survey, None) => json!([]),
 	}
 }
 
