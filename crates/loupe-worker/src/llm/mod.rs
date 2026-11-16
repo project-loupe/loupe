@@ -212,6 +212,9 @@ pub struct LlmRequest {
 	/// Survey host state shared with the broker; required exactly when
 	/// `mcp_mode` is a survey mode, and outlives the MCP connection.
 	pub survey: Option<Arc<crate::review::session::SurveySession>>,
+	/// The lease's token budget for this invocation, lowering the configured
+	/// model-broker token ceiling; `None` leaves it unchanged.
+	pub token_budget: Option<std::num::NonZeroU64>,
 	/// Opaque authority for the exact active lease. It remains in the
 	/// trusted host broker and is never passed to the agent process.
 	pub job_capability: Option<JobCapability>,
@@ -602,6 +605,7 @@ mod tests {
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			survey: None,
+			token_budget: None,
 			job_capability: None,
 		};
 		assert!(

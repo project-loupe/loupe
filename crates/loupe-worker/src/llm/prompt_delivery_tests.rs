@@ -42,6 +42,7 @@ async fn s3_prompt_delivery_fixture() -> (Vec<u8>, String, String) {
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			survey: None,
+			token_budget: None,
 			job_capability: None,
 		})
 		.await
@@ -141,6 +142,7 @@ async fn s3_lifecycle_fixture(
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			survey: None,
+			token_budget: None,
 			job_capability: None,
 		})
 		.await;
@@ -330,6 +332,7 @@ async fn sandbox_output_is_absent_from_success_logs_and_failure_chains() {
 				repo_id: None,
 				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 				survey: None,
+				token_budget: None,
 				job_capability: None,
 			})
 			.await;
@@ -399,6 +402,7 @@ async fn common_quarantine_cancels_and_reaps_the_running_child() {
 		repo_id: None,
 		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 		survey: None,
+		token_budget: None,
 		job_capability: None,
 	};
 	let backend = PromptTestBackend::with_bin(script.as_os_str())

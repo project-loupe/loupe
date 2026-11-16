@@ -84,6 +84,7 @@ impl Scanner for LlmVerifierScanner {
 				finding_id: ctx.finding_id,
 			},
 			survey: None,
+			token_budget: None,
 			job_capability: Some(ctx.job_capability.clone()),
 		};
 		let _resp = self.backend.run(req).await?;

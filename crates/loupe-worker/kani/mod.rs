@@ -594,3 +594,54 @@ fn survey_gate_seals_waits_for_the_profile_and_soft_stops_exactly() {
 	kani::cover!(late && admission == Admission::Deny(Denial::SoftStop), "soft stop denial");
 	kani::cover!(late && tool == SurveyTool::Lead && allowed, "lead stays open after submit_by");
 }
+
+// Over every launch instant with nanosecond precision and every i64 hard
+// deadline; the arithmetic has no loops, so the proof is unbounded.
+#[cfg(kani)]
+#[kani::proof]
+fn survey_timeout_never_reaches_the_hard_deadline() {
+	use std::time::Duration;
+
+	use crate::review::deadline::{invocation_timeout, KILL_MARGIN};
+	let nanos: u32 = kani::any();
+	kani::assume(nanos < 1_000_000_000);
+	let now = Duration::new(kani::any(), nanos);
+	let hard_deadline_at: i64 = kani::any();
+	let timeout = invocation_timeout(now, hard_deadline_at);
+	match timeout {
+		Some(timeout) => {
+			assert!(!timeout.is_zero());
+			let end = now.checked_add(timeout).and_then(|end| end.checked_add(KILL_MARGIN));
+			assert_eq!(end, Some(Duration::from_secs(hard_deadline_at as u64)));
+		},
+		None => {
+			// No launch only when less than the margin, or nothing, is left.
+			if hard_deadline_at >= 0 {
+				let hard = Duration::from_secs(hard_deadline_at as u64);
+				assert!(hard <= now || hard - now <= KILL_MARGIN);
+			}
+		},
+	}
+	kani::cover!(timeout.is_some(), "launch");
+	kani::cover!(timeout.is_none() && hard_deadline_at > 0, "no launch near the deadline");
+	kani::cover!(timeout.is_none() && hard_deadline_at < 0, "no launch for a negative deadline");
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn invocation_token_ceiling_is_the_smaller_cap() {
+	use crate::llm::model_broker::ModelBrokerLimits;
+	let config: Option<u64> = kani::any();
+	let budget: Option<std::num::NonZeroU64> = kani::any();
+	let limits =
+		ModelBrokerLimits { request_ceiling: 1, output_ceiling_bytes: 1, token_ceiling: config };
+	let ceiling = limits.with_token_budget(budget).token_ceiling;
+	match (config, budget) {
+		(None, None) => assert_eq!(ceiling, None),
+		(Some(c), None) => assert_eq!(ceiling, Some(c)),
+		(None, Some(b)) => assert_eq!(ceiling, Some(b.get())),
+		(Some(c), Some(b)) => assert!(ceiling == Some(c.min(b.get()))),
+	}
+	kani::cover!(matches!((config, budget), (Some(c), Some(b)) if b.get() < c), "lease lowers");
+	kani::cover!(matches!((config, budget), (Some(c), Some(b)) if c < b.get()), "config holds");
+}

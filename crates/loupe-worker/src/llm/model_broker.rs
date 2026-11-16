@@ -198,17 +198,26 @@ impl ModelBrokerContext {
 		self.credential.watch()
 	}
 
+	/// `token_budget` caps this session's tokens below the configured
+	/// ceiling; `None` keeps the configured limits.
 	pub async fn start_session(
 		&self, backend: ModelBrokerBackend, security: Arc<crate::canary::JobSecurity>,
+		token_budget: Option<std::num::NonZeroU64>,
 	) -> Result<ModelBrokerSession> {
 		ModelBrokerSession::start_for_job(
 			backend,
 			self.upstream.clone(),
 			self.credential.clone(),
-			self.limits,
+			self.session_limits(token_budget),
 			security,
 		)
 		.await
+	}
+
+	pub(crate) fn session_limits(
+		&self, token_budget: Option<std::num::NonZeroU64>,
+	) -> ModelBrokerLimits {
+		self.limits.with_token_budget(token_budget)
 	}
 
 	pub fn worker_binary(&self) -> crate::sandbox::SandboxPath {
@@ -299,6 +308,19 @@ impl ModelBrokerLimits {
 			anyhow::bail!("model broker token ceiling must be greater than zero when configured");
 		}
 		Ok(())
+	}
+}
+
+impl ModelBrokerLimits {
+	/// These limits for one invocation whose lease grants `budget` tokens:
+	/// the token ceiling is the smaller of the two, and an absent side sets
+	/// no cap.
+	pub fn with_token_budget(self, budget: Option<std::num::NonZeroU64>) -> Self {
+		let token_ceiling = match (self.token_ceiling, budget.map(std::num::NonZeroU64::get)) {
+			(Some(config), Some(lease)) => Some(config.min(lease)),
+			(config, lease) => config.or(lease),
+		};
+		Self { token_ceiling, ..self }
 	}
 }
 
@@ -1253,6 +1275,7 @@ mod tests {
 					vec![cloned.credential_watch()],
 				)
 				.unwrap(),
+				None,
 			)
 			.await
 			.unwrap();
@@ -1522,6 +1545,37 @@ mod tests {
 			output_ceiling_bytes: 1024 * 1024,
 			token_ceiling: None,
 		}
+	}
+
+	#[test]
+	fn token_budget_lowers_but_never_raises_the_ceiling() {
+		let budget = |n| std::num::NonZeroU64::new(n);
+		let configured = |ceiling| ModelBrokerLimits { token_ceiling: ceiling, ..limits() };
+		let ceiling = |config, lease| configured(config).with_token_budget(lease).token_ceiling;
+		assert_eq!(ceiling(None, None), None);
+		assert_eq!(ceiling(Some(100), None), Some(100));
+		assert_eq!(ceiling(None, budget(40)), Some(40));
+		assert_eq!(ceiling(Some(100), budget(40)), Some(40));
+		assert_eq!(ceiling(Some(30), budget(40)), Some(30));
+		assert_eq!(ceiling(Some(40), budget(40)), Some(40));
+		let capped = configured(Some(100)).with_token_budget(budget(40));
+		assert_eq!(
+			(capped.request_ceiling, capped.output_ceiling_bytes),
+			(limits().request_ceiling, limits().output_ceiling_bytes)
+		);
+		assert!(capped.validate().is_ok());
+	}
+
+	#[test]
+	fn sessions_take_the_invocation_token_budget() {
+		let context = ModelBrokerContext::new(
+			crate::sandbox::SandboxPath::fixture("unused-worker".into()),
+			"http://127.0.0.1:1".parse().unwrap(),
+			ModelCredential::anthropic_api_key("unused"),
+			ModelBrokerLimits { token_ceiling: Some(100), ..limits() },
+		);
+		assert_eq!(context.session_limits(None).token_ceiling, Some(100));
+		assert_eq!(context.session_limits(std::num::NonZeroU64::new(7)).token_ceiling, Some(7));
 	}
 
 	fn bwrap_present() -> bool {

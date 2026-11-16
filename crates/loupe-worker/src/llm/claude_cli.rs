@@ -239,6 +239,7 @@ impl LlmBackend for ClaudeCliBackend {
 					effort: self.agent.effort().model_policy()?,
 				},
 				req.security.clone(),
+				req.token_budget,
 			)
 			.await
 			.context("starting host-side Claude model broker")?;
@@ -524,6 +525,7 @@ mod tests {
 				repo_id: None,
 				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 				survey: None,
+				token_budget: None,
 				job_capability: None,
 			})
 			.await;
@@ -720,6 +722,7 @@ mod tests {
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			survey: None,
+			token_budget: None,
 			job_capability: None,
 		};
 
@@ -796,6 +799,7 @@ mod tests {
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			survey: None,
+			token_budget: None,
 			job_capability: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
@@ -837,6 +841,7 @@ mod tests {
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			survey: None,
+			token_budget: None,
 			job_capability: None,
 		};
 
