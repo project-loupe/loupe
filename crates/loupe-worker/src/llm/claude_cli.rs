@@ -522,9 +522,8 @@ mod tests {
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
 				repo_id: None,
-				job_id: None,
+				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 				job_capability: None,
-				finding_id: None,
 			})
 			.await;
 		(result, finished.exists())
@@ -718,9 +717,8 @@ mod tests {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			job_capability: None,
-			finding_id: None,
 		};
 
 		let response = backend.run(req).await.expect("fake Claude CLI should run");
@@ -794,9 +792,8 @@ mod tests {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			job_capability: None,
-			finding_id: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();
@@ -835,9 +832,8 @@ mod tests {
 			timeout: Duration::from_millis(500),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			job_capability: None,
-			finding_id: None,
 		};
 
 		let err = backend.run(req).await.expect_err("must time out");

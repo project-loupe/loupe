@@ -10,7 +10,9 @@ fn decode_fixture(request: &Request) -> Result<ingress::DecodedRequest> {
 	let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
 	Ok(record
 		.as_bytes()
-		.validate_carrying(ingress::McpRequestDecoder)?
+		.validate_carrying(ingress::McpRequestDecoder {
+			protocol_version: LOUPE_MCP_PROTOCOL_VERSION,
+		})?
 		.expect("fixture is not blank"))
 }
 pub(super) fn arguments(name: &str, args: &Value) -> Result<ingress::Arguments> {
@@ -84,4 +86,16 @@ pub(super) async fn tool_submit_verdict(session: &Arc<Session>, args: &Value) ->
 pub(super) async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<String> {
 	let ingress::Arguments::Patch(args) = arguments("submit_patch", args)? else { unreachable!() };
 	submit_patch(session, args).await
+}
+
+pub(super) fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
+	tool_catalog(if verify_mode {
+		McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
+	} else {
+		McpMode::LegacyDiscovery { job_id: submissions_enabled.then_some(1) }
+	})
+}
+
+pub(super) fn loupe_mcp_meta() -> Value {
+	mode_meta(McpMode::LegacyDiscovery { job_id: None })
 }

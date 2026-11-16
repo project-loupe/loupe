@@ -79,9 +79,11 @@ impl Scanner for LlmVerifierScanner {
 			timeout: crate::llm::DEFAULT_REQUEST_TIMEOUT,
 			cancel: ctx.cancel.clone(),
 			repo_id: Some(ctx.repo_id),
-			job_id: Some(ctx.job_id),
+			mcp_mode: crate::mcp::McpMode::LegacyVerify {
+				job_id: ctx.job_id,
+				finding_id: ctx.finding_id,
+			},
 			job_capability: Some(ctx.job_capability.clone()),
-			finding_id: Some(ctx.finding_id),
 		};
 		let _resp = self.backend.run(req).await?;
 
@@ -157,7 +159,8 @@ mod tests {
 			Arc::new(Mutex::new(None));
 		let captured_for_stub = captured.clone();
 		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
-			*captured_for_stub.lock().unwrap() = Some((req.repo_id, req.job_id, req.finding_id));
+			*captured_for_stub.lock().unwrap() =
+				Some((req.repo_id, req.mcp_mode.job_id(), req.mcp_mode.finding_id()));
 			Ok(String::new())
 		}));
 		LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();

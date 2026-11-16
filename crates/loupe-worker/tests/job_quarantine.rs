@@ -121,11 +121,10 @@ printf '{"input":"ordinary","unknown":"%s"}' "$key" | /usr/bin/curl --silent --s
 			timeout: Duration::from_secs(10),
 			cancel: tokio_util::sync::CancellationToken::new(),
 			repo_id: Some(1),
-			job_id: Some(42),
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: Some(42) },
 			job_capability: Some(loupe_proto::JobCapability::from_secret(
 				"synthetic-job-capability",
 			)),
-			finding_id: None,
 		})
 		.await;
 	server.abort();

@@ -141,8 +141,7 @@ async fn all_worker_response_paths_reject_malformed_dtos() {
 				client: std::sync::Arc::new(client),
 				job_capability: capability.clone(),
 				repo_id: 1,
-				job_id: None,
-				finding_id: None,
+				mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
 				workdir: std::env::temp_dir(),
 			};
 			let request = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_prior_findings","arguments":{"query":"","limit":100}}}"#;

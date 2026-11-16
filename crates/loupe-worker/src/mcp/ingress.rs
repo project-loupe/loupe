@@ -32,7 +32,9 @@ impl From<serde_json::Error> for RecordError {
 	}
 }
 
-pub(super) struct McpRequestDecoder;
+pub(super) struct McpRequestDecoder {
+	pub(super) protocol_version: u16,
+}
 pub(super) struct DecodedRequest {
 	pub(super) id: Option<SandboxReplyId>,
 	pub(super) method: Method,
@@ -252,15 +254,15 @@ macro_rules! carry {
 
 fn arguments(
 	u: &Unvalidated<'_, &[u8], Sandbox>, name: &ToolName, raw: Option<&RawValue>,
+	protocol_version: u16,
 ) -> Result<Arguments> {
 	let fields = fields(raw).map_err(DecodeError::from)?;
 	if let Some(version) = fields.get("protocol_version") {
 		let value: Value = serde_json::from_str(version.get()).map_err(DecodeError::from)?;
 		let version = value.as_u64().context("protocol_version must be an integer")?;
-		if version != u64::from(super::LOUPE_MCP_PROTOCOL_VERSION) {
+		if version != u64::from(protocol_version) {
 			anyhow::bail!(
-				"unsupported Loupe MCP protocol_version {version}; worker supports {}",
-				super::LOUPE_MCP_PROTOCOL_VERSION
+				"unsupported Loupe MCP protocol_version {version}; worker supports {protocol_version}"
 			);
 		}
 	}
@@ -438,7 +440,7 @@ impl ValidateCarrying<&[u8], Sandbox> for McpRequestDecoder {
 			_ => ToolName::Unknown(name),
 		};
 		let arguments = if matches!(method, Method::Call) && raw.id.is_some() {
-			arguments(&u, &name, params.get("arguments").copied())
+			arguments(&u, &name, params.get("arguments").copied(), self.protocol_version)
 		} else {
 			// This record will not dispatch a tool. Its params are Sandbox
 			// protocol data and retain the full legacy Value syntax traversal.

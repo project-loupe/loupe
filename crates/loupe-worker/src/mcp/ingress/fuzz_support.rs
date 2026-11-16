@@ -84,7 +84,9 @@ pub async fn observe_records(
 		let scope = crate::ingress_text::observe::Scope::begin();
 		// SAFETY: cfg-only fixture is the original record from the actual bounded framer.
 		let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
-		let parsed = record.as_bytes().validate_carrying(McpRequestDecoder);
+		let parsed = record.as_bytes().validate_carrying(McpRequestDecoder {
+			protocol_version: super::super::LEGACY_LOUPE_MCP_PROTOCOL_VERSION,
+		});
 		let agent_spans = scope.finish();
 		records.push(match parsed {
 			Ok(None) => RecordObservation::Blank { length },
@@ -109,8 +111,12 @@ pub(crate) fn arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
 	)?;
 	// SAFETY: cfg-only original complete Sandbox record constructed above.
 	let original = Untrusted::new(original, unsafe { Ingress::<Sandbox>::new() });
-	let request =
-		original.as_bytes().validate_carrying(McpRequestDecoder)?.expect("fixture record");
+	let request = original
+		.as_bytes()
+		.validate_carrying(McpRequestDecoder {
+			protocol_version: super::super::LEGACY_LOUPE_MCP_PROTOCOL_VERSION,
+		})?
+		.expect("fixture record");
 	request.call.arguments
 }
 

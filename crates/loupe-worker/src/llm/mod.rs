@@ -205,20 +205,13 @@ pub struct LlmRequest {
 	/// `query_prior_findings` scoped to this repo. `None` falls back
 	/// to the no-MCP behaviour (just prompt + stdout).
 	pub repo_id: Option<i64>,
-	/// Job id for the scan currently in progress. Required for the
-	/// `submit_finding` MCP tool to POST to
-	/// `/v1/jobs/{job_id}/llm-findings`; without it, that tool is not
-	/// advertised. `None` falls back to query-only MCP usage (the
-	/// agent can read prior findings but can't write new ones).
-	pub job_id: Option<i64>,
+	/// Tool catalogue the MCP broker serves for this invocation, and
+	/// the job (and, for verification, finding) it attributes
+	/// submissions to.
+	pub mcp_mode: crate::mcp::McpMode,
 	/// Opaque authority for the exact active lease. It remains in the
 	/// trusted host broker and is never passed to the agent process.
 	pub job_capability: Option<JobCapability>,
-	/// Finding id for a verify-kind session. When `Some`, the MCP
-	/// server enters verify mode: `submit_finding` is hidden;
-	/// `submit_verdict`, `submit_patch`, and `validate_patch` are
-	/// advertised instead. `None` keeps the discovery-mode catalog.
-	pub finding_id: Option<i64>,
 }
 impl std::fmt::Debug for LlmRequest {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -604,8 +597,7 @@ mod tests {
 			timeout: std::time::Duration::from_secs(1),
 			cancel: tokio_util::sync::CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
-			finding_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
 			job_capability: None,
 		};
 		assert!(

@@ -66,7 +66,48 @@ use crate::ServerClient;
 const SERVER_NAME: &str = "loupe-mcp";
 const SERVER_VERSION: &str = "0.1.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-const LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
+const LEGACY_LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
+#[cfg(test)]
+const LOUPE_MCP_PROTOCOL_VERSION: u16 = LEGACY_LOUPE_MCP_PROTOCOL_VERSION;
+
+/// Which tool catalogue one broker session serves, and the Loupe MCP
+/// tool protocol version that catalogue speaks.
+// debug-ok: Variants carry only host-assigned numeric job and finding ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpMode {
+	/// Discovery scan. `job_id` attributes `submit_finding`; without
+	/// it the tool is not advertised and the session is read-only.
+	LegacyDiscovery { job_id: Option<i64> },
+	/// Verification of one finding: `submit_verdict`, `submit_patch`
+	/// and `validate_patch` replace the discovery submission tools.
+	LegacyVerify { job_id: i64, finding_id: i64 },
+}
+
+impl McpMode {
+	/// Loupe MCP tool protocol version advertised in `_meta` and tool
+	/// schemas, and required of any `protocol_version` tool argument.
+	pub const fn loupe_protocol_version(self) -> u16 {
+		match self {
+			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => {
+				LEGACY_LOUPE_MCP_PROTOCOL_VERSION
+			},
+		}
+	}
+
+	pub const fn job_id(self) -> Option<i64> {
+		match self {
+			Self::LegacyDiscovery { job_id } => job_id,
+			Self::LegacyVerify { job_id, .. } => Some(job_id),
+		}
+	}
+
+	pub const fn finding_id(self) -> Option<i64> {
+		match self {
+			Self::LegacyDiscovery { .. } => None,
+			Self::LegacyVerify { finding_id, .. } => Some(finding_id),
+		}
+	}
+}
 
 /// How many lines of context to take on each side of the bug-line
 /// range when computing the fingerprint window. Two lines is enough
@@ -157,6 +198,17 @@ struct Session {
 	/// / `submit_patch` / `validate_patch`. `None` keeps the
 	/// discovery-mode catalog.
 	verify: Option<VerifySessionState>,
+}
+
+impl Session {
+	fn mode(&self) -> McpMode {
+		match (&self.verify, self.job_id) {
+			(Some(verify), Some(job_id)) => {
+				McpMode::LegacyVerify { job_id, finding_id: verify.finding_id }
+			},
+			(Some(_), None) | (None, _) => McpMode::LegacyDiscovery { job_id: self.job_id },
+		}
+	}
 }
 
 /// Verify-mode buffer. The agent calls `submit_verdict` first
@@ -251,13 +303,8 @@ impl std::fmt::Debug for RpcError {
 /// Immutable authority and filesystem scope for one host-side MCP
 /// broker session.
 ///
-/// `repo_id` scopes search/lookup tools to this repo. `job_id`, when
-/// `Some`, enables `submit_finding` — submissions POST to
-/// `/v1/jobs/{job_id}/llm-findings`. `finding_id`, when `Some`, flips
-/// the server into verify mode (the agent sees `submit_verdict` /
-/// `submit_patch` / `validate_patch` instead of the discovery
-/// tools); `job_id` MUST also be set in verify mode so the verdict
-/// POST has a job to attribute to. `workdir` is the path the
+/// `repo_id` scopes search/lookup tools to this repo. `mode` selects
+/// the tool catalogue (see [`McpMode`]). `workdir` is the path the
 /// agent's file references resolve against (`/workdir` inside
 /// bwrap, the host worktree path in disable-sandbox mode).
 ///
@@ -273,8 +320,7 @@ pub struct McpSessionContext {
 	pub client: Arc<ServerClient>,
 	pub job_capability: JobCapability,
 	pub repo_id: i64,
-	pub job_id: Option<i64>,
-	pub finding_id: Option<i64>,
+	pub mode: McpMode,
 	pub workdir: PathBuf,
 }
 
@@ -284,18 +330,10 @@ where
 	R: AsyncBufRead + Unpin,
 	W: AsyncWrite + Unpin,
 {
-	let verify = match (context.finding_id, context.job_id) {
-		(Some(fid), Some(_)) => Some(VerifySessionState {
-			finding_id: fid,
-			inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
-		}),
-		(Some(_), None) => {
-			anyhow::bail!(
-				"verify-mode MCP server requires both --finding-id and --job-id; got finding-id only"
-			);
-		},
-		(None, _) => None,
-	};
+	let verify = context.mode.finding_id().map(|finding_id| VerifySessionState {
+		finding_id,
+		inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
+	});
 	let session = Arc::new(Session {
 		security: context.security,
 		tool_boundary: context.tool_boundary,
@@ -303,7 +341,7 @@ where
 		client: context.client,
 		job_capability: context.job_capability,
 		repo_id: context.repo_id,
-		job_id: context.job_id,
+		job_id: context.mode.job_id(),
 		workdir: context.workdir,
 		verify,
 	});
@@ -329,12 +367,15 @@ where
 		// session's sandbox stdin/socket, before UTF-8 or JSON interpretation.
 		#[allow(unsafe_code)]
 		let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
-		let request = match record.as_bytes().validate_carrying(ingress::McpRequestDecoder) {
+		let request = match record.as_bytes().validate_carrying(ingress::McpRequestDecoder {
+			protocol_version: session.mode().loupe_protocol_version(),
+		}) {
 			Ok(Some(r)) => r,
 			Ok(None) => continue,
 			Err(ingress::RecordError::Utf8) => {
 				if session.security.is_quarantined() {
-					write_response(&mut writer, &quarantined_response(Value::Null)).await?;
+					write_response(&mut writer, &quarantined_response(Value::Null, session.mode()))
+						.await?;
 					return Err(crate::canary::JobQuarantined.into());
 				}
 				return Err(std::io::Error::new(
@@ -345,7 +386,8 @@ where
 			},
 			Err(e) => {
 				if session.security.is_quarantined() {
-					write_response(&mut writer, &quarantined_response(Value::Null)).await?;
+					write_response(&mut writer, &quarantined_response(Value::Null, session.mode()))
+						.await?;
 					return Err(crate::canary::JobQuarantined.into());
 				}
 				tracing::debug!(method = "invalid", line_bytes, "loupe-mcp: received request");
@@ -396,7 +438,7 @@ async fn handle_decoded_request(
 	session: &Arc<Session>, method: ingress::Method, call: ingress::ToolCall, id: Value,
 ) -> Response {
 	if session.security.is_quarantined() {
-		return quarantined_response(id);
+		return quarantined_response(id, session.mode());
 	}
 	match method {
 		ingress::Method::Initialize => Response::ok(
@@ -405,14 +447,14 @@ async fn handle_decoded_request(
 				"protocolVersion": MCP_PROTOCOL_VERSION,
 				"capabilities": { "tools": { "listChanged": false } },
 				"serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-				"_meta": loupe_mcp_meta(),
+				"_meta": mode_meta(session.mode()),
 			}),
 		),
 		ingress::Method::List => Response::ok(
 			id,
 			json!({
-				"tools": tool_definitions(session.job_id.is_some(), session.verify.is_some()),
-				"_meta": loupe_mcp_meta(),
+				"tools": tool_catalog(session.mode()),
+				"_meta": mode_meta(session.mode()),
 			}),
 		),
 		ingress::Method::Call => handle_decoded_tool_call(session, call, id).await,
@@ -424,7 +466,7 @@ async fn handle_decoded_request(
 	}
 }
 
-fn quarantined_response(id: Value) -> Response {
+fn quarantined_response(id: Value, mode: McpMode) -> Response {
 	// Numeric/null IDs carry no submitted strings. On a security refusal,
 	// arbitrary string/compound IDs are never echoed back to the sandbox.
 	let id = if id.is_number() { id } else { Value::Null };
@@ -433,30 +475,36 @@ fn quarantined_response(id: Value) -> Response {
 		json!({
 			"content": [{"type":"text", "text":"injection_suspected"}],
 			"isError": true,
-			"_meta": loupe_mcp_meta(),
+			"_meta": mode_meta(mode),
 		}),
 	)
 }
 
-fn loupe_mcp_meta() -> Value {
-	json!({ "loupeProtocolVersion": LOUPE_MCP_PROTOCOL_VERSION })
+fn mode_meta(mode: McpMode) -> Value {
+	json!({ "loupeProtocolVersion": mode.loupe_protocol_version() })
 }
 
 /// MCP tool catalogue. Each entry is the JSON Schema the agent uses
 /// to decide when to call the tool and what shape arguments to send.
 ///
-/// `submissions_enabled` gates the discovery-mode `submit_finding`
-/// — without a job to attribute submissions to (i.e. when the
-/// worker didn't pass `--job-id`), the tool is hidden so the agent
-/// can't try to call it.
+/// In [`McpMode::LegacyDiscovery`] without a job to attribute
+/// submissions to, `submit_finding` is hidden so the agent can't try
+/// to call it.
 ///
-/// `verify_mode` flips the catalog into a different shape entirely:
+/// [`McpMode::LegacyVerify`] selects a different shape entirely:
 /// `submit_finding` and `validate_poc` are hidden; `submit_verdict`,
 /// `submit_patch`, and `validate_patch` are advertised instead.
 /// `query_prior_findings` and `get_finding_by_id` stay in both
 /// modes — they're read-only and useful for the verifier to
 /// cross-check the bug it's verifying against the repo's history.
-fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
+fn tool_catalog(mode: McpMode) -> Value {
+	match mode {
+		McpMode::LegacyDiscovery { job_id } => legacy_tool_catalog(job_id.is_some(), false),
+		McpMode::LegacyVerify { .. } => legacy_tool_catalog(true, true),
+	}
+}
+
+fn legacy_tool_catalog(submissions_enabled: bool, verify_mode: bool) -> Value {
 	let mut tools = vec![
 		json!({
 			"name": "query_prior_findings",
@@ -608,7 +656,7 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 				},
 			},
 		}));
-		add_tool_protocol_version(&mut tools);
+		add_tool_protocol_version(&mut tools, LEGACY_LOUPE_MCP_PROTOCOL_VERSION);
 		return Value::Array(tools);
 	}
 	if submissions_enabled {
@@ -718,11 +766,11 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 			},
 		},
 	}));
-	add_tool_protocol_version(&mut tools);
+	add_tool_protocol_version(&mut tools, LEGACY_LOUPE_MCP_PROTOCOL_VERSION);
 	Value::Array(tools)
 }
 
-fn add_tool_protocol_version(tools: &mut [Value]) {
+fn add_tool_protocol_version(tools: &mut [Value], version: u16) {
 	for tool in tools {
 		let Some(properties) = tool
 			.get_mut("inputSchema")
@@ -735,10 +783,9 @@ fn add_tool_protocol_version(tools: &mut [Value]) {
 			"protocol_version".to_owned(),
 			json!({
 				"type": "integer",
-				"const": LOUPE_MCP_PROTOCOL_VERSION,
+				"const": version,
 				"description": format!(
-					"Optional Loupe MCP tool protocol version. Current version is {}.",
-					LOUPE_MCP_PROTOCOL_VERSION
+					"Optional Loupe MCP tool protocol version. Current version is {version}."
 				),
 			}),
 		);
@@ -792,7 +839,7 @@ async fn handle_decoded_tool_call(
 		})
 		.await;
 	if session.security.is_quarantined() {
-		return quarantined_response(id);
+		return quarantined_response(id, session.mode());
 	}
 
 	match result {
@@ -800,7 +847,7 @@ async fn handle_decoded_tool_call(
 			id,
 			json!({
 				"content": [{ "type": "text", "text": text }],
-				"_meta": loupe_mcp_meta(),
+				"_meta": mode_meta(session.mode()),
 			}),
 		),
 		Err(e) => {
@@ -824,7 +871,7 @@ async fn handle_decoded_tool_call(
 				json!({
 					"content": [{ "type": "text", "text": text }],
 					"isError": true,
-					"_meta": loupe_mcp_meta(),
+					"_meta": mode_meta(session.mode()),
 				}),
 			)
 		},

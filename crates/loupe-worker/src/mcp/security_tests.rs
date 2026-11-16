@@ -46,8 +46,7 @@ fn context(workdir: &Path) -> McpSessionContext {
 		)),
 		job_capability: JobCapability::from_secret("fixture-capability"),
 		repo_id: 1,
-		job_id: Some(1),
-		finding_id: None,
+		mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(1) },
 		workdir: workdir.to_owned(),
 	}
 }
