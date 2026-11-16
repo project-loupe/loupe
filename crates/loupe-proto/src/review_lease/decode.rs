@@ -31,9 +31,9 @@ impl From<serde_json::Error> for ReviewLeaseDecodeError {
 	}
 }
 type Error = ReviewLeaseDecodeError;
-type View<'v, 'a> = Unvalidated<'v, &'a [u8], Server>;
+pub(crate) type View<'v, 'a> = Unvalidated<'v, &'a [u8], Server>;
 
-trait AgentValue: Sized {
+pub(crate) trait AgentValue: Sized {
 	fn admit(mark: &Mark<'_, Agent>, raw: &str) -> Result<Self, Error>;
 }
 struct AgentField<T>(PhantomData<T>);
@@ -109,17 +109,17 @@ fn span(u: &View<'_, '_>, raw: &RawValue) -> Result<std::ops::Range<usize>, Erro
 	}
 	Ok(start..end)
 }
-fn content<T: AgentValue>(u: &View<'_, '_>, raw: &RawValue) -> Result<T, Error> {
+pub(crate) fn content<T: AgentValue>(u: &View<'_, '_>, raw: &RawValue) -> Result<T, Error> {
 	u.carry::<Agent>(span(u, raw)?)
 		.ok_or(Error::Invalid("content span outside response"))?
 		.validate(AgentField::<T>(PhantomData))
 }
-fn optional_content<T: AgentValue>(
+pub(crate) fn optional_content<T: AgentValue>(
 	u: &View<'_, '_>, raw: Option<&RawValue>,
 ) -> Result<Option<T>, Error> {
 	raw.filter(|raw| raw.get() != "null").map(|raw| content(u, raw)).transpose()
 }
-fn metadata<P: IdentPolicy>(
+pub(crate) fn metadata<P: IdentPolicy>(
 	u: &View<'_, '_>, raw: &RawValue,
 ) -> Result<Identifier<P, Server>, Error> {
 	let value = decode_json_string_bounded(raw.get(), P::FIELD, P::MAX_LEN, P::MAX_LEN)?;
@@ -134,7 +134,9 @@ fn content_list<T: AgentValue, const MAX: usize, const MIN: usize>(
 		.map_err(Error::Invalid)
 }
 
-fn generation(u: &View<'_, '_>, raw: &RawValue) -> Result<ReviewGeneration<Server>, Error> {
+pub(crate) fn generation(
+	u: &View<'_, '_>, raw: &RawValue,
+) -> Result<ReviewGeneration<Server>, Error> {
 	#[derive(Deserialize)]
 	#[serde(deny_unknown_fields)]
 	struct Wire<'a> {
@@ -148,7 +150,9 @@ fn generation(u: &View<'_, '_>, raw: &RawValue) -> Result<ReviewGeneration<Serve
 		commit_sha: metadata(u, wire.commit_sha)?,
 	})
 }
-fn profile(u: &View<'_, '_>, raw: &RawValue) -> Result<FrozenReviewProfile<Agent, Server>, Error> {
+pub(crate) fn profile(
+	u: &View<'_, '_>, raw: &RawValue,
+) -> Result<FrozenReviewProfile<Agent, Server>, Error> {
 	#[derive(Deserialize)]
 	#[serde(deny_unknown_fields)]
 	struct Wire<'a> {
@@ -192,7 +196,9 @@ fn unit(u: &View<'_, '_>, raw: &RawValue) -> Result<AssignedReviewUnit<Agent>, E
 		closure_criteria: optional_content(u, wire.closure_criteria)?,
 	})
 }
-fn assignments(u: &View<'_, '_>, raw: &RawValue) -> Result<ReviewAssignments<Agent>, Error> {
+pub(crate) fn assignments(
+	u: &View<'_, '_>, raw: &RawValue,
+) -> Result<ReviewAssignments<Agent>, Error> {
 	let tokens: LeaseList<&RawValue, 32> = serde_json::from_str(raw.get())?;
 	let units = tokens.as_slice().iter().map(|raw| unit(u, raw)).collect::<Result<_, _>>()?;
 	ReviewAssignments::try_from(LeaseList::new(units).map_err(Error::Invalid)?)

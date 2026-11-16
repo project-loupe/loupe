@@ -125,6 +125,15 @@ pub struct UnitResultCheckpointResponse {
 	pub disposition: UnitResultDisposition,
 }
 
+exact_response_decoder!(
+	/// Decode a `leads` response from Server bytes.
+	LeadCheckpointResponseDecoder => LeadCheckpointResponse
+);
+exact_response_decoder!(
+	/// Decode a `review-unit-results` response from Server bytes.
+	UnitResultCheckpointResponseDecoder => UnitResultCheckpointResponse
+);
+
 type View<'v, 'a> = Unvalidated<'v, &'a [u8], Worker>;
 fn content<'a, T>(
 	u: &View<'_, 'a>, raw: &RawValue,

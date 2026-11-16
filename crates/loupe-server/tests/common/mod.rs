@@ -425,3 +425,43 @@ pub fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
 	combined.push_str(key_pem);
 	reqwest::Identity::from_pem(combined.as_bytes()).expect("parse client identity PEM")
 }
+
+/// Every response of a survey phase route must pass the worker's decoder
+/// for that route: its success type, or the error envelope.
+pub fn admit_phase_response(route: &str, status: axum::http::StatusCode, bytes: &[u8]) {
+	use loupe_proto::review_api::*;
+	use loupe_proto::{
+		review_evidence as evidence, review_inventory as inventory, review_terminal as terminal,
+		review_units as units,
+	};
+	let path = route.split('?').next().unwrap();
+	if !path.starts_with("/v1/jobs/") {
+		return;
+	}
+	let response = || marked::server_response(bytes);
+	let admitted = match path.rsplit('/').next().unwrap() {
+		"pin-target" => response().validate_carrying(PinTargetResponseDecoder).is_ok(),
+		"inventory-batches" | "seal-inventory" => {
+			response().validate(ManifestProgressDecoder).is_ok()
+		},
+		"publish-profile" => response().validate(PublishedProfileDecoder).is_ok(),
+		"review-units" => response().validate(units::ReviewUnitResponseDecoder).is_ok(),
+		"leads" => response().validate(evidence::LeadCheckpointResponseDecoder).is_ok(),
+		"review-unit-results" => {
+			response().validate(evidence::UnitResultCheckpointResponseDecoder).is_ok()
+		},
+		"inventory-dispositions" => {
+			response().validate(inventory::InventoryDispositionResponseDecoder).is_ok()
+		},
+		"finalize-survey" => response().validate(terminal::SurveyTerminalResponseDecoder).is_ok(),
+		"limits" => response().validate(PhaseLimitsResponseDecoder).is_ok(),
+		"lead-candidates" => response().validate_carrying(CandidatesResponseDecoder).is_ok(),
+		// Shared legacy routes and the routes of later phases are not checked.
+		_ => return,
+	};
+	if status == axum::http::StatusCode::OK {
+		assert!(admitted, "{path}: server response refused by its decoder");
+	} else {
+		response().validate(ReviewErrorResponseDecoder).expect("phase error envelope");
+	}
+}

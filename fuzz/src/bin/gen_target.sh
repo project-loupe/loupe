@@ -36,6 +36,8 @@ GEN_TEST proto_review_evidence
 GEN_TEST proto_review_inventory
 GEN_TEST proto_review_lease
 GEN_TEST proto_review_lifecycle
+GEN_TEST proto_review_responses_checkpoints
+GEN_TEST proto_review_responses_host
 GEN_TEST proto_review_terminal
 GEN_TEST proto_review_units
 GEN_TEST proto_review_verification

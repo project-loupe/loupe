@@ -68,6 +68,10 @@ pub struct PhaseControlResponse {
 	pub state: PhaseControlState,
 	pub eligible_at: Option<i64>,
 }
+exact_response_decoder!(
+	/// Decode a phase `complete` response from Server bytes.
+	PhaseControlResponseDecoder => PhaseControlResponse
+);
 
 impl<S: Source> std::fmt::Debug for PhaseFailureRequest<S> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

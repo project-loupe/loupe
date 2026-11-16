@@ -315,6 +315,8 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `proto_review_inventory` | Inventory disposition decoder; shared request oracle |
 | `proto_review_lease` | Worker phase-lease validator for survey, drilldown and verify payloads; closed worker errors, carried-text-free Debug |
 | `proto_review_lifecycle` | Phase failure and heartbeat decoders; shared request oracle |
+| `proto_review_responses_checkpoints` | Worker decoders for unit, lead, result, disposition, terminal, candidate, limits and control responses and the error envelope; exact re-serialization, error code classification |
+| `proto_review_responses_host` | Worker decoders for pin-target, manifest progress and published profile responses; Agent carry of profile and assignment text |
 | `proto_review_terminal` | Survey terminal decoder and receipt response; sized payloads at the 32 KiB cap |
 | `proto_review_units` | Review unit decoder; shared request oracle |
 | `proto_review_verification` | Verification terminal decoder and receipt response; shared request oracle |

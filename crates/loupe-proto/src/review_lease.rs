@@ -21,7 +21,7 @@ use loupe_core::text::{Anchor, BoundedText, IdentPolicy, Identifier, SourceRef};
 use loupe_core::Severity;
 use loupe_provenance::Source;
 
-mod decode;
+pub(crate) mod decode;
 pub use decode::{
 	ReviewDrilldownLeaseDecoder, ReviewLeaseDecodeError, ReviewSurveyLeaseDecoder,
 	ReviewVerifyLeaseDecoder,

@@ -44,6 +44,15 @@ use crate::review_lease::{
 };
 use crate::PROTOCOL_VERSION;
 
+mod responses;
+pub use responses::{
+	CandidatesResponseDecoder, ManifestProgressDecoder, PhaseLimitsResponseDecoder,
+	PinTargetResponseDecoder, PublishedProfileDecoder, ReviewErrorCode, ReviewErrorResponse,
+	ReviewErrorResponseDecoder,
+};
+
+pub use crate::review_response::ReviewResponseDecodeError;
+
 // debug-ok: numeric capacity only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,6 +248,7 @@ record_impls!(PublishProfileRequest<S> { protocol_version, profile });
 record_impls!(ManifestProgress<S> { protocol_version, expected_entry_count, expected_digest, received_entry_count, received_canonical_bytes, sealed });
 record_impls!(PublishedProfile<S> { protocol_version, profile_version, profile_digest });
 record_impls!(PreparationDeferral<S> { receipt_id, commit_sha, reason });
+record_impls!(CandidatesResponse<C, M> { protocol_version, candidates });
 
 impl<C: Source, M: Source> Clone for PinTargetResponse<C, M> {
 	fn clone(&self) -> Self {
@@ -641,6 +651,7 @@ mod tests {
 			traits::<PublishedProfile<M>>();
 			traits::<PreparationDeferral<M>>();
 			traits::<PinTargetResponse<C, M>>();
+			traits::<CandidatesResponse<C, M>>();
 		}
 		check::<Agent, Worker>();
 	}
