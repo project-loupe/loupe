@@ -499,3 +499,51 @@ fn bounded_sandbox_golden_cases_match_launch_policy() {
 		check_sandbox_case(false, false, false, Some(index));
 	}
 }
+
+// Every failure class, every status, any try count and any millisecond
+// clock: chains of decisions where each pause plus arbitrary elapsed time
+// advances the clock. Bound: four decisions, one more than the try limit.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(5)]
+fn phase_retry_stays_within_tries_deadline_and_retryable_statuses() {
+	use std::time::Duration;
+
+	use crate::review::retry::{classify, Decision, Failure, MAX_TRIES};
+	let deadline = Duration::from_millis(kani::any());
+	let mut now = Duration::from_millis(kani::any());
+	let mut tries: u8 = 1;
+	let mut retried = false;
+	let mut finished = false;
+	for _ in 0..4 {
+		let failure = match kani::any::<u8>() % 3 {
+			0 => Failure::Timeout,
+			1 => Failure::Connection,
+			_ => Failure::Status(kani::any()),
+		};
+		match classify(failure, tries, now, deadline) {
+			Decision::Retry(pause) => {
+				if let Failure::Status(status) = failure {
+					assert!(status == 429 || (500..=599).contains(&status));
+				}
+				let start = now.checked_add(pause);
+				assert!(start.is_some_and(|start| start < deadline));
+				tries += 1;
+				retried = true;
+				let elapsed = Duration::from_millis(u64::from(kani::any::<u16>()));
+				now = match start.and_then(|start| start.checked_add(elapsed)) {
+					Some(next) => next,
+					None => break,
+				};
+			},
+			Decision::Final => {
+				finished = true;
+				break;
+			},
+		}
+	}
+	assert!(tries <= MAX_TRIES);
+	kani::cover!(retried, "a transient failure is retried");
+	kani::cover!(finished && tries == 1, "a first failure is final");
+	kani::cover!(tries == MAX_TRIES, "the try limit is reached");
+}
