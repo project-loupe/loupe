@@ -21,6 +21,7 @@ impl WorkerOverridesDecoder {
 			log_agent_output: args.log_agent_output,
 			scan_agent: args.scan_agent,
 			verify_agent: args.verify_agent,
+			survey_agent: args.survey_agent,
 			claude_model: args.claude_model.clone(),
 			claude_effort: args.claude_effort.clone(),
 			codex_model: args.codex_model.clone(),

@@ -194,6 +194,20 @@ impl Runner {
 		self
 	}
 
+	/// Review phases this worker runs: survey exactly when it has a survey
+	/// backend. Drilldown and verify are not run, so never advertised.
+	fn review_capabilities(
+		&self,
+	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
+	{
+		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
+		let phases = match self.survey_backend {
+			Some(_) => vec![ReviewCapability::Survey],
+			None => Vec::new(),
+		};
+		LeaseList::new(phases).map_err(|error| anyhow::anyhow!(error))
+	}
+
 	pub(crate) fn client(&self) -> &ServerClient {
 		&self.client
 	}
@@ -217,23 +231,10 @@ impl Runner {
 	/// it. Returns `true` if a job was processed, `false` if the long-
 	/// poll window elapsed without one.
 	pub async fn step(&self, cancel: &CancellationToken) -> Result<bool> {
-		let receipt =
-			self.client.lease_for_runner(self.capabilities.clone(), LEASE_WAIT_SECONDS).await?;
-		match receipt.response {
-			LeaseResponse::Empty { .. } => Ok(false),
-			LeaseResponse::Lease(env) => {
-				self.run_lease(*env, receipt.reviewed_revision, receipt.scanner_patch, cancel)
-					.await?;
-				Ok(true)
-			},
-		}
-	}
-
-	/// Like [`Self::step`], but claims only survey leases, for tests that run
-	/// surveys before the runner advertises the phase.
-	#[cfg(feature = "test-support")]
-	pub async fn step_survey_for_tests(&self, cancel: &CancellationToken) -> Result<bool> {
-		let receipt = self.client.lease_survey_receipt_for_tests(LEASE_WAIT_SECONDS).await?;
+		let receipt = self
+			.client
+			.lease_with(self.capabilities.clone(), self.review_capabilities()?, LEASE_WAIT_SECONDS)
+			.await?;
 		match receipt.response {
 			LeaseResponse::Empty { .. } => Ok(false),
 			LeaseResponse::Lease(env) => {

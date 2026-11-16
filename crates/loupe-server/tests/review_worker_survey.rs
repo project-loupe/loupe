@@ -227,7 +227,7 @@ impl Fixture {
 				let ahead = offset.load(Ordering::SeqCst);
 				SystemTime::now() + Duration::from_secs(u64::try_from(ahead).unwrap())
 			}));
-		runner.step_survey_for_tests(&CancellationToken::new()).await.unwrap()
+		runner.step(&CancellationToken::new()).await.unwrap()
 	}
 
 	fn scalar(&self, sql: &str) -> i64 {
@@ -357,6 +357,23 @@ fn assert_no_complete(calls: &[(String, u16)]) {
 		!routes(calls).contains(&"complete"),
 		"a finalized survey sends no complete: {calls:?}"
 	);
+}
+
+#[tokio::test]
+async fn only_a_worker_with_a_survey_backend_is_leased_a_survey() {
+	let f = fixture().await;
+	let cache = Arc::new(RepoCache::new(f.cache.path().to_owned(), u64::MAX, None).unwrap());
+	let plain = Runner::new(f.client.clone(), cache.clone(), Vec::new());
+	let unclaimed =
+		tokio::time::timeout(Duration::from_secs(2), plain.step(&CancellationToken::new())).await;
+	assert!(matches!(unclaimed, Err(_) | Ok(Ok(false))), "a survey-less worker ran a lease");
+	assert_eq!(f.jobs(), [("queued".to_owned(), None)]);
+	assert_eq!(f.scalar("SELECT COUNT(*) FROM jobs WHERE worker_id IS NOT NULL"), 0);
+
+	let surveyor = Runner::new(f.client.clone(), cache, Vec::new())
+		.with_survey_backend(Arc::new(ScriptedMcpBackend::new(f.client.clone(), full_bootstrap)));
+	assert!(surveyor.step(&CancellationToken::new()).await.unwrap());
+	assert_eq!(f.jobs(), [("succeeded".to_owned(), None)]);
 }
 
 #[tokio::test]
