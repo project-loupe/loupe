@@ -1,10 +1,10 @@
 //! Strict phase execution control on shared legacy/phase lifecycle routes.
 //! ```compile_fail,E0277
-//! let _: loupe_proto::review_lifecycle::PhaseFailureRequest = serde_json::from_str("{}").unwrap();
+//! let _: loupe_proto::review_lifecycle::PhaseFailureRequest<loupe_provenance::Worker> = serde_json::from_str("{}").unwrap();
 //! ```
 use loupe_core::text::policy::Reason;
 use loupe_core::text::{decode_json_string_bounded, BoundedText, TextPolicy};
-use loupe_provenance::{Mark, Unvalidated, Validate, Worker};
+use loupe_provenance::{Mark, Source, Unvalidated, Validate, Worker};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -18,12 +18,31 @@ pub enum FailedOutcome {
 	Failed,
 }
 loupe_core::closed_string_enum!(FailedOutcome { Failed });
-#[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct PhaseFailureRequest {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct PhaseFailureRequest<S: Source> {
 	pub protocol_version: ReviewProtocol,
 	pub outcome: FailedOutcome,
-	pub error: Option<BoundedText<Reason, Worker>>,
+	pub error: Option<BoundedText<Reason, S>>,
 }
+// Source labels are fieldless markers without comparison traits.
+impl<S: Source> Clone for PhaseFailureRequest<S> {
+	fn clone(&self) -> Self {
+		Self {
+			protocol_version: self.protocol_version,
+			outcome: self.outcome,
+			error: self.error.clone(),
+		}
+	}
+}
+impl<S: Source> PartialEq for PhaseFailureRequest<S> {
+	fn eq(&self, other: &Self) -> bool {
+		self.protocol_version == other.protocol_version
+			&& self.outcome == other.outcome
+			&& self.error == other.error
+	}
+}
+impl<S: Source> Eq for PhaseFailureRequest<S> {}
 /// Phase heartbeat requires this body; legacy heartbeat may still be empty.
 // debug-ok: closed protocol and execution states, no input text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +69,7 @@ pub struct PhaseControlResponse {
 	pub eligible_at: Option<i64>,
 }
 
-impl std::fmt::Debug for PhaseFailureRequest {
+impl<S: Source> std::fmt::Debug for PhaseFailureRequest<S> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.write_str("PhaseFailureRequest([redacted])")
 	}
@@ -59,7 +78,7 @@ impl std::fmt::Debug for PhaseFailureRequest {
 /// path can manufacture a Worker-labelled failure reason.
 pub struct PhaseFailureRequestDecoder;
 impl Validate<&[u8], Worker> for PhaseFailureRequestDecoder {
-	type Output = PhaseFailureRequest;
+	type Output = PhaseFailureRequest<Worker>;
 	type Error = Error;
 	fn validate<'v>(
 		self, input: Unvalidated<'v, &[u8]>, mark: Mark<'v, Worker>,
@@ -122,7 +141,7 @@ mod tests {
 		);
 		assert_eq!(result.unwrap().error.unwrap().expose(), "é".repeat(700));
 	}
-	fn failure(raw: &str) -> Result<PhaseFailureRequest, Error> {
+	fn failure(raw: &str) -> Result<PhaseFailureRequest<Worker>, Error> {
 		crate::test_support::worker_request(raw.as_bytes()).validate(PhaseFailureRequestDecoder)
 	}
 	#[test]

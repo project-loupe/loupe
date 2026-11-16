@@ -103,7 +103,7 @@ review_decoders!(validate:
 	api::SealInventoryRequestDecoder => api::SealInventoryRequest, ApiError;
 	inventory::InventoryDispositionRequestDecoder =>
 		inventory::InventoryDispositionRequest<Worker>, ApiError;
-	lifecycle::PhaseFailureRequestDecoder => lifecycle::PhaseFailureRequest, ApiError;
+	lifecycle::PhaseFailureRequestDecoder => lifecycle::PhaseFailureRequest<Worker>, ApiError;
 	lifecycle::PhaseHeartbeatRequestDecoder => lifecycle::PhaseHeartbeatRequest, ApiError;
 );
 review_decoders!(validate_carrying:
@@ -111,9 +111,9 @@ review_decoders!(validate_carrying:
 	units::ReviewUnitRequestDecoder =>
 		units::ReviewUnitRequest<Agent, Worker>, loupe_core::review_payload::Error;
 	evidence::LeadCheckpointRequestDecoder =>
-		evidence::LeadCheckpointRequest, loupe_core::review_payload::Error;
+		evidence::LeadCheckpointRequest<Worker>, loupe_core::review_payload::Error;
 	evidence::UnitResultCheckpointRequestDecoder =>
-		evidence::UnitResultCheckpointRequest, loupe_core::review_payload::Error;
+		evidence::UnitResultCheckpointRequest<Worker>, loupe_core::review_payload::Error;
 	terminal::FinalizeSurveyRequestDecoder =>
 		terminal::FinalizeSurveyRequest<Agent>, terminal::InvalidTerminal;
 	drilldown::FinalizeDrilldownRequestDecoder =>
