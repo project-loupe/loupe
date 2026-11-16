@@ -432,6 +432,39 @@ fn submodule_paths(tree: &git2::Tree<'_>) -> Result<Vec<repo_ingress::Repository
 	Ok(paths)
 }
 
+/// One commit in a bare clone, as libgit2 reports it.
+pub(crate) struct CommitObservation<'a> {
+	pub(crate) repo: &'a git2::Repository,
+	pub(crate) commit: &'a git2::Commit<'a>,
+}
+
+/// The commit `sha` in the bare clone at `bare`, unavailable to `decoder`
+/// except as a `Repo` observation. Blocking.
+#[allow(dead_code, reason = "survey preparation consumes the inventory")]
+pub(crate) fn observe_commit<V, T>(
+	bare: &Path, sha: &str, decoder: V,
+) -> Result<T, crate::review::inventory::InventoryError>
+where
+	V: for<'a> loupe_provenance::Validate<
+		CommitObservation<'a>,
+		Repo,
+		Output = T,
+		Error = crate::review::inventory::InventoryError,
+	>,
+{
+	use crate::review::inventory::InventoryError;
+	let repo = git2::Repository::open_bare(bare).map_err(|_| InventoryError::CommitUnavailable)?;
+	let oid = git2::Oid::from_str(sha).map_err(|_| InventoryError::CommitUnavailable)?;
+	let commit = repo.find_commit(oid).map_err(|_| InventoryError::CommitUnavailable)?;
+	// SAFETY: the actual libgit2 repository and commit handles; every path,
+	// mode and object id the decoder reads comes from them before formatting.
+	#[allow(unsafe_code)]
+	let observation = Untrusted::new(CommitObservation { repo: &repo, commit: &commit }, unsafe {
+		Ingress::<Repo>::new()
+	});
+	observation.validate(decoder)
+}
+
 async fn checkout(
 	bare: &Path, target: CheckoutTarget,
 ) -> Result<(CheckedOutWorktree, BoundedText<RevisionText, Repo>)> {
