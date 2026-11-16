@@ -88,7 +88,20 @@ fn allowed_operation(value: Operation) {
 		| Operation::ModelRequest
 		| Operation::McpSubmitFinding
 		| Operation::McpSubmitVerdict
-		| Operation::McpSubmitPatch => {},
+		| Operation::McpSubmitPatch
+		| Operation::McpGetJobLimits
+		| Operation::McpPublishProfile
+		| Operation::McpProposeReviewUnit
+		| Operation::McpSubmitLead
+		| Operation::McpSubmitReviewUnitResult
+		| Operation::McpSubmitInventoryDisposition
+		| Operation::McpQuerySameProjectLeadCandidates
+		| Operation::McpFinalizeSurvey
+		| Operation::PinTarget
+		| Operation::UploadInventory
+		| Operation::SealInventory
+		| Operation::PhaseHeartbeat
+		| Operation::PhaseFailure => {},
 	}
 }
 #[test]
@@ -108,6 +121,19 @@ fn operation_spellings_are_closed_and_exhaustive() {
 		(Operation::McpSubmitFinding, "mcp_submit_finding"),
 		(Operation::McpSubmitVerdict, "mcp_submit_verdict"),
 		(Operation::McpSubmitPatch, "mcp_submit_patch"),
+		(Operation::McpGetJobLimits, "mcp_get_job_limits"),
+		(Operation::McpPublishProfile, "mcp_publish_profile"),
+		(Operation::McpProposeReviewUnit, "mcp_propose_review_unit"),
+		(Operation::McpSubmitLead, "mcp_submit_lead"),
+		(Operation::McpSubmitReviewUnitResult, "mcp_submit_review_unit_result"),
+		(Operation::McpSubmitInventoryDisposition, "mcp_submit_inventory_disposition"),
+		(Operation::McpQuerySameProjectLeadCandidates, "mcp_query_same_project_lead_candidates"),
+		(Operation::McpFinalizeSurvey, "mcp_finalize_survey"),
+		(Operation::PinTarget, "pin_target"),
+		(Operation::UploadInventory, "upload_inventory"),
+		(Operation::SealInventory, "seal_inventory"),
+		(Operation::PhaseHeartbeat, "phase_heartbeat"),
+		(Operation::PhaseFailure, "phase_failure"),
 	] {
 		allowed_operation(value);
 		assert_eq!(value.as_str(), expected);
