@@ -179,7 +179,8 @@ build_worker_config_file() {
 
 		printf '[agents]\n'
 		printf 'scan = %s\n' "$(toml_string "${LOUPE_SCAN_AGENT:-auto}")"
-		printf 'verify = %s\n\n' "$(toml_string "${LOUPE_VERIFY_AGENT:-auto}")"
+		printf 'verify = %s\n' "$(toml_string "${LOUPE_VERIFY_AGENT:-auto}")"
+		printf 'survey = %s\n\n' "$(toml_string "${LOUPE_SURVEY_AGENT:-auto}")"
 
 		printf '[agents.claude]\n'
 		printf 'model = %s\n' "$(toml_string "${LOUPE_CLAUDE_MODEL:-claude-opus-4-7}")"

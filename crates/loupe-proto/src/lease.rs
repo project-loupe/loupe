@@ -81,7 +81,8 @@ impl<'de> Deserialize<'de> for JobCapability {
 pub struct LeaseRequest<S: Source> {
 	pub protocol_version: u16,
 	pub capabilities: Vec<BoundedText<LeaseCapabilityName, S>>,
-	/// Separate from legacy scanner tags; empty until phase workers exist.
+	/// Separate from legacy scanner tags. Workers list the review phases
+	/// they run; a worker with none sends an empty list.
 	#[serde(default)]
 	pub review_capabilities:
 		crate::review_lease::LeaseList<crate::review_lease::ReviewCapability, 3>,

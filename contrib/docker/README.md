@@ -247,6 +247,7 @@ export CODEX_API_KEY=...
 # Optional, defaults preserve Claude scan + Codex verifier when ready:
 export LOUPE_SCAN_AGENT=auto
 export LOUPE_VERIFY_AGENT=auto
+export LOUPE_SURVEY_AGENT=auto
 # Optional: force Daybreak Blue with a compatible configured Codex model:
 # export LOUPE_CODEX_DAYBREAK=blue
 export LOUPE_SANDBOX_NETWORK=public
@@ -271,8 +272,8 @@ bundle and whichever LLM credentials are set. It also writes
 (cache, sandbox networking, logging, job-agent selection, scanner defaults,
 BKB API URL, broker ceilings, Claude/Codex model/effort, and Codex Daybreak), mounts it
 read-only into the container, and sets
-`LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT` and `LOUPE_VERIFY_AGENT` accept
-`auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
+`LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT`, `LOUPE_VERIFY_AGENT` and
+`LOUPE_SURVEY_AGENT` accept `auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
 startup if that CLI is not authenticated. For Codex, use `CODEX_API_KEY`;
 for compatibility the deploy script also writes `CODEX_API_KEY` from
 `OPENAI_API_KEY` when `CODEX_API_KEY` is absent.

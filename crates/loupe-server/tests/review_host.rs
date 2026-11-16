@@ -1,6 +1,6 @@
-//! Real router/authentication/transaction coverage. Leases are explicit setup
-//! fixtures while phase claims remain closed; final B4 lifecycle tests must
-//! acquire their leases and handoffs through the public claim endpoint.
+//! Real router/authentication/transaction coverage with leases installed as
+//! explicit setup fixtures. Claims through the public lease endpoint are
+//! covered by `review_lifecycle` and the `review_worker_*` suites.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

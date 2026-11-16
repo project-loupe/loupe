@@ -41,6 +41,9 @@ agent_output = false
 [agents]
 scan = "auto"
 verify = "auto"
+# Runs review surveys and advertises `review:survey:v1` when a survey
+# agent is ready.
+survey = "auto"
 
 [agents.claude]
 model = "claude-opus-4-7"

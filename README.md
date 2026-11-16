@@ -392,8 +392,8 @@ pinning, and provider-side fetch-tool filtering are enforced by the trusted
 worker broker rather than by repository-controlled agent settings.
 
 The worker auto-detects authenticated `claude` and `codex` CLIs at
-startup. `[agents].scan` and `[agents].verify` choose which LLM agent
-is used for each job kind:
+startup. `[agents].scan`, `[agents].verify` and `[agents].survey` choose
+which LLM agent is used for each job kind:
 
 - `scan = "auto"` → discovery scanner advertises `scan:llm` only when
   authenticated Claude is ready. This preserves the historical default.
@@ -402,8 +402,13 @@ is used for each job kind:
 - `scan = "claude" | "codex"` or `verify = "claude" | "codex"` →
   require that exact authenticated CLI and fail startup if it is not
   ready.
-- CLI/env overrides are `--scan-agent` / `LOUPE_SCAN_AGENT` and
-  `--verify-agent` / `LOUPE_VERIFY_AGENT`.
+- `survey = "auto"` (the default) → the worker advertises
+  `review:survey:v1` and runs survey leases with Codex preferred and
+  Claude as the fallback; with neither ready it runs no surveys.
+  `survey = "claude" | "codex"` requires that CLI as above.
+- CLI/env overrides are `--scan-agent` / `LOUPE_SCAN_AGENT`,
+  `--verify-agent` / `LOUPE_VERIFY_AGENT` and `--survey-agent` /
+  `LOUPE_SURVEY_AGENT`.
 - **No authenticated agent CLI** → worker refuses to start. A
   "regex-only" loupe-worker isn't a deployment we want operators to
   fall into by accident; install at least one agent CLI and provide

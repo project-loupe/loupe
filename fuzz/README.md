@@ -346,12 +346,14 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_client_ingress` | Six actual private Server decoders, original Agent token spans, independent schema/field admission, leased scanner compatibility and exact host outcomes |
 | `worker_config` | Actual Config file and native Clap owners, independent policy/error oracle, exact argument caps and native path bytes |
 | `worker_extract_json` | Independent character-based balanced-span oracle, quoted braces, escapes and malformed JSON |
+| `worker_inventory_chunks` | Actual inventory chunker over admissible entry sizes: entry, canonical-byte and body limits per batch, complete in-order coverage and a deterministic split |
 | `worker_mcp_ingress` | Actual bounded record framer and private Sandbox decoder, all seven tools, original Agent token spans, syntax/policy precedence and 16 MiB record edges |
 | `worker_mcp_rpc` | Real dispatcher/catalogues, original record and field-policy admission, request IDs, notifications, stateful verdict/patch order and metadata-only logs |
 | `worker_mcp_submission` | Actual original-record finding projection, independent lexical admission, containment, symlink rejection, unchanged ranges and snippet clamping |
+| `worker_mcp_survey_ingress` | Actual survey-catalog decoder over original Sandbox records, all nine tools: Agent carries stay inside the record, rejections never echo content, admitted arguments serialize as valid phase requests |
 | `worker_network_host` | RFC 1123 hostname boundaries, IPv4 acceptance and complete allowlist/public nft rule templates |
 | `worker_network_parsers` | Actual PID, uid_map, route and address parsers, typed-serde PID forms, identity-pair and complete-set checks |
-| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits |
+| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits; the same bytes as survey assignment and profile text under host-authored survey context |
 | `worker_regex_secrets` | Actual scanner walk and Repo finding observation, native path admission with legitimate siblings, independent matches/lines/hash and redacted Debug |
 | `worker_repo_cache` | Actual Repo cursor decoder and file reads, independent exact policy and caps, plus git origin status/UTF-8/whitespace behavior |
 | `worker_repo_observations` | Six actual private Repo validators: native paths, file bytes, fingerprint windows, Git diagnostics, binary OIDs and gitlink bytes |
