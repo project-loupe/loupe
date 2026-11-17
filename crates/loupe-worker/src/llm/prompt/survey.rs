@@ -60,7 +60,7 @@ struct Context<'a> {
 }
 
 #[derive(Serialize)]
-struct Deadlines {
+pub(super) struct Deadlines {
 	launched_at: i64,
 	submit_by_at: i64,
 	submit_by_remaining_seconds: u64,
@@ -78,7 +78,7 @@ struct Capacities<'a> {
 }
 
 #[derive(Serialize)]
-struct Campaign {
+pub(super) struct Campaign {
 	jobs_limit: u64,
 	jobs_admitted: u64,
 	general_remaining: u64,
@@ -86,9 +86,35 @@ struct Campaign {
 	verification_remaining: u64,
 }
 
+impl Deadlines {
+	/// `limits`' deadlines as absolute Unix seconds and as seconds left at
+	/// `now`, saturating at zero.
+	pub(super) fn at(now: i64, limits: &ReviewLimits) -> Self {
+		let left = |at: i64| u64::try_from(at.saturating_sub(now)).unwrap_or(0);
+		Self {
+			launched_at: now,
+			submit_by_at: limits.submit_by,
+			submit_by_remaining_seconds: left(limits.submit_by),
+			hard_deadline_at: limits.hard_deadline_at,
+			hard_deadline_remaining_seconds: left(limits.hard_deadline_at),
+		}
+	}
+}
+
+impl From<&PhaseLimitsResponse> for Campaign {
+	fn from(p: &PhaseLimitsResponse) -> Self {
+		Self {
+			jobs_limit: p.campaign_jobs_limit,
+			jobs_admitted: p.campaign_jobs_admitted,
+			general_remaining: p.campaign_general_remaining,
+			urgent_remaining: p.campaign_urgent_remaining,
+			verification_remaining: p.campaign_verification_remaining,
+		}
+	}
+}
+
 impl<'a> From<&SurveyJobContext<'a>> for Context<'a> {
 	fn from(c: &SurveyJobContext<'a>) -> Self {
-		let left = |at: i64| u64::try_from(at.saturating_sub(c.now)).unwrap_or(0);
 		let p = c.capacity;
 		Self {
 			phase: "survey",
@@ -107,26 +133,14 @@ impl<'a> From<&SurveyJobContext<'a>> for Context<'a> {
 			generation_id: &c.generation.generation_id,
 			generation_commit: &c.generation.commit_sha,
 			checkout_commit: c.checkout_commit,
-			deadlines: Deadlines {
-				launched_at: c.now,
-				submit_by_at: c.limits.submit_by,
-				submit_by_remaining_seconds: left(c.limits.submit_by),
-				hard_deadline_at: c.limits.hard_deadline_at,
-				hard_deadline_remaining_seconds: left(c.limits.hard_deadline_at),
-			},
+			deadlines: Deadlines::at(c.now, c.limits),
 			token_budget: c.limits.token_budget,
 			capacity: Capacities {
 				review_units: &p.new_units,
 				leads: &p.leads,
 				siblings: &p.siblings,
 				candidate_queries: &p.candidate_queries,
-				campaign: Campaign {
-					jobs_limit: p.campaign_jobs_limit,
-					jobs_admitted: p.campaign_jobs_admitted,
-					general_remaining: p.campaign_general_remaining,
-					urgent_remaining: p.campaign_urgent_remaining,
-					verification_remaining: p.campaign_verification_remaining,
-				},
+				campaign: Campaign::from(p),
 			},
 			terminal_action: "finalize_survey",
 		}
