@@ -88,8 +88,8 @@ pub enum McpMode {
 	/// state and the catalog's shape travel separately as a shared
 	/// `SurveySession` in [`PhaseTools::Survey`].
 	Survey,
-	/// Drilldown phase catalog (Loupe MCP protocol 2), with its host state
-	/// carried as the phase session.
+	/// Drilldown phase catalog (Loupe MCP protocol 2). Its host state
+	/// travels as a shared `DrilldownSession` in [`PhaseTools::Drilldown`].
 	Drilldown,
 }
 
@@ -447,6 +447,8 @@ pub(crate) use framing::admitted_record_len;
 mod citation;
 #[cfg(fuzzing)]
 pub use citation::fuzzing as citation_fuzzing;
+mod drilldown;
+mod drilldown_catalog;
 mod ingress;
 #[cfg(test)]
 mod legacy_test_api;
@@ -525,8 +527,9 @@ fn tool_catalog(mode: McpMode, phase: Option<&PhaseTools>) -> Value {
 		(McpMode::LegacyDiscovery { job_id }, _) => legacy_tool_catalog(job_id.is_some(), false),
 		(McpMode::LegacyVerify { .. }, _) => legacy_tool_catalog(true, true),
 		(McpMode::Survey, Some(PhaseTools::Survey(survey))) => survey_catalog::tools(survey),
+		(McpMode::Drilldown, Some(PhaseTools::Drilldown(_))) => drilldown_catalog::tools(),
 		// `run_stream_server` refuses a phase mode without its own session.
-		(McpMode::Survey, None) | (McpMode::Drilldown, _) => json!([]),
+		(McpMode::Survey | McpMode::Drilldown, _) => json!([]),
 	}
 }
 
@@ -818,20 +821,38 @@ fn add_tool_protocol_version(tools: &mut [Value], version: u16) {
 	}
 }
 
+/// A tool call the session's phase dispatcher serves.
+#[derive(Clone, Copy)]
+enum PhaseCall<'a> {
+	Survey(&'a crate::review::session::SurveySession, crate::review::gate::SurveyTool),
+	Drilldown(&'a crate::review::session::DrilldownSession, crate::review::gate::DrilldownTool),
+}
+
 async fn handle_decoded_tool_call(
 	session: &Arc<Session>, call: ingress::ToolCall, id: Value,
 ) -> Response {
 	let tool_name = call.name.log_label();
 	let operation = call.name.operation();
-	let survey_call = match &session.phase {
-		Some(PhaseTools::Survey(survey)) => survey::tool(&call.name).map(|tool| (survey, tool)),
+	let phase_call = match &session.phase {
+		Some(PhaseTools::Survey(survey)) => {
+			survey::tool(&call.name).map(|tool| PhaseCall::Survey(survey, tool))
+		},
+		Some(PhaseTools::Drilldown(drilldown)) => {
+			drilldown::tool(&call.name).map(|tool| PhaseCall::Drilldown(drilldown, tool))
+		},
 		None => None,
 	};
 	let result: Result<String> = session
 		.security
 		.run(operation, async {
-			if let Some((survey, tool)) = survey_call {
-				return survey::dispatch(session, survey, tool, call.arguments).await;
+			match phase_call {
+				Some(PhaseCall::Survey(survey, tool)) => {
+					return survey::dispatch(session, survey, tool, call.arguments).await;
+				},
+				Some(PhaseCall::Drilldown(drilldown, tool)) => {
+					return drilldown::dispatch(session, drilldown, tool, call.arguments).await;
+				},
+				None => {},
 			}
 			match call.arguments {
 				Err(e) => Err(e),
@@ -876,8 +897,11 @@ async fn handle_decoded_tool_call(
 		return quarantined_response(id, session.mode);
 	}
 
-	let with_status = |text: String| match survey_call {
-		Some((survey, _)) => format!("{text}\n{}", survey.status_line()),
+	let with_status = |text: String| match phase_call {
+		Some(PhaseCall::Survey(survey, _)) => format!("{text}\n{}", survey.status_line()),
+		Some(PhaseCall::Drilldown(drilldown, _)) => {
+			format!("{text}\n{}", drilldown.status_line())
+		},
 		None => text,
 	};
 	match result {
@@ -1528,6 +1552,8 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 
 #[cfg(test)]
 mod drilldown_ingress_tests;
+#[cfg(test)]
+mod drilldown_tests;
 #[cfg(test)]
 mod security_tests;
 #[cfg(test)]

@@ -184,15 +184,7 @@ pub(super) enum Arguments {
 	Disposition(Box<DispositionArgs>),
 	Candidates(loupe_core::review_candidates::CandidateQuery<Agent>),
 	Finalize(Box<loupe_core::review_payload::SurveyTerminalV1<Agent>>),
-	#[cfg_attr(
-		not(any(test, fuzzing)),
-		expect(dead_code, reason = "decoded ahead of the drilldown dispatcher")
-	)]
 	SiblingLead(Box<LeadArgs>),
-	#[cfg_attr(
-		not(any(test, fuzzing)),
-		expect(dead_code, reason = "decoded ahead of the drilldown dispatcher")
-	)]
 	FinalizeDrilldown(Box<loupe_core::review_payload::DrilldownTerminalV1<Agent>>),
 }
 pub(super) struct DecodedQueryArgs {

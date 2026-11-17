@@ -50,10 +50,6 @@ impl SurveyTool {
 /// The drilldown catalog's tools.
 // debug-ok: closed tool names only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-	not(any(test, kani)),
-	expect(dead_code, reason = "admitted by the drilldown dispatcher in a later commit")
-)]
 pub(crate) enum DrilldownTool {
 	JobLimits,
 	Candidates,
@@ -91,15 +87,7 @@ pub(crate) enum Denial {
 	AlreadyPublished,
 	ProfileFirst,
 	SoftStop,
-	#[cfg_attr(
-		not(any(test, kani)),
-		expect(dead_code, reason = "admitted by the drilldown dispatcher in a later commit")
-	)]
 	DrilldownSealed,
-	#[cfg_attr(
-		not(any(test, kani)),
-		expect(dead_code, reason = "admitted by the drilldown dispatcher in a later commit")
-	)]
 	SiblingSoftStop,
 }
 
@@ -136,10 +124,6 @@ pub(crate) const SIBLING_SOFT_STOP: &str =
 /// Drilldown admission: a sealed receipt leaves only `get_job_limits` and
 /// an identical finalize replay; `submit_by` closes only sibling leads, as
 /// a `duplicate` finalize depends on the candidate query.
-#[cfg_attr(
-	not(any(test, kani)),
-	expect(dead_code, reason = "admitted by the drilldown dispatcher in a later commit")
-)]
 pub(crate) fn admit_drilldown(
 	tool: DrilldownTool, past_submit_by: bool, receipt_sealed: bool,
 ) -> Admission {

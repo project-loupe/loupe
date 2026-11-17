@@ -7,13 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loupe_proto::review_api::PhaseLimitsResponse;
+use loupe_proto::review_drilldown::DrilldownTerminalResponse;
 use loupe_proto::review_terminal::SurveyTerminalResponse;
 use loupe_proto::JobCapability;
 use loupe_provenance::Server;
 use tokio_util::sync::CancellationToken;
 
-use super::gate::{admit, Admission, RecipeClass, SurveyTool};
-use super::prepare::{at, PreparedSurvey, SurveyRecipe};
+use super::gate::{admit, admit_drilldown, Admission, DrilldownTool, RecipeClass, SurveyTool};
+use super::prepare::{at, PreparedDrilldown, PreparedSurvey, SurveyRecipe};
 use crate::client::PhaseJob;
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
@@ -112,6 +113,11 @@ impl PhaseSession {
 
 	pub fn past_submit_by(&self) -> bool {
 		self.now() >= self.submit_by
+	}
+
+	/// The heartbeat token to cancel once a receipt is sealed.
+	pub fn set_heartbeat(&mut self, heartbeat: CancellationToken) {
+		self.heartbeat = Some(heartbeat);
 	}
 
 	/// Stop the phase heartbeat; called once a receipt is sealed.
@@ -228,7 +234,7 @@ impl SurveySession {
 
 	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.
 	pub fn with_heartbeat(mut self, heartbeat: CancellationToken) -> Self {
-		self.phase.heartbeat = Some(heartbeat);
+		self.phase.set_heartbeat(heartbeat);
 		self
 	}
 
@@ -372,6 +378,139 @@ impl SurveySession {
 	}
 }
 
+/// A drilldown attempt's host state: its phase core, the lead it
+/// investigates, the capacity shown to the agent and the sealed receipt.
+pub struct DrilldownSession {
+	phase: PhaseSession,
+	lead_id: i64,
+	state: Mutex<DrilldownState>,
+}
+impl std::fmt::Debug for DrilldownSession {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("DrilldownSession")
+			.field("job_id", &self.phase.job_id)
+			.field("lead_id", &self.lead_id)
+			.finish_non_exhaustive()
+	}
+}
+
+#[derive(Default)]
+struct DrilldownState {
+	receipt: Option<DrilldownTerminalResponse<Server>>,
+	/// Client keys and queries this attempt saw accepted; the server counts
+	/// each once, so a replay is not counted again.
+	sibling_keys: HashSet<String>,
+	queries: HashSet<(String, u8)>,
+	siblings_remaining: Option<u32>,
+	queries_remaining: Option<u32>,
+}
+
+impl DrilldownSession {
+	/// `limits` is the `/limits` read taken before launch, if any.
+	pub fn new(phase: PhaseSession, lead_id: i64, limits: Option<&PhaseLimitsResponse>) -> Self {
+		let session = Self { phase, lead_id, state: Mutex::default() };
+		if let Some(limits) = limits {
+			session.record_limits(limits);
+		}
+		session
+	}
+
+	/// The session of a prepared attempt: deadlines, lead and capacity come
+	/// from the preparation.
+	pub fn from_prepared(
+		prepared: &PreparedDrilldown, clock: Clock, cancel: CancellationToken,
+	) -> Self {
+		let phase = PhaseSession::new(
+			prepared.job_id,
+			prepared.job_capability.clone(),
+			at(prepared.limits.submit_by),
+			at(prepared.limits.hard_deadline_at),
+			clock,
+			cancel,
+		);
+		Self::new(phase, i64::from(prepared.lead.lead_id), Some(&prepared.phase_limits))
+	}
+
+	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.
+	pub fn with_heartbeat(mut self, heartbeat: CancellationToken) -> Self {
+		self.phase.set_heartbeat(heartbeat);
+		self
+	}
+
+	pub fn phase(&self) -> &PhaseSession {
+		&self.phase
+	}
+
+	pub fn lead_id(&self) -> i64 {
+		self.lead_id
+	}
+
+	fn state(&self) -> MutexGuard<'_, DrilldownState> {
+		// Plain values only; a panicked holder leaves nothing torn.
+		self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	pub(crate) fn admission(&self, tool: DrilldownTool) -> Admission {
+		admit_drilldown(tool, self.phase.past_submit_by(), self.state().receipt.is_some())
+	}
+
+	pub fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		self.phase.record_limits(limits);
+		let mut state = self.state();
+		state.siblings_remaining = Some(limits.siblings.remaining);
+		state.queries_remaining = Some(limits.candidate_queries.remaining);
+	}
+
+	/// A sibling checkpoint under `key` was accepted.
+	pub fn record_sibling(&self, key: &str) {
+		let mut state = self.state();
+		if state.sibling_keys.insert(key.to_owned()) {
+			state.siblings_remaining = state.siblings_remaining.map(|n| n.saturating_sub(1));
+		}
+	}
+
+	/// A candidate query for `query` and `limit` was answered.
+	pub fn record_query(&self, query: &str, limit: u8) {
+		let mut state = self.state();
+		if state.queries.insert((query.to_owned(), limit)) {
+			state.queries_remaining = state.queries_remaining.map(|n| n.saturating_sub(1));
+		}
+	}
+
+	/// The server refused `tool`'s call for its exhausted quota.
+	pub(crate) fn record_exhausted(&self, tool: DrilldownTool) {
+		let mut state = self.state();
+		match tool {
+			DrilldownTool::SiblingLead => state.siblings_remaining = Some(0),
+			DrilldownTool::Candidates => state.queries_remaining = Some(0),
+			DrilldownTool::JobLimits | DrilldownTool::Finalize => {},
+		}
+	}
+
+	pub fn seal(&self, receipt: DrilldownTerminalResponse<Server>) {
+		self.state().receipt.get_or_insert(receipt);
+		self.phase.stop_heartbeat();
+	}
+
+	pub fn receipt(&self) -> Option<DrilldownTerminalResponse<Server>> {
+		self.state().receipt.clone()
+	}
+
+	/// The host-authored line every drilldown tool result ends with.
+	pub fn status_line(&self) -> String {
+		let now = self.phase.now();
+		let state = self.state();
+		let count =
+			|value: Option<u32>| value.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+		let capacity = format!(
+			"sibling leads remaining: {}; candidate queries remaining: {}",
+			count(state.siblings_remaining),
+			count(state.queries_remaining),
+		);
+		self.phase.status_line(now, &capacity)
+	}
+}
+
 impl State {
 	fn apply_limits(&mut self, limits: &PhaseLimitsResponse) {
 		self.units_remaining = Some(limits.new_units.remaining);
@@ -434,5 +573,37 @@ mod tests {
 		session.seal(receipt);
 		assert!(heartbeat.is_cancelled(), "a sealed attempt must not heartbeat");
 		assert!(!cancel.is_cancelled());
+	}
+
+	#[test]
+	fn sealing_a_drilldown_stops_the_heartbeat_and_closes_its_tools() {
+		let (cancel, heartbeat) = (CancellationToken::new(), CancellationToken::new());
+		let now = SystemTime::now();
+		let phase = PhaseSession::new(
+			7,
+			JobCapability::from_secret("session-capability"),
+			now + std::time::Duration::from_secs(60),
+			now + std::time::Duration::from_secs(120),
+			Arc::new(SystemTime::now),
+			cancel.clone(),
+		);
+		let session = DrilldownSession::new(phase, 4, None).with_heartbeat(heartbeat.clone());
+		assert_eq!(session.admission(DrilldownTool::SiblingLead), Admission::Allow);
+		assert!(session
+			.status_line()
+			.ends_with("sibling leads remaining: unknown; candidate queries remaining: unknown"));
+		let receipt = serde_json::json!({"protocol_version":3,"receipt":{"receipt_id":21,
+			"job_id":7,"commit_sha":"a".repeat(40),"result_digest":"b".repeat(64),
+			"summary":{"version":1,"lead_id":4,"disposition":"rejected"}}});
+		let receipt = crate::client::fuzz_support::review_response(
+			loupe_proto::review_drilldown::DrilldownTerminalResponseDecoder,
+			receipt.to_string().as_bytes(),
+		)
+		.unwrap();
+		session.seal(receipt);
+		assert!(heartbeat.is_cancelled(), "a sealed attempt must not heartbeat");
+		assert!(!cancel.is_cancelled());
+		assert_ne!(session.admission(DrilldownTool::SiblingLead), Admission::Allow);
+		assert_eq!(session.admission(DrilldownTool::Finalize), Admission::Allow);
 	}
 }

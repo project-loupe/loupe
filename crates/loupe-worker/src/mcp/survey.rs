@@ -66,7 +66,16 @@ async fn phase_error(
 	}
 	let limits_call = tool == SurveyTool::JobLimits;
 	let record_limits = |limits: &_| survey.record_limits(limits);
-	phase::phase_error(client, survey.phase(), &TEXTS, limits_call, record_limits, error).await
+	phase::phase_error(
+		client,
+		survey.phase(),
+		&TEXTS,
+		limits_call,
+		phase::UNREACHABLE,
+		record_limits,
+		error,
+	)
+	.await
 }
 
 /// A phase call's result, with a failure turned into fixed model text.

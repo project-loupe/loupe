@@ -11,27 +11,27 @@ use super::*;
 use crate::review::gate::{RecipeClass, PROFILE_FIRST, SEALED, SOFT_STOP};
 use crate::review::session::{SurveySession, SurveySessionParts};
 
-const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const SENTINEL: &str = "server-body-sentinel";
+pub(super) const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(super) const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub(super) const SENTINEL: &str = "server-body-sentinel";
 
-struct Seen {
-	head: String,
-	body: Value,
+pub(super) struct Seen {
+	pub(super) head: String,
+	pub(super) body: Value,
 }
 
 type Replies = Arc<Mutex<Vec<(&'static str, VecDeque<(u16, String)>)>>>;
 
 /// Answers each request by the first route whose path suffix matches, in
 /// the order the replies were queued for that route.
-struct FakePhase {
+pub(super) struct FakePhase {
 	base: reqwest::Url,
 	replies: Replies,
 	seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 impl FakePhase {
-	async fn start() -> Self {
+	pub(super) async fn start() -> Self {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
 		let replies: Replies = Arc::default();
@@ -91,7 +91,7 @@ impl FakePhase {
 		Self { base, replies, seen }
 	}
 
-	fn reply(&self, route: &'static str, status: u16, body: impl Into<String>) {
+	pub(super) fn reply(&self, route: &'static str, status: u16, body: impl Into<String>) {
 		let mut replies = self.replies.lock().unwrap();
 		match replies.iter_mut().find(|(r, _)| *r == route) {
 			Some((_, queue)) => queue.push_back((status, body.into())),
@@ -99,16 +99,16 @@ impl FakePhase {
 		}
 	}
 
-	fn seen(&self) -> Vec<Seen> {
+	pub(super) fn seen(&self) -> Vec<Seen> {
 		std::mem::take(&mut *self.seen.lock().unwrap())
 	}
 
-	fn client(&self) -> Arc<ServerClient> {
+	pub(super) fn client(&self) -> Arc<ServerClient> {
 		Arc::new(ServerClient::from_parts(reqwest::Client::new(), self.base.clone()))
 	}
 }
 
-fn error_body(code: &str, current_revision: Option<i64>) -> String {
+pub(super) fn error_body(code: &str, current_revision: Option<i64>) -> String {
 	match current_revision {
 		Some(revision) => format!(
 			r#"{{"protocol_version":3,"error":{{"code":"{code}","detail":null,"current_revision":{revision}}}}}"#
@@ -188,11 +188,11 @@ async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 	Fixture { server, survey, context }
 }
 
-fn call(id: u64, name: &str, arguments: Value) -> Value {
+pub(super) fn call(id: u64, name: &str, arguments: Value) -> Value {
 	json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}})
 }
 
-async fn run(context: McpSessionContext, requests: &[Value]) -> Vec<Value> {
+pub(super) async fn run(context: McpSessionContext, requests: &[Value]) -> Vec<Value> {
 	let input: String = requests.iter().map(|request| format!("{request}\n")).collect();
 	let mut output = Vec::new();
 	run_stream_server(context, input.as_bytes(), &mut output).await.unwrap();
@@ -203,11 +203,11 @@ async fn run(context: McpSessionContext, requests: &[Value]) -> Vec<Value> {
 		.collect()
 }
 
-fn text(response: &Value) -> &str {
+pub(super) fn text(response: &Value) -> &str {
 	response["result"]["content"][0]["text"].as_str().unwrap()
 }
 
-fn is_error(response: &Value) -> bool {
+pub(super) fn is_error(response: &Value) -> bool {
 	response["result"]["isError"] == json!(true)
 }
 

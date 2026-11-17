@@ -10,20 +10,22 @@ use loupe_provenance::{Agent, Server};
 
 use super::ServerClient;
 use crate::client::PhaseError;
-use crate::review::session::{PhaseSession, SurveySession};
+use crate::review::session::{DrilldownSession, PhaseSession, SurveySession};
 
 /// The host state of the review phase an MCP session serves.
 #[derive(Clone)]
 pub enum PhaseTools {
 	Survey(Arc<SurveySession>),
+	Drilldown(Arc<DrilldownSession>),
 }
 
 /// Phase host state accompanies exactly the phase modes, each its own.
 pub(crate) fn mode_matches(mode: super::McpMode, phase: Option<&PhaseTools>) -> anyhow::Result<()> {
 	match (mode, phase) {
 		(super::McpMode::Survey, Some(PhaseTools::Survey(_)))
+		| (super::McpMode::Drilldown, Some(PhaseTools::Drilldown(_)))
 		| (super::McpMode::LegacyDiscovery { .. } | super::McpMode::LegacyVerify { .. }, None) => Ok(()),
-		_ => anyhow::bail!("MCP mode and survey session state disagree"),
+		_ => anyhow::bail!("MCP mode and phase session state disagree"),
 	}
 }
 
@@ -52,10 +54,11 @@ pub(super) fn forbidden(error: &PhaseError) -> bool {
 /// for lost authority and for a reference outside the job's scope, so a
 /// 403 is told apart by reading `/limits` under the same capability;
 /// `record_limits` receives that read. `limits_call` marks a failed
-/// `/limits` call itself, whose 403 needs no probe.
+/// `/limits` call itself, whose 403 needs no probe. `unreachable` is the
+/// call's own text for a server that could not be reached.
 pub(super) async fn phase_error(
 	client: &ServerClient, phase: &PhaseSession, texts: &PhaseTexts, limits_call: bool,
-	record_limits: impl FnOnce(&PhaseLimitsResponse), error: PhaseError,
+	unreachable: &'static str, record_limits: impl FnOnce(&PhaseLimitsResponse), error: PhaseError,
 ) -> String {
 	if forbidden(&error) {
 		if limits_call {
@@ -71,7 +74,7 @@ pub(super) async fn phase_error(
 				phase.record_authority_lost();
 				texts.authority_lost
 			},
-			Err(_) => UNREACHABLE,
+			Err(_) => unreachable,
 		}
 		.to_owned();
 	}
@@ -106,7 +109,7 @@ pub(super) async fn phase_error(
 			ReviewErrorCode::InternalError
 			| ReviewErrorCode::ResponseTooLarge
 			| ReviewErrorCode::Unauthenticated
-			| ReviewErrorCode::RequestFailed => UNREACHABLE,
+			| ReviewErrorCode::RequestFailed => unreachable,
 			ReviewErrorCode::CheckoutConflict
 			| ReviewErrorCode::CompatibilityKeyConflict
 			| ReviewErrorCode::CompatibilityPolicy
@@ -121,7 +124,7 @@ pub(super) async fn phase_error(
 		| PhaseError::Connection
 		| PhaseError::Status { .. }
 		| PhaseError::Response(_)
-		| PhaseError::Decode(_) => UNREACHABLE,
+		| PhaseError::Decode(_) => unreachable,
 	};
 	text.to_owned()
 }
