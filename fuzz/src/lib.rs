@@ -75,6 +75,7 @@ pub mod worker_client_ingress;
 pub mod worker_config;
 pub mod worker_extract_json;
 pub mod worker_inventory_chunks;
+pub mod worker_mcp_drilldown_ingress;
 pub mod worker_mcp_ingress;
 pub mod worker_mcp_rpc;
 pub mod worker_mcp_submission;

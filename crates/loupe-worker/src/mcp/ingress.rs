@@ -42,6 +42,7 @@ pub(super) struct McpRequestDecoder {
 pub(super) enum Catalog {
 	Legacy,
 	Survey,
+	Drilldown,
 }
 pub(super) struct DecodedRequest {
 	pub(super) id: Option<SandboxReplyId>,
@@ -94,6 +95,8 @@ pub(super) enum ToolName {
 	Disposition,
 	Candidates,
 	Finalize,
+	SiblingLead,
+	FinalizeDrilldown,
 	Unknown(String),
 }
 impl ToolName {
@@ -114,6 +117,10 @@ impl ToolName {
 			(Catalog::Survey, "submit_inventory_disposition") => Self::Disposition,
 			(Catalog::Survey, "query_same_project_lead_candidates") => Self::Candidates,
 			(Catalog::Survey, "finalize_survey") => Self::Finalize,
+			(Catalog::Drilldown, "get_job_limits") => Self::JobLimits,
+			(Catalog::Drilldown, "query_same_project_lead_candidates") => Self::Candidates,
+			(Catalog::Drilldown, "submit_sibling_lead") => Self::SiblingLead,
+			(Catalog::Drilldown, "finalize_drilldown") => Self::FinalizeDrilldown,
 			_ => Self::Unknown(name),
 		}
 	}
@@ -132,6 +139,8 @@ impl ToolName {
 			Self::Disposition => Operation::McpSubmitInventoryDisposition,
 			Self::Candidates => Operation::McpQuerySameProjectLeadCandidates,
 			Self::Finalize => Operation::McpFinalizeSurvey,
+			Self::SiblingLead => Operation::McpSubmitSiblingLead,
+			Self::FinalizeDrilldown => Operation::McpFinalizeDrilldown,
 			Self::Get | Self::Unknown(_) => Operation::ReadFinding,
 		}
 	}
@@ -152,6 +161,8 @@ impl ToolName {
 			Self::Disposition => "submit_inventory_disposition",
 			Self::Candidates => "query_same_project_lead_candidates",
 			Self::Finalize => "finalize_survey",
+			Self::SiblingLead => "submit_sibling_lead",
+			Self::FinalizeDrilldown => "finalize_drilldown",
 			Self::Unknown(_) => "unknown",
 		}
 	}
@@ -173,6 +184,16 @@ pub(super) enum Arguments {
 	Disposition(Box<DispositionArgs>),
 	Candidates(loupe_core::review_candidates::CandidateQuery<Agent>),
 	Finalize(Box<loupe_core::review_payload::SurveyTerminalV1<Agent>>),
+	#[cfg_attr(
+		not(any(test, fuzzing)),
+		expect(dead_code, reason = "decoded ahead of the drilldown dispatcher")
+	)]
+	SiblingLead(Box<LeadArgs>),
+	#[cfg_attr(
+		not(any(test, fuzzing)),
+		expect(dead_code, reason = "decoded ahead of the drilldown dispatcher")
+	)]
+	FinalizeDrilldown(Box<loupe_core::review_payload::DrilldownTerminalV1<Agent>>),
 }
 pub(super) struct DecodedQueryArgs {
 	pub(super) query: BoundedText<QueryText, Agent>,
@@ -312,6 +333,7 @@ macro_rules! carry {
 	}};
 }
 
+mod drilldown;
 mod survey;
 pub(super) use survey::{DispositionArgs, LeadArgs, UnitResultArgs};
 
@@ -399,6 +421,9 @@ fn arguments(
 			Arguments::Verdict(DecodedVerdictArgs { verdict })
 		},
 		ToolName::Unknown(_) => return Err(UnknownTool.into()),
+		ToolName::SiblingLead | ToolName::FinalizeDrilldown => {
+			return drilldown::arguments(u, name, &fields);
+		},
 		_ => return survey::arguments(u, name, &fields),
 	})
 }

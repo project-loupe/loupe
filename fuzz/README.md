@@ -351,6 +351,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_mcp_ingress` | Actual bounded record framer and private Sandbox decoder, all seven tools, original Agent token spans, syntax/policy precedence and 16 MiB record edges |
 | `worker_mcp_rpc` | Real dispatcher/catalogues, original record and field-policy admission, request IDs, notifications, stateful verdict/patch order and metadata-only logs |
 | `worker_mcp_submission` | Actual original-record finding projection, independent lexical admission, containment, symlink rejection, unchanged ranges and snippet clamping |
+| `worker_mcp_drilldown_ingress` | Actual drilldown-catalog decoder over original Sandbox records, four tools plus foreign names: Agent carries stay inside the record, rejections never echo content, nested finalize objects admit only their own members, admitted arguments serialize as valid phase requests |
 | `worker_mcp_survey_ingress` | Actual survey-catalog decoder over original Sandbox records, all nine tools: Agent carries stay inside the record, rejections never echo content, admitted arguments serialize as valid phase requests |
 | `worker_network_host` | RFC 1123 hostname boundaries, IPv4 acceptance and complete allowlist/public nft rule templates |
 | `worker_network_parsers` | Actual PID, uid_map, route and address parsers, typed-serde PID forms, identity-pair and complete-set checks |

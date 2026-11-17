@@ -41,7 +41,7 @@ pub(in crate::mcp) struct DispositionArgs {
 	pub(in crate::mcp) mapped_review_unit_ids: Vec<ReviewId>,
 }
 
-trait Content: Sized {
+pub(super) trait Content: Sized {
 	fn admit(mark: &Mark<'_, Agent>, raw: &RawValue) -> Result<Self>;
 }
 fn string_token(raw: &RawValue) -> Result<&str> {
@@ -128,25 +128,47 @@ fn content<T: Content>(u: &Unvalidated<'_, &[u8], Sandbox>, raw: &RawValue) -> R
 	Ok(carry!(u, raw, AgentContent::<T>(PhantomData)))
 }
 
-struct Args<'u, 'v, 'b, 'f, 'a> {
-	u: &'u Unvalidated<'v, &'b [u8], Sandbox>,
-	fields: &'f Fields<'a>,
+pub(super) struct Args<'u, 'v, 'b, 'f, 'a> {
+	pub(super) u: &'u Unvalidated<'v, &'b [u8], Sandbox>,
+	pub(super) fields: &'f Fields<'a>,
+	/// The tool's own arguments, where `protocol_version` is admitted.
+	pub(super) top_level: bool,
 }
-impl<'a> Args<'_, '_, '_, '_, 'a> {
-	fn present(&self, name: &'static str) -> Option<&'a RawValue> {
+impl<'u, 'v, 'b, 'a> Args<'u, 'v, 'b, '_, 'a> {
+	/// The members of the object argument `name`, read as their own
+	/// arguments.
+	pub(super) fn object(&self, name: &'static str) -> Result<Fields<'a>> {
+		let raw = self.present(name).with_context(|| format!("`{name}` argument is required"))?;
+		raw.get()
+			.starts_with('{')
+			.then(|| serde_json::from_str(raw.get()).ok())
+			.flatten()
+			.with_context(|| format!("`{name}` argument must be an object"))
+	}
+	pub(super) fn optional_object(&self, name: &'static str) -> Result<Option<Fields<'a>>> {
+		self.present(name).map(|_| self.object(name)).transpose()
+	}
+	pub(super) fn nested<'g>(&self, fields: &'g Fields<'a>) -> Args<'u, 'v, 'b, 'g, 'a> {
+		Args { u: self.u, fields, top_level: false }
+	}
+	pub(super) fn present(&self, name: &'static str) -> Option<&'a RawValue> {
 		self.fields.get(name).copied().filter(|raw| raw.get() != "null")
 	}
-	fn required<T: Content>(&self, name: &'static str) -> Result<T> {
+	pub(super) fn required<T: Content>(&self, name: &'static str) -> Result<T> {
 		let raw = self.present(name).with_context(|| format!("`{name}` argument is required"))?;
 		content(self.u, raw)
 	}
-	fn optional<T: Content>(&self, name: &'static str) -> Result<Option<T>> {
+	pub(super) fn optional<T: Content>(&self, name: &'static str) -> Result<Option<T>> {
 		self.present(name).map(|raw| content(self.u, raw)).transpose()
 	}
-	fn list<T: Content>(&self, name: &'static str, min: usize, max: usize) -> Result<Vec<T>> {
+	pub(super) fn list<T: Content>(
+		&self, name: &'static str, min: usize, max: usize,
+	) -> Result<Vec<T>> {
 		self.tokens(name, min, max)?.into_iter().map(|raw| content(self.u, raw)).collect()
 	}
-	fn tokens(&self, name: &'static str, min: usize, max: usize) -> Result<Vec<&'a RawValue>> {
+	pub(super) fn tokens(
+		&self, name: &'static str, min: usize, max: usize,
+	) -> Result<Vec<&'a RawValue>> {
 		let tokens: Vec<&'a RawValue> = match self.present(name) {
 			Some(raw) => serde_json::from_str(raw.get())
 				.map_err(|_| anyhow::anyhow!("`{name}` argument must be an array"))?,
@@ -157,7 +179,9 @@ impl<'a> Args<'_, '_, '_, '_, 'a> {
 		}
 		Ok(tokens)
 	}
-	fn closed<T: serde::de::DeserializeOwned>(&self, name: &'static str) -> Result<Option<T>> {
+	pub(super) fn closed<T: serde::de::DeserializeOwned>(
+		&self, name: &'static str,
+	) -> Result<Option<T>> {
 		self.present(name)
 			.map(|raw| {
 				serde_json::from_str(raw.get())
@@ -165,21 +189,21 @@ impl<'a> Args<'_, '_, '_, '_, 'a> {
 			})
 			.transpose()
 	}
-	fn required_closed<T: serde::de::DeserializeOwned>(&self, name: &'static str) -> Result<T> {
+	pub(super) fn required_closed<T: serde::de::DeserializeOwned>(
+		&self, name: &'static str,
+	) -> Result<T> {
 		self.closed(name)?.with_context(|| format!("`{name}` argument is required"))
 	}
-	fn id(&self, name: &'static str) -> Result<Option<ReviewId>> {
+	pub(super) fn id(&self, name: &'static str) -> Result<Option<ReviewId>> {
 		self.present(name).map(|raw| positive_id(name, raw)).transpose()
 	}
 	fn ids(&self, name: &'static str, max: usize) -> Result<Vec<ReviewId>> {
 		self.tokens(name, 0, max)?.into_iter().map(|raw| positive_id(name, raw)).collect()
 	}
-	fn only(&self, allowed: &[&'static str]) -> Result<()> {
-		if self
-			.fields
-			.keys()
-			.all(|key| key == "protocol_version" || allowed.contains(&key.as_str()))
-		{
+	pub(super) fn only(&self, allowed: &[&'static str]) -> Result<()> {
+		if self.fields.keys().all(|key| {
+			(self.top_level && key == "protocol_version") || allowed.contains(&key.as_str())
+		}) {
 			Ok(())
 		} else {
 			Err(UnknownArgument.into())
@@ -198,7 +222,7 @@ fn positive_id(name: &'static str, raw: &RawValue) -> Result<ReviewId> {
 #[error("unknown argument for this tool")]
 pub(in crate::mcp) struct UnknownArgument;
 
-fn payload<T>(
+pub(super) fn payload<T>(
 	value: T, check: impl FnOnce(&T) -> Result<Vec<u8>, loupe_core::review_payload::Error>,
 ) -> Result<T> {
 	check(&value)?;
@@ -208,7 +232,7 @@ fn payload<T>(
 pub(super) fn arguments(
 	u: &Unvalidated<'_, &[u8], Sandbox>, name: &ToolName, fields: &Fields<'_>,
 ) -> Result<Arguments> {
-	let args = Args { u, fields };
+	let args = Args { u, fields, top_level: true };
 	Ok(match name {
 		ToolName::JobLimits => {
 			args.only(&[])?;
@@ -252,62 +276,7 @@ pub(super) fn arguments(
 			request.validate().map_err(anyhow::Error::msg)?;
 			Arguments::ProposeUnit(Box::new(request))
 		},
-		ToolName::Lead => {
-			args.only(&[
-				"client_lead_key",
-				"identity_family",
-				"identity_anchor",
-				"identity_instance_key",
-				"review_unit_id",
-				"hypothesis",
-				"invariant_or_boundary",
-				"source_refs",
-				"next_proof_step",
-				"counterevidence",
-				"proof_gaps",
-				"priority_proposal",
-				"duplicate_of_lead_id",
-				"duplicate_rationale",
-			])?;
-			let duplicate_hint =
-				match (args.id("duplicate_of_lead_id")?, args.present("duplicate_rationale")) {
-					(None, None) => None,
-					(Some(lead_id), Some(_)) => Some(DuplicateLeadHint {
-						lead_id: lead_id.into(),
-						rationale: args.required::<BoundedText<DuplicateRationale, Agent>>(
-							"duplicate_rationale",
-						)?,
-					}),
-					_ => anyhow::bail!(
-						"`duplicate_of_lead_id` and `duplicate_rationale` must be given together"
-					),
-				};
-			let evidence = LeadEvidenceV1 {
-				format: LeadEvidenceFormat::V1,
-				version: Version1,
-				identity_family: args.required::<Identifier<Family, Agent>>("identity_family")?,
-				identity_anchor: args.required::<Anchor<AnchorText, Agent>>("identity_anchor")?,
-				identity_instance_key: args
-					.optional::<Anchor<InstanceKey, Agent>>("identity_instance_key")?,
-				review_unit_id: None,
-				assignment_epoch: None,
-				hypothesis: args.required::<BoundedText<Argument, Agent>>("hypothesis")?,
-				invariant_or_boundary: args
-					.optional::<BoundedText<Reason, Agent>>("invariant_or_boundary")?,
-				source_refs: args.list("source_refs", 1, 16)?,
-				next_proof_step: args.required::<BoundedText<Reason, Agent>>("next_proof_step")?,
-				counterevidence: args
-					.required::<BoundedText<Objective, Agent>>("counterevidence")?,
-				proof_gaps: args.required::<BoundedText<Objective, Agent>>("proof_gaps")?,
-				priority_proposal: args.optional::<PriorityProposal<Agent>>("priority_proposal")?,
-				duplicate_hint,
-			};
-			Arguments::Lead(Box::new(LeadArgs {
-				key: args.required("client_lead_key")?,
-				review_unit_id: args.id("review_unit_id")?,
-				evidence: payload(evidence, LeadEvidenceV1::canonical_bytes)?,
-			}))
-		},
+		ToolName::Lead => Arguments::Lead(Box::new(lead(&args, true)?)),
 		ToolName::UnitResult => {
 			args.only(&[
 				"client_result_key",
@@ -403,5 +372,68 @@ pub(super) fn arguments(
 			Arguments::Finalize(Box::new(payload(terminal, SurveyTerminalV1::canonical_bytes)?))
 		},
 		_ => return Err(UnknownTool.into()),
+	})
+}
+
+/// `submit_lead` arguments; a sibling lead (`with_unit` false) never names
+/// a review unit.
+pub(super) fn lead(args: &Args<'_, '_, '_, '_, '_>, with_unit: bool) -> Result<LeadArgs> {
+	const FIELDS: [&str; 13] = [
+		"client_lead_key",
+		"identity_family",
+		"identity_anchor",
+		"identity_instance_key",
+		"hypothesis",
+		"invariant_or_boundary",
+		"source_refs",
+		"next_proof_step",
+		"counterevidence",
+		"proof_gaps",
+		"priority_proposal",
+		"duplicate_of_lead_id",
+		"duplicate_rationale",
+	];
+	if with_unit {
+		let mut fields = FIELDS.to_vec();
+		fields.insert(4, "review_unit_id");
+		args.only(&fields)?;
+	} else {
+		args.only(&FIELDS)?;
+	}
+	let duplicate_hint =
+		match (args.id("duplicate_of_lead_id")?, args.present("duplicate_rationale")) {
+			(None, None) => None,
+			(Some(lead_id), Some(_)) => Some(DuplicateLeadHint {
+				lead_id: lead_id.into(),
+				rationale: args
+					.required::<BoundedText<DuplicateRationale, Agent>>("duplicate_rationale")?,
+			}),
+			_ => anyhow::bail!(
+				"`duplicate_of_lead_id` and `duplicate_rationale` must be given together"
+			),
+		};
+	let evidence = LeadEvidenceV1 {
+		format: LeadEvidenceFormat::V1,
+		version: Version1,
+		identity_family: args.required::<Identifier<Family, Agent>>("identity_family")?,
+		identity_anchor: args.required::<Anchor<AnchorText, Agent>>("identity_anchor")?,
+		identity_instance_key: args
+			.optional::<Anchor<InstanceKey, Agent>>("identity_instance_key")?,
+		review_unit_id: None,
+		assignment_epoch: None,
+		hypothesis: args.required::<BoundedText<Argument, Agent>>("hypothesis")?,
+		invariant_or_boundary: args
+			.optional::<BoundedText<Reason, Agent>>("invariant_or_boundary")?,
+		source_refs: args.list("source_refs", 1, 16)?,
+		next_proof_step: args.required::<BoundedText<Reason, Agent>>("next_proof_step")?,
+		counterevidence: args.required::<BoundedText<Objective, Agent>>("counterevidence")?,
+		proof_gaps: args.required::<BoundedText<Objective, Agent>>("proof_gaps")?,
+		priority_proposal: args.optional::<PriorityProposal<Agent>>("priority_proposal")?,
+		duplicate_hint,
+	};
+	Ok(LeadArgs {
+		key: args.required("client_lead_key")?,
+		review_unit_id: if with_unit { args.id("review_unit_id")? } else { None },
+		evidence: payload(evidence, LeadEvidenceV1::canonical_bytes)?,
 	})
 }

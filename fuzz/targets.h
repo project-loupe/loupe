@@ -58,6 +58,7 @@ void worker_client_ingress_run(const unsigned char* data, size_t data_len);
 void worker_config_run(const unsigned char* data, size_t data_len);
 void worker_extract_json_run(const unsigned char* data, size_t data_len);
 void worker_inventory_chunks_run(const unsigned char* data, size_t data_len);
+void worker_mcp_drilldown_ingress_run(const unsigned char* data, size_t data_len);
 void worker_mcp_ingress_run(const unsigned char* data, size_t data_len);
 void worker_mcp_rpc_run(const unsigned char* data, size_t data_len);
 void worker_mcp_submission_run(const unsigned char* data, size_t data_len);

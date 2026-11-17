@@ -50,6 +50,7 @@ fuzz/src/cli_render.rs fuzz entry point: the C entry point takes a raw pointer f
 fuzz/src/web_api.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_repo_path.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_submission.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/worker_mcp_drilldown_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_survey_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_extract_json.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_broker_policy.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

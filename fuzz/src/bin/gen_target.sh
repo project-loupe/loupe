@@ -71,6 +71,7 @@ GEN_TEST worker_client_ingress
 GEN_TEST worker_config
 GEN_TEST worker_extract_json
 GEN_TEST worker_inventory_chunks
+GEN_TEST worker_mcp_drilldown_ingress
 GEN_TEST worker_mcp_ingress
 GEN_TEST worker_mcp_rpc
 GEN_TEST worker_mcp_submission

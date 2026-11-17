@@ -69,6 +69,7 @@ const SERVER_VERSION: &str = "0.1.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const LEGACY_LOUPE_MCP_PROTOCOL_VERSION: u16 = 1;
 const SURVEY_LOUPE_MCP_PROTOCOL_VERSION: u16 = 2;
+const DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION: u16 = 2;
 #[cfg(test)]
 const LOUPE_MCP_PROTOCOL_VERSION: u16 = LEGACY_LOUPE_MCP_PROTOCOL_VERSION;
 
@@ -87,6 +88,9 @@ pub enum McpMode {
 	/// state and the catalog's shape travel separately as a shared
 	/// `SurveySession` in [`PhaseTools::Survey`].
 	Survey,
+	/// Drilldown phase catalog (Loupe MCP protocol 2), with its host state
+	/// carried as the phase session.
+	Drilldown,
 }
 
 impl McpMode {
@@ -98,6 +102,7 @@ impl McpMode {
 				LEGACY_LOUPE_MCP_PROTOCOL_VERSION
 			},
 			Self::Survey => SURVEY_LOUPE_MCP_PROTOCOL_VERSION,
+			Self::Drilldown => DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION,
 		}
 	}
 
@@ -105,6 +110,7 @@ impl McpMode {
 		match self {
 			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => ingress::Catalog::Legacy,
 			Self::Survey => ingress::Catalog::Survey,
+			Self::Drilldown => ingress::Catalog::Drilldown,
 		}
 	}
 
@@ -112,13 +118,13 @@ impl McpMode {
 		match self {
 			Self::LegacyDiscovery { job_id } => job_id,
 			Self::LegacyVerify { job_id, .. } => Some(job_id),
-			Self::Survey => None,
+			Self::Survey | Self::Drilldown => None,
 		}
 	}
 
 	pub const fn finding_id(self) -> Option<i64> {
 		match self {
-			Self::LegacyDiscovery { .. } | Self::Survey => None,
+			Self::LegacyDiscovery { .. } | Self::Survey | Self::Drilldown => None,
 			Self::LegacyVerify { finding_id, .. } => Some(finding_id),
 		}
 	}
@@ -519,8 +525,8 @@ fn tool_catalog(mode: McpMode, phase: Option<&PhaseTools>) -> Value {
 		(McpMode::LegacyDiscovery { job_id }, _) => legacy_tool_catalog(job_id.is_some(), false),
 		(McpMode::LegacyVerify { .. }, _) => legacy_tool_catalog(true, true),
 		(McpMode::Survey, Some(PhaseTools::Survey(survey))) => survey_catalog::tools(survey),
-		// `run_stream_server` refuses a survey mode without its session.
-		(McpMode::Survey, None) => json!([]),
+		// `run_stream_server` refuses a phase mode without its own session.
+		(McpMode::Survey, None) | (McpMode::Drilldown, _) => json!([]),
 	}
 }
 
@@ -1520,6 +1526,8 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(test)]
+mod drilldown_ingress_tests;
 #[cfg(test)]
 mod security_tests;
 #[cfg(test)]
