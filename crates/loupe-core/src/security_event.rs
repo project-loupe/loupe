@@ -101,8 +101,6 @@ Operation {
 	PinTarget => "pin_target",
 	UploadInventory => "upload_inventory",
 	SealInventory => "seal_inventory",
-	PhaseHeartbeat => "phase_heartbeat",
-	PhaseFailure => "phase_failure",
 }
 }
 

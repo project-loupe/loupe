@@ -99,9 +99,7 @@ fn allowed_operation(value: Operation) {
 		| Operation::McpFinalizeSurvey
 		| Operation::PinTarget
 		| Operation::UploadInventory
-		| Operation::SealInventory
-		| Operation::PhaseHeartbeat
-		| Operation::PhaseFailure => {},
+		| Operation::SealInventory => {},
 	}
 }
 #[test]
@@ -132,8 +130,6 @@ fn operation_spellings_are_closed_and_exhaustive() {
 		(Operation::PinTarget, "pin_target"),
 		(Operation::UploadInventory, "upload_inventory"),
 		(Operation::SealInventory, "seal_inventory"),
-		(Operation::PhaseHeartbeat, "phase_heartbeat"),
-		(Operation::PhaseFailure, "phase_failure"),
 	] {
 		allowed_operation(value);
 		assert_eq!(value.as_str(), expected);
