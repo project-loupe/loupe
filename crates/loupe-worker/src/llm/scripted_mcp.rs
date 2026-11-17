@@ -172,7 +172,7 @@ mod tests {
 			cancel,
 			repo_id: Some(1),
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(7) },
-			survey: None,
+			phase: None,
 			token_budget: None,
 			job_capability: Some(loupe_proto::JobCapability::from_secret("scripted-capability")),
 		}

@@ -83,7 +83,7 @@ impl Scanner for LlmVerifierScanner {
 				job_id: ctx.job_id,
 				finding_id: ctx.finding_id,
 			},
-			survey: None,
+			phase: None,
 			token_budget: None,
 			job_capability: Some(ctx.job_capability.clone()),
 		};

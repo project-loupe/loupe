@@ -189,7 +189,7 @@ fn s3_compatibility_request_debug_already_redacts_the_prompt() {
 		cancel: tokio_util::sync::CancellationToken::new(),
 		repo_id: None,
 		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-		survey: None,
+		phase: None,
 		token_budget: None,
 		job_capability: None,
 	};

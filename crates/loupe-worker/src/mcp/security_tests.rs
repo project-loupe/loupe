@@ -48,7 +48,7 @@ fn context(workdir: &Path) -> McpSessionContext {
 		repo_id: 1,
 		mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(1) },
 		workdir: workdir.to_owned(),
-		survey: None,
+		phase: None,
 	}
 }
 
@@ -127,7 +127,7 @@ async fn rejected_arguments_never_reach_tool_failure_logs() {
 		workdir: context.workdir,
 		verify: Some(VerifySessionState { finding_id: 1, inner: tokio::sync::Mutex::default() }),
 		mode: McpMode::LegacyVerify { job_id: 1, finding_id: 1 },
-		survey: None,
+		phase: None,
 	});
 	let marker = "private-verdict-7f83b4d69a";
 	let request = Request {

@@ -115,7 +115,7 @@ fn launch(
 		cancel,
 		repo_id: Some(prepared.repo_id),
 		mcp_mode: McpMode::Survey,
-		survey: Some(session.clone()),
+		phase: Some(crate::mcp::PhaseTools::Survey(session.clone())),
 		token_budget: prepared.limits.token_budget,
 		job_capability: Some(prepared.job_capability.clone()),
 	})

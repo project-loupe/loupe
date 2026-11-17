@@ -58,7 +58,7 @@ async fn session_with(
 		workdir: "/tmp".into(),
 		verify: None,
 		mode: McpMode::LegacyDiscovery { job_id: Some(42) },
-		survey: None,
+		phase: None,
 	});
 	(session, task)
 }

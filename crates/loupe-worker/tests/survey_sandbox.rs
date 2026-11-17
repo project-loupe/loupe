@@ -129,7 +129,7 @@ async fn a_sandboxed_agent_reads_its_job_limits_through_the_survey_catalog() {
 			cancel,
 			repo_id: Some(1),
 			mcp_mode: McpMode::Survey,
-			survey: Some(session.clone()),
+			phase: Some(loupe_worker::mcp::PhaseTools::Survey(session.clone())),
 			token_budget: None,
 			job_capability: Some(capability),
 		})

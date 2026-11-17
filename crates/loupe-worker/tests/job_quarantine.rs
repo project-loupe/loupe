@@ -122,7 +122,7 @@ printf '{"input":"ordinary","unknown":"%s"}' "$key" | /usr/bin/curl --silent --s
 			cancel: tokio_util::sync::CancellationToken::new(),
 			repo_id: Some(1),
 			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: Some(42) },
-			survey: None,
+			phase: None,
 			token_budget: None,
 			job_capability: Some(loupe_proto::JobCapability::from_secret(
 				"synthetic-job-capability",

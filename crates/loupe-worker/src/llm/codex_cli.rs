@@ -511,7 +511,7 @@ mod tests {
 				cancel: CancellationToken::new(),
 				repo_id: None,
 				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-				survey: None,
+				phase: None,
 				token_budget: None,
 				job_capability: None,
 			})
@@ -686,7 +686,7 @@ mod tests {
 				cancel: CancellationToken::new(),
 				repo_id: None,
 				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-				survey: None,
+				phase: None,
 				token_budget: None,
 				job_capability: None,
 			})
@@ -759,7 +759,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			survey: None,
+			phase: None,
 			token_budget: None,
 			job_capability: None,
 		};
@@ -799,7 +799,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			survey: None,
+			phase: None,
 			token_budget: None,
 			job_capability: None,
 		};

@@ -253,7 +253,7 @@ async fn run_one(
 		cancel,
 		repo_id: Some(repo_id),
 		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(job_id) },
-		survey: None,
+		phase: None,
 		token_budget: None,
 		job_capability: Some(job_capability),
 	};

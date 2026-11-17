@@ -183,7 +183,7 @@ async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 		repo_id: 1,
 		mode: McpMode::Survey,
 		workdir: PathBuf::from("/nonexistent"),
-		survey: Some(survey.clone()),
+		phase: Some(crate::mcp::PhaseTools::Survey(survey.clone())),
 	};
 	Fixture { server, survey, context }
 }
@@ -557,7 +557,7 @@ async fn candidates_are_framed_with_the_job_tool_boundary() {
 async fn the_broker_fails_closed_when_mode_and_survey_state_disagree() {
 	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
 	let mut context = fixture.context;
-	context.survey = None;
+	context.phase = None;
 	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
 
 	let fixture = super::survey_tests::fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;

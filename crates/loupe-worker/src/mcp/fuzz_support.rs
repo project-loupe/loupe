@@ -44,7 +44,7 @@ impl FuzzSession {
 			} else {
 				McpMode::LegacyDiscovery { job_id: Some(1) }
 			},
-			survey: None,
+			phase: None,
 		}))
 	}
 

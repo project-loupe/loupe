@@ -51,6 +51,7 @@ use loupe_proto::JobCapability;
 #[cfg(test)]
 use loupe_proto::PROTOCOL_VERSION;
 use loupe_provenance::{Agent, Ingress, Repo, Sandbox, Untrusted};
+pub use phase::PhaseTools;
 #[cfg(test)]
 use serde::Deserialize;
 use serde::Serialize;
@@ -84,7 +85,7 @@ pub enum McpMode {
 	LegacyVerify { job_id: i64, finding_id: i64 },
 	/// Survey phase catalog (Loupe MCP protocol 2). The job, its host
 	/// state and the catalog's shape travel separately as a shared
-	/// `SurveySession`.
+	/// `SurveySession` in [`PhaseTools::Survey`].
 	Survey,
 }
 
@@ -214,8 +215,8 @@ struct Session {
 	verify: Option<VerifySessionState>,
 	/// The catalog this session serves and its Loupe MCP protocol version.
 	mode: McpMode,
-	/// Survey host state; present exactly in survey mode.
-	survey: Option<Arc<crate::review::session::SurveySession>>,
+	/// Phase host state; present exactly in a phase mode.
+	phase: Option<PhaseTools>,
 }
 
 /// Verify-mode buffer. The agent calls `submit_verdict` first
@@ -329,18 +330,8 @@ pub struct McpSessionContext {
 	pub repo_id: i64,
 	pub mode: McpMode,
 	pub workdir: PathBuf,
-	/// Survey host state, required exactly when `mode` is a survey mode.
-	pub survey: Option<Arc<crate::review::session::SurveySession>>,
-}
-
-/// Survey host state accompanies exactly the survey modes.
-pub(crate) fn survey_state_matches(
-	mode: McpMode, survey: Option<&Arc<crate::review::session::SurveySession>>,
-) -> Result<()> {
-	if matches!(mode, McpMode::Survey) != survey.is_some() {
-		anyhow::bail!("MCP mode and survey session state disagree");
-	}
-	Ok(())
+	/// Phase host state, required exactly when `mode` is that phase's mode.
+	pub phase: Option<PhaseTools>,
 }
 
 /// Run one host-side MCP broker session until the sandbox proxy closes.
@@ -349,7 +340,7 @@ where
 	R: AsyncBufRead + Unpin,
 	W: AsyncWrite + Unpin,
 {
-	survey_state_matches(context.mode, context.survey.as_ref())?;
+	phase::mode_matches(context.mode, context.phase.as_ref())?;
 	let verify = context.mode.finding_id().map(|finding_id| VerifySessionState {
 		finding_id,
 		inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
@@ -365,7 +356,7 @@ where
 		workdir: context.workdir,
 		verify,
 		mode: context.mode,
-		survey: context.survey,
+		phase: context.phase,
 	});
 	run_session(session, reader, writer, crate::limits::Limits::default()).await
 }
@@ -453,6 +444,7 @@ pub use citation::fuzzing as citation_fuzzing;
 mod ingress;
 #[cfg(test)]
 mod legacy_test_api;
+pub(crate) mod phase;
 mod repo_ingress;
 mod survey;
 mod survey_catalog;
@@ -478,7 +470,7 @@ async fn handle_decoded_request(
 		ingress::Method::List => Response::ok(
 			id,
 			json!({
-				"tools": tool_catalog(session.mode, session.survey.as_deref()),
+				"tools": tool_catalog(session.mode, session.phase.as_ref()),
 				"_meta": mode_meta(session.mode),
 			}),
 		),
@@ -522,11 +514,11 @@ fn mode_meta(mode: McpMode) -> Value {
 /// `query_prior_findings` and `get_finding_by_id` stay in both
 /// modes — they're read-only and useful for the verifier to
 /// cross-check the bug it's verifying against the repo's history.
-fn tool_catalog(mode: McpMode, survey: Option<&crate::review::session::SurveySession>) -> Value {
-	match (mode, survey) {
+fn tool_catalog(mode: McpMode, phase: Option<&PhaseTools>) -> Value {
+	match (mode, phase) {
 		(McpMode::LegacyDiscovery { job_id }, _) => legacy_tool_catalog(job_id.is_some(), false),
 		(McpMode::LegacyVerify { .. }, _) => legacy_tool_catalog(true, true),
-		(McpMode::Survey, Some(survey)) => survey_catalog::tools(survey),
+		(McpMode::Survey, Some(PhaseTools::Survey(survey))) => survey_catalog::tools(survey),
 		// `run_stream_server` refuses a survey mode without its session.
 		(McpMode::Survey, None) => json!([]),
 	}
@@ -825,7 +817,10 @@ async fn handle_decoded_tool_call(
 ) -> Response {
 	let tool_name = call.name.log_label();
 	let operation = call.name.operation();
-	let survey_call = session.survey.as_ref().zip(survey::tool(&call.name));
+	let survey_call = match &session.phase {
+		Some(PhaseTools::Survey(survey)) => survey::tool(&call.name).map(|tool| (survey, tool)),
+		None => None,
+	};
 	let result: Result<String> = session
 		.security
 		.run(operation, async {
@@ -1870,7 +1865,7 @@ mod tests {
 			workdir: workdir.path().to_owned(),
 			verify: None,
 			mode: McpMode::LegacyDiscovery { job_id: Some(42) },
-			survey: None,
+			phase: None,
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
@@ -1913,7 +1908,7 @@ mod tests {
 			workdir: workdir.path().to_owned(),
 			verify: None,
 			mode: McpMode::LegacyDiscovery { job_id: Some(42) },
-			survey: None,
+			phase: None,
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
@@ -2056,7 +2051,7 @@ mod tests {
 				inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
 			}),
 			mode: McpMode::LegacyVerify { job_id: 42, finding_id },
-			survey: None,
+			phase: None,
 		})
 	}
 

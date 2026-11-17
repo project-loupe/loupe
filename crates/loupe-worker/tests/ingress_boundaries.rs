@@ -121,7 +121,7 @@ fn context() -> McpSessionContext {
 		repo_id: 1,
 		mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: Some(1) },
 		workdir: Path::new("/").to_owned(),
-		survey: None,
+		phase: None,
 	}
 }
 

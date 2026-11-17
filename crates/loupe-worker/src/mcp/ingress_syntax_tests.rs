@@ -13,7 +13,7 @@ fn context(workdir: &Path) -> McpSessionContext {
 		repo_id: 1,
 		mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(1) },
 		workdir: workdir.to_owned(),
-		survey: None,
+		phase: None,
 	}
 }
 

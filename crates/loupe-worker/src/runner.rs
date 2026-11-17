@@ -142,7 +142,7 @@ pub struct Runner {
 	max_workdir_bytes: u64,
 	credential_watches: Vec<crate::llm::model_broker::CredentialWatch>,
 	/// The agent that runs survey leases; without one they fail closed.
-	survey_backend: Option<Arc<dyn crate::llm::LlmBackend>>,
+	phase_backend: Option<Arc<dyn crate::llm::LlmBackend>>,
 	survey_clock: crate::review::session::Clock,
 }
 
@@ -159,14 +159,14 @@ impl Runner {
 			capabilities,
 			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 			credential_watches: Vec::new(),
-			survey_backend: None,
+			phase_backend: None,
 			survey_clock: Arc::new(std::time::SystemTime::now),
 		}
 	}
 
 	/// Run survey leases with `backend`.
-	pub fn with_survey_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
-		self.survey_backend = Some(backend);
+	pub fn with_phase_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.phase_backend = Some(backend);
 		self
 	}
 
@@ -201,7 +201,7 @@ impl Runner {
 	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
 	{
 		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
-		let phases = match self.survey_backend {
+		let phases = match self.phase_backend {
 			Some(_) => vec![ReviewCapability::Survey],
 			None => Vec::new(),
 		};
@@ -280,7 +280,7 @@ impl Runner {
 			},
 			self.credential_watches.clone(),
 		)?;
-		let (heartbeat, phase_heartbeat) = match self.survey_hard_deadline(&env) {
+		let (heartbeat, phase_heartbeat) = match self.phase_hard_deadline(&env) {
 			Some(deadline) => {
 				let phase = PhaseHeartbeat::new(scan_cancel.child_token());
 				let task =
@@ -390,7 +390,7 @@ impl Runner {
 		heartbeat: Option<PhaseHeartbeat>,
 	) -> Result<Executed> {
 		anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-		match (&env.payload, &self.survey_backend, heartbeat) {
+		match (&env.payload, &self.phase_backend, heartbeat) {
 			(LeasePayload::ReviewSurvey(lease), Some(backend), Some(heartbeat)) => {
 				let limits = lease.provenance.limits.clone();
 				crate::review::survey::run(
@@ -414,8 +414,8 @@ impl Runner {
 	}
 
 	/// The hard deadline of a survey lease this runner executes.
-	fn survey_hard_deadline(&self, env: &LeaseEnvelope<Agent, Server>) -> Option<SystemTime> {
-		match (&env.payload, &self.survey_backend) {
+	fn phase_hard_deadline(&self, env: &LeaseEnvelope<Agent, Server>) -> Option<SystemTime> {
+		match (&env.payload, &self.phase_backend) {
 			(LeasePayload::ReviewSurvey(lease), Some(_)) => {
 				Some(crate::review::prepare::at(lease.provenance.limits.hard_deadline_at))
 			},
@@ -1062,7 +1062,7 @@ mod tests {
 		let backend = crate::llm::testing::StubLlmBackend::new("never-run", |_| {
 			panic!("an unsupported review lease reached the survey agent")
 		});
-		let runner = Runner::new(client, cache, Vec::new()).with_survey_backend(Arc::new(backend));
+		let runner = Runner::new(client, cache, Vec::new()).with_phase_backend(Arc::new(backend));
 		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
 			"limits":{"soft_deadline_at":100,"submit_by":100,"hard_deadline_at":200,
 			"token_budget":null,"new_unit_limit":32,"lead_limit":16,"sibling_limit":4}});

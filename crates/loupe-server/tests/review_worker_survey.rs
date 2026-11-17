@@ -222,7 +222,7 @@ impl Fixture {
 		let cache = Arc::new(RepoCache::new(self.cache.path().to_owned(), u64::MAX, None).unwrap());
 		let offset = self.offset.clone();
 		let runner = Runner::new(self.client.clone(), cache, Vec::new())
-			.with_survey_backend(Arc::new(ScriptedMcpBackend::new(self.client.clone(), script)))
+			.with_phase_backend(Arc::new(ScriptedMcpBackend::new(self.client.clone(), script)))
 			.with_survey_clock(Arc::new(move || {
 				let ahead = offset.load(Ordering::SeqCst);
 				SystemTime::now() + Duration::from_secs(u64::try_from(ahead).unwrap())
@@ -371,7 +371,7 @@ async fn only_a_worker_with_a_survey_backend_is_leased_a_survey() {
 	assert_eq!(f.scalar("SELECT COUNT(*) FROM jobs WHERE worker_id IS NOT NULL"), 0);
 
 	let surveyor = Runner::new(f.client.clone(), cache, Vec::new())
-		.with_survey_backend(Arc::new(ScriptedMcpBackend::new(f.client.clone(), full_bootstrap)));
+		.with_phase_backend(Arc::new(ScriptedMcpBackend::new(f.client.clone(), full_bootstrap)));
 	assert!(surveyor.step(&CancellationToken::new()).await.unwrap());
 	assert_eq!(f.jobs(), [("succeeded".to_owned(), None)]);
 }
