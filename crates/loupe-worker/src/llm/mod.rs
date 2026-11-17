@@ -545,7 +545,7 @@ pub fn build_verifier_backend(
 /// Build the review-phase [`LlmBackend`] that `[agents] survey` selects, as
 /// the verifier's is built: `auto` prefers
 /// Codex, then Claude. `auto` with neither ready yields `None`, and the
-/// worker then runs no surveys.
+/// worker then runs no review phases.
 pub fn build_phase_backend(
 	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
 	codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,

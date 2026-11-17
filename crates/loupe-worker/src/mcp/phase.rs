@@ -19,6 +19,31 @@ pub enum PhaseTools {
 	Drilldown(Arc<DrilldownSession>),
 }
 
+impl PhaseTools {
+	/// The catalog this phase's sessions serve.
+	pub fn mode(&self) -> super::McpMode {
+		match self {
+			Self::Survey(_) => super::McpMode::Survey,
+			Self::Drilldown(_) => super::McpMode::Drilldown,
+		}
+	}
+
+	pub fn phase(&self) -> &PhaseSession {
+		match self {
+			Self::Survey(survey) => survey.phase(),
+			Self::Drilldown(drilldown) => drilldown.phase(),
+		}
+	}
+
+	/// Whether the attempt sealed its receipt.
+	pub fn sealed(&self) -> bool {
+		match self {
+			Self::Survey(survey) => survey.receipt().is_some(),
+			Self::Drilldown(drilldown) => drilldown.receipt().is_some(),
+		}
+	}
+}
+
 /// Phase host state accompanies exactly the phase modes, each its own.
 pub(crate) fn mode_matches(mode: super::McpMode, phase: Option<&PhaseTools>) -> anyhow::Result<()> {
 	match (mode, phase) {

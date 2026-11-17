@@ -141,9 +141,10 @@ pub struct Runner {
 	capabilities: Vec<&'static str>,
 	max_workdir_bytes: u64,
 	credential_watches: Vec<crate::llm::model_broker::CredentialWatch>,
-	/// The agent that runs survey leases; without one they fail closed.
+	/// The agent that runs survey and drilldown leases; without one they
+	/// fail closed.
 	phase_backend: Option<Arc<dyn crate::llm::LlmBackend>>,
-	survey_clock: crate::review::session::Clock,
+	phase_clock: crate::review::session::Clock,
 }
 
 impl Runner {
@@ -160,24 +161,24 @@ impl Runner {
 			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 			credential_watches: Vec::new(),
 			phase_backend: None,
-			survey_clock: Arc::new(std::time::SystemTime::now),
+			phase_clock: Arc::new(std::time::SystemTime::now),
 		}
 	}
 
-	/// Run survey leases with `backend`.
+	/// Run survey and drilldown leases with `backend`.
 	pub fn with_phase_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
 		self.phase_backend = Some(backend);
 		self
 	}
 
-	pub(crate) fn survey_clock(&self) -> &crate::review::session::Clock {
-		&self.survey_clock
+	pub(crate) fn phase_clock(&self) -> &crate::review::session::Clock {
+		&self.phase_clock
 	}
 
-	/// Replace the clock survey sessions read their deadlines against.
+	/// Replace the clock phase sessions read their deadlines against.
 	#[cfg(any(test, feature = "test-support"))]
-	pub fn with_survey_clock(mut self, clock: crate::review::session::Clock) -> Self {
-		self.survey_clock = clock;
+	pub fn with_phase_clock(mut self, clock: crate::review::session::Clock) -> Self {
+		self.phase_clock = clock;
 		self
 	}
 	pub fn with_credential_watches(
@@ -391,12 +392,13 @@ impl Runner {
 	) -> Result<Executed> {
 		anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
 		match (&env.payload, &self.phase_backend, heartbeat) {
-			(LeasePayload::ReviewSurvey(lease), Some(backend), Some(heartbeat)) => {
-				let limits = lease.provenance.limits.clone();
-				crate::review::survey::run(
-					self, backend, env, &limits, cancel, security, heartbeat,
-				)
-				.await;
+			(LeasePayload::ReviewSurvey(_), Some(backend), Some(heartbeat)) => {
+				crate::review::survey::run(self, backend, env, cancel, security, heartbeat).await;
+				Ok(Executed::Reported)
+			},
+			(LeasePayload::ReviewDrilldown(_), Some(backend), Some(heartbeat)) => {
+				crate::review::drilldown::run(self, backend, env, cancel, security, heartbeat)
+					.await;
 				Ok(Executed::Reported)
 			},
 			(
@@ -413,14 +415,11 @@ impl Runner {
 		}
 	}
 
-	/// The hard deadline of a survey lease this runner executes.
+	/// The hard deadline of a survey or drilldown lease this runner executes.
 	fn phase_hard_deadline(&self, env: &LeaseEnvelope<Agent, Server>) -> Option<SystemTime> {
-		match (&env.payload, &self.phase_backend) {
-			(LeasePayload::ReviewSurvey(lease), Some(_)) => {
-				Some(crate::review::prepare::at(lease.provenance.limits.hard_deadline_at))
-			},
-			_ => None,
-		}
+		self.phase_backend.as_ref()?;
+		let limits = crate::review::phase::limits(&env.payload)?;
+		Some(crate::review::prepare::at(limits.hard_deadline_at))
 	}
 
 	/// Review phase leases fail closed: an unexpected server response
@@ -451,7 +450,7 @@ impl Runner {
 	}
 
 	/// The phase lease heartbeat. Its response only feeds the log; the
-	/// survey handler learns of lost authority from its own calls.
+	/// phase handler learns of lost authority from its own calls.
 	fn spawn_phase_heartbeat(
 		&self, job_id: i64, job_capability: JobCapability, deadline: SystemTime,
 		heartbeat: &PhaseHeartbeat,
@@ -664,7 +663,7 @@ async fn checkout(
 	Ok((CheckedOutWorktree { directory: Arc::new(tmp), pin: None }, head_sha))
 }
 
-/// Control over a phase lease's heartbeat task, which the survey handler
+/// Control over a phase lease's heartbeat task, which the phase handler
 /// stops before its terminal call.
 pub(crate) struct PhaseHeartbeat {
 	stop: CancellationToken,
@@ -1031,7 +1030,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_survey_backend_leaves_other_review_leases_failing_closed() {
+	async fn a_phase_backend_runs_survey_and_drilldown_and_leaves_verify_failing_closed() {
 		use axum::body::Bytes;
 		use axum::extract::Json;
 		use loupe_proto::PROTOCOL_VERSION_HEADER;
@@ -1060,7 +1059,7 @@ mod tests {
 		let cache = Arc::new(RepoCache::new(cache_path.clone(), 1024, None).unwrap());
 		let client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
 		let backend = crate::llm::testing::StubLlmBackend::new("never-run", |_| {
-			panic!("an unsupported review lease reached the survey agent")
+			panic!("no lease in this test may reach the phase agent")
 		});
 		let runner = Runner::new(client, cache, Vec::new()).with_phase_backend(Arc::new(backend));
 		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
@@ -1085,20 +1084,20 @@ mod tests {
 			(
 				json!({"kind":"review_verify","provenance":provenance,"generation":generation,
 				"profile":profile,"finding":finding}),
-				false,
+				None,
 			),
 			(
 				json!({"kind":"review_drilldown","provenance":provenance,"generation":generation,
 				"profile":profile,"lead":lead}),
-				false,
+				Some("hard deadline reached"),
 			),
 			(
 				json!({"kind":"review_survey","provenance":provenance,"context":{
 				"recipe":"corroboration","generation":generation,"assignments":[]}}),
-				true,
+				Some("survey recipe unsupported"),
 			),
 		];
-		for (payload, survey) in cases {
+		for (payload, reported) in cases {
 			let lease = json!({"kind":"lease","protocol_version":PROTOCOL_VERSION,
 				"job_id":1,"job_capability":"test-capability","repo_id":1,
 				"repo":{"host":"invalid.test","owner":"test","repo":"test",
@@ -1118,14 +1117,13 @@ mod tests {
 				)
 				.await;
 			let requests = std::mem::take(&mut *seen.lock().unwrap());
-			if survey {
-				assert!(matches!(executed, Ok(Executed::Reported)), "corroboration is reported");
+			if let Some(reason) = reported {
+				assert!(matches!(executed, Ok(Executed::Reported)), "{reason} is reported");
 				assert_eq!(
 					requests,
 					[(
 						"/v1/jobs/1/complete".to_owned(),
-						json!({"protocol_version":3,"outcome":"failed",
-							"error":"survey recipe unsupported"})
+						json!({"protocol_version":3,"outcome":"failed","error":reason})
 					)]
 				);
 			} else {

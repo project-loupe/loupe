@@ -220,7 +220,7 @@ impl Fixture {
 		let offset = self.offset.clone();
 		let runner = Runner::new(self.client.clone(), cache, Vec::new())
 			.with_phase_backend(Arc::new(ScriptedMcpBackend::new(self.client.clone(), script)))
-			.with_survey_clock(Arc::new(move || {
+			.with_phase_clock(Arc::new(move || {
 				let ahead = offset.load(Ordering::SeqCst);
 				SystemTime::now() + Duration::from_secs(u64::try_from(ahead).unwrap())
 			}));

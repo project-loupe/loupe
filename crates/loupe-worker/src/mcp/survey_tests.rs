@@ -374,7 +374,7 @@ async fn server_errors_reach_the_model_as_fixed_text() {
 	assert!(text(&responses[0]).contains("already used with different content"));
 	assert!(text(&responses[1]).contains("call finalize_survey"));
 	assert!(text(&responses[2]).contains("no longer has authority"));
-	assert!(fixture.survey.authority_lost());
+	assert!(fixture.survey.phase().authority_lost());
 	for response in &responses {
 		assert!(is_error(response));
 		assert!(!text(response).contains(SENTINEL));
@@ -586,7 +586,7 @@ async fn a_refused_reference_is_told_apart_from_lost_authority() {
 		assert!(text(response).contains("refused a referenced unit"), "{}", text(response));
 		assert!(text(response).contains("review units remaining: 3; leads remaining: 4"));
 	}
-	assert!(!fixture.survey.authority_lost());
+	assert!(!fixture.survey.phase().authority_lost());
 	let routes: Vec<_> = fixture
 		.server
 		.seen()

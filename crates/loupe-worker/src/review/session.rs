@@ -248,21 +248,8 @@ impl SurveySession {
 		self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
 
-	pub fn job_id(&self) -> i64 {
-		self.phase.job_id()
-	}
-
 	pub fn recipe(&self) -> RecipeClass {
 		self.recipe
-	}
-
-	/// Phase calls never start past the hard deadline.
-	pub fn phase_job(&self) -> PhaseJob<'_> {
-		self.phase.phase_job()
-	}
-
-	pub fn now(&self) -> SystemTime {
-		self.phase.now()
 	}
 
 	pub(crate) fn admission(&self, tool: SurveyTool) -> Admission {
@@ -342,22 +329,6 @@ impl SurveySession {
 		self.state().receipt.clone()
 	}
 
-	/// Mark the attempt as unable to write and stop its agent.
-	pub fn record_authority_lost(&self) {
-		self.phase.record_authority_lost();
-	}
-
-	/// Whether the hard deadline, less the host's kill margin, has passed.
-	pub fn hard_deadline_reached(&self) -> bool {
-		self.phase.hard_deadline_reached()
-	}
-
-	/// Whether any phase call was denied after preparation: the attempt can
-	/// no longer write.
-	pub fn authority_lost(&self) -> bool {
-		self.phase.authority_lost()
-	}
-
 	pub fn record_limits(&self, limits: &PhaseLimitsResponse) {
 		self.phase.record_limits(limits);
 		self.state().apply_limits(limits);
@@ -365,7 +336,7 @@ impl SurveySession {
 
 	/// The host-authored line every survey tool result ends with.
 	pub fn status_line(&self) -> String {
-		let now = self.now();
+		let now = self.phase.now();
 		let state = self.state();
 		let count =
 			|value: Option<u32>| value.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
@@ -550,8 +521,8 @@ mod tests {
 		let cancel = CancellationToken::new();
 		let session = SurveySession::new(parts(cancel.clone()));
 		assert!(!cancel.is_cancelled());
-		session.record_authority_lost();
-		assert!(session.authority_lost());
+		session.phase().record_authority_lost();
+		assert!(session.phase().authority_lost());
 		assert!(cancel.is_cancelled(), "a denied attempt must stop its agent");
 	}
 

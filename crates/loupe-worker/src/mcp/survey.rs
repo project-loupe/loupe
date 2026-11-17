@@ -98,7 +98,7 @@ pub(super) async fn dispatch(
 	let arguments = arguments?;
 	session.security.admit(operation(tool))?;
 	let client = &session.client;
-	let job = survey.phase_job();
+	let job = survey.phase().phase_job();
 	match arguments {
 		ingress::Arguments::JobLimits => {
 			let limits = settle(client, survey, tool, client.limits(&job).await).await?;
