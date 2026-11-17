@@ -421,9 +421,10 @@ outside that guarantee; a redacted holder does not erase those allocations.
 
 Schema v7 and the B4 server support the pre-proof review API: prepared surveys,
 assigned-lead drilldowns and canonical-finding verification. A worker with a
-survey agent advertises `review:survey:v1` (see [Survey worker](#survey-worker));
-drilldown and verify execution arrive in B6–B7 and are not advertised, and
-production triggers remain legacy until cutover. Explicit phase
+survey agent advertises `review:survey:v1` and `review:drilldown:v1` (see
+[Survey worker](#survey-worker) and [Drilldown worker](#drilldown-worker));
+verify execution arrives in B7 and is not advertised, and production
+triggers remain legacy until cutover. Explicit phase
 advertisements never inherit legacy `verify:*` authority. Reconciliation,
 successor activation and corroboration remain B8-held; proof infrastructure
 remains Stage C. The startup guard rejects persisted kinds absent from
@@ -445,12 +446,14 @@ remains Stage C. The startup guard rejects persisted kinds absent from
 ### Survey worker
 
 `[agents] survey` (or `--survey-agent` / `LOUPE_SURVEY_AGENT`) selects the
-survey agent as `scan` and `verify` are selected, with the same default
-`auto`, which prefers Codex, then Claude. A worker with no ready survey agent
-runs no surveys and sends an empty `review_capabilities` list. With a survey backend the runner sends exactly
-`["review:survey:v1"]` beside its legacy scanner tags; no other phase is
-advertised. The runner dispatches a lease by payload, so legacy jobs never
-reach phase code and unsupported phase payloads fail closed.
+agent for survey and drilldown leases as `scan` and `verify` are selected,
+with the same default `auto`, which prefers Codex, then Claude. A worker
+with no ready survey agent runs neither phase and sends an empty
+`review_capabilities` list. With that backend the runner sends exactly
+`["review:survey:v1","review:drilldown:v1"]` beside its legacy scanner
+tags; verify is not advertised. The runner dispatches a lease by payload,
+so legacy jobs never reach phase code and unsupported phase payloads
+(verify, or any phase without a backend) fail closed.
 
 A survey lease (`crates/loupe-worker/src/review/`) runs in three steps:
 
@@ -496,6 +499,40 @@ arrives past `submit_by` still runs to flush and finalize. The invocation
 is killed 30 s before `hard_deadline_at`; a lease with less time left fails
 without launching the agent. The broker's token ceiling is the smaller of
 the configured ceiling and the lease's token budget.
+
+### Drilldown worker
+
+A drilldown lease investigates one lead of a sealed generation. It shares
+the survey's preparation core, retry, deadlines, heartbeat and failure
+report, and runs in three steps:
+
+1. **Prepare on the host.** Fail closed past the hard deadline before any
+   repository access, check out the generation commit, pin it, then read
+   `/limits`. No inventory is taken; the profile comes from the pin
+   response, else from the lease.
+2. **Run one agent invocation** against the drilldown MCP catalog
+   (protocol version 2): `get_job_limits`,
+   `query_same_project_lead_candidates`, `submit_sibling_lead` and
+   `finalize_drilldown` with one of five dispositions (promote, reject,
+   duplicate, hardening, defer). The prompt carries the job context, the
+   assigned lead and the profile as labelled data. Each tool result ends
+   with a status line (seconds to `submit_by` and to the hard deadline,
+   remaining sibling and candidate-query capacity). Server refusals map to
+   fixed texts: an identity conflict asks the agent to query candidates and
+   finalize as `duplicate`, use a distinct instance key, or `defer`;
+   "revalidation required" asks it to resubmit with `revalidation`.
+3. **End the attempt.** A sealed receipt from `finalize_drilldown` ends
+   the job. Otherwise the host sends `complete{failed}` with a fixed reason
+   and the server's retry policy decides; the host never finalizes on the
+   agent's behalf.
+
+After `submit_by` only `submit_sibling_lead` is closed; candidate queries
+and `finalize_drilldown` stay open so that a `duplicate` finalize remains
+reachable. After a sealed receipt only `get_job_limits` and an identical
+finalize replay are admitted. A retried drilldown starts blind: the prompt
+states the remaining sibling and query capacity from `/limits` and, from
+the second attempt on, that earlier attempts may already have stored
+sibling leads. Each accepted sibling lead gets its own drilldown.
 
 The server owns HTTP and recipe policy; storage owns SQL authority and
 transactions and depends on core, never on server or wire DTOs. One ranked
