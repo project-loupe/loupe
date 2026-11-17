@@ -1,7 +1,8 @@
-//! Per-attempt survey host state. The handler owns it and shares it with the
-//! MCP broker, so it outlives any one agent connection.
+//! Per-attempt review-phase host state. The handler owns it and shares it
+//! with the MCP broker, so it outlives any one agent connection.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,24 +62,114 @@ impl SurveySessionParts {
 	}
 }
 
-pub struct SurveySession {
+/// The state every review phase's attempt shares: who it is, when it must
+/// stop, and whether it can still write.
+pub struct PhaseSession {
 	job_id: i64,
 	capability: JobCapability,
-	recipe: RecipeClass,
-	/// Whether the catalog lists `publish_profile`: fixed at session start,
-	/// whatever the agent publishes later.
-	lists_publish_profile: bool,
 	submit_by: SystemTime,
 	hard_deadline: SystemTime,
 	clock: Clock,
 	cancel: CancellationToken,
 	/// Stops the phase heartbeat once a receipt is sealed.
 	heartbeat: Option<CancellationToken>,
+	authority_lost: AtomicBool,
+	limits: Mutex<Option<PhaseLimitsResponse>>,
+}
+
+impl PhaseSession {
+	/// `cancel` is the agent invocation's token, cancelled once the attempt
+	/// loses its authority.
+	pub fn new(
+		job_id: i64, capability: JobCapability, submit_by: SystemTime, hard_deadline: SystemTime,
+		clock: Clock, cancel: CancellationToken,
+	) -> Self {
+		Self {
+			job_id,
+			capability,
+			submit_by,
+			hard_deadline,
+			clock,
+			cancel,
+			heartbeat: None,
+			authority_lost: AtomicBool::new(false),
+			limits: Mutex::new(None),
+		}
+	}
+
+	pub fn job_id(&self) -> i64 {
+		self.job_id
+	}
+
+	/// Phase calls never start past the hard deadline.
+	pub fn phase_job(&self) -> PhaseJob<'_> {
+		PhaseJob { job_id: self.job_id, capability: &self.capability, deadline: self.hard_deadline }
+	}
+
+	pub fn now(&self) -> SystemTime {
+		(self.clock)()
+	}
+
+	pub fn past_submit_by(&self) -> bool {
+		self.now() >= self.submit_by
+	}
+
+	/// Stop the phase heartbeat; called once a receipt is sealed.
+	pub fn stop_heartbeat(&self) {
+		if let Some(heartbeat) = &self.heartbeat {
+			heartbeat.cancel();
+		}
+	}
+
+	/// Mark the attempt as unable to write and stop its agent.
+	pub fn record_authority_lost(&self) {
+		self.authority_lost.store(true, Ordering::SeqCst);
+		self.cancel.cancel();
+	}
+
+	/// Whether any phase call was denied after preparation: the attempt can
+	/// no longer write.
+	pub fn authority_lost(&self) -> bool {
+		self.authority_lost.load(Ordering::SeqCst)
+	}
+
+	/// Whether the hard deadline, less the host's kill margin, has passed.
+	pub fn hard_deadline_reached(&self) -> bool {
+		self.now() + super::deadline::KILL_MARGIN >= self.hard_deadline
+	}
+
+	pub fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		*self.limits.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+			Some(limits.clone());
+	}
+
+	/// The last `/limits` read, if any.
+	pub fn limits(&self) -> Option<PhaseLimitsResponse> {
+		self.limits.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+	}
+
+	/// The host-authored status line: the shared deadline part followed by
+	/// the phase's `capacity` part.
+	pub fn status_line(&self, now: SystemTime, capacity: &str) -> String {
+		format!(
+			"[loupe status] submit_by: {}; hard deadline: {}; {capacity}",
+			remaining(now, self.submit_by),
+			remaining(now, self.hard_deadline),
+		)
+	}
+}
+
+pub struct SurveySession {
+	phase: PhaseSession,
+	recipe: RecipeClass,
+	/// Whether the catalog lists `publish_profile`: fixed at session start,
+	/// whatever the agent publishes later.
+	lists_publish_profile: bool,
 	state: Mutex<State>,
 }
 impl std::fmt::Debug for SurveySession {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("SurveySession").field("job_id", &self.job_id).finish_non_exhaustive()
+		f.debug_struct("SurveySession").field("job_id", &self.phase.job_id).finish_non_exhaustive()
 	}
 }
 
@@ -93,7 +184,6 @@ struct State {
 	receipt: Option<SurveyTerminalResponse<Server>>,
 	units_remaining: Option<u32>,
 	leads_remaining: Option<u32>,
-	authority_lost: bool,
 }
 
 impl SurveySession {
@@ -115,28 +205,35 @@ impl SurveySession {
 			profile_published: parts.profile_published,
 			..State::default()
 		};
+		let phase = PhaseSession::new(
+			parts.job_id,
+			parts.capability,
+			parts.submit_by,
+			parts.hard_deadline,
+			clock,
+			parts.cancel,
+		);
 		if let Some(limits) = &parts.limits {
+			phase.record_limits(limits);
 			state.apply_limits(limits);
 		}
 		Self {
-			job_id: parts.job_id,
-			capability: parts.capability,
+			phase,
 			recipe: parts.recipe,
 			lists_publish_profile: parts.recipe == RecipeClass::Bootstrap
 				&& !parts.profile_published,
-			submit_by: parts.submit_by,
-			hard_deadline: parts.hard_deadline,
-			clock,
-			cancel: parts.cancel,
-			heartbeat: None,
 			state: Mutex::new(state),
 		}
 	}
 
 	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.
 	pub fn with_heartbeat(mut self, heartbeat: CancellationToken) -> Self {
-		self.heartbeat = Some(heartbeat);
+		self.phase.heartbeat = Some(heartbeat);
 		self
+	}
+
+	pub fn phase(&self) -> &PhaseSession {
+		&self.phase
 	}
 
 	fn state(&self) -> MutexGuard<'_, State> {
@@ -146,7 +243,7 @@ impl SurveySession {
 	}
 
 	pub fn job_id(&self) -> i64 {
-		self.job_id
+		self.phase.job_id()
 	}
 
 	pub fn recipe(&self) -> RecipeClass {
@@ -155,11 +252,11 @@ impl SurveySession {
 
 	/// Phase calls never start past the hard deadline.
 	pub fn phase_job(&self) -> PhaseJob<'_> {
-		PhaseJob { job_id: self.job_id, capability: &self.capability, deadline: self.hard_deadline }
+		self.phase.phase_job()
 	}
 
 	pub fn now(&self) -> SystemTime {
-		(self.clock)()
+		self.phase.now()
 	}
 
 	pub(crate) fn admission(&self, tool: SurveyTool) -> Admission {
@@ -168,7 +265,7 @@ impl SurveySession {
 			tool,
 			self.recipe,
 			state.profile_published,
-			self.now() >= self.submit_by,
+			self.phase.past_submit_by(),
 			state.receipt.is_some(),
 		)
 	}
@@ -232,9 +329,7 @@ impl SurveySession {
 
 	pub fn seal(&self, receipt: SurveyTerminalResponse<Server>) {
 		self.state().receipt.get_or_insert(receipt);
-		if let Some(heartbeat) = &self.heartbeat {
-			heartbeat.cancel();
-		}
+		self.phase.stop_heartbeat();
 	}
 
 	pub fn receipt(&self) -> Option<SurveyTerminalResponse<Server>> {
@@ -243,22 +338,22 @@ impl SurveySession {
 
 	/// Mark the attempt as unable to write and stop its agent.
 	pub fn record_authority_lost(&self) {
-		self.state().authority_lost = true;
-		self.cancel.cancel();
+		self.phase.record_authority_lost();
 	}
 
 	/// Whether the hard deadline, less the host's kill margin, has passed.
 	pub fn hard_deadline_reached(&self) -> bool {
-		self.now() + super::deadline::KILL_MARGIN >= self.hard_deadline
+		self.phase.hard_deadline_reached()
 	}
 
 	/// Whether any phase call was denied after preparation: the attempt can
 	/// no longer write.
 	pub fn authority_lost(&self) -> bool {
-		self.state().authority_lost
+		self.phase.authority_lost()
 	}
 
 	pub fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		self.phase.record_limits(limits);
 		self.state().apply_limits(limits);
 	}
 
@@ -268,13 +363,12 @@ impl SurveySession {
 		let state = self.state();
 		let count =
 			|value: Option<u32>| value.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
-		format!(
-			"[loupe status] submit_by: {}; hard deadline: {}; review units remaining: {}; leads remaining: {}",
-			remaining(now, self.submit_by),
-			remaining(now, self.hard_deadline),
+		let capacity = format!(
+			"review units remaining: {}; leads remaining: {}",
 			count(state.units_remaining),
 			count(state.leads_remaining),
-		)
+		);
+		self.phase.status_line(now, &capacity)
 	}
 }
 
