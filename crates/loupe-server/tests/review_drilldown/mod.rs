@@ -37,9 +37,11 @@ pub(super) async fn request(
 	response(f, req).await
 }
 async fn response(f: &Fixture, req: Request<Body>) -> (StatusCode, Value) {
+	let route = req.uri().to_string();
 	let response = router(f.state.clone()).call(req).await.unwrap();
 	let status = response.status();
 	let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+	common::admit_phase_response(&route, status, &bytes);
 	(
 		status,
 		serde_json::from_slice(&bytes)

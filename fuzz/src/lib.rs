@@ -38,6 +38,7 @@ pub mod proto_review_lease;
 pub mod proto_review_lifecycle;
 mod proto_review_response_oracle;
 pub mod proto_review_responses_checkpoints;
+pub mod proto_review_responses_drilldown;
 pub mod proto_review_responses_host;
 pub mod proto_review_terminal;
 pub mod proto_review_units;
