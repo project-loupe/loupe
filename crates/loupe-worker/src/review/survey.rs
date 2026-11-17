@@ -3,7 +3,6 @@
 //! a `complete{failed}` carrying a fixed host reason.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use loupe_proto::review_lease::ReviewLimits;
 use loupe_proto::LeaseEnvelope;
@@ -11,92 +10,14 @@ use loupe_provenance::{Agent, Server};
 use tokio_util::sync::CancellationToken;
 
 use super::deadline::survey_timeout;
-use super::prepare::{at, prepare, Preparation, PrepareError, PreparedSurvey};
+use super::failure::{report, FailureReason};
+use super::prepare::{at, prepare, Preparation, PreparedSurvey};
 use super::prompts::survey_prompt;
 use super::session::{Clock, SurveySession};
 use crate::canary::JobSecurity;
-use crate::client::{PhaseError, PhaseJob};
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::mcp::McpMode;
 use crate::runner::{PhaseHeartbeat, Runner};
-
-/// How long the failure report may keep retrying.
-const REPORT_WINDOW: Duration = Duration::from_secs(60);
-
-/// Why an attempt ended without a sealed receipt. The text is the whole
-/// `complete{failed}` reason; it never carries agent, repository or server
-/// text.
-// debug-ok: closed host vocabulary only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureReason {
-	AgentExited,
-	HardDeadline,
-	InventoryUnsupported,
-	CheckoutConflict,
-	AuthorityLost,
-	Cancelled,
-	Quarantined,
-	UnsupportedRecipe,
-	CheckoutFailed,
-	WorkdirTooLarge,
-	InventoryMismatch,
-	PhaseRequestFailed,
-	PromptFailed,
-	HostTaskFailed,
-}
-
-impl FailureReason {
-	pub const fn text(self) -> &'static str {
-		match self {
-			Self::AgentExited => "agent exited without finalizing",
-			Self::HardDeadline => "hard deadline reached",
-			Self::InventoryUnsupported => "inventory unsupported",
-			Self::CheckoutConflict => "checkout conflict",
-			Self::AuthorityLost => "authority lost",
-			Self::Cancelled => "job cancelled",
-			Self::Quarantined => "injection_suspected",
-			Self::UnsupportedRecipe => "survey recipe unsupported",
-			Self::CheckoutFailed => "checkout failed",
-			Self::WorkdirTooLarge => "checkout exceeds the workdir size cap",
-			Self::InventoryMismatch => "inventory progress mismatch",
-			Self::PhaseRequestFailed => "phase request failed",
-			Self::PromptFailed => "prompt assembly failed",
-			Self::HostTaskFailed => "host task failed",
-		}
-	}
-
-	fn from_prepare(error: &PrepareError) -> Self {
-		match error {
-			PrepareError::UnsupportedLease => Self::UnsupportedRecipe,
-			PrepareError::HardDeadline => Self::HardDeadline,
-			PrepareError::Checkout => Self::CheckoutFailed,
-			PrepareError::WorkdirTooLarge => Self::WorkdirTooLarge,
-			PrepareError::Inventory(_) => Self::InventoryUnsupported,
-			PrepareError::CheckoutConflict => Self::CheckoutConflict,
-			PrepareError::ManifestMismatch => Self::InventoryMismatch,
-			PrepareError::Quarantined => Self::Quarantined,
-			PrepareError::Cancelled => Self::Cancelled,
-			PrepareError::Internal => Self::HostTaskFailed,
-			PrepareError::Phase(error) if denied(error) => Self::AuthorityLost,
-			PrepareError::Phase(_) => Self::PhaseRequestFailed,
-		}
-	}
-}
-
-/// How long the one try of a failure report sent at or past the hard
-/// deadline may take. It is no longer than the first retry pause, so that
-/// report is never retried.
-const LAST_TRY: Duration = crate::review::retry::PAUSES[0];
-
-/// The failure report retries for a while, never past the hard deadline.
-/// An attempt that ends at or past it still sends the report once.
-fn report_deadline(now: SystemTime, hard_deadline: SystemTime) -> SystemTime {
-	(now + REPORT_WINDOW).min(hard_deadline.max(now + LAST_TRY))
-}
-
-fn denied(error: &PhaseError) -> bool {
-	matches!(error, PhaseError::Rejected { status: 403, .. } | PhaseError::Status { status: 403 })
-}
 
 /// How an attempt ended when it did not fail.
 enum Ended {
@@ -134,14 +55,7 @@ pub(crate) async fn run(
 		Err(_) if cancel.is_cancelled() => FailureReason::Cancelled,
 		Err(reason) => reason,
 	};
-	// The heartbeat must not race the terminal call into a refusal.
-	heartbeat.stop().await;
-	let job = PhaseJob {
-		job_id,
-		capability: &capability,
-		deadline: report_deadline(SystemTime::now(), hard_deadline),
-	};
-	match runner.client().phase_failure_reason(&job, reason).await {
+	match report(runner, job_id, &capability, hard_deadline, &heartbeat, reason).await {
 		Ok(control) => {
 			tracing::warn!(job_id, reason = reason.text(), state = ?control.state, "survey failed");
 		},
@@ -205,59 +119,4 @@ fn launch(
 		token_budget: prepared.limits.token_budget,
 		job_capability: Some(prepared.job_capability.clone()),
 	})
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn the_failure_report_stops_at_the_hard_deadline() {
-		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-		let hard = now + Duration::from_secs(10);
-		assert_eq!(report_deadline(now, hard), hard);
-		let far = now + Duration::from_secs(3_600);
-		assert_eq!(report_deadline(now, far), now + REPORT_WINDOW);
-		let passed = now - Duration::from_secs(10);
-		let once = report_deadline(now, passed);
-		assert_eq!(once, now + LAST_TRY, "a report past the hard deadline is still sent");
-		let since = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-		assert_eq!(
-			crate::review::retry::classify(
-				crate::review::retry::Failure::Timeout,
-				1,
-				since(now),
-				since(once)
-			),
-			crate::review::retry::Decision::Final,
-			"and never retried"
-		);
-	}
-
-	#[test]
-	fn failure_reasons_are_fixed_host_text() {
-		let reasons = [
-			FailureReason::AgentExited,
-			FailureReason::HardDeadline,
-			FailureReason::InventoryUnsupported,
-			FailureReason::CheckoutConflict,
-			FailureReason::AuthorityLost,
-			FailureReason::Cancelled,
-			FailureReason::Quarantined,
-			FailureReason::UnsupportedRecipe,
-			FailureReason::CheckoutFailed,
-			FailureReason::WorkdirTooLarge,
-			FailureReason::InventoryMismatch,
-			FailureReason::PhaseRequestFailed,
-			FailureReason::PromptFailed,
-			FailureReason::HostTaskFailed,
-		];
-		let texts: std::collections::BTreeSet<_> = reasons.iter().map(|r| r.text()).collect();
-		assert_eq!(texts.len(), reasons.len(), "each reason has its own text");
-		assert_eq!(FailureReason::Quarantined.text(), crate::canary::JobQuarantined.to_string());
-		let denied = PrepareError::Phase(PhaseError::Status { status: 403 });
-		assert_eq!(FailureReason::from_prepare(&denied), FailureReason::AuthorityLost);
-		let conflict = PrepareError::CheckoutConflict;
-		assert_eq!(FailureReason::from_prepare(&conflict), FailureReason::CheckoutConflict);
-	}
 }

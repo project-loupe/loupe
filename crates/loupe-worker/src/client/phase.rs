@@ -162,7 +162,7 @@ impl ServerClient {
 	/// Report a failed phase attempt with a reason from the host's closed
 	/// vocabulary.
 	pub(crate) async fn phase_failure_reason(
-		&self, job: &PhaseJob<'_>, reason: crate::review::survey::FailureReason,
+		&self, job: &PhaseJob<'_>, reason: crate::review::failure::FailureReason,
 	) -> Result<PhaseControlResponse, PhaseError> {
 		#[derive(serde::Serialize)]
 		struct HostFailure {

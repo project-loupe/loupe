@@ -1,6 +1,7 @@
 //! Review-phase work on the worker.
 
 pub mod deadline;
+pub mod failure;
 pub mod gate;
 pub(crate) mod inventory;
 pub mod prepare;
