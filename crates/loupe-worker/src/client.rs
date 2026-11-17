@@ -554,9 +554,12 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn lease_request_advertises_survey_with_a_survey_backend() {
+	async fn lease_request_advertises_survey_and_drilldown_with_a_phase_backend() {
 		let request = runner_lease_request(true).await;
-		assert_eq!(request["review_capabilities"], serde_json::json!(["review:survey:v1"]));
+		assert_eq!(
+			request["review_capabilities"],
+			serde_json::json!(["review:survey:v1", "review:drilldown:v1"])
+		);
 		assert_eq!(request["capabilities"], serde_json::json!([]));
 	}
 

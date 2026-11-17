@@ -195,15 +195,15 @@ impl Runner {
 		self
 	}
 
-	/// Review phases this worker runs: survey exactly when it has a survey
-	/// backend. Drilldown and verify are not run, so never advertised.
+	/// Review phases this worker runs: survey and drilldown exactly when it
+	/// has a phase backend. Verify is not run, so never advertised.
 	fn review_capabilities(
 		&self,
 	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
 	{
 		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
 		let phases = match self.phase_backend {
-			Some(_) => vec![ReviewCapability::Survey],
+			Some(_) => vec![ReviewCapability::Survey, ReviewCapability::Drilldown],
 			None => Vec::new(),
 		};
 		LeaseList::new(phases).map_err(|error| anyhow::anyhow!(error))

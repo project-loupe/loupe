@@ -112,7 +112,9 @@ pub struct AgentsConfig {
 	pub scan: JobAgent,
 	pub verify: JobAgent,
 	/// Resolved like `scan` and `verify`: with `auto`, a worker with a
-	/// ready agent runs surveys and advertises `review:survey:v1`.
+	/// ready agent runs surveys and drilldowns and advertises
+	/// `review:survey:v1` and `review:drilldown:v1`. The same agent runs
+	/// both phases.
 	pub survey: JobAgent,
 	pub claude: CliModelConfig,
 	pub codex: CliModelConfig,

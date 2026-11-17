@@ -165,7 +165,7 @@ struct RunArgs {
 	/// Agent backend for LLM verify jobs: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_VERIFY_AGENT", value_enum)]
 	verify_agent: Option<JobAgent>,
-	/// Agent backend for survey leases: auto, claude, or codex.
+	/// Agent backend for survey and drilldown leases: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_SURVEY_AGENT", value_enum)]
 	survey_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
@@ -464,7 +464,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	if let Some(backend) = phase_backend {
 		credential_watches.extend(backend.credential_watch());
 		runner = runner.with_phase_backend(backend);
-		tracing::info!("survey runner enabled (review:survey:v1 advertised)");
+		tracing::info!(
+			"phase runner enabled (review:survey:v1 and review:drilldown:v1 advertised)"
+		);
 	}
 	let runner = runner.with_credential_watches(credential_watches);
 

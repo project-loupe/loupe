@@ -210,7 +210,7 @@ pub fn cancel_campaign(db: &loupe_storage::Db) {
 }
 
 impl Fixture {
-	/// Claim and run one survey lease with `script` as the agent.
+	/// Claim and run one phase lease with `script` as the agent.
 	pub async fn step<F, Fut>(&self, script: F) -> bool
 	where
 		F: Fn(ScriptedAgent) -> Fut + Send + Sync + 'static,
@@ -233,12 +233,17 @@ impl Fixture {
 
 	/// `(state, error)` of each survey job, oldest first.
 	pub fn jobs(&self) -> Vec<(String, Option<String>)> {
+		self.jobs_of("survey")
+	}
+
+	/// `(state, error)` of each job of `kind`, oldest first.
+	pub fn jobs_of(&self, kind: &str) -> Vec<(String, Option<String>)> {
 		self.offline
 			.external_corruption(|conn| {
 				let mut statement =
-					conn.prepare("SELECT state,error FROM jobs WHERE kind='survey' ORDER BY id")?;
+					conn.prepare("SELECT state,error FROM jobs WHERE kind=?1 ORDER BY id")?;
 				let rows = statement
-					.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+					.query_map([kind], |r| Ok((r.get(0)?, r.get(1)?)))?
 					.collect::<Result<Vec<_>, _>>()?;
 				Ok(rows)
 			})
