@@ -1,9 +1,12 @@
 //! What every review-phase dispatcher shares: the phase session a request
-//! carries, and the fixed model text for a failed phase call.
+//! carries, the fixed model text for a failed phase call, and the framing
+//! of candidate-query answers.
 
 use std::sync::Arc;
 
-use loupe_proto::review_api::{PhaseLimitsResponse, ReviewErrorCode};
+use loupe_core::review_candidates::CandidateQuery;
+use loupe_proto::review_api::{CandidatesResponse, PhaseLimitsResponse, ReviewErrorCode};
+use loupe_provenance::{Agent, Server};
 
 use super::ServerClient;
 use crate::client::PhaseError;
@@ -121,4 +124,26 @@ pub(super) async fn phase_error(
 		| PhaseError::Decode(_) => UNREACHABLE,
 	};
 	text.to_owned()
+}
+
+/// A candidate-query answer framed as agent data under the job's tool
+/// boundary.
+pub(super) fn render_candidates(
+	session: &super::Session, query: &CandidateQuery<Agent>,
+	response: &CandidatesResponse<Agent, Server>,
+) -> anyhow::Result<String> {
+	let rendered = (|| {
+		let mut builder = crate::llm::prompt::PromptBuilder::new("").mode(session.data_mode);
+		if response.candidates.as_slice().is_empty() {
+			builder.instruction("No same-project lead or finding matches.\n")?;
+		}
+		builder.data("query", &query.query)?;
+		builder.lead_candidates(response.candidates.as_slice())?;
+		builder.render_fixed(session.tool_boundary)
+	})();
+	rendered.map(crate::llm::prompt::Prompt::into_tool_text).map_err(
+		|_: crate::llm::prompt::PromptError| {
+			anyhow::anyhow!("tool response cannot be safely framed")
+		},
+	)
 }

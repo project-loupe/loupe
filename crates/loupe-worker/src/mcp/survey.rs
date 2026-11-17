@@ -194,21 +194,7 @@ pub(super) async fn dispatch(
 		ingress::Arguments::Candidates(query) => {
 			let response =
 				settle(client, survey, tool, client.lead_candidates(&job, &query).await).await?;
-			let rendered = (|| {
-				let mut builder =
-					crate::llm::prompt::PromptBuilder::new("").mode(session.data_mode);
-				if response.candidates.as_slice().is_empty() {
-					builder.instruction("No same-project lead or finding matches.\n")?;
-				}
-				builder.data("query", &query.query)?;
-				builder.lead_candidates(response.candidates.as_slice())?;
-				builder.render_fixed(session.tool_boundary)
-			})();
-			rendered.map(crate::llm::prompt::Prompt::into_tool_text).map_err(
-				|_: crate::llm::prompt::PromptError| {
-					anyhow::anyhow!("tool response cannot be safely framed")
-				},
-			)
+			phase::render_candidates(session, &query, &response)
 		},
 		ingress::Arguments::Finalize(payload) => {
 			let request =
