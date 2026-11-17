@@ -1,4 +1,4 @@
-//! Typed survey phase calls. Each request body is serialized once and every
+//! Typed review phase calls. Each request body is serialized once and every
 //! try sends those same bytes; failures are retried only as
 //! `review::retry::classify` decides, and never past the caller's deadline.
 
@@ -12,6 +12,9 @@ use loupe_proto::review_api::{
 	PinTargetResponse, PinTargetResponseDecoder, PublishProfileRequest, PublishedProfile,
 	PublishedProfileDecoder, ReviewErrorCode, ReviewErrorResponseDecoder, ReviewProtocol,
 	ReviewResponseDecodeError, SealInventoryRequest,
+};
+use loupe_proto::review_drilldown::{
+	DrilldownTerminalResponse, DrilldownTerminalResponseDecoder, FinalizeDrilldownRequest,
 };
 use loupe_proto::review_evidence::{
 	LeadCheckpointRequest, LeadCheckpointResponse, LeadCheckpointResponseDecoder,
@@ -105,6 +108,15 @@ impl ServerClient {
 		Ok(body.as_bytes().validate(LeadCheckpointResponseDecoder)?)
 	}
 
+	/// Store a further lead found during a drilldown; it gets its own
+	/// drilldown.
+	pub async fn sibling_lead<K: Source>(
+		&self, job: &PhaseJob<'_>, req: &LeadCheckpointRequest<K>,
+	) -> Result<LeadCheckpointResponse, PhaseError> {
+		let body = self.post_phase(job, "sibling-leads", req).await?;
+		Ok(body.as_bytes().validate(LeadCheckpointResponseDecoder)?)
+	}
+
 	pub async fn unit_result<K: Source>(
 		&self, job: &PhaseJob<'_>, req: &UnitResultCheckpointRequest<K>,
 	) -> Result<UnitResultCheckpointResponse, PhaseError> {
@@ -141,6 +153,13 @@ impl ServerClient {
 	) -> Result<SurveyTerminalResponse<Server>, PhaseError> {
 		let body = self.post_phase(job, "finalize-survey", req).await?;
 		Ok(body.as_bytes().validate(SurveyTerminalResponseDecoder)?)
+	}
+
+	pub async fn finalize_drilldown<S: Source>(
+		&self, job: &PhaseJob<'_>, req: &FinalizeDrilldownRequest<S>,
+	) -> Result<DrilldownTerminalResponse<Server>, PhaseError> {
+		let body = self.post_phase(job, "finalize-drilldown", req).await?;
+		Ok(body.as_bytes().validate(DrilldownTerminalResponseDecoder)?)
 	}
 
 	pub async fn phase_heartbeat(

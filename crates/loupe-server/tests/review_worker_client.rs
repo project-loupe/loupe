@@ -10,8 +10,9 @@ use loupe_core::inventory_manifest::{ManifestEntry, ManifestHasher};
 use loupe_core::review_candidates::CandidateQuery;
 use loupe_proto::review_api::{
 	InventoryBatchRequestDecoder, PinTargetRequestDecoder, PinTargetResponse,
-	PublishProfileRequestDecoder,
+	PublishProfileRequestDecoder, ReviewErrorCode,
 };
+use loupe_proto::review_drilldown::{DrilldownDisposition, FinalizeDrilldownRequestDecoder};
 use loupe_proto::review_evidence::{
 	LeadCheckpointRequestDecoder, UnitResultCheckpointRequestDecoder,
 };
@@ -91,12 +92,16 @@ fn fixture() -> Fixture {
 /// Claims a survey lease directly from the router; the worker's own lease
 /// call does not advertise review phases yet.
 async fn claim(f: &Fixture) -> (i64, JobCapability) {
+	claim_kind(f, "review:survey:v1", "review_survey").await
+}
+
+async fn claim_kind(f: &Fixture, capability: &str, kind: &str) -> (i64, JobCapability) {
 	let mut req = Request::post("/v1/jobs/lease")
 		.header(PROTOCOL_VERSION_HEADER, "3")
 		.header("content-type", "application/json")
 		.body(Body::from(
 			json!({"protocol_version":3,"capabilities":[],
-				"review_capabilities":["review:survey:v1"],"wait_seconds":0})
+				"review_capabilities":[capability],"wait_seconds":0})
 			.to_string(),
 		))
 		.unwrap();
@@ -110,7 +115,7 @@ async fn claim(f: &Fixture) -> (i64, JobCapability) {
 		payload: Value,
 	}
 	let lease: Lease = serde_json::from_slice(&bytes).unwrap();
-	assert_eq!(lease.payload["kind"], "review_survey");
+	assert_eq!(lease.payload["kind"], kind);
 	(lease.job_id, lease.job_capability)
 }
 
@@ -252,4 +257,68 @@ async fn phase_client_reports_failure_and_typed_rejections() {
 	let control = client.phase_failure(&job, &failure).await.unwrap();
 	assert_eq!(i64::from(control.job_id), job_id);
 	assert!(matches!(control.state, PhaseControlState::Queued | PhaseControlState::Failed));
+}
+
+#[tokio::test]
+async fn phase_client_drives_a_drilldown_through_the_router() {
+	use common::marked::worker_request as worker;
+	let f = fixture();
+	let (survey_id, survey_capability) = claim(&f).await;
+	let client = serve(&f).await;
+	let deadline = SystemTime::now() + Duration::from_secs(60);
+	let survey = PhaseJob { job_id: survey_id, capability: &survey_capability, deadline };
+	let pin = request(json!({"protocol_version":3,"commit_sha":SHA}));
+	let pin = worker(&pin).validate(PinTargetRequestDecoder).unwrap();
+	client.pin_target(&survey, &pin).await.unwrap();
+	let batch = request(json!({"protocol_version":3,"format_version":1,
+		"expected_entry_count":1,"expected_digest":manifest_digest(),"start_position":0,
+		"entries":[{"raw_path_hex":"7a2e7273","git_mode":0o100644,"object_id":SHA}]}));
+	let batch = worker(&batch).validate(InventoryBatchRequestDecoder).unwrap();
+	client.inventory_batch(&survey, &batch).await.unwrap();
+	client.seal_inventory(&survey).await.unwrap();
+	let profile = request(json!({"protocol_version":3,"profile":{"scope":"worker client"}}));
+	let profile = worker(&profile).validate_carrying(PublishProfileRequestDecoder).unwrap();
+	client.publish_profile(&survey, &profile).await.unwrap();
+	let lead = |key: &str, anchor: &str| {
+		request(json!({"protocol_version":3,"client_lead_key":key,"evidence":{
+			"format":"loupe.lead_evidence","version":1,"identity_family":"allocation",
+			"identity_anchor":anchor,"hypothesis":"Length reaches allocation",
+			"source_refs":[{"path":"z.rs"}],"next_proof_step":"Inspect callers",
+			"counterevidence":"No dominating check","proof_gaps":"Independent verification"}}))
+	};
+	let assigned = lead("allocator", "allocator");
+	let assigned = worker(&assigned).validate_carrying(LeadCheckpointRequestDecoder).unwrap();
+	client.lead(&survey, &assigned).await.unwrap();
+	let terminal = request(json!({"protocol_version":3,"payload":{"version":1,
+		"terminal_reason":"completed","security_model_notes":"Public source boundary"}}));
+	let terminal = worker(&terminal).validate_carrying(FinalizeSurveyRequestDecoder).unwrap();
+	client.finalize_survey(&survey, &terminal).await.unwrap();
+
+	let (job_id, capability) = claim_kind(&f, "review:drilldown:v1", "review_drilldown").await;
+	let job = PhaseJob { job_id, capability: &capability, deadline };
+	client.pin_target(&job, &pin).await.unwrap();
+	let sibling = lead("sibling", "reallocator");
+	let sibling = worker(&sibling).validate_carrying(LeadCheckpointRequestDecoder).unwrap();
+	let created = client.sibling_lead(&job, &sibling).await.unwrap();
+	let replay = client.sibling_lead(&job, &sibling).await.unwrap();
+	assert_eq!(replay.lead_id, created.lead_id, "sibling replay is free");
+
+	let finalize = request(json!({"protocol_version":3,"payload":{"version":1,
+		"disposition":"reject","counterargument":{"argument":"The bound is checked.",
+		"source_refs":[{"path":"z.rs"}]}}}));
+	let finalize = worker(&finalize).validate_carrying(FinalizeDrilldownRequestDecoder).unwrap();
+	let receipt = client.finalize_drilldown(&job, &finalize).await.unwrap();
+	assert_eq!(i64::from(receipt.receipt.job_id), job_id);
+	assert_eq!(receipt.receipt.summary.disposition, DrilldownDisposition::Rejected);
+	let replay = client.finalize_drilldown(&job, &finalize).await.unwrap();
+	assert_eq!(replay.receipt.receipt_id, receipt.receipt.receipt_id, "exact replay is free");
+
+	let other = request(json!({"protocol_version":3,"payload":{"version":1,
+		"disposition":"hardening","explanation":{"argument":"Defensive only.",
+		"source_refs":[{"path":"z.rs"}]}}}));
+	let other = worker(&other).validate_carrying(FinalizeDrilldownRequestDecoder).unwrap();
+	assert!(matches!(
+		client.finalize_drilldown(&job, &other).await.unwrap_err(),
+		PhaseError::Rejected { status: 409, code: ReviewErrorCode::TerminalConflict, .. }
+	));
 }
