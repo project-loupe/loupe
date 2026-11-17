@@ -14,6 +14,7 @@
 
 pub mod marked;
 pub mod offline;
+pub mod phase_worker;
 pub mod wire;
 
 use clap::builder::TypedValueParser;
