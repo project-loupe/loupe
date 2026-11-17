@@ -1,12 +1,13 @@
-//! Host preparation of one survey attempt: check out the target, pin it,
-//! upload and seal the bootstrap inventory, and read the job's limits.
-//! Nothing here runs an agent.
+//! Host preparation of review-phase attempts: the phase-agnostic checkout
+//! and pin, and the survey's inventory upload and limits read. Nothing
+//! here runs an agent.
 
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loupe_core::review_metadata::ReviewCommit;
 use loupe_core::security_event::Operation;
+use loupe_core::RepoSpec;
 use loupe_proto::review_api::{
 	ManifestProgress, PhaseLimitsResponse, PinTargetRequest, PinTargetResponse, ReviewErrorCode,
 	ReviewProtocol,
@@ -16,7 +17,7 @@ use loupe_proto::review_lease::{
 	ReviewGeneration, ReviewLimits, ReviewSurveyContext, ReviewSurveyLease,
 };
 use loupe_proto::{JobCapability, LeaseEnvelope, LeasePayload};
-use loupe_provenance::{Agent, Repo, Server};
+use loupe_provenance::{Agent, Repo, Secret, Server};
 use tokio_util::sync::CancellationToken;
 
 use super::inventory::{CommitDecoder, Inventory, InventoryDecoder, InventoryError};
@@ -152,78 +153,31 @@ pub async fn prepare(
 		ReviewSurveyContext::Corroboration { .. } => return Err(PrepareError::UnsupportedLease),
 	};
 	let limits = provenance.limits;
-	let hard_deadline = at(limits.hard_deadline_at);
-	if SystemTime::now() >= hard_deadline {
-		return Err(PrepareError::HardDeadline);
-	}
-	let job = PhaseJob { job_id, capability: &job_capability, deadline: hard_deadline };
-	let cancelled = || if cancel.is_cancelled() { Err(PrepareError::Cancelled) } else { Ok(()) };
-	let target = match &context {
+	let job =
+		PhaseJob { job_id, capability: &job_capability, deadline: at(limits.hard_deadline_at) };
+	let revision = match &context {
 		ReviewSurveyContext::Bootstrap { target: BootstrapTarget::Pinned { generation, .. } }
 		| ReviewSurveyContext::Ordinary { generation, .. } => Some(generation.commit_sha.expose()),
 		_ => None,
 	};
-
-	cancelled()?;
-	let mut cached = LeaseRepo::ensure(runner.cache(), &repo, github_pat)
-		.await
-		.map_err(|_| PrepareError::Checkout)?;
-	let branch = head_branch.as_ref().map(|branch| branch.expose());
-	let checkout = |bare: std::path::PathBuf| async move {
-		match target {
-			Some(sha) => checkout_revision(&bare, sha).await,
-			None => checkout_latest(&bare, branch).await,
-		}
+	let source = CheckoutSource {
+		repo: &repo,
+		github_pat,
+		branch: head_branch.as_ref().map(|branch| branch.expose()),
+		revision,
 	};
-	let (worktree, revision) = match checkout(cached.path().to_owned()).await {
-		Ok(done) => done,
-		Err(_) => {
-			cached = cached.reclone().await.map_err(|_| PrepareError::Checkout)?;
-			checkout(cached.path().to_owned()).await.map_err(|_| PrepareError::Checkout)?
-		},
-	};
-	runner
-		.enforce_workdir_cap(crate::repo_cache::dir_size(worktree.path()))
-		.map_err(|_| PrepareError::WorkdirTooLarge)?;
-
-	cancelled()?;
-	// Enumerated from the bare clone while this job still holds its pin.
-	let bare = cached.path().to_owned();
-	let sha = revision.expose().to_owned();
-	let bootstrap = recipe == SurveyRecipe::Bootstrap;
-	let (commit, inventory) = tokio::task::spawn_blocking(move || {
-		if bootstrap {
-			let inventory = observe_commit(&bare, &sha, InventoryDecoder)?;
-			Ok((inventory.commit().clone(), Some(inventory)))
-		} else {
-			Ok::<_, InventoryError>((observe_commit(&bare, &sha, CommitDecoder)?, None))
-		}
-	})
-	.await
-	.map_err(|_| PrepareError::Internal)??;
-	let worktree = cached.pin(worktree);
-	cancelled()?;
-
-	let client = runner.client();
-	let pin = PinTargetRequest { protocol_version: ReviewProtocol, commit_sha: commit.clone() };
-	let pinned = guarded(security, Operation::PinTarget, client.pin_target(&job, &pin))
-		.await?
-		.map_err(|error| match error {
-			PhaseError::Rejected {
-				status: 409, code: ReviewErrorCode::CheckoutConflict, ..
-			} => PrepareError::CheckoutConflict,
-			other => PrepareError::Phase(other),
-		})?;
-	let (generation, profile, assignments) = match pinned {
+	let observe =
+		if recipe == SurveyRecipe::Bootstrap { Observe::Inventory } else { Observe::Commit };
+	let Pinned { worktree, commit, inventory, response } =
+		checkout_and_pin(runner, &job, source, observe, security, cancel).await?;
+	let (generation, profile, assignments) = match response {
 		PinTargetResponse::Prepared { generation, profile, assignments, .. } => {
 			(generation, profile, assignments)
 		},
 		PinTargetResponse::Deferred { .. } => return Ok(Preparation::Deferred),
 	};
-	if generation.commit_sha.expose() != commit.expose() {
-		return Err(PrepareError::CheckoutConflict);
-	}
 
+	let client = runner.client();
 	if let Some(inventory) = &inventory {
 		upload(client, &job, security, inventory, cancel).await?;
 	}
@@ -250,6 +204,101 @@ pub async fn prepare(
 		phase_limits,
 		worktree,
 	})))
+}
+
+/// Where a phase attempt's checkout comes from.
+pub(crate) struct CheckoutSource<'a> {
+	pub repo: &'a RepoSpec<Server>,
+	pub github_pat: Option<Secret<String>>,
+	pub branch: Option<&'a str>,
+	/// The commit to check out; `None` follows the branch tip.
+	pub revision: Option<&'a str>,
+}
+
+/// What to read from the checked-out commit before the pin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Observe {
+	Commit,
+	Inventory,
+}
+
+/// A checkout the server accepted as the job's target.
+pub(crate) struct Pinned {
+	pub worktree: CheckedOutWorktree,
+	pub commit: ReviewCommit<Repo>,
+	/// Present when [`Observe::Inventory`] was asked for.
+	pub inventory: Option<Inventory>,
+	/// The pin response; a `Prepared` generation always names `commit`.
+	pub response: PinTargetResponse<Agent, Server>,
+}
+
+/// Check out the job's target (recloning once on failure), enforce the
+/// workdir cap, observe the commit, and pin it. Fails closed past the
+/// job's hard deadline before any repository access.
+pub(crate) async fn checkout_and_pin(
+	runner: &Runner, job: &PhaseJob<'_>, source: CheckoutSource<'_>, observe: Observe,
+	security: &JobSecurity, cancel: &CancellationToken,
+) -> Result<Pinned, PrepareError> {
+	if SystemTime::now() >= job.deadline {
+		return Err(PrepareError::HardDeadline);
+	}
+	let cancelled = || if cancel.is_cancelled() { Err(PrepareError::Cancelled) } else { Ok(()) };
+	let CheckoutSource { repo, github_pat, branch, revision: target } = source;
+
+	cancelled()?;
+	let mut cached = LeaseRepo::ensure(runner.cache(), repo, github_pat)
+		.await
+		.map_err(|_| PrepareError::Checkout)?;
+	let checkout = |bare: std::path::PathBuf| async move {
+		match target {
+			Some(sha) => checkout_revision(&bare, sha).await,
+			None => checkout_latest(&bare, branch).await,
+		}
+	};
+	let (worktree, revision) = match checkout(cached.path().to_owned()).await {
+		Ok(done) => done,
+		Err(_) => {
+			cached = cached.reclone().await.map_err(|_| PrepareError::Checkout)?;
+			checkout(cached.path().to_owned()).await.map_err(|_| PrepareError::Checkout)?
+		},
+	};
+	runner
+		.enforce_workdir_cap(crate::repo_cache::dir_size(worktree.path()))
+		.map_err(|_| PrepareError::WorkdirTooLarge)?;
+
+	cancelled()?;
+	// Enumerated from the bare clone while this job still holds its pin.
+	let bare = cached.path().to_owned();
+	let sha = revision.expose().to_owned();
+	let (commit, inventory) = tokio::task::spawn_blocking(move || match observe {
+		Observe::Inventory => {
+			let inventory = observe_commit(&bare, &sha, InventoryDecoder)?;
+			Ok((inventory.commit().clone(), Some(inventory)))
+		},
+		Observe::Commit => {
+			Ok::<_, InventoryError>((observe_commit(&bare, &sha, CommitDecoder)?, None))
+		},
+	})
+	.await
+	.map_err(|_| PrepareError::Internal)??;
+	let worktree = cached.pin(worktree);
+	cancelled()?;
+
+	let pin = PinTargetRequest { protocol_version: ReviewProtocol, commit_sha: commit.clone() };
+	let response = guarded(security, Operation::PinTarget, runner.client().pin_target(job, &pin))
+		.await?
+		.map_err(|error| match error {
+			PhaseError::Rejected {
+				status: 409, code: ReviewErrorCode::CheckoutConflict, ..
+			} => PrepareError::CheckoutConflict,
+			other => PrepareError::Phase(other),
+		})?;
+	if let PinTargetResponse::Prepared { generation, .. } = &response
+		&& generation.commit_sha.expose() != commit.expose()
+	{
+		return Err(PrepareError::CheckoutConflict);
+	}
+	Ok(Pinned { worktree, commit, inventory, response })
 }
 
 /// Send chunk 0, continue from the server's received prefix, and seal.
