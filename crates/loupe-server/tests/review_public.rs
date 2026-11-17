@@ -107,6 +107,7 @@ async fn call(
 	let response = router(f.state.clone()).call(req).await.unwrap();
 	let status = response.status();
 	let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+	common::admit_phase_response(route, status, &bytes);
 	let body = serde_json::from_slice(&bytes)
 		.unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)}));
 	(status, body)
@@ -639,6 +640,9 @@ async fn profile_version_domain_case(version: rusqlite::types::Value, permitted:
 		json!({"protocol_version":3,"outcome":"failed","error":"Execution interrupted"}),
 	)
 	.await;
+	common::marked::server_response(failure.to_string().as_bytes())
+		.validate(loupe_proto::review_lifecycle::PhaseControlResponseDecoder)
+		.expect("phase control response");
 	assert_eq!(failure["job_id"], survey.job_id);
 	assert_eq!(failure["state"], "queued");
 	assert_eq!(

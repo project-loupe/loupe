@@ -40,9 +40,10 @@ async fn s3_prompt_delivery_fixture() -> (Vec<u8>, String, String) {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await
 		.expect("fixture invocation must complete successfully");
@@ -139,9 +140,10 @@ async fn s3_lifecycle_fixture(
 			timeout,
 			cancel,
 			repo_id: None,
-			job_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await;
 	let elapsed = started.elapsed();
@@ -328,9 +330,10 @@ async fn sandbox_output_is_absent_from_success_logs_and_failure_chains() {
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
 				repo_id: None,
-				job_id: None,
+				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+				survey: None,
+				token_budget: None,
 				job_capability: None,
-				finding_id: None,
 			})
 			.await;
 		if status == 0 {
@@ -397,9 +400,10 @@ async fn common_quarantine_cancels_and_reaps_the_running_child() {
 		timeout: Duration::from_secs(10),
 		cancel: cancel.clone(),
 		repo_id: None,
-		job_id: None,
+		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+		survey: None,
+		token_budget: None,
 		job_capability: None,
-		finding_id: None,
 	};
 	let backend = PromptTestBackend::with_bin(script.as_os_str())
 		.with_sandbox_disabled_for_tests()

@@ -188,9 +188,10 @@ fn s3_compatibility_request_debug_already_redacts_the_prompt() {
 		timeout: std::time::Duration::from_secs(1),
 		cancel: tokio_util::sync::CancellationToken::new(),
 		repo_id: None,
-		job_id: None,
+		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+		survey: None,
+		token_budget: None,
 		job_capability: None,
-		finding_id: None,
 	};
 	assert!(!format!("{request:?}").contains("S3_DEBUG_CONTENT_SENTINEL"));
 }

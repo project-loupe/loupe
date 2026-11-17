@@ -119,3 +119,19 @@ pub fn scanner_config(raw: &str) -> loupe_core::ScannerDocument<loupe_provenance
 		loupe_core::ScannerDocument::registered(mark, serde_json::from_str(raw).unwrap()).unwrap()
 	})
 }
+
+/// The router's own response bytes as the worker receives them, for checking
+/// the worker's response decoders against actual server output.
+#[allow(unsafe_code)]
+pub fn server_response(bytes: &[u8]) -> Untrusted<&[u8], loupe_provenance::Server> {
+	// SAFETY: integration tests only; the bytes come from the in-process router.
+	Untrusted::new(bytes, unsafe { Ingress::<loupe_provenance::Server>::new() })
+}
+
+/// Authored request bytes as Worker input, for building typed requests the
+/// worker's phase client then sends to the actual router.
+#[allow(unsafe_code)]
+pub fn worker_request(bytes: &[u8]) -> Untrusted<&[u8], loupe_provenance::Worker> {
+	// SAFETY: integration tests only; the bytes are authored fixtures.
+	Untrusted::new(bytes, unsafe { Ingress::<loupe_provenance::Worker>::new() })
+}

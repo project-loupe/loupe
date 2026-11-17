@@ -24,6 +24,8 @@ pub mod model_broker;
 pub mod model_proxy;
 pub mod prompt;
 pub mod prompts;
+#[cfg(any(test, feature = "test-support"))]
+mod scripted_mcp;
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -205,20 +207,19 @@ pub struct LlmRequest {
 	/// `query_prior_findings` scoped to this repo. `None` falls back
 	/// to the no-MCP behaviour (just prompt + stdout).
 	pub repo_id: Option<i64>,
-	/// Job id for the scan currently in progress. Required for the
-	/// `submit_finding` MCP tool to POST to
-	/// `/v1/jobs/{job_id}/llm-findings`; without it, that tool is not
-	/// advertised. `None` falls back to query-only MCP usage (the
-	/// agent can read prior findings but can't write new ones).
-	pub job_id: Option<i64>,
+	/// Tool catalogue the MCP broker serves for this invocation, and
+	/// the job (and, for verification, finding) it attributes
+	/// submissions to.
+	pub mcp_mode: crate::mcp::McpMode,
+	/// Survey host state shared with the broker; required exactly when
+	/// `mcp_mode` is a survey mode, and outlives the MCP connection.
+	pub survey: Option<Arc<crate::review::session::SurveySession>>,
+	/// The lease's token budget for this invocation, lowering the configured
+	/// model-broker token ceiling; `None` leaves it unchanged.
+	pub token_budget: Option<std::num::NonZeroU64>,
 	/// Opaque authority for the exact active lease. It remains in the
 	/// trusted host broker and is never passed to the agent process.
 	pub job_capability: Option<JobCapability>,
-	/// Finding id for a verify-kind session. When `Some`, the MCP
-	/// server enters verify mode: `submit_finding` is hidden;
-	/// `submit_verdict`, `submit_patch`, and `validate_patch` are
-	/// advertised instead. `None` keeps the discovery-mode catalog.
-	pub finding_id: Option<i64>,
 }
 impl std::fmt::Debug for LlmRequest {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -541,6 +542,41 @@ pub fn build_verifier_backend(
 	}
 }
 
+/// Build the survey [`LlmBackend`] as the verifier's is built: `auto` prefers
+/// Codex, then Claude. `auto` with neither ready yields `None`, and the
+/// worker then runs no surveys.
+pub fn build_survey_backend(
+	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
+	codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,
+	runtime: BackendRuntimeConfig,
+) -> Result<Option<Arc<dyn LlmBackend>>> {
+	let BackendRuntimeConfig { network, launch, log_agent_output, model_broker } = runtime;
+	let codex = match selection {
+		JobAgent::Auto if codex_ready => true,
+		JobAgent::Auto if claude_ready => false,
+		JobAgent::Auto => {
+			tracing::info!("no survey agent ready; survey leases are not run");
+			return Ok(None);
+		},
+		JobAgent::Claude => {
+			require_agent_ready("survey", JobAgent::Claude, claude_ready)?;
+			false
+		},
+		JobAgent::Codex => {
+			require_agent_ready("survey", JobAgent::Codex, codex_ready)?;
+			true
+		},
+	};
+	let backend = if codex {
+		tracing::info!("survey backend: codex");
+		build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker, launch)?
+	} else {
+		tracing::info!("survey backend: claude");
+		build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker, launch)?
+	};
+	Ok(Some(backend))
+}
+
 fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<()> {
 	if !ready {
 		anyhow::bail!(
@@ -604,8 +640,9 @@ mod tests {
 			timeout: std::time::Duration::from_secs(1),
 			cancel: tokio_util::sync::CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
-			finding_id: None,
+			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
 		};
 		assert!(
@@ -890,6 +927,43 @@ mod tests {
 	}
 
 	#[test]
+	fn survey_backend_follows_the_verifier_selection() {
+		let codex = crate::test_support::sandbox_agent(
+			true,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("gpt-test"),
+				effort: crate::config::ConfiguredText::Builtin("xhigh"),
+			},
+		);
+		let claude = crate::test_support::sandbox_agent(
+			false,
+			CliModelConfig {
+				model: crate::config::ConfiguredText::Builtin("claude-test"),
+				effort: crate::config::ConfiguredText::Builtin("max"),
+			},
+		);
+		let build = |selection, claude_ready, codex_ready| {
+			build_survey_backend(
+				None,
+				selection,
+				claude_ready,
+				codex_ready,
+				codex.clone(),
+				claude.clone(),
+				BackendRuntimeConfig::default(),
+			)
+			.map(|backend| backend.map(|backend| backend.id()))
+		};
+		assert_eq!(build(JobAgent::Auto, true, true).unwrap(), Some("codex-cli"));
+		assert_eq!(build(JobAgent::Auto, true, false).unwrap(), Some("claude-cli"));
+		assert_eq!(build(JobAgent::Auto, false, false).unwrap(), None);
+		assert_eq!(build(JobAgent::Claude, true, true).unwrap(), Some("claude-cli"));
+		assert_eq!(build(JobAgent::Codex, false, true).unwrap(), Some("codex-cli"));
+		let error = build(JobAgent::Codex, true, false).unwrap_err();
+		assert!(error.to_string().contains("survey agent `codex`"), "{error}");
+	}
+
+	#[test]
 	fn verifier_backend_honors_explicit_selection() {
 		let codex = crate::test_support::sandbox_agent(
 			true,
@@ -964,6 +1038,7 @@ pub mod testing {
 	use anyhow::Result;
 	use async_trait::async_trait;
 
+	pub use super::scripted_mcp::{ScriptedAgent, ScriptedMcpBackend, ToolResult};
 	use super::{LlmBackend, LlmRequest, LlmResponse};
 
 	type AsyncStubFn = Arc<

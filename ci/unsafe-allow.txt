@@ -50,6 +50,7 @@ fuzz/src/cli_render.rs fuzz entry point: the C entry point takes a raw pointer f
 fuzz/src/web_api.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/core_text_repo_path.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_submission.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/worker_mcp_survey_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_extract_json.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_broker_policy.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_broker_usage.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
@@ -105,7 +106,7 @@ crates/loupe-server/src/config/input.rs actual native path/hostname/PEM parser c
 crates/loupe-server/src/ingress/router_fuzz.rs cfg-only synthetic Operator registration fixture enters the actual named decoder
 crates/loupe-server/src/reporters/fixtures.rs private unit fixture mints Agent for historical report content; Db values use actual SQLite reads
 crates/loupe-server/src/test_support.rs private unit fixtures mint fixed Agent/Operator/Worker for synthetic original messages
-crates/loupe-server/tests/common/marked.rs integration-only fixed Agent/Repo/Operator fixtures and explicit synthetic Operator authority for authored setup
+crates/loupe-server/tests/common/marked.rs integration-only fixed Agent/Repo/Operator fixtures, authored Worker request fixtures and explicit synthetic Operator authority for authored setup; Server labels the in-process router's own response bytes
 crates/loupe-storage/src/ingress/refs.rs cfg-only synthetic original column fixture mints Db then calls actual stored-reference validator
 crates/loupe-storage/src/test_support.rs private fixed Agent/Db/Config/Repo fixtures and synthetic Operator authority for DAO and scope controls
 fuzz/src/fixtures.rs private fixed Agent synthetic input fixture for concrete policy and constructor fuzz controls
@@ -126,3 +127,6 @@ fuzz/src/proto_review_verification.rs fuzz entry point: the C entry point takes 
 fuzz/src/proto_review_api.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_lease.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_compatibility.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_responses_host.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_responses_checkpoints.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/worker_inventory_chunks.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

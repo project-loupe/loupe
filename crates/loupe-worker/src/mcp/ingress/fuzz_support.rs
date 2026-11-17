@@ -46,6 +46,7 @@ fn argument_value(arguments: Arguments) -> Value {
 				json!({"verdict":"inconclusive","notes":reason.expose(),"terminal":terminal})
 			},
 		},
+		_ => json!({"survey": true}),
 	}
 }
 fn request_value(request: DecodedRequest) -> RequestObservation {
@@ -84,7 +85,10 @@ pub async fn observe_records(
 		let scope = crate::ingress_text::observe::Scope::begin();
 		// SAFETY: cfg-only fixture is the original record from the actual bounded framer.
 		let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
-		let parsed = record.as_bytes().validate_carrying(McpRequestDecoder);
+		let parsed = record.as_bytes().validate_carrying(McpRequestDecoder {
+			protocol_version: super::super::LEGACY_LOUPE_MCP_PROTOCOL_VERSION,
+			catalog: Catalog::Legacy,
+		});
 		let agent_spans = scope.finish();
 		records.push(match parsed {
 			Ok(None) => RecordObservation::Blank { length },
@@ -100,8 +104,19 @@ pub async fn observe_records(
 	}
 }
 
-#[allow(unsafe_code)]
 pub(crate) fn arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
+	catalog_fixture(Catalog::Legacy, super::super::LEGACY_LOUPE_MCP_PROTOCOL_VERSION, name, args)
+}
+
+#[cfg(test)]
+pub(crate) fn survey_arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
+	catalog_fixture(Catalog::Survey, super::super::SURVEY_LOUPE_MCP_PROTOCOL_VERSION, name, args)
+}
+
+#[allow(unsafe_code)]
+fn catalog_fixture(
+	catalog: Catalog, protocol_version: u16, name: &str, args: &Value,
+) -> Result<Arguments> {
 	// Serialization constructs the fixture's original wire record. The production
 	// decoder has not interpreted any part of it and receives no decoded Value.
 	let original = serde_json::to_vec(
@@ -109,8 +124,10 @@ pub(crate) fn arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
 	)?;
 	// SAFETY: cfg-only original complete Sandbox record constructed above.
 	let original = Untrusted::new(original, unsafe { Ingress::<Sandbox>::new() });
-	let request =
-		original.as_bytes().validate_carrying(McpRequestDecoder)?.expect("fixture record");
+	let request = original
+		.as_bytes()
+		.validate_carrying(McpRequestDecoder { protocol_version, catalog })?
+		.expect("fixture record");
 	request.call.arguments
 }
 
@@ -121,4 +138,103 @@ pub(crate) fn finding_fixture(
 		anyhow::bail!("not finding")
 	};
 	args.into_submission(workdir)
+}
+
+// debug-ok: Cfg-only synthetic observation of one survey record; values are fuzz assertions only.
+#[derive(Debug)]
+pub struct SurveyObservation {
+	/// The decoded tool label and, for accepted arguments, the exact request
+	/// bytes the host would send (with placeholder host fields).
+	pub decoded: Option<(String, Result<Vec<u8>, String>)>,
+	pub agent_spans: Vec<std::ops::Range<usize>>,
+}
+
+/// One original record through the survey-catalog decoder.
+#[allow(unsafe_code)]
+pub fn observe_survey_record(record: &[u8]) -> SurveyObservation {
+	let scope = crate::ingress_text::observe::Scope::begin();
+	// SAFETY: cfg-only fixture is one complete original record.
+	let original = Untrusted::new(record.to_vec(), unsafe { Ingress::<Sandbox>::new() });
+	let parsed = original.as_bytes().validate_carrying(McpRequestDecoder {
+		protocol_version: super::super::SURVEY_LOUPE_MCP_PROTOCOL_VERSION,
+		catalog: Catalog::Survey,
+	});
+	let agent_spans = scope.finish();
+	let decoded = match parsed {
+		Ok(Some(request)) => {
+			let tool = match &request.call.name {
+				ToolName::Unknown(_) => "unknown".to_owned(),
+				known => known.log_label().to_owned(),
+			};
+			Some((tool, request.call.arguments.map(survey_bytes).map_err(|e| format!("{e:#}"))))
+		},
+		_ => None,
+	};
+	SurveyObservation { decoded, agent_spans }
+}
+
+fn survey_bytes(arguments: Arguments) -> Vec<u8> {
+	use loupe_proto::review_api::ReviewProtocol;
+	let encoded = match arguments {
+		Arguments::JobLimits => Ok(Vec::new()),
+		Arguments::PublishProfile(profile) => {
+			serde_json::to_vec(&loupe_proto::review_api::PublishProfileRequest {
+				protocol_version: ReviewProtocol,
+				profile,
+			})
+		},
+		Arguments::ProposeUnit(request) => serde_json::to_vec(&*request),
+		Arguments::Lead(args) => {
+			let args = *args;
+			let mut evidence = args.evidence;
+			evidence.review_unit_id = args.review_unit_id.map(i64::from);
+			evidence.assignment_epoch = args.review_unit_id.map(|_| 1);
+			serde_json::to_vec(&loupe_proto::review_evidence::LeadCheckpointRequest {
+				protocol_version: ReviewProtocol,
+				client_lead_key: args.key,
+				evidence,
+			})
+		},
+		Arguments::UnitResult(args) => {
+			serde_json::to_vec(&loupe_proto::review_evidence::UnitResultCheckpointRequest {
+				protocol_version: ReviewProtocol,
+				client_result_key: args.key,
+				result: args.result,
+			})
+		},
+		Arguments::Disposition(args) => {
+			let args = *args;
+			let request = loupe_proto::review_inventory::InventoryDispositionRequest {
+				protocol_version: ReviewProtocol,
+				client_inventory_disposition_key: args.key,
+				source_path: args.path,
+				expected_revision: 0,
+				disposition: args.disposition,
+				reason: args.reason,
+				mappings: loupe_proto::review_lease::LeaseList::new(
+					args.mapped_review_unit_ids
+						.into_iter()
+						.map(|review_unit_id| loupe_proto::review_inventory::UnitMapping {
+							review_unit_id,
+							assignment_epoch: 1,
+						})
+						.collect(),
+				)
+				.unwrap_or_else(|_| panic!("decoder admitted more than eight mappings")),
+			};
+			serde_json::to_vec(&request)
+		},
+		Arguments::Candidates(query) => {
+			assert!(query.validate().is_ok(), "decoder admitted an invalid candidate query");
+			Ok(query.query.expose().as_bytes().to_vec())
+		},
+		Arguments::Finalize(terminal) => {
+			serde_json::to_vec(&loupe_proto::review_terminal::FinalizeSurveyRequest {
+				protocol_version: ReviewProtocol,
+				payload: *terminal,
+			})
+		},
+		_ => panic!("survey catalog decoded a legacy tool"),
+	};
+	encoded.unwrap_or_else(|_| panic!("decoder admitted arguments that do not serialize"))
 }

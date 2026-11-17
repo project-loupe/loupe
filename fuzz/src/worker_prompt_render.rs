@@ -1,6 +1,7 @@
 //! Arbitrary original Server bytes enter the actual owner before rendering.
 //! The entire input is the description, so the canonical raw corpus is also
-//! useful to unit tests. Both modes and closed/text projections run each time.
+//! useful to unit tests. Both modes and closed/text projections run each time,
+//! and the same bytes enter a survey prompt as assignment and profile text.
 
 use loupe_worker::llm::prompt::{
 	fuzz_support, DataMode, PromptError, MAX_RENDERED_PROMPT_BYTES, PREAMBLE,
@@ -16,6 +17,7 @@ pub fn do_test(data: &[u8]) {
 	}
 	for candidates in [[[0x11; 16], [0x22; 16], [0x33; 16]], derived] {
 		for mode in [DataMode::Delimited, DataMode::Marked] {
+			check_survey(data, candidates, mode);
 			for projection in [false, true] {
 				let Some(result) = fuzz_support::render(data, mode, projection, candidates) else {
 					continue; // Original UTF-8/policy admission rejected these bytes.
@@ -70,17 +72,26 @@ pub fn do_test(data: &[u8]) {
 pub(crate) fn decode_composition(
 	rendered: &str, recipe: &[(&str, &str)], suffix: &str, boundary: &str, mode: DataMode,
 ) -> Vec<String> {
+	let labelled: Vec<_> =
+		recipe.iter().map(|(trusted, field)| (*trusted, *field, "agent")).collect();
+	decode_labelled(rendered, &labelled, suffix, boundary, mode)
+}
+
+/// As `decode_composition`, with the expected source label of each part.
+pub(crate) fn decode_labelled(
+	rendered: &str, recipe: &[(&str, &str, &str)], suffix: &str, boundary: &str, mode: DataMode,
+) -> Vec<String> {
 	assert_eq!(boundary.len(), 32);
 	assert!(boundary.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
 	let close = format!("\n</loupe-data boundary=\"{boundary}\">\n");
 	let mut tail = rendered;
 	let mut recovered = Vec::new();
-	for (trusted, field) in recipe {
+	for (trusted, field, source) in recipe {
 		tail = tail
 			.strip_prefix(trusted)
 			.unwrap_or_else(|| panic!("exact trusted span before {field}"));
 		let opening =
-			format!("<loupe-data field=\"{field}\" source=\"agent\" boundary=\"{boundary}\">\n");
+			format!("<loupe-data field=\"{field}\" source=\"{source}\" boundary=\"{boundary}\">\n");
 		tail = tail
 			.strip_prefix(&opening)
 			.unwrap_or_else(|| panic!("exact opening after trusted span for {field}"));
@@ -122,6 +133,52 @@ fn decode_payload(payload: &str, mode: DataMode) -> String {
 		.join("␞.");
 	assert_eq!(payload, canonical, "canonical Marked encoding by original scalar groups");
 	recovered
+}
+
+/// The survey projections: host scalars under `server`, the same agent text
+/// in the `assignments` and `profile` parts, one boundary for all three.
+fn check_survey(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode) {
+	let Some(survey) = fuzz_support::render_survey(data, mode, candidates) else {
+		return; // The lease owner rejected these bytes as agent text.
+	};
+	// The lease owner normalises agent text on admission; the renderer must
+	// carry the admitted text exactly.
+	let raw = survey.admitted.as_str();
+	let escaped = serde_json::to_string(raw).unwrap_or_else(|error| panic!("oracle: {error}"));
+	let expected = candidates
+		.iter()
+		.map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+		.find(|candidate| !escaped.contains(candidate) && !survey.commit.contains(candidate));
+	let Some(expected) = expected else {
+		assert!(matches!(survey.prompt, Err(PromptError::Collision)));
+		return;
+	};
+	let prompt = survey.prompt.unwrap_or_else(|error| panic!("bounded admitted render: {error}"));
+	let [context, units, profile] = &survey.spans;
+	let parts = decode_labelled(
+		prompt.expose(),
+		&[
+			(context, "job_context", "server"),
+			(units, "assignments", "agent"),
+			(profile, "profile", "agent"),
+		],
+		"",
+		&expected,
+		mode,
+	);
+	let parse = |text: &str| -> Value {
+		serde_json::from_str(text).unwrap_or_else(|error| panic!("projection: {error}"))
+	};
+	let context = parse(&parts[0]);
+	assert_eq!(context["phase"], "survey");
+	assert_eq!(context["workflow_contract_version"], 2);
+	assert_eq!(context["checkout_commit"], survey.commit.as_str());
+	assert_eq!(context["token_budget"], 7);
+	assert_eq!(context["capacity"]["leads"]["remaining"], 0);
+	assert_eq!(context["terminal_action"], "finalize_survey");
+	assert_eq!(parse(&parts[1])[0]["objective"], raw);
+	assert_eq!(parse(&parts[1])[0]["assignment_epoch"], 2);
+	assert_eq!(parse(&parts[2])["note"], raw);
 }
 
 pub fn worker_prompt_render_test<Out: test_logger::Output>(data: &[u8], _out: Out) {

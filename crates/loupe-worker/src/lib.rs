@@ -32,6 +32,7 @@ mod limits;
 pub mod llm;
 pub mod mcp;
 pub mod repo_cache;
+pub mod review;
 pub mod runner;
 pub mod sandbox;
 mod sandbox_network;
@@ -43,6 +44,14 @@ pub use client::ServerClient;
 #[doc(hidden)]
 pub use git_credentials::run_git_credential_helper;
 pub use repo_cache::{RepoCache, RepoKey};
+/// Survey preparation, for integration tests against the router.
+#[cfg(feature = "test-support")]
+pub use review::prepare as survey_prepare;
+/// The pure inventory chunking core, for its fuzz target.
+#[cfg(fuzzing)]
+pub mod inventory_fuzz {
+	pub use crate::review::inventory::{chunks, EntrySize, BODY_CAP, FRAME_BYTES};
+}
 pub use runner::Runner;
 pub use scanner::{ScanContext, Scanner, VerifyContext, VerifyOutcome};
 

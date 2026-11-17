@@ -1,4 +1,4 @@
-//! HTTP evidence producers with explicit leases while public claims stay shut.
+//! HTTP evidence producers with explicit fixture leases.
 use loupe_storage::checkpoints::Operation;
 use loupe_storage::{leads, review_intents, review_units, unit_holds, Db, StoredEvidence};
 

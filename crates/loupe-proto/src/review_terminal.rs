@@ -17,7 +17,9 @@ use loupe_core::review_metadata::{ReviewCommit, ReviewDigest};
 use loupe_core::review_payload::{
 	ContinuationClass, SurveyTerminalReason, SurveyTerminalV1, SurveyTerminalV1Decoder, Version1,
 };
-use loupe_provenance::{Agent, Source, Unvalidated, ValidateCarrying, Worker};
+use loupe_provenance::{
+	Agent, Mark, Server, Source, Unvalidated, Validate, ValidateCarrying, Worker,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -100,6 +102,50 @@ pub struct SurveyTerminalResponse<S: Source> {
 	pub receipt: SurveyReceipt<S>,
 }
 record_impls!(SurveyTerminalResponse<S> { protocol_version, receipt });
+
+/// Decode a `finalize-survey` response; receipt metadata stays Server.
+pub struct SurveyTerminalResponseDecoder;
+impl Validate<&[u8], Server> for SurveyTerminalResponseDecoder {
+	type Output = SurveyTerminalResponse<Server>;
+	type Error = crate::review_api::ReviewResponseDecodeError;
+	fn validate<'v>(
+		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
+	) -> Result<Self::Output, Self::Error> {
+		#[derive(Deserialize)]
+		#[serde(deny_unknown_fields)]
+		struct Wire<'a> {
+			protocol_version: ReviewProtocol,
+			#[serde(borrow)]
+			receipt: Receipt<'a>,
+		}
+		#[derive(Deserialize)]
+		#[serde(deny_unknown_fields)]
+		struct Receipt<'a> {
+			receipt_id: ReviewId,
+			job_id: ReviewId,
+			#[serde(borrow)]
+			commit_sha: &'a RawValue,
+			#[serde(borrow)]
+			result_digest: &'a RawValue,
+			terminal_reason: SurveyTerminalReason,
+			summary: SurveySummary,
+		}
+		let wire: Wire<'_> = serde_json::from_slice(u.get())?;
+		let receipt = wire.receipt;
+		let value = SurveyTerminalResponse {
+			protocol_version: wire.protocol_version,
+			receipt: SurveyReceipt {
+				receipt_id: receipt.receipt_id,
+				job_id: receipt.job_id,
+				commit_sha: crate::review_response::metadata(&mark, receipt.commit_sha)?,
+				result_digest: crate::review_response::metadata(&mark, receipt.result_digest)?,
+				terminal_reason: receipt.terminal_reason,
+				summary: receipt.summary,
+			},
+		};
+		crate::review_response::exact(u.get(), value)
+	}
+}
 
 // debug-ok: one closed rejection category, without decoder diagnostics.
 #[derive(Debug, thiserror::Error)]

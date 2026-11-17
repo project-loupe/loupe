@@ -99,6 +99,8 @@ pub struct AgentsSection {
 	pub claude: AgentSection,
 	#[serde(default)]
 	pub codex: CodexAgentSection,
+	#[serde(default)]
+	pub survey: Option<JobAgent>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -76,5 +76,10 @@ pub struct ReviewUnitResponse {
 	pub accepted_priority_band: PriorityBand,
 }
 
+exact_response_decoder!(
+	/// Decode a `review-units` response from Server bytes.
+	ReviewUnitResponseDecoder => ReviewUnitResponse
+);
+
 #[cfg(test)]
 mod tests;

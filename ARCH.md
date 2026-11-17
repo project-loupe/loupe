@@ -420,9 +420,10 @@ outside that guarantee; a redacted holder does not erase those allocations.
 ## Storage layout for the review harness
 
 Schema v7 and the B4 server support the pre-proof review API: prepared surveys,
-assigned-lead drilldowns and canonical-finding verification. Current workers
-still advertise only legacy capabilities; worker execution arrives in B5–B7,
-and production triggers remain legacy until cutover. Explicit phase
+assigned-lead drilldowns and canonical-finding verification. A worker with a
+survey agent advertises `review:survey:v1` (see [Survey worker](#survey-worker));
+drilldown and verify execution arrive in B6–B7 and are not advertised, and
+production triggers remain legacy until cutover. Explicit phase
 advertisements never inherit legacy `verify:*` authority. Reconciliation,
 successor activation and corroboration remain B8-held; proof infrastructure
 remains Stage C. The startup guard rejects persisted kinds absent from
@@ -440,6 +441,61 @@ remains Stage C. The startup guard rejects persisted kinds absent from
 | `review_intents`, `unit_holds` | Pending handoffs, canonical verification obligations and exact continuation reservations |
 | `admission_candidates`, `admission_claim`, `admission` | Global ranked backlog, transactional first claim and monotonic protected budget |
 | `terminal_payloads`, `review_coverage` | Retained typed finalization evidence and shared current-result coverage validation |
+
+### Survey worker
+
+`[agents] survey` (or `--survey-agent` / `LOUPE_SURVEY_AGENT`) selects the
+survey agent as `scan` and `verify` are selected, with the same default
+`auto`, which prefers Codex, then Claude. A worker with no ready survey agent
+runs no surveys and sends an empty `review_capabilities` list. With a survey backend the runner sends exactly
+`["review:survey:v1"]` beside its legacy scanner tags; no other phase is
+advertised. The runner dispatches a lease by payload, so legacy jobs never
+reach phase code and unsupported phase payloads fail closed.
+
+A survey lease (`crates/loupe-worker/src/review/`) runs in three steps:
+
+1. **Prepare on the host.** Check out the target, pin it, enumerate the
+   tracked tree from the bare cache clone and upload it in deterministic
+   chunks, seal the manifest, then read `/limits`. Modes are canonicalised
+   as Git does (regular files `100644`/`100755` by the executable bit,
+   symlinks `120000`, gitlinks `160000`; trees are not entries), and the
+   digest covers the canonical modes. An entry the manifest rejects, or a
+   tree over 1 000 000 entries, fails the job with a fixed reason.
+2. **Run one agent invocation** against the survey MCP catalog (protocol
+   version 2): limits, profile publication for bootstrap recipes, unit
+   proposals, leads, unit results, inventory dispositions, same-project
+   candidate queries and `finalize_survey`. A pure gate admits each call
+   from host state, and every tool result ends with a host-authored status
+   line (seconds to `submit_by` and to the hard deadline, remaining unit
+   and lead capacity).
+3. **End the attempt.** A sealed terminal receipt from `finalize_survey`
+   ends the job. An invocation that ends without one is an execution
+   failure: the host sends `complete{failed}` with a fixed reason and the
+   server's retry policy decides. The host never finalizes on the agent's
+   behalf.
+
+Retries. A phase HTTP call that fails by timeout, connection error, 429 or
+5xx is re-sent with identical bytes, at most three tries with 1 s and 4 s
+pauses, never past `hard_deadline_at`; every phase write replays by key or
+digest. 400, 403, 409 and 413 are never retried. Once the tries are spent
+the agent sees an error telling it to retry under the same client key.
+
+A retried bootstrap starts blind: the lease carries only the pinned
+generation and published profile, not the earlier attempt's units. The
+prompt states the remaining unit and lead capacity read from `/limits`
+and, from the second attempt on, that earlier units are picked up by later
+coverage jobs, that low capacity is expected and that `finalize_survey` is
+the answer to exhausted capacity.
+
+Deadlines. The worker uses `submit_by` as the point to stop opening new
+inquiry and does not read `soft_deadline_at`. The prompt carries absolute
+and remaining times. After `submit_by` the gate refuses
+`propose_review_unit` and `query_same_project_lead_candidates`; leads,
+results, dispositions and `finalize_survey` stay open, so a lease that
+arrives past `submit_by` still runs to flush and finalize. The invocation
+is killed 30 s before `hard_deadline_at`; a lease with less time left fails
+without launching the agent. The broker's token ceiling is the smaller of
+the configured ceiling and the lease's token budget.
 
 The server owns HTTP and recipe policy; storage owns SQL authority and
 transactions and depends on core, never on server or wire DTOs. One ranked

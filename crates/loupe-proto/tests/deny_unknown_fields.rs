@@ -22,6 +22,11 @@ const EXCEPTIONS: &[(&str, &str, &str)] = &[
 		"Tag",
 		"bootstrap and context peek only the kind/recipe tag; each per-variant Wire re-parses the same bytes with deny_unknown_fields",
 	),
+	(
+		"loupe-proto/src/review_api/responses.rs",
+		"Tag",
+		"the pin response peeks only the outcome tag; each per-variant Wire re-parses the same bytes with deny_unknown_fields",
+	),
 ];
 
 struct Item {

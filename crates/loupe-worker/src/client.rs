@@ -19,6 +19,7 @@ use reqwest::Url;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 mod ingress;
+mod phase;
 #[cfg(fuzzing)]
 pub use ingress::fuzz_support;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub(crate) use ingress::fuzz_support;
 pub(crate) use ingress::fuzz_support::lease_fixture as test_lease;
 #[cfg(any(test, fuzzing))]
 pub(crate) use ingress::fuzz_support::scanner_patch_fixture as test_scanner_patch;
+pub use phase::{PhaseError, PhaseJob};
 
 /// Named authentication handoff: Bytes keeps this shared secret owner alive
 /// through header clones. HTTP/TLS encoding and kernel copies are not covered
@@ -93,6 +95,36 @@ impl ServerClient {
 	pub(crate) async fn lease_for_runner(
 		&self, capabilities: Vec<&'static str>, wait_seconds: u32,
 	) -> Result<LeaseReceipt> {
+		self.lease_with(capabilities, Default::default(), wait_seconds).await
+	}
+
+	/// Claim a survey lease without running it, for tests that drive survey
+	/// preparation directly.
+	#[cfg(feature = "test-support")]
+	pub async fn lease_survey_for_tests(
+		&self, wait_seconds: u32,
+	) -> Result<LeaseResponse<Agent, Server>> {
+		Ok(self.lease_survey_receipt_for_tests(wait_seconds).await?.response)
+	}
+
+	#[cfg(feature = "test-support")]
+	pub(crate) async fn lease_survey_receipt_for_tests(
+		&self, wait_seconds: u32,
+	) -> Result<LeaseReceipt> {
+		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
+		let review =
+			LeaseList::new(vec![ReviewCapability::Survey]).map_err(|error| anyhow!(error))?;
+		self.lease_with(Vec::new(), review, wait_seconds).await
+	}
+
+	pub(crate) async fn lease_with(
+		&self, capabilities: Vec<&'static str>,
+		review_capabilities: loupe_proto::review_lease::LeaseList<
+			loupe_proto::review_lease::ReviewCapability,
+			3,
+		>,
+		wait_seconds: u32,
+	) -> Result<LeaseReceipt> {
 		let url = self.url("/v1/jobs/lease");
 		// Scanner capabilities are closed static declarations, not Config input.
 		#[derive(serde::Serialize)]
@@ -108,7 +140,7 @@ impl ServerClient {
 		let req = BuiltinLeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities,
-			review_capabilities: Default::default(),
+			review_capabilities,
 			wait_seconds,
 		};
 		#[allow(
@@ -458,8 +490,9 @@ mod tests {
 		assert!(!error.to_string().contains(HEADER_CAPABILITY));
 	}
 
-	#[tokio::test]
-	async fn lease_request_keeps_review_capabilities_empty() {
+	/// Run one runner step against a one-shot server and return the lease
+	/// request body it sent.
+	async fn runner_lease_request(survey: bool) -> serde_json::Value {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
 		let task = tokio::spawn(async move {
@@ -486,21 +519,45 @@ mod tests {
 					break request[end + 4..end + 4 + length].to_vec();
 				}
 			};
-			let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-			assert_eq!(request["review_capabilities"], serde_json::json!([]));
-			assert_eq!(request["capabilities"], serde_json::json!(["verify:llm"]));
+			let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
 			let body = format!("{{\"kind\":\"empty\",\"protocol_version\":{PROTOCOL_VERSION}}}");
 			let response = format!(
 				"HTTP/1.1 200 OK\r\nX-Loupe-Protocol: {PROTOCOL_VERSION}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
 				body.len()
 			);
 			stream.write_all(response.as_bytes()).await.unwrap();
+			sent
 		});
-		ServerClient::from_parts(reqwest::Client::new(), base)
-			.lease(vec!["verify:llm"], 0)
-			.await
-			.unwrap();
-		task.await.unwrap();
+		let tmp = tempfile::tempdir().unwrap();
+		let cache = std::sync::Arc::new(
+			crate::repo_cache::RepoCache::new(tmp.path().join("cache"), 1024, None).unwrap(),
+		);
+		let client = std::sync::Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
+		let mut runner = crate::runner::Runner::new(client, cache, Vec::new());
+		if survey {
+			runner = runner.with_survey_backend(std::sync::Arc::new(
+				crate::llm::testing::StubLlmBackend::new("never-run", |_| {
+					panic!("an empty lease reached the survey agent")
+				}),
+			));
+		}
+		let processed = runner.step(&tokio_util::sync::CancellationToken::new()).await.unwrap();
+		assert!(!processed);
+		task.await.unwrap()
+	}
+
+	#[tokio::test]
+	async fn lease_request_keeps_review_capabilities_empty() {
+		let request = runner_lease_request(false).await;
+		assert_eq!(request["review_capabilities"], serde_json::json!([]));
+		assert_eq!(request["capabilities"], serde_json::json!([]));
+	}
+
+	#[tokio::test]
+	async fn lease_request_advertises_survey_with_a_survey_backend() {
+		let request = runner_lease_request(true).await;
+		assert_eq!(request["review_capabilities"], serde_json::json!(["review:survey:v1"]));
+		assert_eq!(request["capabilities"], serde_json::json!([]));
 	}
 
 	#[tokio::test]

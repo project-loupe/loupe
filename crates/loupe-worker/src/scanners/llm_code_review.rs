@@ -252,9 +252,10 @@ async fn run_one(
 		timeout: cfg.per_request_timeout,
 		cancel,
 		repo_id: Some(repo_id),
-		job_id: Some(job_id),
+		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(job_id) },
+		survey: None,
+		token_budget: None,
 		job_capability: Some(job_capability),
-		finding_id: None,
 	};
 	match backend.run(req).await {
 		Ok(r) => {

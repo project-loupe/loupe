@@ -32,7 +32,17 @@ impl From<serde_json::Error> for RecordError {
 	}
 }
 
-pub(super) struct McpRequestDecoder;
+pub(super) struct McpRequestDecoder {
+	pub(super) protocol_version: u16,
+	pub(super) catalog: Catalog,
+}
+/// Which tool names a session can decode. A name from the other catalog is
+/// an unknown tool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Catalog {
+	Legacy,
+	Survey,
+}
 pub(super) struct DecodedRequest {
 	pub(super) id: Option<SandboxReplyId>,
 	pub(super) method: Method,
@@ -76,9 +86,37 @@ pub(super) enum ToolName {
 	Verdict,
 	Patch,
 	ValidatePatch,
+	JobLimits,
+	PublishProfile,
+	ProposeUnit,
+	Lead,
+	UnitResult,
+	Disposition,
+	Candidates,
+	Finalize,
 	Unknown(String),
 }
 impl ToolName {
+	fn decode(catalog: Catalog, name: String) -> Self {
+		match (catalog, name.as_str()) {
+			(Catalog::Legacy, "query_prior_findings") => Self::Query,
+			(Catalog::Legacy, "get_finding_by_id") => Self::Get,
+			(Catalog::Legacy, "submit_finding") => Self::Finding,
+			(Catalog::Legacy, "validate_poc") => Self::Poc,
+			(Catalog::Legacy, "submit_verdict") => Self::Verdict,
+			(Catalog::Legacy, "submit_patch") => Self::Patch,
+			(Catalog::Legacy, "validate_patch") => Self::ValidatePatch,
+			(Catalog::Survey, "get_job_limits") => Self::JobLimits,
+			(Catalog::Survey, "publish_profile") => Self::PublishProfile,
+			(Catalog::Survey, "propose_review_unit") => Self::ProposeUnit,
+			(Catalog::Survey, "submit_lead") => Self::Lead,
+			(Catalog::Survey, "submit_review_unit_result") => Self::UnitResult,
+			(Catalog::Survey, "submit_inventory_disposition") => Self::Disposition,
+			(Catalog::Survey, "query_same_project_lead_candidates") => Self::Candidates,
+			(Catalog::Survey, "finalize_survey") => Self::Finalize,
+			_ => Self::Unknown(name),
+		}
+	}
 	pub(super) fn operation(&self) -> loupe_core::security_event::Operation {
 		use loupe_core::security_event::Operation;
 		match self {
@@ -86,6 +124,14 @@ impl ToolName {
 			Self::Finding | Self::Poc => Operation::McpSubmitFinding,
 			Self::Verdict => Operation::McpSubmitVerdict,
 			Self::Patch | Self::ValidatePatch => Operation::McpSubmitPatch,
+			Self::JobLimits => Operation::McpGetJobLimits,
+			Self::PublishProfile => Operation::McpPublishProfile,
+			Self::ProposeUnit => Operation::McpProposeReviewUnit,
+			Self::Lead => Operation::McpSubmitLead,
+			Self::UnitResult => Operation::McpSubmitReviewUnitResult,
+			Self::Disposition => Operation::McpSubmitInventoryDisposition,
+			Self::Candidates => Operation::McpQuerySameProjectLeadCandidates,
+			Self::Finalize => Operation::McpFinalizeSurvey,
 			Self::Get | Self::Unknown(_) => Operation::ReadFinding,
 		}
 	}
@@ -98,6 +144,14 @@ impl ToolName {
 			Self::Verdict => "submit_verdict",
 			Self::Patch => "submit_patch",
 			Self::ValidatePatch => "validate_patch",
+			Self::JobLimits => "get_job_limits",
+			Self::PublishProfile => "publish_profile",
+			Self::ProposeUnit => "propose_review_unit",
+			Self::Lead => "submit_lead",
+			Self::UnitResult => "submit_review_unit_result",
+			Self::Disposition => "submit_inventory_disposition",
+			Self::Candidates => "query_same_project_lead_candidates",
+			Self::Finalize => "finalize_survey",
 			Self::Unknown(_) => "unknown",
 		}
 	}
@@ -111,6 +165,14 @@ pub(super) enum Arguments {
 	Verdict(DecodedVerdictArgs),
 	Patch(DecodedPatchArgs),
 	ValidatePatch(BoundedText<policy::PatchUnified, Agent>),
+	JobLimits,
+	PublishProfile(loupe_core::review_payload::GeneratedProfile<Agent>),
+	ProposeUnit(Box<loupe_proto::review_units::ReviewUnitRequest<Agent, Agent>>),
+	Lead(Box<LeadArgs>),
+	UnitResult(Box<UnitResultArgs>),
+	Disposition(Box<DispositionArgs>),
+	Candidates(loupe_core::review_candidates::CandidateQuery<Agent>),
+	Finalize(Box<loupe_core::review_payload::SurveyTerminalV1<Agent>>),
 }
 pub(super) struct DecodedQueryArgs {
 	pub(super) query: BoundedText<QueryText, Agent>,
@@ -250,17 +312,20 @@ macro_rules! carry {
 	}};
 }
 
+mod survey;
+pub(super) use survey::{DispositionArgs, LeadArgs, UnitResultArgs};
+
 fn arguments(
 	u: &Unvalidated<'_, &[u8], Sandbox>, name: &ToolName, raw: Option<&RawValue>,
+	protocol_version: u16,
 ) -> Result<Arguments> {
 	let fields = fields(raw).map_err(DecodeError::from)?;
 	if let Some(version) = fields.get("protocol_version") {
 		let value: Value = serde_json::from_str(version.get()).map_err(DecodeError::from)?;
 		let version = value.as_u64().context("protocol_version must be an integer")?;
-		if version != u64::from(super::LOUPE_MCP_PROTOCOL_VERSION) {
+		if version != u64::from(protocol_version) {
 			anyhow::bail!(
-				"unsupported Loupe MCP protocol_version {version}; worker supports {}",
-				super::LOUPE_MCP_PROTOCOL_VERSION
+				"unsupported Loupe MCP protocol_version {version}; worker supports {protocol_version}"
 			);
 		}
 	}
@@ -334,6 +399,7 @@ fn arguments(
 			Arguments::Verdict(DecodedVerdictArgs { verdict })
 		},
 		ToolName::Unknown(_) => return Err(UnknownTool.into()),
+		_ => return survey::arguments(u, name, &fields),
 	})
 }
 
@@ -427,18 +493,9 @@ impl ValidateCarrying<&[u8], Sandbox> for McpRequestDecoder {
 			.map(|r| serde_json::from_str::<String>(r.get()))
 			.transpose()?
 			.unwrap_or_default();
-		let name = match name.as_str() {
-			"query_prior_findings" => ToolName::Query,
-			"get_finding_by_id" => ToolName::Get,
-			"submit_finding" => ToolName::Finding,
-			"validate_poc" => ToolName::Poc,
-			"submit_verdict" => ToolName::Verdict,
-			"submit_patch" => ToolName::Patch,
-			"validate_patch" => ToolName::ValidatePatch,
-			_ => ToolName::Unknown(name),
-		};
+		let name = ToolName::decode(self.catalog, name);
 		let arguments = if matches!(method, Method::Call) && raw.id.is_some() {
-			arguments(&u, &name, params.get("arguments").copied())
+			arguments(&u, &name, params.get("arguments").copied(), self.protocol_version)
 		} else {
 			// This record will not dispatch a tool. Its params are Sandbox
 			// protocol data and retain the full legacy Value syntax traversal.

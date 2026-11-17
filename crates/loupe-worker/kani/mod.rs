@@ -499,3 +499,149 @@ fn bounded_sandbox_golden_cases_match_launch_policy() {
 		check_sandbox_case(false, false, false, Some(index));
 	}
 }
+
+// Every failure class, every status, any try count and any millisecond
+// clock: chains of decisions where each pause plus arbitrary elapsed time
+// advances the clock. Bound: four decisions, one more than the try limit.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(5)]
+fn phase_retry_stays_within_tries_deadline_and_retryable_statuses() {
+	use std::time::Duration;
+
+	use crate::review::retry::{classify, Decision, Failure, MAX_TRIES};
+	let deadline = Duration::from_millis(kani::any());
+	let mut now = Duration::from_millis(kani::any());
+	let mut tries: u8 = 1;
+	let mut retried = false;
+	let mut finished = false;
+	for _ in 0..4 {
+		let failure = match kani::any::<u8>() % 3 {
+			0 => Failure::Timeout,
+			1 => Failure::Connection,
+			_ => Failure::Status(kani::any()),
+		};
+		match classify(failure, tries, now, deadline) {
+			Decision::Retry(pause) => {
+				if let Failure::Status(status) = failure {
+					assert!(status == 429 || (500..=599).contains(&status));
+				}
+				let start = now.checked_add(pause);
+				assert!(start.is_some_and(|start| start < deadline));
+				tries += 1;
+				retried = true;
+				let elapsed = Duration::from_millis(u64::from(kani::any::<u16>()));
+				now = match start.and_then(|start| start.checked_add(elapsed)) {
+					Some(next) => next,
+					None => break,
+				};
+			},
+			Decision::Final => {
+				finished = true;
+				break;
+			},
+		}
+	}
+	assert!(tries <= MAX_TRIES);
+	kani::cover!(retried, "a transient failure is retried");
+	kani::cover!(finished && tries == 1, "a first failure is final");
+	kani::cover!(tries == MAX_TRIES, "the try limit is reached");
+}
+
+// Every tool, recipe and attempt state: the domain is 8 x 2 x 2 x 2 x 2, so
+// the harness is exhaustive without loops.
+#[cfg(kani)]
+#[kani::proof]
+fn survey_gate_seals_waits_for_the_profile_and_soft_stops_exactly() {
+	use crate::review::gate::{admit, Admission, Denial, RecipeClass, SurveyTool};
+	let tool = SurveyTool::ALL[usize::from(kani::any::<u8>() % 8)];
+	let recipe = if kani::any() { RecipeClass::Bootstrap } else { RecipeClass::Ordinary };
+	let published: bool = kani::any();
+	let late: bool = kani::any();
+	let sealed: bool = kani::any();
+	let admission = admit(tool, recipe, published, late, sealed);
+	let allowed = admission == Admission::Allow;
+	// No write after a sealed receipt: only limits and a finalize replay.
+	if sealed {
+		assert_eq!(allowed, matches!(tool, SurveyTool::JobLimits | SurveyTool::Finalize));
+	}
+	// No profile-dependent call before publication on bootstrap.
+	if recipe == RecipeClass::Bootstrap && !published && tool.needs_profile() {
+		assert!(!allowed);
+	}
+	if tool == SurveyTool::PublishProfile && allowed {
+		assert!(recipe == RecipeClass::Bootstrap && !published && !sealed);
+	}
+	// Passing submit_by denies exactly the inquiry-opening tools, with the
+	// fixed soft-stop reason, and changes nothing else.
+	let early = admit(tool, recipe, published, false, sealed);
+	let late_admission = admit(tool, recipe, published, true, sealed);
+	if early == Admission::Allow && late_admission != Admission::Allow {
+		assert!(tool.opens_inquiry());
+		assert_eq!(late_admission, Admission::Deny(Denial::SoftStop));
+	}
+	if early == Admission::Allow && tool.opens_inquiry() {
+		assert_eq!(late_admission, Admission::Deny(Denial::SoftStop));
+	}
+	if !tool.opens_inquiry() {
+		assert_eq!(early, late_admission);
+	}
+	kani::cover!(sealed && tool == SurveyTool::Finalize && allowed, "finalize replay after seal");
+	kani::cover!(
+		!sealed && recipe == RecipeClass::Bootstrap && !published && tool == SurveyTool::Lead,
+		"bootstrap lead before publication"
+	);
+	kani::cover!(late && admission == Admission::Deny(Denial::SoftStop), "soft stop denial");
+	kani::cover!(late && tool == SurveyTool::Lead && allowed, "lead stays open after submit_by");
+}
+
+// Over every launch instant with nanosecond precision and every i64 hard
+// deadline; the arithmetic has no loops, so the proof is unbounded.
+#[cfg(kani)]
+#[kani::proof]
+fn survey_timeout_never_reaches_the_hard_deadline() {
+	use std::time::Duration;
+
+	use crate::review::deadline::{invocation_timeout, KILL_MARGIN};
+	let nanos: u32 = kani::any();
+	kani::assume(nanos < 1_000_000_000);
+	let now = Duration::new(kani::any(), nanos);
+	let hard_deadline_at: i64 = kani::any();
+	let timeout = invocation_timeout(now, hard_deadline_at);
+	match timeout {
+		Some(timeout) => {
+			assert!(!timeout.is_zero());
+			let end = now.checked_add(timeout).and_then(|end| end.checked_add(KILL_MARGIN));
+			assert_eq!(end, Some(Duration::from_secs(hard_deadline_at as u64)));
+		},
+		None => {
+			// No launch only when less than the margin, or nothing, is left.
+			if hard_deadline_at >= 0 {
+				let hard = Duration::from_secs(hard_deadline_at as u64);
+				assert!(hard <= now || hard - now <= KILL_MARGIN);
+			}
+		},
+	}
+	kani::cover!(timeout.is_some(), "launch");
+	kani::cover!(timeout.is_none() && hard_deadline_at > 0, "no launch near the deadline");
+	kani::cover!(timeout.is_none() && hard_deadline_at < 0, "no launch for a negative deadline");
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn invocation_token_ceiling_is_the_smaller_cap() {
+	use crate::llm::model_broker::ModelBrokerLimits;
+	let config: Option<u64> = kani::any();
+	let budget: Option<std::num::NonZeroU64> = kani::any();
+	let limits =
+		ModelBrokerLimits { request_ceiling: 1, output_ceiling_bytes: 1, token_ceiling: config };
+	let ceiling = limits.with_token_budget(budget).token_ceiling;
+	match (config, budget) {
+		(None, None) => assert_eq!(ceiling, None),
+		(Some(c), None) => assert_eq!(ceiling, Some(c)),
+		(None, Some(b)) => assert_eq!(ceiling, Some(b.get())),
+		(Some(c), Some(b)) => assert!(ceiling == Some(c.min(b.get()))),
+	}
+	kani::cover!(matches!((config, budget), (Some(c), Some(b)) if b.get() < c), "lease lowers");
+	kani::cover!(matches!((config, budget), (Some(c), Some(b)) if c < b.get()), "config holds");
+}

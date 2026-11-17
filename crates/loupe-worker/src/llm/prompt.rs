@@ -153,10 +153,15 @@ impl<'a> PromptBuilder<'a> {
 		self.payload_bytes = bytes;
 		Ok(())
 	}
-	// This serializer is private. Only the three closed projections below can
+	// This serializer is private. Only the closed projections below can
 	// reach it; callers cannot apply a source label to arbitrary Serialize/Value.
 	fn projection(
 		&mut self, field: &'static str, value: &impl Serialize,
+	) -> Result<(), PromptError> {
+		self.projection_from(field, Agent::NAME, value)
+	}
+	fn projection_from(
+		&mut self, field: &'static str, source: &'static str, value: &impl Serialize,
 	) -> Result<(), PromptError> {
 		if self.parts.len() >= MAX_PARTS {
 			return Err(PromptError::Parts);
@@ -169,7 +174,7 @@ impl<'a> PromptBuilder<'a> {
 		let mut writer = ProjectionWriter { bytes, limit: count.len };
 		serde_json::to_writer(&mut writer, value).map_err(|_| PromptError::Projection)?;
 		let value = String::from_utf8(writer.bytes).map_err(|_| PromptError::Projection)?;
-		self.raw_data(field, Agent::NAME, Cow::Owned(value))
+		self.raw_data(field, source, Cow::Owned(value))
 	}
 	pub(crate) fn verification(
 		&mut self, id: i64, finding: &loupe_core::Finding<Agent>,
@@ -185,6 +190,11 @@ impl<'a> PromptBuilder<'a> {
 		&mut self, repo_id: i64, findings: &[loupe_proto::FindingSummary<Agent, Server>],
 	) -> Result<(), PromptError> {
 		self.projection("findings", &PriorFindings { repo_id, findings })
+	}
+	pub(crate) fn lead_candidates(
+		&mut self, candidates: &[loupe_core::review_candidates::Candidate<Agent, Server>],
+	) -> Result<(), PromptError> {
+		self.projection("candidates", &candidates)
 	}
 	pub fn render(self) -> Result<Prompt, PromptError> {
 		self.render_with(|| {
@@ -479,6 +489,9 @@ impl Serialize for Summary<'_> {
 #[cfg(test)]
 #[path = "prompt_tests.rs"]
 mod tests;
+
+mod survey;
+pub(crate) use survey::SurveyJobContext;
 
 #[cfg(any(test, fuzzing))]
 pub mod fuzz_support;

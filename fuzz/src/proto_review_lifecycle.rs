@@ -11,6 +11,7 @@ use loupe_proto::review_lifecycle::{
 	PhaseControlResponse, PhaseControlState, PhaseFailureRequest, PhaseFailureRequestDecoder,
 	PhaseHeartbeatRequest, PhaseHeartbeatRequestDecoder,
 };
+use loupe_provenance::Worker;
 use loupe_server::fuzz_support::review_request;
 use serde_json::json;
 
@@ -22,7 +23,7 @@ const PROTOCOL: u64 = loupe_proto::PROTOCOL_VERSION as u64;
 const FAILURE_SEED: &[u8] = br#"{"protocol_version":3,"outcome":"failed","error":"seed reason"}"#;
 const HEARTBEAT_SEED: &[u8] = br#"{"protocol_version":3}"#;
 
-fn failure(raw: &[u8]) -> Option<PhaseFailureRequest> {
+fn failure(raw: &[u8]) -> Option<PhaseFailureRequest<Worker>> {
 	review_request(PhaseFailureRequestDecoder, raw).ok()
 }
 fn heartbeat(raw: &[u8]) -> Option<PhaseHeartbeatRequest> {

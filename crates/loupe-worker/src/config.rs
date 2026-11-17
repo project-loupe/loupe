@@ -111,6 +111,9 @@ pub struct LoggingConfig {
 pub struct AgentsConfig {
 	pub scan: JobAgent,
 	pub verify: JobAgent,
+	/// Resolved like `scan` and `verify`: with `auto`, a worker with a
+	/// ready agent runs surveys and advertises `review:survey:v1`.
+	pub survey: JobAgent,
 	pub claude: CliModelConfig,
 	pub codex: CliModelConfig,
 	pub codex_daybreak: CodexDaybreak,
@@ -140,6 +143,7 @@ pub struct WorkerConfigOverrides {
 	pub log_agent_output: Option<bool>,
 	pub scan_agent: Option<JobAgent>,
 	pub verify_agent: Option<JobAgent>,
+	pub survey_agent: Option<JobAgent>,
 	pub claude_model: Option<ConfiguredText>,
 	pub claude_effort: Option<ConfiguredText>,
 	pub codex_model: Option<ConfiguredText>,
@@ -254,6 +258,9 @@ struct AgentsSection {
 	pub claude: AgentSection,
 	#[serde(default)]
 	pub codex: CodexAgentSection,
+	// Last, so positional `agents = [...]` documents keep their meaning.
+	#[serde(default)]
+	pub survey: Option<JobAgent>,
 }
 
 // debug-ok: Private Config decoder scratch; model/effort are taken at ingress and Daybreak is a closed mode.
@@ -375,6 +382,9 @@ impl WorkerConfig {
 		if let Some(v) = file.agents.verify {
 			self.agents.verify = v;
 		}
+		if let Some(v) = file.agents.survey {
+			self.agents.survey = v;
+		}
 		if let Some(v) = decoded.claude_model {
 			self.agents.claude.model = v;
 		}
@@ -459,6 +469,9 @@ impl WorkerConfig {
 		}
 		if let Some(v) = overrides.verify_agent {
 			self.agents.verify = v;
+		}
+		if let Some(v) = overrides.survey_agent {
+			self.agents.survey = v;
 		}
 		if let Some(v) = overrides.claude_model {
 			self.agents.claude.model = v;
@@ -666,6 +679,7 @@ impl Default for WorkerConfig {
 			agents: AgentsConfig {
 				scan: JobAgent::Auto,
 				verify: JobAgent::Auto,
+				survey: JobAgent::Auto,
 				claude: CliModelConfig {
 					model: ConfiguredText::Builtin(DEFAULT_CLAUDE_MODEL),
 					effort: ConfiguredText::Builtin(DEFAULT_CLAUDE_EFFORT),
@@ -824,6 +838,7 @@ mod tests {
 		assert_eq!(cfg.logging.level.for_operation(), "info");
 		assert_eq!(cfg.agents.scan, JobAgent::Auto);
 		assert_eq!(cfg.agents.verify, JobAgent::Auto);
+		assert_eq!(cfg.agents.survey, JobAgent::Auto);
 		assert_eq!(cfg.agents.claude.model.for_operation(), "claude-opus-4-7");
 		assert_eq!(cfg.agents.claude.effort.for_operation(), "max");
 		assert_eq!(cfg.agents.codex.model.for_operation(), "gpt-5.5");
@@ -870,6 +885,7 @@ agent_output = true
 [agents]
 scan = "codex"
 verify = "claude"
+survey = "auto"
 
 [agents.claude]
 model = "claude-custom"
@@ -1052,6 +1068,47 @@ allowlist = ["from-file.example"]
 		)
 		.unwrap_err();
 		assert!(err.to_string().contains("agents.codex.effort"), "got: {err}");
+	}
+
+	#[test]
+	fn survey_agent_override_replaces_the_file_selection() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[agents]\nsurvey = \"claude\"\n").unwrap();
+		let from_file = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap();
+		assert_eq!(from_file.agents.survey, JobAgent::Claude);
+		let overridden = WorkerConfig::load(
+			Some(&path),
+			WorkerConfigOverrides { survey_agent: Some(JobAgent::Codex), ..Default::default() },
+		)
+		.unwrap();
+		assert_eq!(overridden.agents.survey, JobAgent::Codex);
+		let without_file = WorkerConfig::load(
+			None,
+			WorkerConfigOverrides { survey_agent: Some(JobAgent::Auto), ..Default::default() },
+		)
+		.unwrap();
+		assert_eq!(without_file.agents.survey, JobAgent::Auto);
+	}
+
+	#[test]
+	fn positional_agents_keep_their_field_order() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "agents = ['claude', 'codex', ['Model-A', 'high']]\n").unwrap();
+		let cfg = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap();
+		assert_eq!(cfg.agents.claude.model.for_operation(), "Model-A");
+		assert_eq!(cfg.agents.claude.effort.for_operation(), "high");
+	}
+
+	#[test]
+	fn invalid_survey_agent_is_rejected() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[agents]\nsurvey = \"llama\"\n").unwrap();
+		let err = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+		let msg = format!("{err:#}");
+		assert!(msg.contains("unknown variant") && msg.contains("bytes "), "got: {msg}");
 	}
 
 	#[test]

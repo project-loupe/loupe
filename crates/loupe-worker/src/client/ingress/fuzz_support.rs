@@ -46,6 +46,23 @@ fn received(original: &[u8]) -> Untrusted<Bytes, Server> {
 	Untrusted::new(bytes, unsafe { Ingress::<Server>::new() })
 }
 
+/// Decode a synthetic original Server body with a review response decoder,
+/// as the phase client receives it.
+pub fn review_response<V, O, E>(decoder: V, original: &[u8]) -> Result<O, E>
+where
+	V: for<'a> loupe_provenance::Validate<&'a [u8], Server, Output = O, Error = E>,
+{
+	received(original).as_bytes().validate(decoder)
+}
+
+/// As [`review_response`], for decoders that carry Agent content.
+pub fn review_response_carrying<V, O, E>(decoder: V, original: &[u8]) -> Result<O, E>
+where
+	V: for<'a> loupe_provenance::ValidateCarrying<&'a [u8], Server, Output = O, Error = E>,
+{
+	received(original).as_bytes().validate_carrying(decoder)
+}
+
 #[cfg(test)]
 pub(crate) fn lease_fixture(original: &[u8]) -> super::super::LeaseReceipt {
 	lease(&received(original)).expect("original synthetic lease fixture")

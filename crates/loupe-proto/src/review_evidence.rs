@@ -1,10 +1,10 @@
 //! Strict typed checkpoint envelopes; paths retain their exact Git identity.
 //! Worker idempotency keys remain separate from carried Agent semantics.
 //! ```compile_fail,E0277
-//! let _:loupe_proto::review_evidence::LeadCheckpointRequest=serde_json::from_str("{}").unwrap();
+//! let _:loupe_proto::review_evidence::LeadCheckpointRequest<loupe_provenance::Worker>=serde_json::from_str("{}").unwrap();
 //! ```
 //! ```compile_fail,E0277
-//! let _:loupe_proto::review_evidence::UnitResultCheckpointRequest=serde_json::from_str("{}").unwrap();
+//! let _:loupe_proto::review_evidence::UnitResultCheckpointRequest<loupe_provenance::Worker>=serde_json::from_str("{}").unwrap();
 //! ```
 use loupe_core::canonical;
 use loupe_core::review_payload::{
@@ -13,39 +13,68 @@ use loupe_core::review_payload::{
 };
 use loupe_core::text::policy::ClientKey;
 use loupe_core::text::{decode_json_string_bounded, IdentPolicy, Identifier};
-use loupe_provenance::{Agent, Unvalidated, Validate, ValidateCarrying, Worker};
+use loupe_provenance::{Agent, Source, Unvalidated, Validate, ValidateCarrying, Worker};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::review_api::ReviewProtocol;
 use crate::review_lease::ReviewId;
 
-// debug-ok: fields use redacted typed owners and closed protocol metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LeadCheckpointRequest {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct LeadCheckpointRequest<K: Source> {
 	pub protocol_version: ReviewProtocol,
-	pub client_lead_key: Identifier<ClientKey, Worker>,
+	pub client_lead_key: Identifier<ClientKey, K>,
 	pub evidence: LeadEvidenceV1<Agent>,
 }
 
-// debug-ok: fields use redacted typed owners and closed protocol metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct UnitResultCheckpointRequest {
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct UnitResultCheckpointRequest<K: Source> {
 	pub protocol_version: ReviewProtocol,
-	pub client_result_key: Identifier<ClientKey, Worker>,
+	pub client_result_key: Identifier<ClientKey, K>,
 	pub result: UnitResultPayloadV1<Agent>,
 }
 
-impl LeadCheckpointRequest {
-	pub fn digest(&self) -> Result<[u8; 32], serde_json::Error> {
-		Ok(canonical::digest(&canonical::canonical_bytes(&serde_json::to_value(self)?)))
-	}
+// Key source labels are fieldless markers without comparison traits.
+macro_rules! keyed_request_impls {
+	($name:ident { $key:ident, $payload:ident }) => {
+		impl<K: Source> Clone for $name<K> {
+			fn clone(&self) -> Self {
+				Self {
+					protocol_version: self.protocol_version,
+					$key: self.$key.clone(),
+					$payload: self.$payload.clone(),
+				}
+			}
+		}
+		impl<K: Source> PartialEq for $name<K> {
+			fn eq(&self, other: &Self) -> bool {
+				self.protocol_version == other.protocol_version
+					&& self.$key == other.$key
+					&& self.$payload == other.$payload
+			}
+		}
+		impl<K: Source> Eq for $name<K> {}
+		// Fields use redacted typed owners and closed protocol metadata.
+		impl<K: Source> std::fmt::Debug for $name<K> {
+			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				f.debug_struct(stringify!($name))
+					.field("protocol_version", &self.protocol_version)
+					.field(stringify!($key), &self.$key)
+					.field(stringify!($payload), &self.$payload)
+					.finish()
+			}
+		}
+		impl<K: Source> $name<K> {
+			pub fn digest(&self) -> Result<[u8; 32], serde_json::Error> {
+				Ok(canonical::digest(&canonical::canonical_bytes(&serde_json::to_value(self)?)))
+			}
+		}
+	};
 }
-impl UnitResultCheckpointRequest {
-	pub fn digest(&self) -> Result<[u8; 32], serde_json::Error> {
-		Ok(canonical::digest(&canonical::canonical_bytes(&serde_json::to_value(self)?)))
-	}
-}
+keyed_request_impls!(LeadCheckpointRequest { client_lead_key, evidence });
+keyed_request_impls!(UnitResultCheckpointRequest { client_result_key, result });
 
 // debug-ok: closed response vocabulary contains no content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +125,15 @@ pub struct UnitResultCheckpointResponse {
 	pub disposition: UnitResultDisposition,
 }
 
+exact_response_decoder!(
+	/// Decode a `leads` response from Server bytes.
+	LeadCheckpointResponseDecoder => LeadCheckpointResponse
+);
+exact_response_decoder!(
+	/// Decode a `review-unit-results` response from Server bytes.
+	UnitResultCheckpointResponseDecoder => UnitResultCheckpointResponse
+);
+
 type View<'v, 'a> = Unvalidated<'v, &'a [u8], Worker>;
 fn content<'a, T>(
 	u: &View<'_, 'a>, raw: &RawValue,
@@ -112,7 +150,7 @@ macro_rules! request_decoder {
 	($decoder:ident, $request:ident, $key:ident, $payload:ident, $content:ident) => {
 		pub struct $decoder;
 		impl ValidateCarrying<&[u8], Worker> for $decoder {
-			type Output = $request;
+			type Output = $request<Worker>;
 			type Error = Error;
 			fn validate(self, u: View<'_, '_>) -> Result<Self::Output, Error> {
 				if u.get().len() > 256 * 1024 {
@@ -175,10 +213,10 @@ mod tests {
 
 	use super::*;
 	use crate::test_support::worker_request;
-	fn decode_lead(raw: &str) -> Result<LeadCheckpointRequest, Error> {
+	fn decode_lead(raw: &str) -> Result<LeadCheckpointRequest<Worker>, Error> {
 		worker_request(raw.as_bytes()).validate_carrying(LeadCheckpointRequestDecoder)
 	}
-	fn decode_result(raw: &str) -> Result<UnitResultCheckpointRequest, Error> {
+	fn decode_result(raw: &str) -> Result<UnitResultCheckpointRequest<Worker>, Error> {
 		worker_request(raw.as_bytes()).validate_carrying(UnitResultCheckpointRequestDecoder)
 	}
 	fn lead() -> Value {
@@ -216,7 +254,7 @@ mod tests {
 	#[test]
 	fn complete_request_digest_binds_key_epoch_hint_and_exact_paths() {
 		let value = lead();
-		let original: LeadCheckpointRequest = decode_lead(&value.to_string()).unwrap();
+		let original: LeadCheckpointRequest<Worker> = decode_lead(&value.to_string()).unwrap();
 		let digest = original.digest().unwrap();
 		for (field, replacement) in [
 			("assignment_epoch", json!(1)),
@@ -263,7 +301,8 @@ mod tests {
 			assert!(decode_lead(&raw).is_err());
 		}
 		let result = json!({"protocol_version":3,"client_result_key":"result","result":{"format":"loupe.unit_result","version":1,"review_unit_id":1,"assignment_epoch":0,"disposition":"no_lead_found","inspected_refs":[{"path":"a.rs"}],"created_lead_ids":[],"counterevidence":"Guard holds","proof_gaps":"None"}});
-		let valid: UnitResultCheckpointRequest = decode_result(&result.to_string()).unwrap();
+		let valid: UnitResultCheckpointRequest<Worker> =
+			decode_result(&result.to_string()).unwrap();
 		assert!(valid.digest().is_ok());
 		for (field, value) in [
 			("created_lead_ids", json!([1])),

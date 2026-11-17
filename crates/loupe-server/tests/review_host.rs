@@ -1,6 +1,6 @@
-//! Real router/authentication/transaction coverage. Leases are explicit setup
-//! fixtures while phase claims remain closed; final B4 lifecycle tests must
-//! acquire their leases and handoffs through the public claim endpoint.
+//! Real router/authentication/transaction coverage with leases installed as
+//! explicit setup fixtures. Claims through the public lease endpoint are
+//! covered by `review_lifecycle` and the `review_worker_*` suites.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -155,9 +155,11 @@ async fn request(f: &Fixture, job: i64, route: &str, payload: Value) -> (StatusC
 }
 
 async fn response(f: &Fixture, request: Request<Body>) -> (StatusCode, Value) {
+	let route = request.uri().to_string();
 	let response = router(f.state.clone()).call(request).await.unwrap();
 	let status = response.status();
 	let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+	common::admit_phase_response(&route, status, &bytes);
 	let json = serde_json::from_slice(&bytes)
 		.unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)}));
 	(status, json)

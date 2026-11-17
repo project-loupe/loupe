@@ -1,5 +1,5 @@
-//! Actual router/mTLS calls with explicit fixture leases while runtime gates
-//! remain closed. No request gets a database mutation or authority bypass.
+//! Actual router/mTLS calls with explicit fixture leases. No request gets a
+//! database mutation or authority bypass.
 use loupe_storage::review_units;
 
 use super::*;

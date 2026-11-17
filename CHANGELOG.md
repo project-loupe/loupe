@@ -11,7 +11,7 @@
 - Add campaign-aware review scheduling with frozen budgets, resumable survey batches, bounded fair claims, and deadline handling while preserving legacy leasing.
 - File GitHub issues through a server-wide GitHub App by default, with repo-scoped short-lived installation tokens, an optional tracker-owner allowlist, and a schema v4 bump; keep per-repo PATs as a fallback.
 - Add guarded schema v7 with lossless inventory paths and retained typed review evidence; preserve historical records and source metadata (see the [offline upgrade runbook](contrib/upgrading-schema-v7.md)).
-- Expose authenticated pre-proof survey, drilldown and verification APIs with transaction-bound authority, independent checkpoints, bounded context and finishing-worker receipt replay. Current workers advertise no phase capabilities and production triggers remain legacy.
+- Expose authenticated pre-proof survey, drilldown and verification APIs with transaction-bound authority, independent checkpoints, bounded context and finishing-worker receipt replay. Production triggers remain legacy.
 - Add attempt-bound checkout preparation, resumable lossless manifests and immutable review-profile publication; retain durable deferrals for unsupported successor work.
 - Admit pending work by risk at claim time, protect urgent and mandatory verification capacity, and commit validated lease responses with their assignments and one-time charges. Preserve unfinished evidence through retries, cancellation and exhausted budgets.
 - Render GitHub reports as readable prose that wraps, keeping agent text inert with inline code instead of per-field code blocks.
@@ -20,6 +20,8 @@
 - Allow explicit quiescent reset of incompatible derived generations without dropping canonical findings, mandatory verification intent or replay history.
 - Reject non-string encodings of closed review evidence values.
 - Reject the array form of review phase request, phase lease and generation reset objects.
+- Run review surveys on workers: a worker with a ready survey agent (`[agents] survey`, `--survey-agent` or `LOUPE_SURVEY_AGENT`, default `auto` like `scan` and `verify`) advertises `review:survey:v1`, pins and inventories the generation's tree, and drives the agent through the survey tool catalog until it finalizes.
+- Decode worker-side review responses strictly, rejecting malformed or unexpected server replies instead of ignoring them.
 
 ## v0.1 — 2026-09-07
 

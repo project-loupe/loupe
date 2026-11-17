@@ -130,9 +130,10 @@ async fn claude_reaches_fake_upstream_only_through_the_broker() {
 			timeout: Duration::from_secs(10),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await
 		.expect("Claude must run through the real no-egress sandbox and model proxy");
@@ -260,9 +261,10 @@ exec /usr/bin/curl --silent --show-error --fail-with-body -X POST "${base_url}/r
 			timeout: Duration::from_secs(10),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await
 		.expect("Codex must run through the real no-egress sandbox and model proxy");
@@ -345,9 +347,10 @@ async fn selected_claude_cli_reaches_the_messages_contract() {
 			timeout: Duration::from_secs(3),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await;
 
@@ -421,9 +424,10 @@ async fn selected_codex_cli_reaches_the_responses_contract() {
 			timeout: Duration::from_secs(3),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await;
 
@@ -515,9 +519,10 @@ async fn selected_claude_cli_completes_a_local_response_with_the_exact_prompt() 
 			timeout: Duration::from_secs(15),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			job_id: None,
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: None,
-			finding_id: None,
 		})
 		.await;
 	server.abort();
@@ -752,9 +757,10 @@ async fn codex_cli_commands_and_mcp_with_daybreak(
 			timeout: Duration::from_secs(30),
 			cancel: CancellationToken::new(),
 			repo_id: Some(7),
-			job_id: None,
+			mcp_mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: None },
+			survey: None,
+			token_budget: None,
 			job_capability: Some(loupe_proto::JobCapability::from_secret("host-job-capability")),
-			finding_id: None,
 		})
 		.await;
 	server.abort();

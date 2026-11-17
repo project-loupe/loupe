@@ -6,15 +6,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use loupe_core::security_event::Operation;
 use loupe_core::text::policy::RevisionText;
 use loupe_core::text::BoundedText;
 use loupe_proto::{
-	CompleteOutcome, FindingsBatch, JobCapability, LeaseEnvelope, LeasePayload, LeaseResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	CompleteOutcome, JobCapability, LeaseEnvelope, LeasePayload, LeaseResponse, PROTOCOL_VERSION,
 };
 use loupe_provenance::{Agent, Ingress, Repo, Server, Untrusted};
 use tokio_util::sync::CancellationToken;
@@ -22,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use crate::client::ServerClient;
 use crate::host_outcome::{CheckoutFailure, HostVerifyReason, ReviewedRevisionFact};
 use crate::repo_cache::{RepoCache, RepoKey};
-use crate::scanner::{ScanContext, Scanner, VerifyContext};
+use crate::scanner::Scanner;
+#[cfg(test)]
+use crate::scanner::{ScanContext, VerifyContext};
+mod legacy;
 mod repo_ingress;
 #[cfg(fuzzing)]
 pub use repo_ingress::fuzz_support as fuzz_repo;
@@ -66,7 +68,7 @@ impl CheckedOutWorktree {
 
 #[derive(serde::Serialize)]
 #[serde(untagged)]
-enum CompletionRevision {
+pub(crate) enum CompletionRevision {
 	CheckedOut(BoundedText<RevisionText, Repo>),
 	Reviewed(BoundedText<RevisionText, Server>),
 }
@@ -89,6 +91,49 @@ pub(crate) struct RunnerCompletion {
 	error: Option<CompletionDiagnostic>,
 }
 
+/// A lease's repository in the bare cache, pinned against eviction
+/// while a job uses it.
+pub(crate) struct LeaseRepo {
+	cache: Arc<RepoCache>,
+	key: RepoKey,
+	clone_url: BoundedText<loupe_core::text::policy::CloneUrl, Server>,
+	github_pat: Option<Arc<loupe_provenance::Secret<String>>>,
+	ensured: crate::repo_cache::EnsuredRepo,
+}
+
+impl LeaseRepo {
+	/// Refresh (or clone) the lease's repository into the cache.
+	pub(crate) async fn ensure(
+		cache: &Arc<RepoCache>, repo: &loupe_core::RepoSpec<Server>,
+		github_pat: Option<loupe_provenance::Secret<String>>,
+	) -> Result<Self> {
+		let key = RepoKey::new(repo.host.expose(), repo.owner.expose(), repo.repo.expose())?;
+		let clone_url = repo.clone_url.clone();
+		let github_pat = github_pat.map(Arc::new);
+		let ensured = cache.ensure_repo(&key, clone_url.expose(), github_pat.as_ref()).await?;
+		Ok(Self { cache: cache.clone(), key, clone_url, github_pat, ensured })
+	}
+
+	/// Path of the bare cache clone.
+	pub(crate) fn path(&self) -> &Path {
+		&self.ensured.path
+	}
+
+	/// Discard the cached clone and clone it afresh. The current pin is
+	/// released first so the cache may replace the entry.
+	pub(crate) async fn reclone(self) -> Result<Self> {
+		let Self { cache, key, clone_url, github_pat, ensured } = self;
+		drop(ensured);
+		let ensured = cache.reclone_repo(&key, clone_url.expose(), github_pat.as_ref()).await?;
+		Ok(Self { cache, key, clone_url, github_pat, ensured })
+	}
+
+	/// Hand the cache pin to a worktree checked out from this clone.
+	pub(crate) fn pin(self, worktree: CheckedOutWorktree) -> CheckedOutWorktree {
+		worktree.pinned(self.ensured._pin)
+	}
+}
+
 pub struct Runner {
 	client: Arc<ServerClient>,
 	cache: Arc<RepoCache>,
@@ -96,6 +141,9 @@ pub struct Runner {
 	capabilities: Vec<&'static str>,
 	max_workdir_bytes: u64,
 	credential_watches: Vec<crate::llm::model_broker::CredentialWatch>,
+	/// The agent that runs survey leases; without one they fail closed.
+	survey_backend: Option<Arc<dyn crate::llm::LlmBackend>>,
+	survey_clock: crate::review::session::Clock,
 }
 
 impl Runner {
@@ -111,7 +159,26 @@ impl Runner {
 			capabilities,
 			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 			credential_watches: Vec::new(),
+			survey_backend: None,
+			survey_clock: Arc::new(std::time::SystemTime::now),
 		}
+	}
+
+	/// Run survey leases with `backend`.
+	pub fn with_survey_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.survey_backend = Some(backend);
+		self
+	}
+
+	pub(crate) fn survey_clock(&self) -> &crate::review::session::Clock {
+		&self.survey_clock
+	}
+
+	/// Replace the clock survey sessions read their deadlines against.
+	#[cfg(any(test, feature = "test-support"))]
+	pub fn with_survey_clock(mut self, clock: crate::review::session::Clock) -> Self {
+		self.survey_clock = clock;
+		self
 	}
 	pub fn with_credential_watches(
 		mut self, watches: Vec<crate::llm::model_broker::CredentialWatch>,
@@ -127,12 +194,47 @@ impl Runner {
 		self
 	}
 
+	/// Review phases this worker runs: survey exactly when it has a survey
+	/// backend. Drilldown and verify are not run, so never advertised.
+	fn review_capabilities(
+		&self,
+	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
+	{
+		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
+		let phases = match self.survey_backend {
+			Some(_) => vec![ReviewCapability::Survey],
+			None => Vec::new(),
+		};
+		LeaseList::new(phases).map_err(|error| anyhow::anyhow!(error))
+	}
+
+	pub(crate) fn client(&self) -> &ServerClient {
+		&self.client
+	}
+
+	pub(crate) fn cache(&self) -> &Arc<RepoCache> {
+		&self.cache
+	}
+
+	/// Fail a job whose checkout exceeds the per-job workdir size cap.
+	pub(crate) fn enforce_workdir_cap(&self, workdir_size: u64) -> Result<()> {
+		if workdir_size > self.max_workdir_bytes {
+			anyhow::bail!(
+				"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
+				self.max_workdir_bytes
+			);
+		}
+		Ok(())
+	}
+
 	/// Run one iteration: long-poll for a job and, if one arrives, run
 	/// it. Returns `true` if a job was processed, `false` if the long-
 	/// poll window elapsed without one.
 	pub async fn step(&self, cancel: &CancellationToken) -> Result<bool> {
-		let receipt =
-			self.client.lease_for_runner(self.capabilities.clone(), LEASE_WAIT_SECONDS).await?;
+		let receipt = self
+			.client
+			.lease_with(self.capabilities.clone(), self.review_capabilities()?, LEASE_WAIT_SECONDS)
+			.await?;
 		match receipt.response {
 			LeaseResponse::Empty { .. } => Ok(false),
 			LeaseResponse::Lease(env) => {
@@ -178,7 +280,17 @@ impl Runner {
 			},
 			self.credential_watches.clone(),
 		)?;
-		let heartbeat = self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone());
+		let (heartbeat, phase_heartbeat) = match self.survey_hard_deadline(&env) {
+			Some(deadline) => {
+				let phase = PhaseHeartbeat::new(scan_cancel.child_token());
+				let task =
+					self.spawn_phase_heartbeat(job_id, job_capability.clone(), deadline, &phase);
+				(task, Some(phase))
+			},
+			None => {
+				(self.spawn_heartbeat(job_id, job_capability.clone(), scan_cancel.clone()), None)
+			},
+		};
 		let execution_cancel = scan_cancel.child_token();
 		let task_cancel = execution_cancel.clone();
 		let quarantine_cancel = security.cancellation();
@@ -197,6 +309,7 @@ impl Runner {
 				scanner_patch,
 				execution_cancel.clone(),
 				security.clone(),
+				phase_heartbeat,
 			)
 			.await;
 		// Heartbeat cleanup cancels this token even after a healthy execution.
@@ -207,6 +320,11 @@ impl Runner {
 		scan_cancel.cancel();
 		let _ = heartbeat.await;
 		let _ = cancellation.await;
+		let outcome = match outcome {
+			Ok(Executed::Reported) => return Ok(()),
+			Ok(Executed::Legacy(head_sha)) => Ok(head_sha),
+			Err(error) => Err(error),
+		};
 		let outcome = if security.is_quarantined() {
 			Err(crate::canary::JobQuarantined.into())
 		} else if execution_cancelled || cancel.is_cancelled() {
@@ -264,272 +382,53 @@ impl Runner {
 		}
 	}
 
+	/// Dispatch one lease to the handler for its payload.
 	async fn execute(
 		&self, env: LeaseEnvelope<Agent, Server>, reviewed_revision: ReviewedRevisionFact,
 		scanner_patch: Option<crate::source_discovery::ScannerConfigPatch>,
 		cancel: CancellationToken, security: Arc<crate::canary::JobSecurity>,
-	) -> Result<Option<CompletionRevision>> {
+		heartbeat: Option<PhaseHeartbeat>,
+	) -> Result<Executed> {
 		anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-		// An unexpected server response must not fetch repository contents.
-		if matches!(
-			&env.payload,
-			LeasePayload::ReviewSurvey(_)
-				| LeasePayload::ReviewDrilldown(_)
-				| LeasePayload::ReviewVerify(_)
-		) {
-			anyhow::bail!("review lease arrived but phase execution is not enabled");
-		}
-		let tool_boundary = crate::llm::prompt::JobToolBoundary::new()?;
-		let key =
-			RepoKey::new(env.repo.host.expose(), env.repo.owner.expose(), env.repo.repo.expose())?;
-		let clone_url = env.repo.clone_url.clone();
-		let github_pat = env.github_pat.map(Arc::new);
-		let mut ensured =
-			self.cache.ensure_repo(&key, env.repo.clone_url.expose(), github_pat.as_ref()).await?;
-		// `ensured` (and its pin) lives until the end of this fn; the
-		// repo cache won't evict the bare clone while the worktree
-		// alternate is still in use.
-
-		match env.payload {
-			LeasePayload::ReviewSurvey(_)
-			| LeasePayload::ReviewDrilldown(_)
-			| LeasePayload::ReviewVerify(_) => {
-				unreachable!("review payloads are rejected before repository access")
-			},
-			LeasePayload::Verify { finding_id, finding, reviewed_sha: _ } => {
-				let ReviewedRevisionFact::Available(revision) = reviewed_revision else {
-					self.submit_revision_unavailable_verdict(
-						env.job_id,
-						&env.job_capability,
-						finding_id,
-						HostVerifyReason::MissingReviewedRevision,
-						&security,
-						&cancel,
-					)
-					.await?;
-					return Ok(None);
-				};
-				// The lease decoder retains the Server mark through this operational view.
-				let reviewed_sha = revision.clone().into_revision();
-				let (workdir, head_sha) =
-					match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
-						Ok(ok) => ok,
-						Err(first_error) => {
-							tracing::warn!(
-								job_id = env.job_id,
-								finding_id,
-								error = %first_error,
-								"verify revision missing from refreshed cache; re-cloning",
-							);
-							drop(ensured);
-							ensured = self
-								.cache
-								.reclone_repo(&key, clone_url.expose(), github_pat.as_ref())
-								.await?;
-							match checkout_revision(&ensured.path, reviewed_sha.expose()).await {
-								Ok(ok) => ok,
-								Err(second_error) => {
-									self.submit_revision_unavailable_verdict(
-										env.job_id,
-										&env.job_capability,
-										finding_id,
-										HostVerifyReason::ReviewedRevisionUnavailable {
-											revision,
-											failure: second_error
-												.downcast_ref::<CheckoutFailure>()
-												.copied()
-												.unwrap_or(CheckoutFailure::Task),
-										},
-										&security,
-										&cancel,
-									)
-									.await?;
-									return Ok(Some(CompletionRevision::Reviewed(reviewed_sha)));
-								},
-							}
-						},
-					};
-				let workdir = workdir.pinned(ensured._pin);
-				let workdir_size = crate::repo_cache::dir_size(workdir.path());
-				if workdir_size > self.max_workdir_bytes {
-					anyhow::bail!(
-						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
-						self.max_workdir_bytes
-					);
-				}
-				let vctx = VerifyContext {
-					sandbox_workdir: workdir.sandbox_path(),
-					security: security.clone(),
-					tool_boundary,
-					workdir: workdir.path().to_path_buf(),
-					repo: env.repo.clone(),
-					repo_id: env.repo_id,
-					job_id: env.job_id,
-					job_capability: env.job_capability.clone(),
-					finding_id,
-					finding: *finding,
-					config: scanner_patch,
-					cancel: cancel.clone(),
-				};
-				// The server filters leases by advertised capabilities. This worker
-				// selects the first scanner with any verify:* tag, without per-tag matching.
-				let verifier = self
-					.scanners
-					.iter()
-					.find(|s| s.capabilities().iter().any(|c| c.starts_with("verify:")))
-					.ok_or_else(|| {
-						anyhow::anyhow!(
-							"verify lease arrived but worker advertises no verify:* scanner"
-						)
-					})?;
-				anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-				let outcome = verifier.verify(&vctx).await?;
-				security.admit(Operation::SubmitVerdict)?;
-				anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-				match outcome {
-					crate::VerifyOutcome::Host(reason) => {
-						security
-							.run(
-								Operation::SubmitVerdict,
-								self.client.submit_host_verdict(
-									env.job_id,
-									&env.job_capability,
-									reason,
-								),
-							)
-							.await?;
-					},
-					crate::VerifyOutcome::Verdict(verdict) => {
-						tracing::info!(
-							job_id = env.job_id,
-							finding_id,
-							verifier = verifier.id(),
-							"submitting verdict (in-process verifier)"
-						);
-						security
-							.run(
-								Operation::SubmitVerdict,
-								self.client.submit_verdict(
-									env.job_id,
-									&env.job_capability,
-									&VerdictSubmission {
-										protocol_version: PROTOCOL_VERSION,
-										verdict,
-									},
-								),
-							)
-							.await?;
-					},
-					crate::VerifyOutcome::Submitted => {
-						// MCP-driven verifier already POSTed via the MCP
-						// child's session-end flush. POSTing again from
-						// here would land a duplicate verification row;
-						// the runner stays out of the way.
-						tracing::info!(
-							job_id = env.job_id,
-							finding_id,
-							verifier = verifier.id(),
-							"verifier submitted verdict via MCP (runner skipping POST)"
-						);
-					},
-				}
-				Ok(Some(CompletionRevision::CheckedOut(head_sha)))
-			},
-			LeasePayload::Scan { since_sha } => {
-				tracing::info!(job_id = env.job_id, "checking out worktree");
-				let (workdir, head_sha) = match checkout_latest(
-					&ensured.path,
-					env.head_branch.as_ref().map(|v| v.expose()),
+		match (&env.payload, &self.survey_backend, heartbeat) {
+			(LeasePayload::ReviewSurvey(lease), Some(backend), Some(heartbeat)) => {
+				let limits = lease.provenance.limits.clone();
+				crate::review::survey::run(
+					self, backend, env, &limits, cancel, security, heartbeat,
 				)
-				.await
-				{
-					Ok(ok) => ok,
-					Err(first_error) => {
-						tracing::warn!(
-							job_id = env.job_id,
-							error = %first_error,
-							"scan checkout failed from refreshed cache; re-cloning",
-						);
-						drop(ensured);
-						ensured = self
-							.cache
-							.reclone_repo(&key, clone_url.expose(), github_pat.as_ref())
-							.await?;
-						checkout_latest(&ensured.path, env.head_branch.as_ref().map(|v| v.expose()))
-							.await?
-					},
-				};
-				let workdir = workdir.pinned(ensured._pin);
-				let workdir_size = crate::repo_cache::dir_size(workdir.path());
-				tracing::info!(job_id = env.job_id, workdir_bytes = workdir_size, "worktree ready");
-				if workdir_size > self.max_workdir_bytes {
-					anyhow::bail!(
-						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
-						self.max_workdir_bytes
-					);
-				}
-				let ctx = ScanContext {
-					sandbox_workdir: workdir.sandbox_path(),
-					security: security.clone(),
-					tool_boundary,
-					workdir: workdir.path().to_path_buf(),
-					repo: env.repo.clone(),
-					repo_id: env.repo_id,
-					job_id: env.job_id,
-					job_capability: env.job_capability.clone(),
-					head_sha: head_sha.clone(),
-					base_sha: since_sha,
-					config: scanner_patch,
-					cancel: cancel.clone(),
-				};
-
-				let mut all = Vec::new();
-				for s in &self.scanners {
-					security.admit(Operation::SubmitFindings)?;
-					anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-					tracing::info!(job_id = env.job_id, scanner = s.id(), "running scanner");
-					let result = s.scan(&ctx).await;
-					security.admit(Operation::SubmitFindings)?;
-					anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-					match result {
-						Ok(mut findings) => {
-							// `returned_count` is the number of findings the
-							// scanner handed back for the runner to batch-POST
-							// to `/v1/jobs/{id}/findings` below. It's NOT the
-							// total submission count for the job — agent-driven
-							// scanners (e.g. `llm-code-review`) submit
-							// mid-session via the MCP `submit_finding` tool and
-							// always return an empty `Vec`, so a zero here only
-							// means "nothing was added to the batch." Check the
-							// server's findings table for the actual emission
-							// count when an agent scanner runs.
-							tracing::info!(
-								job_id = env.job_id,
-								scanner = s.id(),
-								returned_count = findings.len(),
-								"scanner finished",
-							);
-							all.append(&mut findings);
-						},
-						Err(_) => {
-							tracing::warn!(scanner = s.id(), "scanner failed");
-							anyhow::bail!("scanner failed");
-						},
-					}
-				}
-				anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-				if !all.is_empty() {
-					let batch = FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all };
-					security
-						.run(
-							Operation::SubmitFindings,
-							self.client.submit_findings(env.job_id, &env.job_capability, &batch),
-						)
-						.await?;
-				}
-				Ok(Some(CompletionRevision::CheckedOut(head_sha)))
+				.await;
+				Ok(Executed::Reported)
+			},
+			(
+				LeasePayload::ReviewSurvey(_)
+				| LeasePayload::ReviewDrilldown(_)
+				| LeasePayload::ReviewVerify(_),
+				..,
+			) => self.execute_review(env).map(Executed::Legacy),
+			(LeasePayload::Scan { .. } | LeasePayload::Verify { .. }, ..) => {
+				legacy::run(self, env, reviewed_revision, scanner_patch, cancel, security)
+					.await
+					.map(Executed::Legacy)
 			},
 		}
+	}
+
+	/// The hard deadline of a survey lease this runner executes.
+	fn survey_hard_deadline(&self, env: &LeaseEnvelope<Agent, Server>) -> Option<SystemTime> {
+		match (&env.payload, &self.survey_backend) {
+			(LeasePayload::ReviewSurvey(lease), Some(_)) => {
+				Some(crate::review::prepare::at(lease.provenance.limits.hard_deadline_at))
+			},
+			_ => None,
+		}
+	}
+
+	/// Review phase leases fail closed: an unexpected server response
+	/// must not fetch repository contents.
+	fn execute_review(
+		&self, _env: LeaseEnvelope<Agent, Server>,
+	) -> Result<Option<CompletionRevision>> {
+		anyhow::bail!("review lease arrived but phase execution is not enabled");
 	}
 
 	async fn submit_revision_unavailable_verdict(
@@ -549,6 +448,38 @@ impl Runner {
 				self.client.submit_host_verdict(job_id, job_capability, reason),
 			)
 			.await
+	}
+
+	/// The phase lease heartbeat. Its response only feeds the log; the
+	/// survey handler learns of lost authority from its own calls.
+	fn spawn_phase_heartbeat(
+		&self, job_id: i64, job_capability: JobCapability, deadline: SystemTime,
+		heartbeat: &PhaseHeartbeat,
+	) -> tokio::task::JoinHandle<()> {
+		let client = self.client.clone();
+		let cancel = heartbeat.stop.clone();
+		let stopped = heartbeat.stopped.clone();
+		tokio::spawn(async move {
+			let _stopped = stopped.drop_guard();
+			let job = crate::client::PhaseJob { job_id, capability: &job_capability, deadline };
+			loop {
+				tokio::select! {
+					biased;
+					_ = cancel.cancelled() => return,
+					result = async {
+						tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+						client.phase_heartbeat(&job).await
+					} => match result {
+						Ok(response) => tracing::debug!(
+							job_id,
+							lease_expires_at = response.lease_expires_at,
+							"phase heartbeat"
+						),
+						Err(_) => tracing::warn!(job_id, "phase heartbeat failed"),
+					},
+				}
+			}
+		})
 	}
 
 	fn spawn_heartbeat(
@@ -572,6 +503,14 @@ impl Runner {
 			}
 		})
 	}
+}
+
+/// How `execute` ended a lease that did not fail.
+pub(crate) enum Executed {
+	/// The legacy handler finished; the runner sends its completion.
+	Legacy(Option<CompletionRevision>),
+	/// A phase handler already sent the job's terminal call, if any.
+	Reported,
 }
 
 /// Produce a fresh worktree from the bare clone at `bare` checked out
@@ -617,6 +556,38 @@ fn submodule_paths(tree: &git2::Tree<'_>) -> Result<Vec<repo_ingress::Repository
 	})
 	.context("inspecting repository submodules")?;
 	Ok(paths)
+}
+
+/// One commit in a bare clone, as libgit2 reports it.
+pub(crate) struct CommitObservation<'a> {
+	pub(crate) repo: &'a git2::Repository,
+	pub(crate) commit: &'a git2::Commit<'a>,
+}
+
+/// The commit `sha` in the bare clone at `bare`, unavailable to `decoder`
+/// except as a `Repo` observation. Blocking.
+pub(crate) fn observe_commit<V, T>(
+	bare: &Path, sha: &str, decoder: V,
+) -> Result<T, crate::review::inventory::InventoryError>
+where
+	V: for<'a> loupe_provenance::Validate<
+		CommitObservation<'a>,
+		Repo,
+		Output = T,
+		Error = crate::review::inventory::InventoryError,
+	>,
+{
+	use crate::review::inventory::InventoryError;
+	let repo = git2::Repository::open_bare(bare).map_err(|_| InventoryError::CommitUnavailable)?;
+	let oid = git2::Oid::from_str(sha).map_err(|_| InventoryError::CommitUnavailable)?;
+	let commit = repo.find_commit(oid).map_err(|_| InventoryError::CommitUnavailable)?;
+	// SAFETY: the actual libgit2 repository and commit handles; every path,
+	// mode and object id the decoder reads comes from them before formatting.
+	#[allow(unsafe_code)]
+	let observation = Untrusted::new(CommitObservation { repo: &repo, commit: &commit }, unsafe {
+		Ingress::<Repo>::new()
+	});
+	observation.validate(decoder)
 }
 
 async fn checkout(
@@ -691,6 +662,38 @@ async fn checkout(
 		.await
 		.map_err(|_| CheckoutFailure::Task)??;
 	Ok((CheckedOutWorktree { directory: Arc::new(tmp), pin: None }, head_sha))
+}
+
+/// Control over a phase lease's heartbeat task, which the survey handler
+/// stops before its terminal call.
+pub(crate) struct PhaseHeartbeat {
+	stop: CancellationToken,
+	stopped: CancellationToken,
+}
+
+impl PhaseHeartbeat {
+	fn new(stop: CancellationToken) -> Self {
+		Self { stop, stopped: CancellationToken::new() }
+	}
+
+	/// A handle with no heartbeat task behind it.
+	#[cfg(test)]
+	fn idle() -> Self {
+		let heartbeat = Self::new(CancellationToken::new());
+		heartbeat.stopped.cancel();
+		heartbeat
+	}
+
+	/// The token that stops the heartbeat without waiting for it.
+	pub(crate) fn stop_token(&self) -> CancellationToken {
+		self.stop.clone()
+	}
+
+	/// Stop the heartbeat and wait until no heartbeat request is in flight.
+	pub(crate) async fn stop(&self) {
+		self.stop.cancel();
+		self.stopped.cancelled().await;
+	}
 }
 
 #[cfg(test)]
@@ -1002,6 +1005,7 @@ mod tests {
 					receipt.scanner_patch,
 					CancellationToken::new(),
 					security,
+					None,
 				)
 				.await
 				.err()
@@ -1024,6 +1028,117 @@ mod tests {
 		);
 		stop.cancel();
 		server.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_survey_backend_leaves_other_review_leases_failing_closed() {
+		use axum::body::Bytes;
+		use axum::extract::Json;
+		use loupe_proto::PROTOCOL_VERSION_HEADER;
+		use serde_json::json;
+
+		let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+		let record = seen.clone();
+		let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
+			let record = record.clone();
+			async move {
+				let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+				record.lock().unwrap().push((uri.path().to_owned(), body));
+				(
+					[(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())],
+					Json(
+						json!({"protocol_version":3,"job_id":1,"state":"queued","eligible_at":null}),
+					),
+				)
+			}
+		});
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+		let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		let tmp = tempfile::tempdir().unwrap();
+		let cache_path = tmp.path().join("cache");
+		let cache = Arc::new(RepoCache::new(cache_path.clone(), 1024, None).unwrap());
+		let client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
+		let backend = crate::llm::testing::StubLlmBackend::new("never-run", |_| {
+			panic!("an unsupported review lease reached the survey agent")
+		});
+		let runner = Runner::new(client, cache, Vec::new()).with_survey_backend(Arc::new(backend));
+		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
+			"limits":{"soft_deadline_at":100,"submit_by":100,"hard_deadline_at":200,
+			"token_budget":null,"new_unit_limit":32,"lead_limit":16,"sibling_limit":4}});
+		let generation = json!({"generation_id":3,"commit_sha":"a".repeat(40)});
+		let profile = json!({"profile_version":1,"profile_digest":"b".repeat(64),"profile":{"purpose":"test"}});
+		let lead = json!({"lead_id":4,"producer_commit_sha":"a".repeat(40),
+			"identity_family":"memory-safety","identity_anchor":"request allocation",
+			"hypothesis":"Unbounded allocation","source_refs":[{"path":"src/lib.rs"}],
+			"next_proof_step":"Trace allocation","counterevidence":"Authentication",
+			"proof_gaps":"No reproducer"});
+		let evidence = json!({"version":1,"l2_argument":{"attacker_source":"Remote request",
+			"control":"Request length","sink":"Allocation","reachable_path":"Handler calls allocator",
+			"trust_boundary":"Request to memory"},"material_locations":[{"role":"sink","file":"src/lib.rs"}],
+			"counterevidence":"Authentication precedes allocation",
+			"assumptions_gaps":"Authenticated attacker","confidence":"medium"});
+		let finding = json!({"finding_id":4,"reviewed_commit_sha":"a".repeat(40),"severity":"high",
+			"title":"Unbounded allocation","description":"Requests allocate without a limit",
+			"identity_family":"memory-safety","identity_anchor":"request allocation","evidence":evidence});
+		let cases = [
+			(
+				json!({"kind":"review_verify","provenance":provenance,"generation":generation,
+				"profile":profile,"finding":finding}),
+				false,
+			),
+			(
+				json!({"kind":"review_drilldown","provenance":provenance,"generation":generation,
+				"profile":profile,"lead":lead}),
+				false,
+			),
+			(
+				json!({"kind":"review_survey","provenance":provenance,"context":{
+				"recipe":"corroboration","generation":generation,"assignments":[]}}),
+				true,
+			),
+		];
+		for (payload, survey) in cases {
+			let lease = json!({"kind":"lease","protocol_version":PROTOCOL_VERSION,
+				"job_id":1,"job_capability":"test-capability","repo_id":1,
+				"repo":{"host":"invalid.test","owner":"test","repo":"test",
+					"clone_url":format!("file://{}/missing",tmp.path().display())},
+				"head_branch":null,"lease_expires_at":200,"scanner_config":null,"payload":payload});
+			let receipt = crate::client::test_lease(lease.to_string().as_bytes());
+			let LeaseResponse::Lease(env) = receipt.response else { panic!("lease fixture") };
+			let security = crate::canary::JobSecurity::new(Default::default(), vec![]).unwrap();
+			let executed = runner
+				.execute(
+					*env,
+					receipt.reviewed_revision,
+					receipt.scanner_patch,
+					CancellationToken::new(),
+					security,
+					Some(PhaseHeartbeat::idle()),
+				)
+				.await;
+			let requests = std::mem::take(&mut *seen.lock().unwrap());
+			if survey {
+				assert!(matches!(executed, Ok(Executed::Reported)), "corroboration is reported");
+				assert_eq!(
+					requests,
+					[(
+						"/v1/jobs/1/complete".to_owned(),
+						json!({"protocol_version":3,"outcome":"failed",
+							"error":"survey recipe unsupported"})
+					)]
+				);
+			} else {
+				assert_eq!(
+					executed.err().map(|error| error.to_string()).as_deref(),
+					Some("review lease arrived but phase execution is not enabled")
+				);
+				assert!(requests.is_empty(), "{requests:?}");
+			}
+			let cached = std::fs::read_dir(&cache_path).unwrap().count();
+			assert_eq!(cached, 0, "an unsupported review lease touched the repository cache");
+		}
+		server.abort();
 	}
 
 	struct NeverRunReviewScanner;

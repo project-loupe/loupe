@@ -24,6 +24,8 @@
 
 #[macro_use]
 mod record;
+#[macro_use]
+mod review_response;
 mod credential_wire;
 mod findings_admin;
 mod job_io;
@@ -45,6 +47,8 @@ mod version;
 
 #[cfg(test)]
 mod array_form_tests;
+#[cfg(test)]
+mod review_response_tests;
 #[cfg(test)]
 #[path = "../tests/support/fixtures.rs"]
 mod test_support;

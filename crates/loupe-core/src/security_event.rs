@@ -90,6 +90,19 @@ Operation {
 	McpSubmitFinding => "mcp_submit_finding",
 	McpSubmitVerdict => "mcp_submit_verdict",
 	McpSubmitPatch => "mcp_submit_patch",
+	McpGetJobLimits => "mcp_get_job_limits",
+	McpPublishProfile => "mcp_publish_profile",
+	McpProposeReviewUnit => "mcp_propose_review_unit",
+	McpSubmitLead => "mcp_submit_lead",
+	McpSubmitReviewUnitResult => "mcp_submit_review_unit_result",
+	McpSubmitInventoryDisposition => "mcp_submit_inventory_disposition",
+	McpQuerySameProjectLeadCandidates => "mcp_query_same_project_lead_candidates",
+	McpFinalizeSurvey => "mcp_finalize_survey",
+	PinTarget => "pin_target",
+	UploadInventory => "upload_inventory",
+	SealInventory => "seal_inventory",
+	PhaseHeartbeat => "phase_heartbeat",
+	PhaseFailure => "phase_failure",
 }
 }
 

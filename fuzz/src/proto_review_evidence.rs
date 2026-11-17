@@ -16,6 +16,7 @@ use loupe_proto::review_evidence::{
 	LeadOutcome, PriorityBand, UnitResultCheckpointRequest, UnitResultCheckpointRequestDecoder,
 	UnitResultCheckpointResponse,
 };
+use loupe_provenance::Worker;
 use loupe_server::fuzz_support::review_request;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -28,10 +29,10 @@ const PROTOCOL: u64 = loupe_proto::PROTOCOL_VERSION as u64;
 const PAYLOAD_CAP: usize = 64 * 1024;
 const VERSIONS: &[(&str, u64)] = &[("protocol_version", PROTOCOL), ("version", 1)];
 
-fn lead(raw: &[u8]) -> Option<LeadCheckpointRequest> {
+fn lead(raw: &[u8]) -> Option<LeadCheckpointRequest<Worker>> {
 	review_request(LeadCheckpointRequestDecoder, raw).ok()
 }
-fn result(raw: &[u8]) -> Option<UnitResultCheckpointRequest> {
+fn result(raw: &[u8]) -> Option<UnitResultCheckpointRequest<Worker>> {
 	review_request(UnitResultCheckpointRequestDecoder, raw).ok()
 }
 

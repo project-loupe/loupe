@@ -91,6 +91,10 @@ pub struct InventoryDispositionResponse {
 	pub inventory_entry_id: ReviewId,
 	pub revision: u64,
 }
+exact_response_decoder!(
+	/// Decode an `inventory-dispositions` response from Server bytes.
+	InventoryDispositionResponseDecoder => InventoryDispositionResponse
+);
 
 pub const MAX_REQUEST_BYTES: usize = 8192;
 pub struct InventoryDispositionRequestDecoder;
