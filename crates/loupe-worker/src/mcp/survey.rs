@@ -53,6 +53,24 @@ const TEXTS: PhaseTexts = PhaseTexts {
 	not_found: "the referenced object does not exist for this survey",
 };
 
+/// Only the keyed writes can be retried under a client key; the other
+/// calls are read-only or are made safe to replay by identical content.
+fn unreachable(tool: SurveyTool) -> &'static str {
+	match tool {
+		SurveyTool::JobLimits | SurveyTool::Candidates => phase::READ_UNREACHABLE,
+		SurveyTool::PublishProfile => {
+			"the server could not be reached after retries; retry later with the identical publish_profile call"
+		},
+		SurveyTool::Finalize => {
+			"the server could not be reached after retries; retry later with the identical finalize_survey call"
+		},
+		SurveyTool::ProposeUnit
+		| SurveyTool::Lead
+		| SurveyTool::UnitResult
+		| SurveyTool::Disposition => phase::UNREACHABLE,
+	}
+}
+
 async fn phase_error(
 	client: &ServerClient, survey: &SurveySession, tool: SurveyTool, error: PhaseError,
 ) -> String {
@@ -71,7 +89,7 @@ async fn phase_error(
 		survey.phase(),
 		&TEXTS,
 		limits_call,
-		phase::UNREACHABLE,
+		unreachable(tool),
 		record_limits,
 		error,
 	)

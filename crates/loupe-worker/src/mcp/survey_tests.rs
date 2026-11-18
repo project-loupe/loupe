@@ -649,3 +649,39 @@ async fn capacity_counts_new_leads_once_and_follows_quota_refusals() {
 	assert!(status(3).contains("review units remaining: 30; leads remaining: 0"), "{}", status(3));
 	assert!(status(4).contains("review units remaining: 0; leads remaining: 0"), "{}", status(4));
 }
+
+#[tokio::test]
+async fn unreachable_calls_without_a_client_key_are_not_told_to_reuse_one() {
+	let ordinary = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
+	let responses = run(
+		ordinary.context,
+		&[
+			call(1, "get_job_limits", json!({})),
+			call(2, "query_same_project_lead_candidates", json!({"query": "parse"})),
+			call(3, "finalize_survey", json!({"terminal_reason": "completed"})),
+			call(4, "submit_lead", lead_arguments("lead-1")),
+		],
+	)
+	.await;
+	let bootstrap =
+		fixture(SurveyRecipe::Bootstrap { profile_published: false }, Duration::ZERO).await;
+	let publish = run(
+		bootstrap.context,
+		&[call(1, "publish_profile", json!({"profile": {"purpose": "test"}}))],
+	)
+	.await;
+	for (response, expected) in [
+		(&responses[0], "retry later"),
+		(&responses[1], "retry later"),
+		(&responses[2], "identical finalize_survey call"),
+		(&publish[0], "identical publish_profile call"),
+	] {
+		let reply = text(response);
+		assert!(is_error(response), "{reply}");
+		assert!(reply.contains("could not be reached"), "{reply}");
+		assert!(!reply.contains("client key"), "{reply}");
+		assert!(reply.contains(expected), "{reply}");
+	}
+	let lead = text(&responses[3]);
+	assert!(lead.contains("SAME client key"), "{lead}");
+}

@@ -92,8 +92,11 @@ async fn phase_error(
 	}
 	let limits_call = tool == DrilldownTool::JobLimits;
 	let record_limits = |limits: &_| drilldown.record_limits(limits);
-	let unreachable =
-		if tool == DrilldownTool::Finalize { FINALIZE_UNREACHABLE } else { phase::UNREACHABLE };
+	let unreachable = match tool {
+		DrilldownTool::Finalize => FINALIZE_UNREACHABLE,
+		DrilldownTool::JobLimits | DrilldownTool::Candidates => phase::READ_UNREACHABLE,
+		DrilldownTool::SiblingLead => phase::UNREACHABLE,
+	};
 	phase::phase_error(
 		client,
 		drilldown.phase(),

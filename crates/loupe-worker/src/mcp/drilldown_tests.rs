@@ -284,9 +284,19 @@ async fn an_unreachable_finalize_is_told_to_retry_the_identical_call() {
 	let fixture = fixture(Duration::ZERO).await;
 	let responses = run(
 		fixture.context,
-		&[call(1, "finalize_drilldown", promote()), call(2, "submit_sibling_lead", sibling("s-1"))],
+		&[
+			call(1, "finalize_drilldown", promote()),
+			call(2, "submit_sibling_lead", sibling("s-1")),
+			call(3, "get_job_limits", json!({})),
+			call(4, "query_same_project_lead_candidates", json!({"query": "parse"})),
+		],
 	)
 	.await;
+	for read in &responses[2..] {
+		let reply = text(read);
+		assert!(reply.contains("could not be reached"), "{reply}");
+		assert!(!reply.contains("client key"), "{reply}");
+	}
 	let finalize = text(&responses[0]);
 	assert!(is_error(&responses[0]));
 	assert!(finalize.contains("could not be reached"), "{finalize}");

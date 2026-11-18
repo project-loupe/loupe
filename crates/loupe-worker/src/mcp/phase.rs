@@ -68,6 +68,9 @@ pub(super) struct PhaseTexts {
 }
 
 pub(super) const UNREACHABLE: &str = "the server could not be reached after retries; retry later with the SAME client key and identical content";
+/// For calls that only read, so carry neither a client key nor content.
+pub(super) const READ_UNREACHABLE: &str =
+	"the server could not be reached after retries; retry later";
 const INVALID: &str =
 	"the server rejected the request as invalid; check the arguments against the tool schema";
 
