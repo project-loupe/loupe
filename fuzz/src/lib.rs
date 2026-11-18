@@ -27,6 +27,7 @@ pub mod core_text_ident;
 pub mod core_text_json;
 pub mod core_text_repo_path;
 mod fixtures;
+mod phase_ingress_common;
 pub mod proto_dto;
 pub mod proto_review_api;
 mod proto_review_common;

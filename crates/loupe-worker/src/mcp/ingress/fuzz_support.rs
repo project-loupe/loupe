@@ -150,9 +150,9 @@ pub(crate) fn finding_fixture(
 	args.into_submission(workdir)
 }
 
-// debug-ok: Cfg-only synthetic observation of one survey record; values are fuzz assertions only.
+// debug-ok: Cfg-only synthetic observation of one phase record; values are fuzz assertions only.
 #[derive(Debug)]
-pub struct SurveyObservation {
+pub struct PhaseObservation {
 	/// The decoded tool label and, for accepted arguments, the exact request
 	/// bytes the host would send (with placeholder host fields).
 	pub decoded: Option<(String, Result<Vec<u8>, String>)>,
@@ -160,7 +160,7 @@ pub struct SurveyObservation {
 }
 
 /// One original record through the survey-catalog decoder.
-pub fn observe_survey_record(record: &[u8]) -> SurveyObservation {
+pub fn observe_survey_record(record: &[u8]) -> PhaseObservation {
 	observe_phase_record(
 		record,
 		Catalog::Survey,
@@ -170,7 +170,7 @@ pub fn observe_survey_record(record: &[u8]) -> SurveyObservation {
 }
 
 /// One original record through the drilldown-catalog decoder.
-pub fn observe_drilldown_record(record: &[u8]) -> SurveyObservation {
+pub fn observe_drilldown_record(record: &[u8]) -> PhaseObservation {
 	observe_phase_record(
 		record,
 		Catalog::Drilldown,
@@ -182,7 +182,7 @@ pub fn observe_drilldown_record(record: &[u8]) -> SurveyObservation {
 #[allow(unsafe_code)]
 fn observe_phase_record(
 	record: &[u8], catalog: Catalog, protocol_version: u16, bytes: fn(Arguments) -> Vec<u8>,
-) -> SurveyObservation {
+) -> PhaseObservation {
 	let scope = crate::ingress_text::observe::Scope::begin();
 	// SAFETY: cfg-only fixture is one complete original record.
 	let original = Untrusted::new(record.to_vec(), unsafe { Ingress::<Sandbox>::new() });
@@ -199,7 +199,7 @@ fn observe_phase_record(
 		},
 		_ => None,
 	};
-	SurveyObservation { decoded, agent_spans }
+	PhaseObservation { decoded, agent_spans }
 }
 
 fn survey_bytes(arguments: Arguments) -> Vec<u8> {

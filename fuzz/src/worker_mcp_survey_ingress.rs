@@ -3,9 +3,9 @@
 //! content, and admitted arguments always serialize as a valid phase request.
 use loupe_worker::mcp::fuzz_support::observe_survey_record;
 
+use crate::phase_ingress_common as common;
 use crate::utils::test_logger;
 
-const SENTINEL: &str = "zq9sentinel";
 const TOOLS: [&str; 9] = [
 	"get_job_limits",
 	"publish_profile",
@@ -44,64 +44,23 @@ const FIELDS: [&str; 24] = [
 	"profile",
 ];
 
-/// A structured record whose every string carries the sentinel.
-fn structured(data: &[u8]) -> Vec<u8> {
-	let tool = TOOLS[usize::from(data.first().copied().unwrap_or(0)) % TOOLS.len()];
-	let mut members = Vec::new();
-	for chunk in data.get(1..).unwrap_or_default().chunks(3) {
-		let field = FIELDS[usize::from(chunk[0]) % FIELDS.len()];
-		let length = usize::from(chunk.get(1).copied().unwrap_or(0)) * 24;
-		let text = format!("{SENTINEL}{}", "a".repeat(length));
-		let value = match chunk.get(2).copied().unwrap_or(0) % 8 {
-			0 => format!("{text:?}"),
-			1 => format!("[{{\"path\":{text:?}}}]"),
-			2 => format!("{{\"k\":{text:?}}}"),
-			3 => "[4,5]".to_owned(),
-			4 => "7".to_owned(),
-			5 => "\"mapped\"".to_owned(),
-			6 => "\"high\"".to_owned(),
-			_ => "null".to_owned(),
-		};
-		members.push(format!("{field:?}:{value}"));
+/// A field value of the given shape, its strings carrying `text`.
+fn value(text: &str, shape: u8) -> String {
+	match shape % 8 {
+		0 => format!("{text:?}"),
+		1 => format!("[{{\"path\":{text:?}}}]"),
+		2 => format!("{{\"k\":{text:?}}}"),
+		3 => "[4,5]".to_owned(),
+		4 => "7".to_owned(),
+		5 => "\"mapped\"".to_owned(),
+		6 => "\"high\"".to_owned(),
+		_ => "null".to_owned(),
 	}
-	format!(
-		r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{{}}}}}}}"#,
-		members.join(",")
-	)
-	.into_bytes()
 }
 
 pub fn do_test(data: &[u8]) {
-	if data.len() > 65_536 {
-		return;
-	}
-	let record = match data.first().copied().unwrap_or(0) % 2 {
-		0 => data.get(1..).unwrap_or_default().to_vec(),
-		_ => structured(data.get(1..).unwrap_or_default()),
-	};
-	if record.contains(&b'\n') {
-		return;
-	}
-	let observed = observe_survey_record(&record);
-	for span in &observed.agent_spans {
-		assert!(record.get(span.clone()).is_some(), "Agent carry escaped the original record");
-	}
-	let Some((tool, arguments)) = observed.decoded else { return };
-	if tool == "unknown" || tool == "submit_finding" {
-		assert!(arguments.is_err(), "a name outside the survey catalog decoded arguments");
-	}
-	if let Err(error) = arguments {
-		assert!(!error.contains(SENTINEL), "argument error echoed Agent content: {error}");
-		for span in &observed.agent_spans {
-			let token = &record[span.clone()];
-			let inner =
-				token.strip_prefix(b"\"").and_then(|t| t.strip_suffix(b"\"")).unwrap_or(token);
-			if inner.len() >= 12 {
-				let inner = String::from_utf8_lossy(inner);
-				assert!(!error.contains(&*inner), "argument error echoed an Agent token: {error}");
-			}
-		}
-	}
+	let Some(record) = common::record(data, &TOOLS, &FIELDS, value) else { return };
+	common::check(&record, &["submit_finding"], observe_survey_record);
 }
 
 pub fn worker_mcp_survey_ingress_test<Out: test_logger::Output>(data: &[u8], _out: Out) {
