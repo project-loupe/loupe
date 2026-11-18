@@ -2,7 +2,9 @@
 //! epochs and revisions, call the phase client, update the attempt state and
 //! answer with fixed host text. Server response bodies never reach the model.
 
-use loupe_proto::review_api::{PublishProfileRequest, ReviewErrorCode, ReviewProtocol};
+use loupe_proto::review_api::{
+	PhaseLimitsResponse, PublishProfileRequest, ReviewErrorCode, ReviewProtocol,
+};
 use loupe_proto::review_evidence::{
 	LeadCheckpointRequest, LeadOutcome, UnitResultCheckpointRequest,
 };
@@ -10,11 +12,11 @@ use loupe_proto::review_inventory::{InventoryDispositionRequest, UnitMapping};
 use loupe_proto::review_lease::LeaseList;
 use loupe_proto::review_terminal::FinalizeSurveyRequest;
 
-use super::phase::{forbidden, PhaseTexts};
+use super::phase::PhaseTexts;
 use super::*;
 use crate::client::PhaseError;
 use crate::review::gate::{Admission, SurveyTool};
-use crate::review::session::SurveySession;
+use crate::review::session::{PhaseSession, SurveySession};
 
 pub(super) fn tool(name: &ingress::ToolName) -> Option<SurveyTool> {
 	use ingress::ToolName;
@@ -71,29 +73,34 @@ fn unreachable(tool: SurveyTool) -> &'static str {
 	}
 }
 
-async fn phase_error(
-	client: &ServerClient, survey: &SurveySession, tool: SurveyTool, error: PhaseError,
-) -> String {
-	if !forbidden(&error)
-		&& let PhaseError::Rejected {
-			code: ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit,
-			..
-		} = error
-	{
-		survey.record_exhausted(tool);
+impl phase::PhaseCalls for SurveySession {
+	type Tool = SurveyTool;
+
+	const TEXTS: PhaseTexts = TEXTS;
+
+	fn phase(&self) -> &PhaseSession {
+		SurveySession::phase(self)
 	}
-	let limits_call = tool == SurveyTool::JobLimits;
-	let record_limits = |limits: &_| survey.record_limits(limits);
-	phase::phase_error(
-		client,
-		survey.phase(),
-		&TEXTS,
-		limits_call,
-		unreachable(tool),
-		record_limits,
-		error,
-	)
-	.await
+
+	fn exhausts(code: ReviewErrorCode) -> bool {
+		matches!(code, ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit)
+	}
+
+	fn record_exhausted(&self, tool: SurveyTool) {
+		SurveySession::record_exhausted(self, tool);
+	}
+
+	fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		SurveySession::record_limits(self, limits);
+	}
+
+	fn limits_call(tool: SurveyTool) -> bool {
+		tool == SurveyTool::JobLimits
+	}
+
+	fn unreachable(tool: SurveyTool) -> &'static str {
+		unreachable(tool)
+	}
 }
 
 /// A phase call's result, with a failure turned into fixed model text.
@@ -102,7 +109,7 @@ async fn settle<T>(
 ) -> Result<T> {
 	match result {
 		Ok(value) => Ok(value),
-		Err(error) => Err(refuse(phase_error(client, survey, tool, error).await)),
+		Err(error) => Err(refuse(phase::phase_error(client, survey, tool, error).await)),
 	}
 }
 
@@ -214,7 +221,7 @@ pub(super) async fn dispatch(
 					{
 						survey.record_revision(&path, revision);
 					}
-					Err(refuse(phase_error(client, survey, tool, error).await))
+					Err(refuse(phase::phase_error(client, survey, tool, error).await))
 				},
 			}
 		},

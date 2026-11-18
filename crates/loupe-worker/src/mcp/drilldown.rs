@@ -2,7 +2,7 @@
 //! client, update the attempt state and answer with fixed host text. Server
 //! response bodies never reach the model.
 
-use loupe_proto::review_api::{ReviewErrorCode, ReviewProtocol};
+use loupe_proto::review_api::{PhaseLimitsResponse, ReviewErrorCode, ReviewProtocol};
 use loupe_proto::review_drilldown::FinalizeDrilldownRequest;
 use loupe_proto::review_evidence::{LeadCheckpointRequest, LeadOutcome};
 
@@ -10,7 +10,7 @@ use super::phase::{forbidden, PhaseTexts};
 use super::*;
 use crate::client::PhaseError;
 use crate::review::gate::{Admission, DrilldownTool};
-use crate::review::session::DrilldownSession;
+use crate::review::session::{DrilldownSession, PhaseSession};
 
 pub(super) fn tool(name: &ingress::ToolName) -> Option<DrilldownTool> {
 	use ingress::ToolName;
@@ -79,34 +79,42 @@ fn own_text(tool: DrilldownTool, error: &PhaseError) -> Option<&'static str> {
 	})
 }
 
-async fn phase_error(
-	client: &ServerClient, drilldown: &DrilldownSession, tool: DrilldownTool, error: PhaseError,
-) -> String {
-	if !forbidden(&error)
-		&& let PhaseError::Rejected { code: ReviewErrorCode::CheckpointLimit, .. } = error
-	{
-		drilldown.record_exhausted(tool);
+impl phase::PhaseCalls for DrilldownSession {
+	type Tool = DrilldownTool;
+
+	const TEXTS: PhaseTexts = TEXTS;
+
+	fn phase(&self) -> &PhaseSession {
+		DrilldownSession::phase(self)
 	}
-	if let Some(text) = own_text(tool, &error) {
-		return text.to_owned();
+
+	fn exhausts(code: ReviewErrorCode) -> bool {
+		code == ReviewErrorCode::CheckpointLimit
 	}
-	let limits_call = tool == DrilldownTool::JobLimits;
-	let record_limits = |limits: &_| drilldown.record_limits(limits);
-	let unreachable = match tool {
-		DrilldownTool::Finalize => FINALIZE_UNREACHABLE,
-		DrilldownTool::JobLimits | DrilldownTool::Candidates => phase::READ_UNREACHABLE,
-		DrilldownTool::SiblingLead => phase::UNREACHABLE,
-	};
-	phase::phase_error(
-		client,
-		drilldown.phase(),
-		&TEXTS,
-		limits_call,
-		unreachable,
-		record_limits,
-		error,
-	)
-	.await
+
+	fn record_exhausted(&self, tool: DrilldownTool) {
+		DrilldownSession::record_exhausted(self, tool);
+	}
+
+	fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		DrilldownSession::record_limits(self, limits);
+	}
+
+	fn limits_call(tool: DrilldownTool) -> bool {
+		tool == DrilldownTool::JobLimits
+	}
+
+	fn unreachable(tool: DrilldownTool) -> &'static str {
+		match tool {
+			DrilldownTool::Finalize => FINALIZE_UNREACHABLE,
+			DrilldownTool::JobLimits | DrilldownTool::Candidates => phase::READ_UNREACHABLE,
+			DrilldownTool::SiblingLead => phase::UNREACHABLE,
+		}
+	}
+
+	fn own_text(tool: DrilldownTool, error: &PhaseError) -> Option<&'static str> {
+		own_text(tool, error)
+	}
 }
 
 async fn settle<T>(
@@ -115,7 +123,7 @@ async fn settle<T>(
 ) -> Result<T> {
 	match result {
 		Ok(value) => Ok(value),
-		Err(error) => Err(refuse(phase_error(client, drilldown, tool, error).await)),
+		Err(error) => Err(refuse(phase::phase_error(client, drilldown, tool, error).await)),
 	}
 }
 

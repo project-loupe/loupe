@@ -78,16 +78,47 @@ pub(super) fn forbidden(error: &PhaseError) -> bool {
 	matches!(error, PhaseError::Rejected { status: 403, .. } | PhaseError::Status { status: 403 })
 }
 
+/// What the shared failure text needs from one phase's session.
+pub(super) trait PhaseCalls {
+	type Tool: Copy;
+	const TEXTS: PhaseTexts;
+
+	fn phase(&self) -> &PhaseSession;
+	/// Whether a rejection with `code` exhausts the capacity `tool` uses.
+	fn exhausts(code: ReviewErrorCode) -> bool;
+	fn record_exhausted(&self, tool: Self::Tool);
+	fn record_limits(&self, limits: &PhaseLimitsResponse);
+	/// Whether `tool` is the `/limits` call itself.
+	fn limits_call(tool: Self::Tool) -> bool;
+	/// The call's own text for a server that could not be reached.
+	fn unreachable(tool: Self::Tool) -> &'static str;
+	/// The phase's own text for a non-403 error, ahead of the shared table.
+	fn own_text(_tool: Self::Tool, _error: &PhaseError) -> Option<&'static str> {
+		None
+	}
+}
+
 /// The fixed text for a failed phase call. The server answers 403 both
 /// for lost authority and for a reference outside the job's scope, so a
-/// 403 is told apart by reading `/limits` under the same capability;
-/// `record_limits` receives that read. `limits_call` marks a failed
-/// `/limits` call itself, whose 403 needs no probe. `unreachable` is the
-/// call's own text for a server that could not be reached.
-pub(super) async fn phase_error(
-	client: &ServerClient, phase: &PhaseSession, texts: &PhaseTexts, limits_call: bool,
-	unreachable: &'static str, record_limits: impl FnOnce(&PhaseLimitsResponse), error: PhaseError,
+/// 403 is told apart by reading `/limits` under the same capability and
+/// the session records that read. A failed `/limits` call itself needs no
+/// probe.
+pub(super) async fn phase_error<P: PhaseCalls>(
+	client: &ServerClient, session: &P, tool: P::Tool, error: PhaseError,
 ) -> String {
+	if !forbidden(&error)
+		&& let PhaseError::Rejected { code, .. } = &error
+		&& P::exhausts(*code)
+	{
+		session.record_exhausted(tool);
+	}
+	if let Some(text) = P::own_text(tool, &error) {
+		return text.to_owned();
+	}
+	let phase = session.phase();
+	let texts = &P::TEXTS;
+	let limits_call = P::limits_call(tool);
+	let unreachable = P::unreachable(tool);
 	if forbidden(&error) {
 		if limits_call {
 			phase.record_authority_lost();
@@ -95,7 +126,7 @@ pub(super) async fn phase_error(
 		}
 		return match client.limits(&phase.phase_job()).await {
 			Ok(limits) => {
-				record_limits(&limits);
+				session.record_limits(&limits);
 				texts.reference_refused
 			},
 			Err(probe) if forbidden(&probe) => {
