@@ -22,7 +22,8 @@ pub(crate) async fn run(
 	runner: &Runner, backend: &Arc<dyn LlmBackend>, env: LeaseEnvelope<Agent, Server>,
 	cancel: CancellationToken, security: Arc<JobSecurity>, heartbeat: PhaseHeartbeat,
 ) {
-	let lease = Lease::new(&env);
+	// Dispatch passes only phase leases.
+	let lease = Lease::new(&env).unwrap_or_else(|| Lease::expired(&env));
 	let attempt = attempt(runner, backend, env, &cancel, &security, &heartbeat);
 	phase::run(runner, "survey", lease, attempt, &cancel, &security, &heartbeat).await;
 }

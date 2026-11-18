@@ -36,15 +36,20 @@ pub(super) struct Lease {
 }
 
 impl Lease {
-	pub(super) fn new(env: &LeaseEnvelope<Agent, Server>) -> Self {
-		// Dispatch hands only phase leases to a phase handler; any other
-		// lease would report once, as at a passed hard deadline.
-		let hard_deadline_at = limits(&env.payload).map_or(0, |limits| limits.hard_deadline_at);
-		Self {
-			job_id: env.job_id,
-			capability: env.job_capability.clone(),
-			hard_deadline: at(hard_deadline_at),
-		}
+	/// `None` for a lease that is not a phase lease.
+	pub(super) fn new(env: &LeaseEnvelope<Agent, Server>) -> Option<Self> {
+		let limits = limits(&env.payload)?;
+		Some(Self::with_deadline(env, at(limits.hard_deadline_at)))
+	}
+
+	/// A lease whose hard deadline has passed, so its failure is reported
+	/// once and never retried.
+	pub(super) fn expired(env: &LeaseEnvelope<Agent, Server>) -> Self {
+		Self::with_deadline(env, SystemTime::UNIX_EPOCH)
+	}
+
+	fn with_deadline(env: &LeaseEnvelope<Agent, Server>, hard_deadline: SystemTime) -> Self {
+		Self { job_id: env.job_id, capability: env.job_capability.clone(), hard_deadline }
 	}
 }
 
