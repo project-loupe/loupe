@@ -637,7 +637,7 @@ fn drilldown_gate_seals_and_soft_stops_only_sibling_leads() {
 // deadline; the arithmetic has no loops, so the proof is unbounded.
 #[cfg(kani)]
 #[kani::proof]
-fn survey_timeout_never_reaches_the_hard_deadline() {
+fn phase_timeout_never_reaches_the_hard_deadline() {
 	use std::time::Duration;
 
 	use crate::review::deadline::{invocation_timeout, KILL_MARGIN};
