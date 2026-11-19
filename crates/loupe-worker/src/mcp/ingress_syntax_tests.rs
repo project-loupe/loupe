@@ -11,9 +11,8 @@ fn context(workdir: &Path) -> McpSessionContext {
 		)),
 		job_capability: JobCapability::from_secret("syntax-fixture-capability"),
 		repo_id: 1,
-		mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(1) },
+		scope: crate::mcp::McpScope::LegacyDiscovery { job_id: Some(1) },
 		workdir: workdir.to_owned(),
-		phase: None,
 	}
 }
 
@@ -164,7 +163,7 @@ async fn admitted_notes_reach_verdict_http_unchanged() {
 		let workdir = tempfile::tempdir().unwrap();
 		let mut context = context(workdir.path());
 		context.client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), url));
-		context.mode = crate::mcp::McpMode::LegacyVerify { job_id: 1, finding_id: 1 };
+		context.scope = crate::mcp::McpScope::LegacyVerify { job_id: 1, finding_id: 1 };
 		let record = verdict(token);
 		let mut output = Vec::new();
 		run_stream_server(context, record.as_bytes(), &mut output).await.unwrap();

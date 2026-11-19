@@ -181,9 +181,8 @@ async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 		client: server.client(),
 		job_capability: JobCapability::from_secret("survey-capability"),
 		repo_id: 1,
-		mode: McpMode::Survey,
+		scope: crate::mcp::McpScope::Phase(crate::mcp::PhaseTools::Survey(survey.clone())),
 		workdir: PathBuf::from("/nonexistent"),
-		phase: Some(crate::mcp::PhaseTools::Survey(survey.clone())),
 	};
 	Fixture { server, survey, context }
 }
@@ -551,19 +550,6 @@ async fn candidates_are_framed_with_the_job_tool_boundary() {
 	assert!(text.contains(r#""identity_anchor":"parse""#), "{text}");
 	let seen = fixture.server.seen();
 	assert!(seen[0].head.starts_with("GET /v1/jobs/7/lead-candidates?query=parse&limit=3 "));
-}
-
-#[tokio::test]
-async fn the_broker_fails_closed_when_mode_and_survey_state_disagree() {
-	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.phase = None;
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
-
-	let fixture = super::survey_tests::fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.mode = McpMode::LegacyDiscovery { job_id: Some(7) };
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
 }
 
 #[tokio::test]

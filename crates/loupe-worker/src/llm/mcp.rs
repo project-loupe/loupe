@@ -62,9 +62,7 @@ impl McpBroker {
 		let repo_id = request.repo_id.context("MCP request is missing its repo id")?;
 		let job_capability =
 			request.job_capability.clone().context("MCP request is missing its job capability")?;
-		let mode = request.mcp_mode;
-		crate::mcp::phase::mode_matches(mode, request.phase.as_ref())?;
-		let phase = request.phase.clone();
+		let scope = request.mcp_scope.clone();
 		let tool_boundary = request.tool_boundary;
 		let security = request.security.clone();
 		let workdir = request.workdir.clone();
@@ -100,9 +98,8 @@ impl McpBroker {
 					client,
 					job_capability,
 					repo_id,
-					mode,
+					scope,
 					workdir,
-					phase,
 				},
 				BufReader::new(read),
 				write,
@@ -201,8 +198,7 @@ mod tests {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: Some(1),
-			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(7) },
-			phase: None,
+			mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: Some(7) },
 			token_budget: None,
 			job_capability: Some(loupe_proto::JobCapability::from_secret("test-capability")),
 		}

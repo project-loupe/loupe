@@ -12,7 +12,7 @@ use loupe_worker::canary::JobSecurity;
 use loupe_worker::llm::mcp::McpContext;
 use loupe_worker::llm::model_broker::{ModelBrokerContext, ModelBrokerLimits, ModelCredential};
 use loupe_worker::llm::{ClaudeCliBackend, LlmBackend, LlmRequest};
-use loupe_worker::mcp::McpMode;
+use loupe_worker::mcp::McpScope;
 use loupe_worker::review::gate::RecipeClass;
 use loupe_worker::review::session::{SurveySession, SurveySessionParts};
 use loupe_worker::sandbox::{SandboxNetworkConfig, SandboxNetworkMode};
@@ -128,8 +128,7 @@ async fn a_sandboxed_agent_reads_its_job_limits_through_the_survey_catalog() {
 			timeout: Duration::from_secs(20),
 			cancel,
 			repo_id: Some(1),
-			mcp_mode: McpMode::Survey,
-			phase: Some(loupe_worker::mcp::PhaseTools::Survey(session.clone())),
+			mcp_scope: McpScope::Phase(loupe_worker::mcp::PhaseTools::Survey(session.clone())),
 			token_budget: None,
 			job_capability: Some(capability),
 		})

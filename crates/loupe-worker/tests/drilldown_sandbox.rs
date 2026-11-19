@@ -12,7 +12,7 @@ use loupe_worker::canary::JobSecurity;
 use loupe_worker::llm::mcp::McpContext;
 use loupe_worker::llm::model_broker::{ModelBrokerContext, ModelBrokerLimits, ModelCredential};
 use loupe_worker::llm::{ClaudeCliBackend, LlmBackend, LlmRequest};
-use loupe_worker::mcp::McpMode;
+use loupe_worker::mcp::McpScope;
 use loupe_worker::review::session::{DrilldownSession, PhaseSession};
 use loupe_worker::sandbox::{SandboxNetworkConfig, SandboxNetworkMode};
 use serde_json::json;
@@ -125,8 +125,7 @@ async fn a_sandboxed_agent_reads_its_job_limits_through_the_drilldown_catalog() 
 			timeout: Duration::from_secs(20),
 			cancel,
 			repo_id: Some(1),
-			mcp_mode: McpMode::Drilldown,
-			phase: Some(loupe_worker::mcp::PhaseTools::Drilldown(session.clone())),
+			mcp_scope: McpScope::Phase(loupe_worker::mcp::PhaseTools::Drilldown(session.clone())),
 			token_budget: None,
 			job_capability: Some(capability),
 		})

@@ -510,8 +510,7 @@ mod tests {
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
 				repo_id: None,
-				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-				phase: None,
+				mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 				token_budget: None,
 				job_capability: None,
 			})
@@ -685,8 +684,7 @@ mod tests {
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
 				repo_id: None,
-				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-				phase: None,
+				mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 				token_budget: None,
 				job_capability: None,
 			})
@@ -758,8 +756,7 @@ mod tests {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			phase: None,
+			mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 			token_budget: None,
 			job_capability: None,
 		};
@@ -798,8 +795,7 @@ mod tests {
 			timeout: Duration::from_millis(500),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			phase: None,
+			mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 			token_budget: None,
 			job_capability: None,
 		};

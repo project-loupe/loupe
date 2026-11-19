@@ -39,12 +39,11 @@ impl FuzzSession {
 				finding_id: 1,
 				inner: tokio::sync::Mutex::default(),
 			}),
-			mode: if verify {
-				McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
+			scope: if verify {
+				McpScope::LegacyVerify { job_id: 1, finding_id: 1 }
 			} else {
-				McpMode::LegacyDiscovery { job_id: Some(1) }
+				McpScope::LegacyDiscovery { job_id: Some(1) }
 			},
-			phase: None,
 		}))
 	}
 
@@ -104,12 +103,9 @@ pub fn validate_finding(workdir: &Path, args: &Value) -> Result<()> {
 }
 
 pub fn catalogue(verify: bool) -> Value {
-	tool_catalog(
-		if verify {
-			McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
-		} else {
-			McpMode::LegacyDiscovery { job_id: Some(1) }
-		},
-		None,
-	)
+	tool_catalog(&if verify {
+		McpScope::LegacyVerify { job_id: 1, finding_id: 1 }
+	} else {
+		McpScope::LegacyDiscovery { job_id: Some(1) }
+	})
 }

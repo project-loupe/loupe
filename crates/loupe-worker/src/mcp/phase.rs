@@ -44,16 +44,6 @@ impl PhaseTools {
 	}
 }
 
-/// Phase host state accompanies exactly the phase modes, each its own.
-pub(crate) fn mode_matches(mode: super::McpMode, phase: Option<&PhaseTools>) -> anyhow::Result<()> {
-	match (mode, phase) {
-		(super::McpMode::Survey, Some(PhaseTools::Survey(_)))
-		| (super::McpMode::Drilldown, Some(PhaseTools::Drilldown(_)))
-		| (super::McpMode::LegacyDiscovery { .. } | super::McpMode::LegacyVerify { .. }, None) => Ok(()),
-		_ => anyhow::bail!("MCP mode and phase session state disagree"),
-	}
-}
-
 /// A phase's own wording for the failures whose text names the phase or
 /// its tools.
 pub(super) struct PhaseTexts {

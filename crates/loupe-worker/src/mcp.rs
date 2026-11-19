@@ -130,6 +130,35 @@ impl McpMode {
 	}
 }
 
+/// What one broker session serves: a legacy catalog with the job (and
+/// finding) it attributes submissions to, or a review phase with its
+/// shared host state.
+#[derive(Clone)]
+pub enum McpScope {
+	LegacyDiscovery { job_id: Option<i64> },
+	LegacyVerify { job_id: i64, finding_id: i64 },
+	Phase(PhaseTools),
+}
+
+impl McpScope {
+	pub fn mode(&self) -> McpMode {
+		match self {
+			Self::LegacyDiscovery { job_id } => McpMode::LegacyDiscovery { job_id: *job_id },
+			Self::LegacyVerify { job_id, finding_id } => {
+				McpMode::LegacyVerify { job_id: *job_id, finding_id: *finding_id }
+			},
+			Self::Phase(phase) => phase.mode(),
+		}
+	}
+
+	pub fn phase(&self) -> Option<&PhaseTools> {
+		match self {
+			Self::Phase(phase) => Some(phase),
+			Self::LegacyDiscovery { .. } | Self::LegacyVerify { .. } => None,
+		}
+	}
+}
+
 /// How many lines of context to take on each side of the bug-line
 /// range when computing the fingerprint window. Two lines is enough
 /// to keep the hash stable across `cargo fmt`-style reflows while
@@ -219,10 +248,8 @@ struct Session {
 	/// / `submit_patch` / `validate_patch`. `None` keeps the
 	/// discovery-mode catalog.
 	verify: Option<VerifySessionState>,
-	/// The catalog this session serves and its Loupe MCP protocol version.
-	mode: McpMode,
-	/// Phase host state; present exactly in a phase mode.
-	phase: Option<PhaseTools>,
+	/// The catalog this session serves, with its phase host state.
+	scope: McpScope,
 }
 
 /// Verify-mode buffer. The agent calls `submit_verdict` first
@@ -317,8 +344,8 @@ impl std::fmt::Debug for RpcError {
 /// Immutable authority and filesystem scope for one host-side MCP
 /// broker session.
 ///
-/// `repo_id` scopes search/lookup tools to this repo. `mode` selects
-/// the tool catalogue (see [`McpMode`]). `workdir` is the path the
+/// `repo_id` scopes search/lookup tools to this repo. `scope` selects
+/// the tool catalogue (see [`McpScope`]). `workdir` is the path the
 /// agent's file references resolve against (`/workdir` inside
 /// bwrap, the host worktree path in disable-sandbox mode).
 ///
@@ -334,10 +361,8 @@ pub struct McpSessionContext {
 	pub client: Arc<ServerClient>,
 	pub job_capability: JobCapability,
 	pub repo_id: i64,
-	pub mode: McpMode,
+	pub scope: McpScope,
 	pub workdir: PathBuf,
-	/// Phase host state, required exactly when `mode` is that phase's mode.
-	pub phase: Option<PhaseTools>,
 }
 
 /// Run one host-side MCP broker session until the sandbox proxy closes.
@@ -346,8 +371,8 @@ where
 	R: AsyncBufRead + Unpin,
 	W: AsyncWrite + Unpin,
 {
-	phase::mode_matches(context.mode, context.phase.as_ref())?;
-	let verify = context.mode.finding_id().map(|finding_id| VerifySessionState {
+	let mode = context.scope.mode();
+	let verify = mode.finding_id().map(|finding_id| VerifySessionState {
 		finding_id,
 		inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
 	});
@@ -358,11 +383,10 @@ where
 		client: context.client,
 		job_capability: context.job_capability,
 		repo_id: context.repo_id,
-		job_id: context.mode.job_id(),
+		job_id: mode.job_id(),
 		workdir: context.workdir,
 		verify,
-		mode: context.mode,
-		phase: context.phase,
+		scope: context.scope,
 	});
 	run_session(session, reader, writer, crate::limits::Limits::default()).await
 }
@@ -387,15 +411,18 @@ where
 		#[allow(unsafe_code)]
 		let record = Untrusted::new(record, unsafe { Ingress::<Sandbox>::new() });
 		let request = match record.as_bytes().validate_carrying(ingress::McpRequestDecoder {
-			protocol_version: session.mode.loupe_protocol_version(),
-			catalog: session.mode.catalog(),
+			protocol_version: session.scope.mode().loupe_protocol_version(),
+			catalog: session.scope.mode().catalog(),
 		}) {
 			Ok(Some(r)) => r,
 			Ok(None) => continue,
 			Err(ingress::RecordError::Utf8) => {
 				if session.security.is_quarantined() {
-					write_response(&mut writer, &quarantined_response(Value::Null, session.mode))
-						.await?;
+					write_response(
+						&mut writer,
+						&quarantined_response(Value::Null, session.scope.mode()),
+					)
+					.await?;
 					return Err(crate::canary::JobQuarantined.into());
 				}
 				return Err(std::io::Error::new(
@@ -406,8 +433,11 @@ where
 			},
 			Err(e) => {
 				if session.security.is_quarantined() {
-					write_response(&mut writer, &quarantined_response(Value::Null, session.mode))
-						.await?;
+					write_response(
+						&mut writer,
+						&quarantined_response(Value::Null, session.scope.mode()),
+					)
+					.await?;
 					return Err(crate::canary::JobQuarantined.into());
 				}
 				tracing::debug!(method = "invalid", line_bytes, "loupe-mcp: received request");
@@ -463,7 +493,7 @@ async fn handle_decoded_request(
 	session: &Arc<Session>, method: ingress::Method, call: ingress::ToolCall, id: Value,
 ) -> Response {
 	if session.security.is_quarantined() {
-		return quarantined_response(id, session.mode);
+		return quarantined_response(id, session.scope.mode());
 	}
 	match method {
 		ingress::Method::Initialize => Response::ok(
@@ -472,14 +502,14 @@ async fn handle_decoded_request(
 				"protocolVersion": MCP_PROTOCOL_VERSION,
 				"capabilities": { "tools": { "listChanged": false } },
 				"serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-				"_meta": mode_meta(session.mode),
+				"_meta": mode_meta(session.scope.mode()),
 			}),
 		),
 		ingress::Method::List => Response::ok(
 			id,
 			json!({
-				"tools": tool_catalog(session.mode, session.phase.as_ref()),
-				"_meta": mode_meta(session.mode),
+				"tools": tool_catalog(&session.scope),
+				"_meta": mode_meta(session.scope.mode()),
 			}),
 		),
 		ingress::Method::Call => handle_decoded_tool_call(session, call, id).await,
@@ -522,14 +552,12 @@ fn mode_meta(mode: McpMode) -> Value {
 /// `query_prior_findings` and `get_finding_by_id` stay in both
 /// modes — they're read-only and useful for the verifier to
 /// cross-check the bug it's verifying against the repo's history.
-fn tool_catalog(mode: McpMode, phase: Option<&PhaseTools>) -> Value {
-	match (mode, phase) {
-		(McpMode::LegacyDiscovery { job_id }, _) => legacy_tool_catalog(job_id.is_some(), false),
-		(McpMode::LegacyVerify { .. }, _) => legacy_tool_catalog(true, true),
-		(McpMode::Survey, Some(PhaseTools::Survey(survey))) => survey_catalog::tools(survey),
-		(McpMode::Drilldown, Some(PhaseTools::Drilldown(_))) => drilldown_catalog::tools(),
-		// `run_stream_server` refuses a phase mode without its own session.
-		(McpMode::Survey | McpMode::Drilldown, _) => json!([]),
+fn tool_catalog(scope: &McpScope) -> Value {
+	match scope {
+		McpScope::LegacyDiscovery { job_id } => legacy_tool_catalog(job_id.is_some(), false),
+		McpScope::LegacyVerify { .. } => legacy_tool_catalog(true, true),
+		McpScope::Phase(PhaseTools::Survey(survey)) => survey_catalog::tools(survey),
+		McpScope::Phase(PhaseTools::Drilldown(_)) => drilldown_catalog::tools(),
 	}
 }
 
@@ -833,7 +861,7 @@ async fn handle_decoded_tool_call(
 ) -> Response {
 	let tool_name = call.name.log_label();
 	let operation = call.name.operation();
-	let phase_call = match &session.phase {
+	let phase_call = match session.scope.phase() {
 		Some(PhaseTools::Survey(survey)) => {
 			survey::tool(&call.name).map(|tool| PhaseCall::Survey(survey, tool))
 		},
@@ -894,7 +922,7 @@ async fn handle_decoded_tool_call(
 		})
 		.await;
 	if session.security.is_quarantined() {
-		return quarantined_response(id, session.mode);
+		return quarantined_response(id, session.scope.mode());
 	}
 
 	let with_status = |text: String| match phase_call {
@@ -909,7 +937,7 @@ async fn handle_decoded_tool_call(
 			id,
 			json!({
 				"content": [{ "type": "text", "text": with_status(text) }],
-				"_meta": mode_meta(session.mode),
+				"_meta": mode_meta(session.scope.mode()),
 			}),
 		),
 		Err(e) => {
@@ -934,7 +962,7 @@ async fn handle_decoded_tool_call(
 				json!({
 					"content": [{ "type": "text", "text": text }],
 					"isError": true,
-					"_meta": mode_meta(session.mode),
+					"_meta": mode_meta(session.scope.mode()),
 				}),
 			)
 		},
@@ -1898,8 +1926,7 @@ mod tests {
 			job_id: Some(42),
 			workdir: workdir.path().to_owned(),
 			verify: None,
-			mode: McpMode::LegacyDiscovery { job_id: Some(42) },
-			phase: None,
+			scope: McpScope::LegacyDiscovery { job_id: Some(42) },
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
@@ -1941,8 +1968,7 @@ mod tests {
 			job_id: Some(42),
 			workdir: workdir.path().to_owned(),
 			verify: None,
-			mode: McpMode::LegacyDiscovery { job_id: Some(42) },
-			phase: None,
+			scope: McpScope::LegacyDiscovery { job_id: Some(42) },
 		});
 		let mut args = serde_json::to_value(&submission).unwrap();
 		args["protocol_version"] = json!(LOUPE_MCP_PROTOCOL_VERSION);
@@ -2084,8 +2110,7 @@ mod tests {
 				finding_id,
 				inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
 			}),
-			mode: McpMode::LegacyVerify { job_id: 42, finding_id },
-			phase: None,
+			scope: McpScope::LegacyVerify { job_id: 42, finding_id },
 		})
 	}
 

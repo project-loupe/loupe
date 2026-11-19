@@ -72,9 +72,8 @@ async fn fixture(offset: Duration) -> Fixture {
 		client: server.client(),
 		job_capability: JobCapability::from_secret("drilldown-capability"),
 		repo_id: 1,
-		mode: McpMode::Drilldown,
+		scope: crate::mcp::McpScope::Phase(PhaseTools::Drilldown(drilldown.clone())),
 		workdir: PathBuf::from("/nonexistent"),
-		phase: Some(PhaseTools::Drilldown(drilldown.clone())),
 	};
 	Fixture { server, drilldown, context, cancel }
 }
@@ -466,22 +465,4 @@ async fn unknown_and_host_owned_arguments_never_reach_the_server() {
 		assert!(status(response).starts_with("[loupe status]"));
 	}
 	assert!(fixture.server.seen().is_empty());
-}
-
-#[tokio::test]
-async fn the_broker_fails_closed_when_mode_and_phase_session_disagree() {
-	let fixture = fixture(Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.phase = None;
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
-
-	let fixture = super::drilldown_tests::fixture(Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.mode = McpMode::Survey;
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
-
-	let fixture = super::drilldown_tests::fixture(Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.mode = McpMode::LegacyDiscovery { job_id: Some(7) };
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
 }

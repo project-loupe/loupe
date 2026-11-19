@@ -126,8 +126,7 @@ pub(super) async fn invoke(
 		timeout,
 		cancel,
 		repo_id: Some(launch.repo_id),
-		mcp_mode: tools.mode(),
-		phase: Some(tools),
+		mcp_scope: crate::mcp::McpScope::Phase(tools),
 		token_budget: launch.limits.token_budget,
 		job_capability: Some(launch.job_capability.clone()),
 	};

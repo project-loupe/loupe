@@ -207,13 +207,11 @@ pub struct LlmRequest {
 	/// `query_prior_findings` scoped to this repo. `None` falls back
 	/// to the no-MCP behaviour (just prompt + stdout).
 	pub repo_id: Option<i64>,
-	/// Tool catalogue the MCP broker serves for this invocation, and
+	/// Tool catalogue the MCP broker serves for this invocation, with
 	/// the job (and, for verification, finding) it attributes
-	/// submissions to.
-	pub mcp_mode: crate::mcp::McpMode,
-	/// Phase host state shared with the broker; required exactly when
-	/// `mcp_mode` is that phase's mode, and outlives the MCP connection.
-	pub phase: Option<crate::mcp::PhaseTools>,
+	/// submissions to, or the phase host state shared with the broker,
+	/// which outlives the MCP connection.
+	pub mcp_scope: crate::mcp::McpScope,
 	/// The lease's token budget for this invocation, lowering the configured
 	/// model-broker token ceiling; `None` leaves it unchanged.
 	pub token_budget: Option<std::num::NonZeroU64>,
@@ -641,8 +639,7 @@ mod tests {
 			timeout: std::time::Duration::from_secs(1),
 			cancel: tokio_util::sync::CancellationToken::new(),
 			repo_id: None,
-			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			phase: None,
+			mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 			token_budget: None,
 			job_capability: None,
 		};
