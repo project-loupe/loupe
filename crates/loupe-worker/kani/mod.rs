@@ -595,11 +595,49 @@ fn survey_gate_seals_waits_for_the_profile_and_soft_stops_exactly() {
 	kani::cover!(late && tool == SurveyTool::Lead && allowed, "lead stays open after submit_by");
 }
 
+// Every drilldown tool and attempt state: the domain is 4 x 2 x 2, so the
+// harness is exhaustive without loops.
+#[cfg(kani)]
+#[kani::proof]
+fn drilldown_gate_seals_and_soft_stops_only_sibling_leads() {
+	use crate::review::gate::{admit_drilldown, Admission, Denial, DrilldownTool};
+	let tool = DrilldownTool::ALL[usize::from(kani::any::<u8>() % 4)];
+	let late: bool = kani::any();
+	let sealed: bool = kani::any();
+	let admission = admit_drilldown(tool, late, sealed);
+	let allowed = admission == Admission::Allow;
+	// Nothing but limits and a finalize replay after a sealed receipt.
+	if sealed {
+		assert_eq!(allowed, matches!(tool, DrilldownTool::JobLimits | DrilldownTool::Finalize));
+		if !allowed {
+			assert_eq!(admission, Admission::Deny(Denial::DrilldownSealed));
+		}
+	}
+	// Finalize is never denied, so the terminal action stays reachable.
+	if tool == DrilldownTool::Finalize {
+		assert!(allowed);
+	}
+	// Before sealing, exactly sibling leads are denied, exactly after submit_by.
+	if !sealed {
+		assert_eq!(!allowed, late && tool == DrilldownTool::SiblingLead);
+		if !allowed {
+			assert_eq!(admission, Admission::Deny(Denial::SiblingSoftStop));
+		}
+	}
+	kani::cover!(sealed && tool == DrilldownTool::Finalize, "finalize replay after seal");
+	kani::cover!(sealed && tool == DrilldownTool::Candidates && !allowed, "query after seal");
+	kani::cover!(late && !sealed && !allowed, "sibling soft stop");
+	kani::cover!(
+		late && !sealed && tool == DrilldownTool::Candidates && allowed,
+		"query after submit_by"
+	);
+}
+
 // Over every launch instant with nanosecond precision and every i64 hard
 // deadline; the arithmetic has no loops, so the proof is unbounded.
 #[cfg(kani)]
 #[kani::proof]
-fn survey_timeout_never_reaches_the_hard_deadline() {
+fn phase_timeout_never_reaches_the_hard_deadline() {
 	use std::time::Duration;
 
 	use crate::review::deadline::{invocation_timeout, KILL_MARGIN};

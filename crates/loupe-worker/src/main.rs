@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use loupe_worker::config::{LoggingConfig, WorkerConfig};
 use loupe_worker::llm::{
-	bkb_mcp_available, build_scan_backend, build_survey_backend, build_verifier_backend,
+	bkb_mcp_available, build_phase_backend, build_scan_backend, build_verifier_backend,
 	claude_auth_available, claude_available, codex_auth_available, codex_available,
 	BackendRuntimeConfig, JobAgent, McpContext, ModelBrokerRuntimeConfig,
 };
@@ -165,7 +165,7 @@ struct RunArgs {
 	/// Agent backend for LLM verify jobs: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_VERIFY_AGENT", value_enum)]
 	verify_agent: Option<JobAgent>,
-	/// Agent backend for survey leases: auto, claude, or codex.
+	/// Agent backend for survey and drilldown leases: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_SURVEY_AGENT", value_enum)]
 	survey_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
@@ -420,7 +420,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// for the verify-mode tool surface (`submit_verdict` /
 	// `submit_patch` / `validate_patch`); without it, the agent has
 	// no way to commit a verdict.
-	let survey_backend = build_survey_backend(
+	let phase_backend = build_phase_backend(
 		Some(mcp_ctx.clone()),
 		cfg.agents.survey,
 		claude,
@@ -461,10 +461,12 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 
 	let mut runner =
 		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
-	if let Some(backend) = survey_backend {
+	if let Some(backend) = phase_backend {
 		credential_watches.extend(backend.credential_watch());
-		runner = runner.with_survey_backend(backend);
-		tracing::info!("survey runner enabled (review:survey:v1 advertised)");
+		runner = runner.with_phase_backend(backend);
+		tracing::info!(
+			"phase runner enabled (review:survey:v1 and review:drilldown:v1 advertised)"
+		);
 	}
 	let runner = runner.with_credential_watches(credential_watches);
 

@@ -11,27 +11,27 @@ use super::*;
 use crate::review::gate::{RecipeClass, PROFILE_FIRST, SEALED, SOFT_STOP};
 use crate::review::session::{SurveySession, SurveySessionParts};
 
-const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const SENTINEL: &str = "server-body-sentinel";
+pub(super) const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(super) const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub(super) const SENTINEL: &str = "server-body-sentinel";
 
-struct Seen {
-	head: String,
-	body: Value,
+pub(super) struct Seen {
+	pub(super) head: String,
+	pub(super) body: Value,
 }
 
 type Replies = Arc<Mutex<Vec<(&'static str, VecDeque<(u16, String)>)>>>;
 
 /// Answers each request by the first route whose path suffix matches, in
 /// the order the replies were queued for that route.
-struct FakePhase {
+pub(super) struct FakePhase {
 	base: reqwest::Url,
 	replies: Replies,
 	seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 impl FakePhase {
-	async fn start() -> Self {
+	pub(super) async fn start() -> Self {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
 		let replies: Replies = Arc::default();
@@ -91,7 +91,7 @@ impl FakePhase {
 		Self { base, replies, seen }
 	}
 
-	fn reply(&self, route: &'static str, status: u16, body: impl Into<String>) {
+	pub(super) fn reply(&self, route: &'static str, status: u16, body: impl Into<String>) {
 		let mut replies = self.replies.lock().unwrap();
 		match replies.iter_mut().find(|(r, _)| *r == route) {
 			Some((_, queue)) => queue.push_back((status, body.into())),
@@ -99,16 +99,16 @@ impl FakePhase {
 		}
 	}
 
-	fn seen(&self) -> Vec<Seen> {
+	pub(super) fn seen(&self) -> Vec<Seen> {
 		std::mem::take(&mut *self.seen.lock().unwrap())
 	}
 
-	fn client(&self) -> Arc<ServerClient> {
+	pub(super) fn client(&self) -> Arc<ServerClient> {
 		Arc::new(ServerClient::from_parts(reqwest::Client::new(), self.base.clone()))
 	}
 }
 
-fn error_body(code: &str, current_revision: Option<i64>) -> String {
+pub(super) fn error_body(code: &str, current_revision: Option<i64>) -> String {
 	match current_revision {
 		Some(revision) => format!(
 			r#"{{"protocol_version":3,"error":{{"code":"{code}","detail":null,"current_revision":{revision}}}}}"#
@@ -181,18 +181,17 @@ async fn fixture(recipe: SurveyRecipe, offset: Duration) -> Fixture {
 		client: server.client(),
 		job_capability: JobCapability::from_secret("survey-capability"),
 		repo_id: 1,
-		mode: McpMode::Survey,
+		scope: crate::mcp::McpScope::Phase(crate::mcp::PhaseTools::Survey(survey.clone())),
 		workdir: PathBuf::from("/nonexistent"),
-		survey: Some(survey.clone()),
 	};
 	Fixture { server, survey, context }
 }
 
-fn call(id: u64, name: &str, arguments: Value) -> Value {
+pub(super) fn call(id: u64, name: &str, arguments: Value) -> Value {
 	json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}})
 }
 
-async fn run(context: McpSessionContext, requests: &[Value]) -> Vec<Value> {
+pub(super) async fn run(context: McpSessionContext, requests: &[Value]) -> Vec<Value> {
 	let input: String = requests.iter().map(|request| format!("{request}\n")).collect();
 	let mut output = Vec::new();
 	run_stream_server(context, input.as_bytes(), &mut output).await.unwrap();
@@ -203,11 +202,11 @@ async fn run(context: McpSessionContext, requests: &[Value]) -> Vec<Value> {
 		.collect()
 }
 
-fn text(response: &Value) -> &str {
+pub(super) fn text(response: &Value) -> &str {
 	response["result"]["content"][0]["text"].as_str().unwrap()
 }
 
-fn is_error(response: &Value) -> bool {
+pub(super) fn is_error(response: &Value) -> bool {
 	response["result"]["isError"] == json!(true)
 }
 
@@ -374,7 +373,7 @@ async fn server_errors_reach_the_model_as_fixed_text() {
 	assert!(text(&responses[0]).contains("already used with different content"));
 	assert!(text(&responses[1]).contains("call finalize_survey"));
 	assert!(text(&responses[2]).contains("no longer has authority"));
-	assert!(fixture.survey.authority_lost());
+	assert!(fixture.survey.phase().authority_lost());
 	for response in &responses {
 		assert!(is_error(response));
 		assert!(!text(response).contains(SENTINEL));
@@ -554,19 +553,6 @@ async fn candidates_are_framed_with_the_job_tool_boundary() {
 }
 
 #[tokio::test]
-async fn the_broker_fails_closed_when_mode_and_survey_state_disagree() {
-	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.survey = None;
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
-
-	let fixture = super::survey_tests::fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
-	let mut context = fixture.context;
-	context.mode = McpMode::LegacyDiscovery { job_id: Some(7) };
-	assert!(run_stream_server(context, &b""[..], Vec::new()).await.is_err());
-}
-
-#[tokio::test]
 async fn a_refused_reference_is_told_apart_from_lost_authority() {
 	let fixture = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
 	fixture.server.reply("/leads", 403, error_body("denied", None));
@@ -586,7 +572,7 @@ async fn a_refused_reference_is_told_apart_from_lost_authority() {
 		assert!(text(response).contains("refused a referenced unit"), "{}", text(response));
 		assert!(text(response).contains("review units remaining: 3; leads remaining: 4"));
 	}
-	assert!(!fixture.survey.authority_lost());
+	assert!(!fixture.survey.phase().authority_lost());
 	let routes: Vec<_> = fixture
 		.server
 		.seen()
@@ -648,4 +634,40 @@ async fn capacity_counts_new_leads_once_and_follows_quota_refusals() {
 	assert!(status(2).contains("review units remaining: 30; leads remaining: 11"), "{}", status(2));
 	assert!(status(3).contains("review units remaining: 30; leads remaining: 0"), "{}", status(3));
 	assert!(status(4).contains("review units remaining: 0; leads remaining: 0"), "{}", status(4));
+}
+
+#[tokio::test]
+async fn unreachable_calls_without_a_client_key_are_not_told_to_reuse_one() {
+	let ordinary = fixture(SurveyRecipe::Ordinary, Duration::ZERO).await;
+	let responses = run(
+		ordinary.context,
+		&[
+			call(1, "get_job_limits", json!({})),
+			call(2, "query_same_project_lead_candidates", json!({"query": "parse"})),
+			call(3, "finalize_survey", json!({"terminal_reason": "completed"})),
+			call(4, "submit_lead", lead_arguments("lead-1")),
+		],
+	)
+	.await;
+	let bootstrap =
+		fixture(SurveyRecipe::Bootstrap { profile_published: false }, Duration::ZERO).await;
+	let publish = run(
+		bootstrap.context,
+		&[call(1, "publish_profile", json!({"profile": {"purpose": "test"}}))],
+	)
+	.await;
+	for (response, expected) in [
+		(&responses[0], "retry later"),
+		(&responses[1], "retry later"),
+		(&responses[2], "identical finalize_survey call"),
+		(&publish[0], "identical publish_profile call"),
+	] {
+		let reply = text(response);
+		assert!(is_error(response), "{reply}");
+		assert!(reply.contains("could not be reached"), "{reply}");
+		assert!(!reply.contains("client key"), "{reply}");
+		assert!(reply.contains(expected), "{reply}");
+	}
+	let lead = text(&responses[3]);
+	assert!(lead.contains("SAME client key"), "{lead}");
 }

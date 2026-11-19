@@ -254,11 +254,12 @@ async fn run_flow(
 		let server_client = server_client_for_stub.clone();
 		async move {
 			if req.prompt.expose().contains("independent second opinion") {
-				let job_id = req.mcp_mode.job_id().expect("verify sessions must carry a job_id");
+				let job_id =
+					req.mcp_scope.mode().job_id().expect("verify sessions must carry a job_id");
 				let job_capability =
 					req.job_capability.expect("verify sessions must carry a job capability");
 				assert!(
-					req.mcp_mode.finding_id().is_some(),
+					req.mcp_scope.mode().finding_id().is_some(),
 					"verify sessions must carry finding_id (otherwise MCP wouldn't \
 					 enter verify mode); got finding_id=None",
 				);
@@ -278,7 +279,8 @@ async fn run_flow(
 				return Ok(String::new());
 			}
 			// Discovery: simulate the agent calling submit_finding.
-			let job_id = req.mcp_mode.job_id().expect("discovery sessions must carry a job_id");
+			let job_id =
+				req.mcp_scope.mode().job_id().expect("discovery sessions must carry a job_id");
 			let job_capability =
 				req.job_capability.expect("discovery sessions must carry a job capability");
 			let finding = LlmFindingSubmission {

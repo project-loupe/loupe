@@ -119,9 +119,8 @@ fn context() -> McpSessionContext {
 		)),
 		job_capability: JobCapability::from_secret("fixture-capability"),
 		repo_id: 1,
-		mode: loupe_worker::mcp::McpMode::LegacyDiscovery { job_id: Some(1) },
+		scope: loupe_worker::mcp::McpScope::LegacyDiscovery { job_id: Some(1) },
 		workdir: Path::new("/").to_owned(),
-		survey: None,
 	}
 }
 
@@ -162,7 +161,7 @@ async fn mcp_verdict_rejects_control_before_lock_and_flush() {
 	let (client, task) = response(json!({})).await;
 	let mut context = context();
 	context.client = Arc::new(client);
-	context.mode = loupe_worker::mcp::McpMode::LegacyVerify { job_id: 1, finding_id: 1 };
+	context.scope = loupe_worker::mcp::McpScope::LegacyVerify { job_id: 1, finding_id: 1 };
 	let record = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"submit_verdict","arguments":{"verdict":"confirmed","notes":"private\u0001note"}}}"#;
 	let mut output = Vec::new();
 	let result = run_stream_server(context, record.as_slice(), &mut output).await;

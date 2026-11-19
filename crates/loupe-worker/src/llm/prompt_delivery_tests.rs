@@ -40,8 +40,7 @@ async fn s3_prompt_delivery_fixture() -> (Vec<u8>, String, String) {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: None,
-			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			survey: None,
+			mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 			token_budget: None,
 			job_capability: None,
 		})
@@ -140,8 +139,7 @@ async fn s3_lifecycle_fixture(
 			timeout,
 			cancel,
 			repo_id: None,
-			mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-			survey: None,
+			mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 			token_budget: None,
 			job_capability: None,
 		})
@@ -330,8 +328,7 @@ async fn sandbox_output_is_absent_from_success_logs_and_failure_chains() {
 				timeout: Duration::from_secs(5),
 				cancel: CancellationToken::new(),
 				repo_id: None,
-				mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-				survey: None,
+				mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 				token_budget: None,
 				job_capability: None,
 			})
@@ -400,8 +397,7 @@ async fn common_quarantine_cancels_and_reaps_the_running_child() {
 		timeout: Duration::from_secs(10),
 		cancel: cancel.clone(),
 		repo_id: None,
-		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: None },
-		survey: None,
+		mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: None },
 		token_budget: None,
 		job_capability: None,
 	};

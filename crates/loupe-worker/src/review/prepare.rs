@@ -1,22 +1,24 @@
-//! Host preparation of one survey attempt: check out the target, pin it,
-//! upload and seal the bootstrap inventory, and read the job's limits.
-//! Nothing here runs an agent.
+//! Host preparation of review-phase attempts: the phase-agnostic checkout
+//! and pin, the survey's inventory upload, and each phase's limits read. Nothing
+//! here runs an agent.
 
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loupe_core::review_metadata::ReviewCommit;
 use loupe_core::security_event::Operation;
+use loupe_core::RepoSpec;
 use loupe_proto::review_api::{
 	ManifestProgress, PhaseLimitsResponse, PinTargetRequest, PinTargetResponse, ReviewErrorCode,
 	ReviewProtocol,
 };
 use loupe_proto::review_lease::{
-	BootstrapTarget, FrozenReviewProfile, OrdinarySurveyRecipe, ReviewAssignments,
-	ReviewGeneration, ReviewLimits, ReviewSurveyContext, ReviewSurveyLease,
+	AssignedReviewLead, BootstrapTarget, FrozenReviewProfile, OrdinarySurveyRecipe,
+	ReviewAssignments, ReviewDrilldownLease, ReviewGeneration, ReviewLimits, ReviewSurveyContext,
+	ReviewSurveyLease,
 };
 use loupe_proto::{JobCapability, LeaseEnvelope, LeasePayload};
-use loupe_provenance::{Agent, Repo, Server};
+use loupe_provenance::{Agent, Repo, Secret, Server};
 use tokio_util::sync::CancellationToken;
 
 use super::inventory::{CommitDecoder, Inventory, InventoryDecoder, InventoryError};
@@ -152,78 +154,31 @@ pub async fn prepare(
 		ReviewSurveyContext::Corroboration { .. } => return Err(PrepareError::UnsupportedLease),
 	};
 	let limits = provenance.limits;
-	let hard_deadline = at(limits.hard_deadline_at);
-	if SystemTime::now() >= hard_deadline {
-		return Err(PrepareError::HardDeadline);
-	}
-	let job = PhaseJob { job_id, capability: &job_capability, deadline: hard_deadline };
-	let cancelled = || if cancel.is_cancelled() { Err(PrepareError::Cancelled) } else { Ok(()) };
-	let target = match &context {
+	let job =
+		PhaseJob { job_id, capability: &job_capability, deadline: at(limits.hard_deadline_at) };
+	let revision = match &context {
 		ReviewSurveyContext::Bootstrap { target: BootstrapTarget::Pinned { generation, .. } }
 		| ReviewSurveyContext::Ordinary { generation, .. } => Some(generation.commit_sha.expose()),
 		_ => None,
 	};
-
-	cancelled()?;
-	let mut cached = LeaseRepo::ensure(runner.cache(), &repo, github_pat)
-		.await
-		.map_err(|_| PrepareError::Checkout)?;
-	let branch = head_branch.as_ref().map(|branch| branch.expose());
-	let checkout = |bare: std::path::PathBuf| async move {
-		match target {
-			Some(sha) => checkout_revision(&bare, sha).await,
-			None => checkout_latest(&bare, branch).await,
-		}
+	let source = CheckoutSource {
+		repo: &repo,
+		github_pat,
+		branch: head_branch.as_ref().map(|branch| branch.expose()),
+		revision,
 	};
-	let (worktree, revision) = match checkout(cached.path().to_owned()).await {
-		Ok(done) => done,
-		Err(_) => {
-			cached = cached.reclone().await.map_err(|_| PrepareError::Checkout)?;
-			checkout(cached.path().to_owned()).await.map_err(|_| PrepareError::Checkout)?
-		},
-	};
-	runner
-		.enforce_workdir_cap(crate::repo_cache::dir_size(worktree.path()))
-		.map_err(|_| PrepareError::WorkdirTooLarge)?;
-
-	cancelled()?;
-	// Enumerated from the bare clone while this job still holds its pin.
-	let bare = cached.path().to_owned();
-	let sha = revision.expose().to_owned();
-	let bootstrap = recipe == SurveyRecipe::Bootstrap;
-	let (commit, inventory) = tokio::task::spawn_blocking(move || {
-		if bootstrap {
-			let inventory = observe_commit(&bare, &sha, InventoryDecoder)?;
-			Ok((inventory.commit().clone(), Some(inventory)))
-		} else {
-			Ok::<_, InventoryError>((observe_commit(&bare, &sha, CommitDecoder)?, None))
-		}
-	})
-	.await
-	.map_err(|_| PrepareError::Internal)??;
-	let worktree = cached.pin(worktree);
-	cancelled()?;
-
-	let client = runner.client();
-	let pin = PinTargetRequest { protocol_version: ReviewProtocol, commit_sha: commit.clone() };
-	let pinned = guarded(security, Operation::PinTarget, client.pin_target(&job, &pin))
-		.await?
-		.map_err(|error| match error {
-			PhaseError::Rejected {
-				status: 409, code: ReviewErrorCode::CheckoutConflict, ..
-			} => PrepareError::CheckoutConflict,
-			other => PrepareError::Phase(other),
-		})?;
-	let (generation, profile, assignments) = match pinned {
+	let observe =
+		if recipe == SurveyRecipe::Bootstrap { Observe::Inventory } else { Observe::Commit };
+	let Pinned { worktree, commit, inventory, response } =
+		checkout_and_pin(runner, &job, source, observe, security, cancel).await?;
+	let (generation, profile, assignments) = match response {
 		PinTargetResponse::Prepared { generation, profile, assignments, .. } => {
 			(generation, profile, assignments)
 		},
 		PinTargetResponse::Deferred { .. } => return Ok(Preparation::Deferred),
 	};
-	if generation.commit_sha.expose() != commit.expose() {
-		return Err(PrepareError::CheckoutConflict);
-	}
 
+	let client = runner.client();
 	if let Some(inventory) = &inventory {
 		upload(client, &job, security, inventory, cancel).await?;
 	}
@@ -250,6 +205,193 @@ pub async fn prepare(
 		phase_limits,
 		worktree,
 	})))
+}
+
+/// Everything later stages of a drilldown attempt need.
+pub struct PreparedDrilldown {
+	pub job_id: i64,
+	pub job_capability: JobCapability,
+	pub repo_id: i64,
+	pub attempt: NonZeroU32,
+	pub campaign_id: i64,
+	/// The lease's deadlines and quotas.
+	pub limits: ReviewLimits,
+	/// The lead this job investigates, as claimed.
+	pub lead: AssignedReviewLead<Agent, Server>,
+	/// The generation the pin prepared, and the commit checked out for it.
+	pub generation: ReviewGeneration<Server>,
+	pub commit: ReviewCommit<Repo>,
+	/// The pin response's profile, else the lease's.
+	pub profile: FrozenReviewProfile<Agent, Server>,
+	/// Remaining capacity read after the pin.
+	pub phase_limits: PhaseLimitsResponse,
+	/// The pinned checkout the agent reads.
+	pub worktree: CheckedOutWorktree,
+}
+
+impl std::fmt::Debug for PreparedDrilldown {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("PreparedDrilldown([redacted])")
+	}
+}
+
+impl PreparedDrilldown {
+	/// The phase-call context of this attempt, bounded by its hard deadline.
+	pub fn phase_job(&self) -> PhaseJob<'_> {
+		PhaseJob {
+			job_id: self.job_id,
+			capability: &self.job_capability,
+			deadline: at(self.limits.hard_deadline_at),
+		}
+	}
+}
+
+/// Prepare one drilldown attempt for `env`: check out and pin the
+/// generation commit, then read the remaining capacity. The generation is
+/// already sealed, so no inventory is taken. Leases past their hard
+/// deadline fail closed before any repository access.
+pub async fn prepare_drilldown(
+	runner: &Runner, env: LeaseEnvelope<Agent, Server>, security: &JobSecurity,
+	cancel: &CancellationToken,
+) -> Result<PreparedDrilldown, PrepareError> {
+	let LeaseEnvelope {
+		job_id,
+		job_capability,
+		repo_id,
+		repo,
+		head_branch,
+		github_pat,
+		payload,
+		..
+	} = env;
+	let LeasePayload::ReviewDrilldown(lease) = payload else {
+		return Err(PrepareError::UnsupportedLease);
+	};
+	let ReviewDrilldownLease { provenance, generation: leased, profile, lead } = *lease;
+	let limits = provenance.limits;
+	let job =
+		PhaseJob { job_id, capability: &job_capability, deadline: at(limits.hard_deadline_at) };
+	let source = CheckoutSource {
+		repo: &repo,
+		github_pat,
+		branch: head_branch.as_ref().map(|branch| branch.expose()),
+		revision: Some(leased.commit_sha.expose()),
+	};
+	let Pinned { worktree, commit, response, .. } =
+		checkout_and_pin(runner, &job, source, Observe::Commit, security, cancel).await?;
+	let PinTargetResponse::Prepared { generation, profile: pinned, .. } = response else {
+		return Err(PrepareError::UnsupportedLease);
+	};
+	let phase_limits = runner.client().limits(&job).await?;
+	Ok(PreparedDrilldown {
+		job_id,
+		job_capability: job_capability.clone(),
+		repo_id,
+		attempt: provenance.attempt,
+		campaign_id: provenance.campaign_id.into(),
+		limits,
+		lead,
+		generation,
+		commit,
+		profile: pinned.unwrap_or(profile),
+		phase_limits,
+		worktree,
+	})
+}
+
+/// Where a phase attempt's checkout comes from.
+pub(crate) struct CheckoutSource<'a> {
+	pub repo: &'a RepoSpec<Server>,
+	pub github_pat: Option<Secret<String>>,
+	pub branch: Option<&'a str>,
+	/// The commit to check out; `None` follows the branch tip.
+	pub revision: Option<&'a str>,
+}
+
+/// What to read from the checked-out commit before the pin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Observe {
+	Commit,
+	Inventory,
+}
+
+/// A checkout the server accepted as the job's target.
+pub(crate) struct Pinned {
+	pub worktree: CheckedOutWorktree,
+	pub commit: ReviewCommit<Repo>,
+	/// Present when [`Observe::Inventory`] was asked for.
+	pub inventory: Option<Inventory>,
+	/// The pin response; a `Prepared` generation always names `commit`.
+	pub response: PinTargetResponse<Agent, Server>,
+}
+
+/// Check out the job's target (recloning once on failure), enforce the
+/// workdir cap, observe the commit, and pin it. Fails closed past the
+/// job's hard deadline before any repository access.
+pub(crate) async fn checkout_and_pin(
+	runner: &Runner, job: &PhaseJob<'_>, source: CheckoutSource<'_>, observe: Observe,
+	security: &JobSecurity, cancel: &CancellationToken,
+) -> Result<Pinned, PrepareError> {
+	if SystemTime::now() >= job.deadline {
+		return Err(PrepareError::HardDeadline);
+	}
+	let cancelled = || if cancel.is_cancelled() { Err(PrepareError::Cancelled) } else { Ok(()) };
+	let CheckoutSource { repo, github_pat, branch, revision: target } = source;
+
+	cancelled()?;
+	let mut cached = LeaseRepo::ensure(runner.cache(), repo, github_pat)
+		.await
+		.map_err(|_| PrepareError::Checkout)?;
+	let checkout = |bare: std::path::PathBuf| async move {
+		match target {
+			Some(sha) => checkout_revision(&bare, sha).await,
+			None => checkout_latest(&bare, branch).await,
+		}
+	};
+	let (worktree, revision) = match checkout(cached.path().to_owned()).await {
+		Ok(done) => done,
+		Err(_) => {
+			cached = cached.reclone().await.map_err(|_| PrepareError::Checkout)?;
+			checkout(cached.path().to_owned()).await.map_err(|_| PrepareError::Checkout)?
+		},
+	};
+	runner
+		.enforce_workdir_cap(crate::repo_cache::dir_size(worktree.path()))
+		.map_err(|_| PrepareError::WorkdirTooLarge)?;
+
+	cancelled()?;
+	// Enumerated from the bare clone while this job still holds its pin.
+	let bare = cached.path().to_owned();
+	let sha = revision.expose().to_owned();
+	let (commit, inventory) = tokio::task::spawn_blocking(move || match observe {
+		Observe::Inventory => {
+			let inventory = observe_commit(&bare, &sha, InventoryDecoder)?;
+			Ok((inventory.commit().clone(), Some(inventory)))
+		},
+		Observe::Commit => {
+			Ok::<_, InventoryError>((observe_commit(&bare, &sha, CommitDecoder)?, None))
+		},
+	})
+	.await
+	.map_err(|_| PrepareError::Internal)??;
+	let worktree = cached.pin(worktree);
+	cancelled()?;
+
+	let pin = PinTargetRequest { protocol_version: ReviewProtocol, commit_sha: commit.clone() };
+	let response = guarded(security, Operation::PinTarget, runner.client().pin_target(job, &pin))
+		.await?
+		.map_err(|error| match error {
+			PhaseError::Rejected {
+				status: 409, code: ReviewErrorCode::CheckoutConflict, ..
+			} => PrepareError::CheckoutConflict,
+			other => PrepareError::Phase(other),
+		})?;
+	if let PinTargetResponse::Prepared { generation, .. } = &response
+		&& generation.commit_sha.expose() != commit.expose()
+	{
+		return Err(PrepareError::CheckoutConflict);
+	}
+	Ok(Pinned { worktree, commit, inventory, response })
 }
 
 /// Send chunk 0, continue from the server's received prefix, and seal.
@@ -483,5 +625,183 @@ mod tests {
 		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 		let cached = std::fs::read_dir(cache.path().join("cache")).map(|dir| dir.count());
 		assert!(matches!(cached, Ok(0) | Err(_)), "repository cache was touched");
+	}
+
+	fn drilldown_lease(
+		hard_deadline_at: i64, clone_url: &str, commit: &str,
+	) -> LeaseEnvelope<Agent, Server> {
+		let body = json!({"kind":"lease","protocol_version":3,"job_id":1,
+			"job_capability":"test-capability","repo_id":1,
+			"repo":{"host":"invalid.test","owner":"test","repo":"test","clone_url":clone_url},
+			"head_branch":null,"lease_expires_at":200,"scanner_config":null,
+			"payload":{"kind":"review_drilldown","provenance":{"workflow_contract_version":1,
+				"campaign_id":2,"attempt":2,"limits":{"soft_deadline_at":100,"submit_by":100,
+				"hard_deadline_at":hard_deadline_at,"token_budget":null,"new_unit_limit":0,
+				"lead_limit":0,"sibling_limit":4}},
+			"generation":{"generation_id":3,"commit_sha":commit},
+			"profile":{"profile_version":1,"profile_digest":"b".repeat(64),
+				"profile":{"purpose":"lease profile"}},
+			"lead":{"lead_id":4,"producer_commit_sha":commit,"identity_family":"memory-safety",
+				"identity_anchor":"request allocation","hypothesis":"Unbounded allocation",
+				"source_refs":[{"path":"main.rs"}],"next_proof_step":"Trace allocation",
+				"counterevidence":"Authentication","proof_gaps":"No reproducer"}}});
+		let LeaseResponse::Lease(env) =
+			crate::client::test_lease(body.to_string().as_bytes()).response
+		else {
+			panic!("drilldown lease fixture")
+		};
+		*env
+	}
+
+	fn head(url: &str) -> String {
+		let repo = git2::Repository::open(url.trim_start_matches("file://")).unwrap();
+		repo.refname_to_id("refs/heads/main").unwrap().to_string()
+	}
+
+	#[tokio::test]
+	async fn expired_and_cancelled_drilldowns_never_touch_the_repository() {
+		let (_origin, url) = origin();
+		let (base, requests) = server(500, String::new()).await;
+		let cache = tempfile::tempdir().unwrap();
+		let runner = runner(base, &cache.path().join("cache"));
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let commit = head(&url);
+		let error = prepare_drilldown(
+			&runner,
+			drilldown_lease(1, &url, &commit),
+			&security,
+			&CancellationToken::new(),
+		)
+		.await
+		.unwrap_err();
+		assert!(matches!(error, PrepareError::HardDeadline), "{error}");
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let lease = drilldown_lease(i64::MAX / 2, &url, &commit);
+		let error = prepare_drilldown(&runner, lease, &security, &cancel).await.unwrap_err();
+		assert!(matches!(error, PrepareError::Cancelled), "{error}");
+		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+		let cached = std::fs::read_dir(cache.path().join("cache")).map(|dir| dir.count());
+		assert!(matches!(cached, Ok(0) | Err(_)), "repository cache was touched");
+	}
+
+	#[tokio::test]
+	async fn a_survey_lease_is_not_a_drilldown() {
+		let (base, requests) = server(500, String::new()).await;
+		let cache = tempfile::tempdir().unwrap();
+		let runner = runner(base, &cache.path().join("cache"));
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let lease = lease(unresolved(), i64::MAX / 2);
+		let error = prepare_drilldown(&runner, lease, &security, &CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert!(matches!(error, PrepareError::UnsupportedLease), "{error}");
+		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn a_drilldown_pin_conflict_is_a_checkout_conflict() {
+		let (_origin, url) = origin();
+		let conflict =
+			r#"{"protocol_version":3,"error":{"code":"checkout_conflict","detail":null}}"#;
+		let (base, requests) = server(409, conflict.to_owned()).await;
+		let cache = tempfile::tempdir().unwrap();
+		let runner = runner(base, cache.path());
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let lease = drilldown_lease(i64::MAX / 2, &url, &head(&url));
+		let error = prepare_drilldown(&runner, lease, &security, &CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert!(matches!(error, PrepareError::CheckoutConflict), "{error}");
+		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1, "only the pin was sent");
+	}
+
+	/// Answers `pin-target` with `pin` and every other request with `rest`,
+	/// recording request heads.
+	async fn routed(
+		pin: String, rest: String,
+	) -> (reqwest::Url, Arc<std::sync::Mutex<Vec<String>>>) {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+		let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let seen = heads.clone();
+		tokio::spawn(async move {
+			loop {
+				let (mut stream, _) = listener.accept().await.unwrap();
+				let mut request = Vec::new();
+				let head = loop {
+					let mut buf = [0; 8192];
+					let read = stream.read(&mut buf).await.unwrap();
+					request.extend_from_slice(&buf[..read]);
+					let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+						continue;
+					};
+					let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+					let length: usize = head
+						.lines()
+						.find_map(|line| line.strip_prefix("content-length:"))
+						.map_or(0, |value| value.trim().parse().unwrap());
+					if request.len() >= end + 4 + length || read == 0 {
+						break head;
+					}
+				};
+				let body = if head.contains("/pin-target ") { &pin } else { &rest };
+				seen.lock().unwrap().push(head.lines().next().unwrap_or("").to_owned());
+				let response = format!(
+					"HTTP/1.1 200 OK\r\nX-Loupe-Protocol: 3\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+					body.len()
+				);
+				let _ = stream.write_all(response.as_bytes()).await;
+			}
+		});
+		(base, heads)
+	}
+
+	fn limits() -> String {
+		json!({"protocol_version":3,"soft_deadline_at":100,"submit_by":100,"hard_deadline_at":200,
+			"remaining_seconds":60,"new_units":{"limit":0,"remaining":0},
+			"leads":{"limit":0,"remaining":0},"siblings":{"limit":4,"remaining":3},
+			"candidate_queries":{"limit":32,"remaining":30},"campaign_jobs_limit":10,
+			"campaign_jobs_admitted":2,"campaign_general_remaining":5,
+			"campaign_urgent_remaining":1,"campaign_verification_remaining":2,
+			"proof_capacity":"unavailable","artifact_capacity":"unavailable",
+			"output_capacity":"unavailable","tokens":{"status":"none"}})
+		.to_string()
+	}
+
+	#[tokio::test]
+	async fn a_drilldown_pins_the_generation_commit_then_reads_limits() {
+		let (_origin, url) = origin();
+		let commit = head(&url);
+		let pin = |profile: serde_json::Value| {
+			json!({"outcome":"prepared","protocol_version":3,
+				"generation":{"generation_id":3,"commit_sha":commit},
+				"profile":profile,"assignments":null})
+			.to_string()
+		};
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let pinned = json!({"profile_version":2,"profile_digest":"c".repeat(64),
+			"profile":{"purpose":"pinned profile"}});
+		for (profile, version) in [(serde_json::Value::Null, 1), (pinned, 2)] {
+			let (base, heads) = routed(pin(profile), limits()).await;
+			let cache = tempfile::tempdir().unwrap();
+			let runner = runner(base, cache.path());
+			let lease = drilldown_lease(i64::MAX / 2, &url, &commit);
+			let prepared = prepare_drilldown(&runner, lease, &security, &CancellationToken::new())
+				.await
+				.unwrap();
+			assert_eq!(
+				*heads.lock().unwrap(),
+				["post /v1/jobs/1/pin-target http/1.1", "get /v1/jobs/1/limits http/1.1"]
+			);
+			assert_eq!(prepared.commit.expose(), commit);
+			assert_eq!(prepared.generation.commit_sha.expose(), commit);
+			assert_eq!(i64::from(prepared.lead.lead_id), 4);
+			assert_eq!(prepared.attempt.get(), 2);
+			assert_eq!(prepared.profile.profile_version.get(), version);
+			assert_eq!(prepared.phase_limits.siblings.remaining, 3);
+			assert_eq!(prepared.phase_job().deadline, at(i64::MAX / 2));
+		}
 	}
 }

@@ -37,6 +37,7 @@ GEN_TEST proto_review_inventory
 GEN_TEST proto_review_lease
 GEN_TEST proto_review_lifecycle
 GEN_TEST proto_review_responses_checkpoints
+GEN_TEST proto_review_responses_drilldown
 GEN_TEST proto_review_responses_host
 GEN_TEST proto_review_terminal
 GEN_TEST proto_review_units
@@ -70,6 +71,7 @@ GEN_TEST worker_client_ingress
 GEN_TEST worker_config
 GEN_TEST worker_extract_json
 GEN_TEST worker_inventory_chunks
+GEN_TEST worker_mcp_drilldown_ingress
 GEN_TEST worker_mcp_ingress
 GEN_TEST worker_mcp_rpc
 GEN_TEST worker_mcp_submission

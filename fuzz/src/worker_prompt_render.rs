@@ -1,7 +1,8 @@
 //! Arbitrary original Server bytes enter the actual owner before rendering.
 //! The entire input is the description, so the canonical raw corpus is also
 //! useful to unit tests. Both modes and closed/text projections run each time,
-//! and the same bytes enter a survey prompt as assignment and profile text.
+//! and the same bytes enter a survey prompt as assignment and profile text and
+//! a drilldown prompt as lead hypothesis and profile text.
 
 use loupe_worker::llm::prompt::{
 	fuzz_support, DataMode, PromptError, MAX_RENDERED_PROMPT_BYTES, PREAMBLE,
@@ -17,7 +18,8 @@ pub fn do_test(data: &[u8]) {
 	}
 	for candidates in [[[0x11; 16], [0x22; 16], [0x33; 16]], derived] {
 		for mode in [DataMode::Delimited, DataMode::Marked] {
-			check_survey(data, candidates, mode);
+			check_phase(data, candidates, mode, Phase::Survey);
+			check_phase(data, candidates, mode, Phase::Drilldown);
 			for projection in [false, true] {
 				let Some(result) = fuzz_support::render(data, mode, projection, candidates) else {
 					continue; // Original UTF-8/policy admission rejected these bytes.
@@ -135,31 +137,48 @@ fn decode_payload(payload: &str, mode: DataMode) -> String {
 	recovered
 }
 
-/// The survey projections: host scalars under `server`, the same agent text
-/// in the `assignments` and `profile` parts, one boundary for all three.
-fn check_survey(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode) {
-	let Some(survey) = fuzz_support::render_survey(data, mode, candidates) else {
+#[derive(Clone, Copy)]
+enum Phase {
+	Survey,
+	Drilldown,
+}
+
+/// The phase projections: host scalars under `server`, the same agent text
+/// in the assignment (`assignments` or `lead`) and `profile` parts, one
+/// boundary for all three.
+fn check_phase(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode, phase: Phase) {
+	let rendered = match phase {
+		Phase::Survey => fuzz_support::render_survey(data, mode, candidates)
+			.map(|r| (r.prompt, r.spans, r.commit, r.admitted)),
+		Phase::Drilldown => fuzz_support::render_drilldown(data, mode, candidates)
+			.map(|r| (r.prompt, r.spans, r.commit, r.admitted)),
+	};
+	let Some((prompt, spans, commit, admitted)) = rendered else {
 		return; // The lease owner rejected these bytes as agent text.
 	};
 	// The lease owner normalises agent text on admission; the renderer must
 	// carry the admitted text exactly.
-	let raw = survey.admitted.as_str();
+	let raw = admitted.as_str();
 	let escaped = serde_json::to_string(raw).unwrap_or_else(|error| panic!("oracle: {error}"));
 	let expected = candidates
 		.iter()
 		.map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
-		.find(|candidate| !escaped.contains(candidate) && !survey.commit.contains(candidate));
+		.find(|candidate| !escaped.contains(candidate) && !commit.contains(candidate));
 	let Some(expected) = expected else {
-		assert!(matches!(survey.prompt, Err(PromptError::Collision)));
+		assert!(matches!(prompt, Err(PromptError::Collision)));
 		return;
 	};
-	let prompt = survey.prompt.unwrap_or_else(|error| panic!("bounded admitted render: {error}"));
-	let [context, units, profile] = &survey.spans;
+	let prompt = prompt.unwrap_or_else(|error| panic!("bounded admitted render: {error}"));
+	let (assigned, phase_name, terminal) = match phase {
+		Phase::Survey => ("assignments", "survey", "finalize_survey"),
+		Phase::Drilldown => ("lead", "drilldown", "finalize_drilldown"),
+	};
+	let [context, assignment, profile] = &spans;
 	let parts = decode_labelled(
 		prompt.expose(),
 		&[
 			(context, "job_context", "server"),
-			(units, "assignments", "agent"),
+			(assignment, assigned, "agent"),
 			(profile, "profile", "agent"),
 		],
 		"",
@@ -170,14 +189,26 @@ fn check_survey(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode) {
 		serde_json::from_str(text).unwrap_or_else(|error| panic!("projection: {error}"))
 	};
 	let context = parse(&parts[0]);
-	assert_eq!(context["phase"], "survey");
+	assert_eq!(context["phase"], phase_name);
 	assert_eq!(context["workflow_contract_version"], 2);
-	assert_eq!(context["checkout_commit"], survey.commit.as_str());
+	assert_eq!(context["checkout_commit"], commit.as_str());
 	assert_eq!(context["token_budget"], 7);
-	assert_eq!(context["capacity"]["leads"]["remaining"], 0);
-	assert_eq!(context["terminal_action"], "finalize_survey");
-	assert_eq!(parse(&parts[1])[0]["objective"], raw);
-	assert_eq!(parse(&parts[1])[0]["assignment_epoch"], 2);
+	assert_eq!(context["terminal_action"], terminal);
+	let assignment = parse(&parts[1]);
+	match phase {
+		Phase::Survey => {
+			assert_eq!(context["capacity"]["leads"]["remaining"], 0);
+			assert_eq!(assignment[0]["objective"], raw);
+			assert_eq!(assignment[0]["assignment_epoch"], 2);
+		},
+		Phase::Drilldown => {
+			assert_eq!(context["lead_id"], 4);
+			assert_eq!(context["producer_commit"], commit.as_str());
+			assert_eq!(context["capacity"]["siblings"]["remaining"], 0);
+			assert_eq!(assignment["hypothesis"], raw);
+			assert_eq!(assignment["identity_family"], "memory-safety");
+		},
+	}
 	assert_eq!(parse(&parts[2])["note"], raw);
 }
 

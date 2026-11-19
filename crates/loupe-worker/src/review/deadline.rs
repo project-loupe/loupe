@@ -1,4 +1,4 @@
-//! How long one survey invocation may run.
+//! How long one review-phase agent invocation may run.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,9 +8,9 @@ use loupe_proto::review_lease::ReviewLimits;
 /// report the attempt.
 pub const KILL_MARGIN: Duration = Duration::from_secs(30);
 
-/// The invocation timeout for a survey launched at `now`, or `None` when
+/// The invocation timeout for a phase agent launched at `now`, or `None` when
 /// the attempt must not launch.
-pub fn survey_timeout(limits: &ReviewLimits, now: SystemTime) -> Option<Duration> {
+pub fn phase_timeout(limits: &ReviewLimits, now: SystemTime) -> Option<Duration> {
 	invocation_timeout(now.duration_since(UNIX_EPOCH).ok()?, limits.hard_deadline_at)
 }
 
@@ -63,7 +63,7 @@ mod tests {
 			lead_limit: 1,
 			sibling_limit: 1,
 		};
-		assert_eq!(survey_timeout(&limits, UNIX_EPOCH + S(1_000)), Some(S(970)));
-		assert_eq!(survey_timeout(&limits, UNIX_EPOCH + S(1_980)), None);
+		assert_eq!(phase_timeout(&limits, UNIX_EPOCH + S(1_000)), Some(S(970)));
+		assert_eq!(phase_timeout(&limits, UNIX_EPOCH + S(1_980)), None);
 	}
 }

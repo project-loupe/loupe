@@ -5,19 +5,19 @@ use serde_json::{json, Value};
 use super::{add_tool_protocol_version, SURVEY_LOUPE_MCP_PROTOCOL_VERSION};
 use crate::review::session::SurveySession;
 
-const KEY_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
+pub(super) const KEY_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 
-fn source_refs(min: usize, max: usize) -> Value {
+pub(super) fn source_refs(min: usize, max: usize) -> Value {
 	json!({"type":"array","minItems":min,"maxItems":max,"items":{"$ref":"#/$defs/source_ref"}})
 }
 
-fn defs() -> Value {
+pub(super) fn defs() -> Value {
 	json!({"source_ref":{"type":"object","required":["path"],"additionalProperties":false,
 		"properties":{"path":{"type":"string","maxLength":512},
 		"symbol":{"type":"string","maxLength":256}}}})
 }
 
-fn text(max: usize) -> Value {
+pub(super) fn text(max: usize) -> Value {
 	json!({"type":"string","maxLength":max})
 }
 

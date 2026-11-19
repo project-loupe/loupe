@@ -90,14 +90,11 @@ pub(super) async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> R
 }
 
 pub(super) fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
-	tool_catalog(
-		if verify_mode {
-			McpMode::LegacyVerify { job_id: 1, finding_id: 1 }
-		} else {
-			McpMode::LegacyDiscovery { job_id: submissions_enabled.then_some(1) }
-		},
-		None,
-	)
+	tool_catalog(&if verify_mode {
+		McpScope::LegacyVerify { job_id: 1, finding_id: 1 }
+	} else {
+		McpScope::LegacyDiscovery { job_id: submissions_enabled.then_some(1) }
+	})
 }
 
 pub(super) fn loupe_mcp_meta() -> Value {

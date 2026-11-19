@@ -203,8 +203,11 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	let stub_backend = Arc::new(StubLlmBackend::new_async("stub", move |req| {
 		let http = http_for_stub.clone();
 		async move {
-			let job_id =
-				req.mcp_mode.job_id().expect("test stub requires job_id (one-pass agent flow)");
+			let job_id = req
+				.mcp_scope
+				.mode()
+				.job_id()
+				.expect("test stub requires job_id (one-pass agent flow)");
 			let job_capability = req.job_capability.expect("test stub requires a job capability");
 			let finding = LlmFindingSubmission {
 				protocol_version: PROTOCOL_VERSION,

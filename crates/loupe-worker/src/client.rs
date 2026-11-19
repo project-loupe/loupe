@@ -535,7 +535,7 @@ mod tests {
 		let client = std::sync::Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
 		let mut runner = crate::runner::Runner::new(client, cache, Vec::new());
 		if survey {
-			runner = runner.with_survey_backend(std::sync::Arc::new(
+			runner = runner.with_phase_backend(std::sync::Arc::new(
 				crate::llm::testing::StubLlmBackend::new("never-run", |_| {
 					panic!("an empty lease reached the survey agent")
 				}),
@@ -554,9 +554,12 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn lease_request_advertises_survey_with_a_survey_backend() {
+	async fn lease_request_advertises_survey_and_drilldown_with_a_phase_backend() {
 		let request = runner_lease_request(true).await;
-		assert_eq!(request["review_capabilities"], serde_json::json!(["review:survey:v1"]));
+		assert_eq!(
+			request["review_capabilities"],
+			serde_json::json!(["review:survey:v1", "review:drilldown:v1"])
+		);
 		assert_eq!(request["capabilities"], serde_json::json!([]));
 	}
 
