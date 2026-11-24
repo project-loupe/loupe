@@ -421,11 +421,11 @@ outside that guarantee; a redacted holder does not erase those allocations.
 
 Schema v7 and the B4 server support the pre-proof review API: prepared surveys,
 assigned-lead drilldowns and canonical-finding verification. A worker
-advertises `review:survey:v1` with a survey agent and `review:drilldown:v1`
-with a drilldown agent (see
-[Survey worker](#survey-worker) and [Drilldown worker](#drilldown-worker));
-verify execution arrives in B7 and is not advertised, and production
-triggers remain legacy until cutover. Explicit phase
+advertises `review:survey:v1` with a survey agent, `review:drilldown:v1`
+with a drilldown agent and `review:verify:v1` with a verifier agent (see
+[Survey worker](#survey-worker), [Drilldown worker](#drilldown-worker) and
+[Verification worker](#verification-worker)). Production triggers remain
+legacy until cutover. Explicit phase
 advertisements never inherit legacy `verify:*` authority. Reconciliation,
 successor activation and corroboration remain B8-held; proof infrastructure
 remains Stage C. The startup guard rejects persisted kinds absent from
@@ -450,14 +450,16 @@ remains Stage C. The startup guard rejects persisted kinds absent from
 agent for survey leases as `scan` and `verify` are selected, with the same
 default `auto`, which prefers Codex, then Claude. `[agents] drilldown` (or
 `--drilldown-agent` / `LOUPE_DRILLDOWN_AGENT`) selects the agent for
-drilldown leases in the same way. The keys choose a backend; the model is
+drilldown leases in the same way. `[agents] verify` (or `--verify-agent` /
+`LOUPE_VERIFY_AGENT`) selects the agent for legacy and campaign verification
+alike. The keys choose a backend; the model is
 configured once per backend, and nothing enforces a difference between
-phases, so on `auto` both resolve to the same backend. The runner holds one
-backend per phase and sends in `review_capabilities`, beside its legacy
-scanner tags, `review:survey:v1` and `review:drilldown:v1` for the phases
-that have one; verify is not advertised. The runner dispatches a lease by payload,
-so legacy jobs never reach phase code and unsupported phase payloads
-(verify, or a phase without its backend) fail closed.
+phases, so on `auto` all three resolve to the same backend. The runner holds
+one backend per phase and sends in `review_capabilities`, beside its legacy
+scanner tags, `review:survey:v1`, `review:drilldown:v1` and
+`review:verify:v1` for the phases that have one. The runner dispatches a
+lease by payload, so legacy jobs never reach phase code and the leases of a
+phase without its backend fail closed.
 
 A survey lease (`crates/loupe-worker/src/review/`) runs in three steps:
 
@@ -537,6 +539,48 @@ finalize replay are admitted. A retried drilldown starts blind: the prompt
 states the remaining sibling and query capacity from `/limits` and, from
 the second attempt on, that earlier attempts may already have stored
 sibling leads. Each accepted sibling lead gets its own drilldown.
+
+### Verification worker
+
+A verify lease tests one promoted finding of a sealed generation. It shares
+the drilldown's preparation, retry, deadlines, heartbeat and failure report,
+and runs in three steps:
+
+1. **Prepare on the host.** As for a drilldown: check out the generation
+   commit, pin it and read `/limits`. The lease carries the finding and the
+   drilldown's whole L2 evidence; there is no further read route.
+2. **Run one agent invocation** against the verification MCP catalog
+   (protocol version 2): `get_job_limits` and `finalize_verification` with
+   one of three verdicts (verified, rejected, inconclusive). The prompt
+   presents the drilldown's argument as an unverified claim to refute or
+   re-derive from the checkout. Server refusals map to fixed texts, and
+   every 403 means lost authority and ends the session, as a verify call
+   carries no reference the server could refuse.
+3. **End the attempt.** A sealed receipt from `finalize_verification` ends
+   the job, whatever the agent does afterwards. Otherwise the host sends
+   `complete{failed}` with a fixed reason and the server's retry policy
+   decides; after the last attempt the finding stays `validating`.
+
+No command is run and no artifact is stored, so `verified` is reachable only
+at evidence rung L2 for a finding to which end-to-end proof does not apply.
+The host supplies that rung and that applicability; the agent gives the
+rationale and its own evidence. A finding that does need a proof is finalized
+`inconclusive` with `awaiting_proof_infrastructure`, whose blocker text the
+host supplies, and stays `validating`. A `verified` verdict moves the finding
+to `confirmed` and reports it after commit, or to `awaiting_approval` when the
+repository requires approval; `rejected` moves it to `dismissed`.
+
+`submit_by` closes neither tool. After a sealed receipt the server answers an
+identical finalize with the same receipt, refuses a different one and refuses
+`/limits`, which ends the session. A retried attempt and a
+continuation job start blind: neither sees an earlier attempt's blocker,
+partial evidence or notes.
+
+Independence is limited. The server requires the verifier's own evidence but
+does not compare it with the drilldown's. Claim ordering prefers another
+worker, by enrolled certificate, than one that ran the finding's drilldown;
+it is a preference and never a hard filter, so a single worker verifies its
+own findings. Nothing compares agents or models, and the server knows neither.
 
 The server owns HTTP and recipe policy; storage owns SQL authority and
 transactions and depends on core, never on server or wire DTOs. One ranked

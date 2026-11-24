@@ -398,7 +398,9 @@ startup. `[agents].scan`, `[agents].verify`, `[agents].survey` and
 - `scan = "auto"` → discovery scanner advertises `scan:llm` only when
   authenticated Claude is ready. This preserves the historical default.
 - `verify = "auto"` → verifier scanner advertises `verify:llm` with
-  Codex preferred and Claude as the fallback.
+  Codex preferred and Claude as the fallback. The same agent runs campaign
+  verification: the worker also advertises `review:verify:v1` and runs
+  verify leases on it, so legacy and campaign verification cannot differ.
 - `scan = "claude" | "codex"` or `verify = "claude" | "codex"` →
   require that exact authenticated CLI and fail startup if it is not
   ready.
@@ -411,8 +413,11 @@ startup. `[agents].scan`, `[agents].verify`, `[agents].survey` and
 - These keys choose a backend. The model is configured once per backend
   (`[agents.claude]`, `[agents.codex]`), so running two phases on
   different models needs two backends. Nothing enforces a difference
-  between phases: on `auto`, survey and drilldown resolve to the same
-  backend.
+  between phases: on `auto`, survey, drilldown and verify resolve to the
+  same backend. The server prefers to lease a verification to another
+  worker than the one whose drilldown promoted the finding, but this is
+  never a hard filter: a single worker verifies its own findings, and the
+  server knows no model identity.
 - CLI/env overrides are `--scan-agent` / `LOUPE_SCAN_AGENT`,
   `--verify-agent` / `LOUPE_VERIFY_AGENT`, `--survey-agent` /
   `LOUPE_SURVEY_AGENT` and `--drilldown-agent` /
@@ -464,8 +469,9 @@ secret-handling model.
 For the coordinated HTTP protocol-3 rollout, follow the
 [protocol upgrade runbook](contrib/upgrading-protocol-v3.md). The server exposes
 the pre-proof review API only to explicit phase advertisements. Current workers
-advertise none, and production triggers still use the legacy pipeline; this
-does not activate end-to-end v2 worker execution.
+advertise the survey, drilldown and verify phases their agents can run, but
+production triggers still use the legacy pipeline, so no campaign is opened and
+no phase work is leased outside tests.
 
 For existing installations, follow the
 [schema-v7 offline upgrade runbook](contrib/upgrading-schema-v7.md) before
@@ -918,7 +924,9 @@ in `validating`). The full state machine + reaper details are in
 `crates/loupe-server/src/routes/jobs.rs`.
 
 A worker with an authenticated verifier agent advertises `verify:llm`
-according to `[agents].verify` — see step 5 for backend selection. A
+according to `[agents].verify` — see step 5 for backend selection. Review
+campaigns verify their findings through separate `review:verify:v1` leases
+on the same agent (see the verification worker in `ARCH.md`). A
 deployment can run discovery and verifier on the same worker, on
 separate workers, or share a single worker with both — the lease loop
 matches by capability, not by binary. To force role separation, either

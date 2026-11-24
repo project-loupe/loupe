@@ -22,6 +22,7 @@
 - Reject the array form of review phase request, phase lease and generation reset objects.
 - Run review surveys on workers: a worker with a ready survey agent (`[agents] survey`, `--survey-agent` or `LOUPE_SURVEY_AGENT`, default `auto` like `scan` and `verify`) advertises `review:survey:v1`, pins and inventories the generation's tree, and drives the agent through the survey tool catalog until it finalizes.
 - Run review drilldowns on workers: a worker with a ready drilldown agent (`[agents] drilldown`, `--drilldown-agent` or `LOUPE_DRILLDOWN_AGENT`, default `auto`, independent of `survey`) investigates leads and advertises `review:drilldown:v1`. Each drilldown pins the generation commit, may record sibling leads, and ends by promoting, rejecting, deduplicating, marking as hardening or deferring its lead through `finalize_drilldown`.
+- Run campaign verifications on workers: a worker advertises `review:verify:v1` and verifies promoted findings with the agent that `[agents] verify` (`--verify-agent` or `LOUPE_VERIFY_AGENT`) selects for legacy verification. The key now selects the agent for both. Each verification pins the generation commit and ends as verified, rejected or inconclusive through `finalize_verification`; without proof execution, `verified` is limited to findings to which end-to-end proof does not apply.
 - Decode worker-side review responses strictly, rejecting malformed or unexpected server replies instead of ignoring them.
 
 ## v0.1 — 2026-09-07

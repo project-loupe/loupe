@@ -275,7 +275,8 @@ BKB API URL, broker ceilings, Claude/Codex model/effort, and Codex Daybreak), mo
 read-only into the container, and sets
 `LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT`, `LOUPE_VERIFY_AGENT`,
 `LOUPE_SURVEY_AGENT` and `LOUPE_DRILLDOWN_AGENT` accept `auto`, `claude`, or
-`codex`; explicit `claude`/`codex` selections fail
+`codex`; `LOUPE_VERIFY_AGENT` selects the agent for legacy and campaign
+verification alike. Explicit `claude`/`codex` selections fail
 startup if that CLI is not authenticated. For Codex, use `CODEX_API_KEY`;
 for compatibility the deploy script also writes `CODEX_API_KEY` from
 `OPENAI_API_KEY` when `CODEX_API_KEY` is absent.

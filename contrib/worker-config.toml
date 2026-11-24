@@ -40,6 +40,8 @@ agent_output = false
 
 [agents]
 scan = "auto"
+# Runs legacy and campaign verification, and advertises `verify:llm` and
+# `review:verify:v1`.
 verify = "auto"
 # Runs review surveys and advertises `review:survey:v1` when this agent is
 # ready.
