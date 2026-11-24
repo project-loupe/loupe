@@ -10,13 +10,14 @@ use loupe_provenance::{Agent, Server};
 
 use super::ServerClient;
 use crate::client::PhaseError;
-use crate::review::session::{DrilldownSession, PhaseSession, SurveySession};
+use crate::review::session::{DrilldownSession, PhaseSession, SurveySession, VerifySession};
 
 /// The host state of the review phase an MCP session serves.
 #[derive(Clone)]
 pub enum PhaseTools {
 	Survey(Arc<SurveySession>),
 	Drilldown(Arc<DrilldownSession>),
+	Verify(Arc<VerifySession>),
 }
 
 impl PhaseTools {
@@ -25,6 +26,7 @@ impl PhaseTools {
 		match self {
 			Self::Survey(_) => super::McpMode::Survey,
 			Self::Drilldown(_) => super::McpMode::Drilldown,
+			Self::Verify(_) => super::McpMode::Verify,
 		}
 	}
 
@@ -32,6 +34,7 @@ impl PhaseTools {
 		match self {
 			Self::Survey(survey) => survey.phase(),
 			Self::Drilldown(drilldown) => drilldown.phase(),
+			Self::Verify(verify) => verify.phase(),
 		}
 	}
 
@@ -40,6 +43,7 @@ impl PhaseTools {
 		match self {
 			Self::Survey(survey) => survey.receipt().is_some(),
 			Self::Drilldown(drilldown) => drilldown.receipt().is_some(),
+			Self::Verify(verify) => verify.receipt().is_some(),
 		}
 	}
 }

@@ -92,7 +92,9 @@ pub enum McpMode {
 	/// Drilldown phase catalog (Loupe MCP protocol 2). Its host state
 	/// travels as a shared `DrilldownSession` in [`PhaseTools::Drilldown`].
 	Drilldown,
-	/// Verify phase catalog (Loupe MCP protocol 2).
+	/// Verify phase catalog (Loupe MCP protocol 2), unlike the legacy
+	/// verification catalog. Its host state travels as a shared
+	/// `VerifySession` in [`PhaseTools::Verify`].
 	Verify,
 }
 
@@ -492,6 +494,8 @@ pub(crate) mod phase;
 mod repo_ingress;
 mod survey;
 mod survey_catalog;
+mod verify;
+mod verify_catalog;
 #[cfg(test)]
 use legacy_test_api::*;
 
@@ -564,6 +568,7 @@ fn tool_catalog(scope: &McpScope) -> Value {
 		McpScope::LegacyVerify { .. } => legacy_tool_catalog(true, true),
 		McpScope::Phase(PhaseTools::Survey(survey)) => survey_catalog::tools(survey),
 		McpScope::Phase(PhaseTools::Drilldown(_)) => drilldown_catalog::tools(),
+		McpScope::Phase(PhaseTools::Verify(_)) => verify_catalog::tools(),
 	}
 }
 
@@ -860,6 +865,7 @@ fn add_tool_protocol_version(tools: &mut [Value], version: u16) {
 enum PhaseCall<'a> {
 	Survey(&'a crate::review::session::SurveySession, crate::review::gate::SurveyTool),
 	Drilldown(&'a crate::review::session::DrilldownSession, crate::review::gate::DrilldownTool),
+	Verify(&'a crate::review::session::VerifySession, verify::VerifyTool),
 }
 
 async fn handle_decoded_tool_call(
@@ -874,6 +880,9 @@ async fn handle_decoded_tool_call(
 		Some(PhaseTools::Drilldown(drilldown)) => {
 			drilldown::tool(&call.name).map(|tool| PhaseCall::Drilldown(drilldown, tool))
 		},
+		Some(PhaseTools::Verify(verify)) => {
+			verify::tool(&call.name).map(|tool| PhaseCall::Verify(verify, tool))
+		},
 		None => None,
 	};
 	let result: Result<String> = session
@@ -885,6 +894,9 @@ async fn handle_decoded_tool_call(
 				},
 				Some(PhaseCall::Drilldown(drilldown, tool)) => {
 					return drilldown::dispatch(session, drilldown, tool, call.arguments).await;
+				},
+				Some(PhaseCall::Verify(verify, tool)) => {
+					return verify::dispatch(session, verify, tool, call.arguments).await;
 				},
 				None => {},
 			}
@@ -936,6 +948,7 @@ async fn handle_decoded_tool_call(
 		Some(PhaseCall::Drilldown(drilldown, _)) => {
 			format!("{text}\n{}", drilldown.status_line())
 		},
+		Some(PhaseCall::Verify(verify, _)) => format!("{text}\n{}", verify.status_line()),
 		None => text,
 	};
 	match result {
@@ -1596,6 +1609,8 @@ mod survey_ingress_tests;
 mod survey_tests;
 #[cfg(test)]
 mod verify_ingress_tests;
+#[cfg(test)]
+mod verify_tests;
 
 #[cfg(test)]
 mod prompt_baseline_tests;
