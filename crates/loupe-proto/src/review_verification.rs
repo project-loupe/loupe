@@ -9,7 +9,9 @@
 //! let _: loupe_proto::review_verification::FinalizeVerificationRequest<loupe_provenance::Operator> = serde_json::from_str("{}").unwrap();
 //! ```
 use loupe_core::review_payload::{VerificationTerminalV1, VerificationTerminalV1Decoder, Version1};
-use loupe_provenance::{Agent, Source, Unvalidated, ValidateCarrying, Worker};
+use loupe_provenance::{
+	Agent, Mark, Server, Source, Unvalidated, Validate, ValidateCarrying, Worker,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -75,6 +77,35 @@ pub struct VerificationTerminalResponse<S: Source> {
 }
 
 record_impls!(VerificationTerminalResponse<S> {protocol_version,receipt});
+
+const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+
+/// Decode a `finalize-verification` response; receipt metadata stays Server.
+pub struct VerificationTerminalResponseDecoder;
+impl Validate<&[u8], Server> for VerificationTerminalResponseDecoder {
+	type Output = VerificationTerminalResponse<Server>;
+	type Error = crate::review_api::ReviewResponseDecodeError;
+	fn validate<'v>(
+		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
+	) -> Result<Self::Output, Self::Error> {
+		if u.get().len() > MAX_RESPONSE_BYTES {
+			return Err(Self::Error::Invalid("verification terminal response exceeds its cap"));
+		}
+		let (protocol_version, receipt) =
+			crate::review_response::terminal::<VerificationSummary>(&mark, u.get())?;
+		let value = VerificationTerminalResponse {
+			protocol_version,
+			receipt: VerificationReceipt {
+				receipt_id: receipt.receipt_id,
+				job_id: receipt.job_id,
+				commit_sha: receipt.commit_sha,
+				result_digest: receipt.result_digest,
+				summary: receipt.summary,
+			},
+		};
+		crate::review_response::exact(u.get(), value)
+	}
+}
 
 // debug-ok: one closed decoder rejection without content.
 #[derive(Debug, thiserror::Error)]

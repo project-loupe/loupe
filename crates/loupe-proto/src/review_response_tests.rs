@@ -9,6 +9,7 @@ use crate::review_inventory::InventoryDispositionResponseDecoder;
 use crate::review_lifecycle::PhaseControlResponseDecoder;
 use crate::review_terminal::SurveyTerminalResponseDecoder;
 use crate::review_units::ReviewUnitResponseDecoder;
+use crate::review_verification::VerificationTerminalResponseDecoder;
 use crate::test_support::server_response;
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -351,4 +352,131 @@ fn drilldown_receipts_refuse_malformed_summaries_and_metadata() {
 	for value in bad {
 		assert!(decode(value.clone()).is_err(), "accepted {value}");
 	}
+}
+
+fn verification(summary: Value) -> Value {
+	json!({"protocol_version":3,"receipt":{"receipt_id":2,"job_id":8,"commit_sha":SHA,
+		"result_digest":DIGEST,"summary":summary}})
+}
+fn verification_summary(verdict: &str, state: &str) -> Value {
+	json!({"version":1,"finding_id":4,"verification_id":7,"verdict":verdict,
+		"finding_state":state})
+}
+fn inconclusive(continuation: Value) -> Value {
+	let mut summary = verification_summary("inconclusive", "validating");
+	summary["continuation"] = continuation;
+	summary
+}
+
+#[test]
+fn verification_receipts_round_trip_for_every_summary_shape() {
+	let decode = |raw: &str| plain(VerificationTerminalResponseDecoder, raw);
+	for (verdict, state) in
+		[("verified", "confirmed"), ("verified", "awaiting_approval"), ("rejected", "dismissed")]
+	{
+		check(&decode, verification(verification_summary(verdict, state)));
+	}
+	check(
+		&decode,
+		verification(inconclusive(json!({"state":"pending","class":"source_analysis_remaining",
+			"revision":1,"logical_sequence":2,"not_before":60}))),
+	);
+	for reason in ["awaiting_proof_infrastructure", "external_dependency", "requires_successor"] {
+		check(
+			&decode,
+			verification(inconclusive(json!({"state":"blocked","class":reason,"revision":1,
+				"logical_sequence":1,"reason":reason}))),
+		);
+	}
+}
+
+#[test]
+fn verification_receipts_refuse_malformed_summaries_and_metadata() {
+	let decode = |value: Value| plain(VerificationTerminalResponseDecoder, &value.to_string());
+	let summary = inconclusive(json!({"state":"pending","class":"source_analysis_remaining",
+		"revision":1,"logical_sequence":2,"not_before":60}));
+	assert!(decode(verification(summary.clone())).is_ok());
+	let mut bad = vec![];
+	for (key, value) in [
+		("unexpected", json!(0)),
+		("version", json!(2)),
+		("finding_id", json!(0)),
+		("finding_id", json!("4")),
+		("verification_id", json!(-1)),
+		("verdict", json!("confirmed")),
+		("verdict", json!({"inconclusive":null})),
+		("finding_state", json!("open")),
+		("finding_state", json!({"validating":null})),
+		("continuation", json!(null)),
+		("continuation", json!({"state":"pending"})),
+		(
+			"continuation",
+			json!({"state":"blocked","class":"external_dependency","revision":1,
+			"logical_sequence":1,"reason":"source_analysis_remaining"}),
+		),
+		(
+			"continuation",
+			json!({"state":"blocked","class":"external_dependency","revision":1,
+			"logical_sequence":1,"reason":"external_dependency","not_before":60}),
+		),
+		("continuation", json!(["pending", "source_analysis_remaining", 1, 2, 60])),
+	] {
+		let mut changed = summary.clone();
+		changed[key] = value;
+		bad.push(verification(changed));
+	}
+	for key in ["version", "finding_id", "verification_id", "verdict", "finding_state"] {
+		let mut changed = summary.clone();
+		changed.as_object_mut().unwrap().remove(key);
+		bad.push(verification(changed));
+	}
+	for (key, value) in [
+		("commit_sha", json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")),
+		("commit_sha", json!("aaaa")),
+		("result_digest", json!(SHA)),
+		("receipt_id", json!(-1)),
+		("terminal_reason", json!("completed")),
+		("summary", json!([1, 4, 7, "rejected", "dismissed"])),
+	] {
+		let mut changed = verification(summary.clone());
+		changed["receipt"][key] = value;
+		bad.push(changed);
+	}
+	let mut wrong_protocol = verification(summary);
+	wrong_protocol["protocol_version"] = json!(4);
+	bad.push(wrong_protocol);
+	for value in bad {
+		assert!(decode(value.clone()).is_err(), "accepted {value}");
+	}
+}
+
+#[test]
+fn verification_receipts_refuse_nested_duplicate_and_unknown_members() {
+	let valid = verification(inconclusive(json!({"state":"pending",
+		"class":"source_analysis_remaining","revision":1,"logical_sequence":2,"not_before":60})));
+	let raw = valid.to_string();
+	assert!(plain(VerificationTerminalResponseDecoder, &raw).is_ok());
+	let receipt = &valid["receipt"];
+	let summary = &receipt["summary"];
+	let continuation = &summary["continuation"];
+	for (object, name) in
+		[(receipt, "receipt"), (summary, "summary"), (continuation, "continuation")]
+	{
+		let opening = format!("\"{name}\":{{");
+		assert_eq!(raw.matches(&opening).count(), 1);
+		let unknown = raw.replace(&opening, &format!("{opening}\"unexpected\":0,"));
+		assert!(plain(VerificationTerminalResponseDecoder, &unknown).is_err(), "{unknown}");
+		for (key, value) in object.as_object().unwrap() {
+			let duplicate = raw.replace(&opening, &format!("{opening}\"{key}\":{value},"));
+			assert!(plain(VerificationTerminalResponseDecoder, &duplicate).is_err(), "{duplicate}");
+		}
+	}
+}
+
+#[test]
+fn verification_responses_stop_at_the_route_response_cap() {
+	let raw = verification(verification_summary("rejected", "dismissed")).to_string();
+	let boundary = format!("{raw}{}", " ".repeat(16 * 1024 - raw.len()));
+	assert!(plain(VerificationTerminalResponseDecoder, &boundary).is_ok());
+	assert!(plain(VerificationTerminalResponseDecoder, &(boundary + " ")).is_err());
 }

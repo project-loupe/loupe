@@ -41,6 +41,7 @@ mod proto_review_response_oracle;
 pub mod proto_review_responses_checkpoints;
 pub mod proto_review_responses_drilldown;
 pub mod proto_review_responses_host;
+pub mod proto_review_responses_verification;
 pub mod proto_review_terminal;
 pub mod proto_review_units;
 pub mod proto_review_verification;
