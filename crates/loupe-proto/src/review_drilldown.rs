@@ -93,33 +93,15 @@ impl Validate<&[u8], Server> for DrilldownTerminalResponseDecoder {
 	fn validate<'v>(
 		self, u: Unvalidated<'v, &[u8]>, mark: Mark<'v, Server>,
 	) -> Result<Self::Output, Self::Error> {
-		#[derive(Deserialize)]
-		#[serde(deny_unknown_fields)]
-		struct Wire<'a> {
-			protocol_version: ReviewProtocol,
-			#[serde(borrow)]
-			receipt: Receipt<'a>,
-		}
-		#[derive(Deserialize)]
-		#[serde(deny_unknown_fields)]
-		struct Receipt<'a> {
-			receipt_id: ReviewId,
-			job_id: ReviewId,
-			#[serde(borrow)]
-			commit_sha: &'a RawValue,
-			#[serde(borrow)]
-			result_digest: &'a RawValue,
-			summary: DrilldownSummary,
-		}
-		let wire: Wire<'_> = serde_json::from_slice(u.get())?;
-		let receipt = wire.receipt;
+		let (protocol_version, receipt) =
+			crate::review_response::terminal::<DrilldownSummary>(&mark, u.get())?;
 		let value = DrilldownTerminalResponse {
-			protocol_version: wire.protocol_version,
+			protocol_version,
 			receipt: DrilldownReceipt {
 				receipt_id: receipt.receipt_id,
 				job_id: receipt.job_id,
-				commit_sha: crate::review_response::metadata(&mark, receipt.commit_sha)?,
-				result_digest: crate::review_response::metadata(&mark, receipt.result_digest)?,
+				commit_sha: receipt.commit_sha,
+				result_digest: receipt.result_digest,
 				summary: receipt.summary,
 			},
 		};

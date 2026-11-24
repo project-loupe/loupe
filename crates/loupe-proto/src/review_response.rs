@@ -3,12 +3,14 @@
 //! received JSON, which also refuses sequence-form objects, map-form enums
 //! and integer tags.
 
+use loupe_provenance::{Mark, Server};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
-use crate::review_lease::ReviewLeaseDecodeError;
+use crate::review_api::ReviewProtocol;
+use crate::review_lease::{ReviewCommit, ReviewDigest, ReviewId, ReviewLeaseDecodeError};
 
 /// A bounded, content-free response admission failure.
 // debug-ok: parser errors retain only static classifications and policy errors.
@@ -95,4 +97,48 @@ pub(crate) fn metadata<P: loupe_core::text::IdentPolicy>(
 	let value =
 		loupe_core::text::decode_json_string_bounded(raw.get(), P::FIELD, P::MAX_LEN, P::MAX_LEN)?;
 	Ok(loupe_core::text::Identifier::new(mark, &value)?)
+}
+
+/// The members shared by the terminal receipts of finding phases.
+pub(crate) struct TerminalReceipt<T> {
+	pub(crate) receipt_id: ReviewId,
+	pub(crate) job_id: ReviewId,
+	pub(crate) commit_sha: ReviewCommit<Server>,
+	pub(crate) result_digest: ReviewDigest<Server>,
+	pub(crate) summary: T,
+}
+
+/// Decodes a terminal response whose receipt adds only a metadata `summary`.
+/// The caller admits the typed response through [`exact`].
+pub(crate) fn terminal<T: DeserializeOwned>(
+	mark: &Mark<'_, Server>, raw: &[u8],
+) -> Result<(ReviewProtocol, TerminalReceipt<T>), Error> {
+	#[derive(Deserialize)]
+	#[serde(deny_unknown_fields, bound(deserialize = "T: DeserializeOwned"))]
+	struct Wire<'a, T> {
+		protocol_version: ReviewProtocol,
+		#[serde(borrow)]
+		receipt: Receipt<'a, T>,
+	}
+	#[derive(Deserialize)]
+	#[serde(deny_unknown_fields, bound(deserialize = "T: DeserializeOwned"))]
+	struct Receipt<'a, T> {
+		receipt_id: ReviewId,
+		job_id: ReviewId,
+		#[serde(borrow)]
+		commit_sha: &'a RawValue,
+		#[serde(borrow)]
+		result_digest: &'a RawValue,
+		summary: T,
+	}
+	let wire: Wire<'_, T> = serde_json::from_slice(raw)?;
+	let receipt = wire.receipt;
+	let receipt = TerminalReceipt {
+		receipt_id: receipt.receipt_id,
+		job_id: receipt.job_id,
+		commit_sha: metadata(mark, receipt.commit_sha)?,
+		result_digest: metadata(mark, receipt.result_digest)?,
+		summary: receipt.summary,
+	};
+	Ok((wire.protocol_version, receipt))
 }
