@@ -148,12 +148,10 @@ enum Phase {
 /// boundary for all three.
 fn check_phase(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode, phase: Phase) {
 	let rendered = match phase {
-		Phase::Survey => fuzz_support::render_survey(data, mode, candidates)
-			.map(|r| (r.prompt, r.spans, r.commit, r.admitted)),
-		Phase::Drilldown => fuzz_support::render_drilldown(data, mode, candidates)
-			.map(|r| (r.prompt, r.spans, r.commit, r.admitted)),
+		Phase::Survey => fuzz_support::render_survey(data, mode, candidates),
+		Phase::Drilldown => fuzz_support::render_drilldown(data, mode, candidates),
 	};
-	let Some((prompt, spans, commit, admitted)) = rendered else {
+	let Some(fuzz_support::PhaseRender { prompt, spans, commit, admitted }) = rendered else {
 		return; // The lease owner rejected these bytes as agent text.
 	};
 	// The lease owner normalises agent text on admission; the renderer must
