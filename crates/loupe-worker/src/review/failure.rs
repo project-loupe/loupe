@@ -69,16 +69,9 @@ impl FailureReason {
 			PrepareError::Internal => Self::HostTaskFailed,
 			PrepareError::Phase(error) if denied(error) => Self::AuthorityLost,
 			PrepareError::Phase(_) => Self::PhaseRequestFailed,
-		}
-	}
-
-	/// For a phase that works on one subject of a sealed generation. Its pin
-	/// never defers and the lease kind is checked by dispatch, so an
-	/// unsupported lease here is a server response the host refuses.
-	pub(crate) fn from_subject_prepare(error: &PrepareError) -> Self {
-		match error {
-			PrepareError::UnsupportedLease => Self::PhaseRequestFailed,
-			other => Self::from_prepare(other),
+			// Dispatch checks the lease kind and a sealed generation's pin never
+			// defers, so this is a server response the host refuses.
+			PrepareError::UnexpectedSubject => Self::PhaseRequestFailed,
 		}
 	}
 }
@@ -170,11 +163,10 @@ mod tests {
 
 	#[test]
 	fn only_a_survey_reports_an_unsupported_recipe() {
-		let unsupported = PrepareError::UnsupportedLease;
-		let subject = FailureReason::from_subject_prepare;
-		assert_eq!(FailureReason::from_prepare(&unsupported), FailureReason::UnsupportedRecipe);
-		assert_eq!(subject(&unsupported), FailureReason::PhaseRequestFailed);
-		let conflict = PrepareError::CheckoutConflict;
-		assert_eq!(subject(&conflict), FailureReason::CheckoutConflict);
+		let reason = FailureReason::from_prepare;
+		assert_eq!(reason(&PrepareError::UnsupportedLease), FailureReason::UnsupportedRecipe);
+		assert_eq!(reason(&PrepareError::UnexpectedSubject), FailureReason::PhaseRequestFailed);
+		assert!(!PrepareError::UnexpectedSubject.to_string().contains("survey"));
+		assert_eq!(reason(&PrepareError::CheckoutConflict), FailureReason::CheckoutConflict);
 	}
 }

@@ -15,7 +15,7 @@ use loupe_proto::review_api::{
 use loupe_proto::review_lease::{
 	AssignedReviewFinding, AssignedReviewLead, BootstrapTarget, FrozenReviewProfile,
 	OrdinarySurveyRecipe, ReviewAssignments, ReviewDrilldownLease, ReviewGeneration, ReviewLimits,
-	ReviewSurveyContext, ReviewSurveyLease, ReviewVerifyLease,
+	ReviewProvenance, ReviewSurveyContext, ReviewSurveyLease, ReviewVerifyLease,
 };
 use loupe_proto::{JobCapability, LeaseEnvelope, LeasePayload};
 use loupe_provenance::{Agent, Repo, Secret, Server};
@@ -35,6 +35,10 @@ use crate::runner::{
 pub enum PrepareError {
 	#[error("lease is not a survey this worker runs")]
 	UnsupportedLease,
+	/// A lease on one subject of a sealed generation carried another payload,
+	/// or its pin was deferred.
+	#[error("unexpected lease payload or pin outcome")]
+	UnexpectedSubject,
 	#[error("hard deadline reached")]
 	HardDeadline,
 	#[error("repository checkout failed")]
@@ -207,8 +211,9 @@ pub async fn prepare(
 	})))
 }
 
-/// Everything later stages of a drilldown attempt need.
-pub struct PreparedDrilldown {
+/// Everything later stages of an attempt on one subject of a sealed
+/// generation need: a drilldown's lead or a verification's finding.
+pub struct PreparedSubject<T> {
 	pub job_id: i64,
 	pub job_capability: JobCapability,
 	pub repo_id: i64,
@@ -216,26 +221,26 @@ pub struct PreparedDrilldown {
 	pub campaign_id: i64,
 	/// The lease's deadlines and quotas.
 	pub limits: ReviewLimits,
-	/// The lead this job investigates, as claimed.
-	pub lead: AssignedReviewLead<Agent, Server>,
+	/// What this job works on, as claimed.
+	pub subject: T,
 	/// The generation the pin prepared, and the commit checked out for it.
 	pub generation: ReviewGeneration<Server>,
 	pub commit: ReviewCommit<Repo>,
 	/// The pin response's profile, else the lease's.
 	pub profile: FrozenReviewProfile<Agent, Server>,
-	/// Remaining capacity read after the pin.
+	/// Deadlines and remaining capacity read after the pin.
 	pub phase_limits: PhaseLimitsResponse,
 	/// The pinned checkout the agent reads.
 	pub worktree: CheckedOutWorktree,
 }
 
-impl std::fmt::Debug for PreparedDrilldown {
+impl<T> std::fmt::Debug for PreparedSubject<T> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("PreparedDrilldown([redacted])")
+		f.write_str("PreparedSubject([redacted])")
 	}
 }
 
-impl PreparedDrilldown {
+impl<T> PreparedSubject<T> {
 	/// The phase-call context of this attempt, bounded by its hard deadline.
 	pub fn phase_job(&self) -> PhaseJob<'_> {
 		PhaseJob {
@@ -246,90 +251,53 @@ impl PreparedDrilldown {
 	}
 }
 
-/// Prepare one drilldown attempt for `env`: check out and pin the
-/// generation commit, then read the remaining capacity. The generation is
-/// already sealed, so no inventory is taken. Leases past their hard
-/// deadline fail closed before any repository access.
+/// Prepare one drilldown attempt for `env`.
 pub async fn prepare_drilldown(
 	runner: &Runner, env: LeaseEnvelope<Agent, Server>, security: &JobSecurity,
 	cancel: &CancellationToken,
-) -> Result<PreparedDrilldown, PrepareError> {
-	let LeaseEnvelope {
-		job_id,
-		job_capability,
-		repo_id,
-		repo,
-		head_branch,
-		github_pat,
-		payload,
-		..
-	} = env;
-	let LeasePayload::ReviewDrilldown(lease) = payload else {
-		return Err(PrepareError::UnsupportedLease);
+) -> Result<PreparedSubject<AssignedReviewLead<Agent, Server>>, PrepareError> {
+	let open = |payload| match payload {
+		LeasePayload::ReviewDrilldown(lease) => {
+			let ReviewDrilldownLease { provenance, generation, profile, lead } = *lease;
+			Some(SubjectLease { provenance, generation, profile, subject: lead })
+		},
+		_ => None,
 	};
-	let ReviewDrilldownLease { provenance, generation: leased, profile, lead } = *lease;
-	let limits = provenance.limits;
-	let job =
-		PhaseJob { job_id, capability: &job_capability, deadline: at(limits.hard_deadline_at) };
-	let source = CheckoutSource {
-		repo: &repo,
-		github_pat,
-		branch: head_branch.as_ref().map(|branch| branch.expose()),
-		revision: Some(leased.commit_sha.expose()),
-	};
-	let SealedGeneration { worktree, commit, generation, profile, phase_limits } =
-		prepare_generation(runner, &job, source, profile, security, cancel).await?;
-	Ok(PreparedDrilldown {
-		job_id,
-		job_capability: job_capability.clone(),
-		repo_id,
-		attempt: provenance.attempt,
-		campaign_id: provenance.campaign_id.into(),
-		limits,
-		lead,
-		generation,
-		commit,
-		profile,
-		phase_limits,
-		worktree,
-	})
+	prepare_subject(runner, env, open, security, cancel).await
 }
 
-/// Everything later stages of a verify attempt need.
-pub struct PreparedVerify {
-	pub job_id: i64,
-	pub job_capability: JobCapability,
-	pub repo_id: i64,
-	pub attempt: NonZeroU32,
-	pub campaign_id: i64,
-	/// The lease's deadlines and quotas.
-	pub limits: ReviewLimits,
-	/// The finding this job verifies, as claimed.
-	pub finding: AssignedReviewFinding<Agent, Server>,
-	/// The generation the pin prepared, and the commit checked out for it.
-	pub generation: ReviewGeneration<Server>,
-	pub commit: ReviewCommit<Repo>,
-	/// The pin response's profile, else the lease's.
-	pub profile: FrozenReviewProfile<Agent, Server>,
-	/// Deadlines and campaign capacity read after the pin.
-	pub phase_limits: PhaseLimitsResponse,
-	/// The pinned checkout the agent reads.
-	pub worktree: CheckedOutWorktree,
-}
-
-impl std::fmt::Debug for PreparedVerify {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("PreparedVerify([redacted])")
-	}
-}
-
-/// Prepare one verify attempt for `env`: check out and pin the generation
-/// commit, then read the limits. Leases past their hard deadline fail closed
-/// before any repository access.
+/// Prepare one verify attempt for `env`.
 pub async fn prepare_verify(
 	runner: &Runner, env: LeaseEnvelope<Agent, Server>, security: &JobSecurity,
 	cancel: &CancellationToken,
-) -> Result<PreparedVerify, PrepareError> {
+) -> Result<PreparedSubject<AssignedReviewFinding<Agent, Server>>, PrepareError> {
+	let open = |payload| match payload {
+		LeasePayload::ReviewVerify(lease) => {
+			let ReviewVerifyLease { provenance, generation, profile, finding } = *lease;
+			Some(SubjectLease { provenance, generation, profile, subject: finding })
+		},
+		_ => None,
+	};
+	prepare_subject(runner, env, open, security, cancel).await
+}
+
+/// The payload of a lease on one subject of a sealed generation.
+struct SubjectLease<T> {
+	provenance: ReviewProvenance,
+	generation: ReviewGeneration<Server>,
+	profile: FrozenReviewProfile<Agent, Server>,
+	subject: T,
+}
+
+/// Check out and pin the generation commit of the lease `open` reads, then
+/// read the limits. The generation is already sealed, so no inventory is
+/// taken. Leases past their hard deadline fail closed before any repository
+/// access.
+async fn prepare_subject<T>(
+	runner: &Runner, env: LeaseEnvelope<Agent, Server>,
+	open: impl FnOnce(LeasePayload<Agent, Server>) -> Option<SubjectLease<T>>,
+	security: &JobSecurity, cancel: &CancellationToken,
+) -> Result<PreparedSubject<T>, PrepareError> {
 	let LeaseEnvelope {
 		job_id,
 		job_capability,
@@ -340,10 +308,8 @@ pub async fn prepare_verify(
 		payload,
 		..
 	} = env;
-	let LeasePayload::ReviewVerify(lease) = payload else {
-		return Err(PrepareError::UnsupportedLease);
-	};
-	let ReviewVerifyLease { provenance, generation: leased, profile, finding } = *lease;
+	let SubjectLease { provenance, generation: leased, profile, subject } =
+		open(payload).ok_or(PrepareError::UnexpectedSubject)?;
 	let limits = provenance.limits;
 	let job =
 		PhaseJob { job_id, capability: &job_capability, deadline: at(limits.hard_deadline_at) };
@@ -353,54 +319,25 @@ pub async fn prepare_verify(
 		branch: head_branch.as_ref().map(|branch| branch.expose()),
 		revision: Some(leased.commit_sha.expose()),
 	};
-	let SealedGeneration { worktree, commit, generation, profile, phase_limits } =
-		prepare_generation(runner, &job, source, profile, security, cancel).await?;
-	Ok(PreparedVerify {
+	let Pinned { worktree, commit, response, .. } =
+		checkout_and_pin(runner, &job, source, Observe::Commit, security, cancel).await?;
+	let PinTargetResponse::Prepared { generation, profile: pinned, .. } = response else {
+		return Err(PrepareError::UnexpectedSubject);
+	};
+	let phase_limits = runner.client().limits(&job).await?;
+	Ok(PreparedSubject {
 		job_id,
 		job_capability: job_capability.clone(),
 		repo_id,
 		attempt: provenance.attempt,
 		campaign_id: provenance.campaign_id.into(),
 		limits,
-		finding,
+		subject,
 		generation,
 		commit,
-		profile,
+		profile: pinned.unwrap_or(profile),
 		phase_limits,
 		worktree,
-	})
-}
-
-/// A sealed generation's checkout, prepared for a job that works on one
-/// subject of it.
-struct SealedGeneration {
-	worktree: CheckedOutWorktree,
-	commit: ReviewCommit<Repo>,
-	generation: ReviewGeneration<Server>,
-	/// The pin response's profile, else the lease's.
-	profile: FrozenReviewProfile<Agent, Server>,
-	/// Remaining capacity read after the pin.
-	phase_limits: PhaseLimitsResponse,
-}
-
-/// Check out and pin the sealed generation `source` names, then read the
-/// limits. No inventory is taken.
-async fn prepare_generation(
-	runner: &Runner, job: &PhaseJob<'_>, source: CheckoutSource<'_>,
-	leased: FrozenReviewProfile<Agent, Server>, security: &JobSecurity, cancel: &CancellationToken,
-) -> Result<SealedGeneration, PrepareError> {
-	let Pinned { worktree, commit, response, .. } =
-		checkout_and_pin(runner, job, source, Observe::Commit, security, cancel).await?;
-	let PinTargetResponse::Prepared { generation, profile: pinned, .. } = response else {
-		return Err(PrepareError::UnsupportedLease);
-	};
-	let phase_limits = runner.client().limits(job).await?;
-	Ok(SealedGeneration {
-		worktree,
-		commit,
-		generation,
-		profile: pinned.unwrap_or(leased),
-		phase_limits,
 	})
 }
 
@@ -810,7 +747,7 @@ mod tests {
 		let error = prepare_drilldown(&runner, lease, &security, &CancellationToken::new())
 			.await
 			.unwrap_err();
-		assert!(matches!(error, PrepareError::UnsupportedLease), "{error}");
+		assert!(matches!(error, PrepareError::UnexpectedSubject), "{error}");
 		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 	}
 
@@ -912,7 +849,7 @@ mod tests {
 			);
 			assert_eq!(prepared.commit.expose(), commit);
 			assert_eq!(prepared.generation.commit_sha.expose(), commit);
-			assert_eq!(i64::from(prepared.lead.lead_id), 4);
+			assert_eq!(i64::from(prepared.subject.lead_id), 4);
 			assert_eq!(prepared.attempt.get(), 2);
 			assert_eq!(prepared.profile.profile_version.get(), version);
 			assert_eq!(prepared.phase_limits.siblings.remaining, 3);
@@ -969,10 +906,10 @@ mod tests {
 		let commit = head(&url);
 		let lease = drilldown_lease(i64::MAX / 2, &url, &commit);
 		let error = prepare_verify(&runner, lease, &security, &cancel).await.unwrap_err();
-		assert!(matches!(error, PrepareError::UnsupportedLease), "{error}");
+		assert!(matches!(error, PrepareError::UnexpectedSubject), "{error}");
 		let lease = verify_lease(i64::MAX / 2, &url, &commit);
 		let error = prepare_drilldown(&runner, lease, &security, &cancel).await.unwrap_err();
-		assert!(matches!(error, PrepareError::UnsupportedLease), "{error}");
+		assert!(matches!(error, PrepareError::UnexpectedSubject), "{error}");
 		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 	}
 
@@ -1018,7 +955,7 @@ mod tests {
 			assert_eq!(prepared.limits, leased);
 			assert_eq!(prepared.commit.expose(), commit);
 			assert_eq!(prepared.generation.commit_sha.expose(), commit);
-			assert_eq!(i64::from(prepared.finding.finding_id), 5);
+			assert_eq!(i64::from(prepared.subject.finding_id), 5);
 			assert_eq!((prepared.job_id, prepared.repo_id, prepared.campaign_id), (1, 1, 2));
 			assert_eq!(prepared.attempt.get(), 2);
 			assert_eq!(prepared.profile.profile_version.get(), version);

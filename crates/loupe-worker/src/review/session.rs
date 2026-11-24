@@ -8,15 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use loupe_proto::review_api::PhaseLimitsResponse;
 use loupe_proto::review_drilldown::DrilldownTerminalResponse;
-use loupe_proto::review_lease::ReviewLimits;
+use loupe_proto::review_lease::{AssignedReviewFinding, AssignedReviewLead, ReviewLimits};
 use loupe_proto::review_terminal::SurveyTerminalResponse;
 use loupe_proto::review_verification::VerificationTerminalResponse;
 use loupe_proto::JobCapability;
-use loupe_provenance::Server;
+use loupe_provenance::{Agent, Server};
 use tokio_util::sync::CancellationToken;
 
 use super::gate::{admit, admit_drilldown, Admission, DrilldownTool, RecipeClass, SurveyTool};
-use super::prepare::{at, PreparedDrilldown, PreparedSurvey, PreparedVerify, SurveyRecipe};
+use super::prepare::{at, PreparedSubject, PreparedSurvey, SurveyRecipe};
 use crate::client::PhaseJob;
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
@@ -410,7 +410,8 @@ impl DrilldownSession {
 	/// The session of a prepared attempt: deadlines, lead and capacity come
 	/// from the preparation.
 	pub fn from_prepared(
-		prepared: &PreparedDrilldown, clock: Clock, cancel: CancellationToken,
+		prepared: &PreparedSubject<AssignedReviewLead<Agent, Server>>, clock: Clock,
+		cancel: CancellationToken,
 	) -> Self {
 		let phase = PhaseSession::from_lease(
 			prepared.job_id,
@@ -419,7 +420,7 @@ impl DrilldownSession {
 			clock,
 			cancel,
 		);
-		Self::new(phase, i64::from(prepared.lead.lead_id), Some(&prepared.phase_limits))
+		Self::new(phase, i64::from(prepared.subject.lead_id), Some(&prepared.phase_limits))
 	}
 
 	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.
@@ -530,7 +531,8 @@ impl VerifySession {
 	/// The session of a prepared attempt: deadlines and finding come from the
 	/// preparation.
 	pub fn from_prepared(
-		prepared: &PreparedVerify, clock: Clock, cancel: CancellationToken,
+		prepared: &PreparedSubject<AssignedReviewFinding<Agent, Server>>, clock: Clock,
+		cancel: CancellationToken,
 	) -> Self {
 		let phase = PhaseSession::from_lease(
 			prepared.job_id,
@@ -539,7 +541,7 @@ impl VerifySession {
 			clock,
 			cancel,
 		);
-		Self::new(phase, i64::from(prepared.finding.finding_id), Some(&prepared.phase_limits))
+		Self::new(phase, i64::from(prepared.subject.finding_id), Some(&prepared.phase_limits))
 	}
 
 	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.

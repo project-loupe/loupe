@@ -11,7 +11,7 @@ use loupe_proto::review_lease::{
 };
 use loupe_provenance::{Agent, Repo, Server};
 
-use super::prepare::{PreparedDrilldown, PreparedSurvey, PreparedVerify, SurveyRecipe};
+use super::prepare::{PreparedSubject, PreparedSurvey, SurveyRecipe};
 use crate::llm::prompt::{
 	DrilldownJobContext, Prompt, PromptBuilder, PromptError, SurveyJobContext, VerifyJobContext,
 	PREAMBLE,
@@ -205,7 +205,7 @@ pub(crate) fn fuzz_spans() -> [String; 3] {
 
 /// The prompt for one prepared drilldown attempt launched at `now`.
 pub fn drilldown_prompt(
-	prepared: &PreparedDrilldown, now: SystemTime,
+	prepared: &PreparedSubject<AssignedReviewLead<Agent, Server>>, now: SystemTime,
 ) -> Result<Prompt, PromptError> {
 	DrilldownPromptInput::from(prepared).builder(now)?.render()
 }
@@ -222,8 +222,8 @@ pub(crate) struct DrilldownPromptInput<'a> {
 	pub profile: &'a FrozenReviewProfile<Agent, Server>,
 }
 
-impl<'a> From<&'a PreparedDrilldown> for DrilldownPromptInput<'a> {
-	fn from(p: &'a PreparedDrilldown) -> Self {
+impl<'a> From<&'a PreparedSubject<AssignedReviewLead<Agent, Server>>> for DrilldownPromptInput<'a> {
+	fn from(p: &'a PreparedSubject<AssignedReviewLead<Agent, Server>>) -> Self {
 		Self {
 			attempt: p.attempt,
 			repo_id: p.repo_id,
@@ -231,7 +231,7 @@ impl<'a> From<&'a PreparedDrilldown> for DrilldownPromptInput<'a> {
 			checkout_commit: &p.commit,
 			limits: &p.limits,
 			phase_limits: &p.phase_limits,
-			lead: &p.lead,
+			lead: &p.subject,
 			profile: &p.profile,
 		}
 	}
@@ -368,7 +368,9 @@ pub(crate) fn drilldown_fuzz_spans() -> [String; 3] {
 }
 
 /// The prompt for one prepared verify attempt launched at `now`.
-pub fn verify_prompt(prepared: &PreparedVerify, now: SystemTime) -> Result<Prompt, PromptError> {
+pub fn verify_prompt(
+	prepared: &PreparedSubject<AssignedReviewFinding<Agent, Server>>, now: SystemTime,
+) -> Result<Prompt, PromptError> {
 	VerifyPromptInput::from(prepared).builder(now)?.render()
 }
 
@@ -384,8 +386,8 @@ pub(crate) struct VerifyPromptInput<'a> {
 	pub profile: &'a FrozenReviewProfile<Agent, Server>,
 }
 
-impl<'a> From<&'a PreparedVerify> for VerifyPromptInput<'a> {
-	fn from(p: &'a PreparedVerify) -> Self {
+impl<'a> From<&'a PreparedSubject<AssignedReviewFinding<Agent, Server>>> for VerifyPromptInput<'a> {
+	fn from(p: &'a PreparedSubject<AssignedReviewFinding<Agent, Server>>) -> Self {
 		Self {
 			attempt: p.attempt,
 			repo_id: p.repo_id,
@@ -393,7 +395,7 @@ impl<'a> From<&'a PreparedVerify> for VerifyPromptInput<'a> {
 			checkout_commit: &p.commit,
 			limits: &p.limits,
 			phase_limits: &p.phase_limits,
-			finding: &p.finding,
+			finding: &p.subject,
 			profile: &p.profile,
 		}
 	}

@@ -34,7 +34,7 @@ async fn attempt(
 ) -> Result<Ended, FailureReason> {
 	let prepared = prepare_verify(runner, env, security, cancel)
 		.await
-		.map_err(|e| FailureReason::from_subject_prepare(&e))?;
+		.map_err(|e| FailureReason::from_prepare(&e))?;
 	let agent_cancel = cancel.child_token();
 	let session = Arc::new(
 		VerifySession::from_prepared(&prepared, runner.phase_clock().clone(), agent_cancel.clone())
