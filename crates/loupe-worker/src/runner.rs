@@ -139,6 +139,7 @@ impl LeaseRepo {
 struct PhaseBackends {
 	survey: Option<Arc<dyn crate::llm::LlmBackend>>,
 	drilldown: Option<Arc<dyn crate::llm::LlmBackend>>,
+	verify: Option<Arc<dyn crate::llm::LlmBackend>>,
 }
 
 impl PhaseBackends {
@@ -148,9 +149,8 @@ impl PhaseBackends {
 		match payload {
 			LeasePayload::ReviewSurvey(_) => self.survey.as_ref(),
 			LeasePayload::ReviewDrilldown(_) => self.drilldown.as_ref(),
-			LeasePayload::ReviewVerify(_)
-			| LeasePayload::Scan { .. }
-			| LeasePayload::Verify { .. } => None,
+			LeasePayload::ReviewVerify(_) => self.verify.as_ref(),
+			LeasePayload::Scan { .. } | LeasePayload::Verify { .. } => None,
 		}
 	}
 
@@ -209,6 +209,12 @@ impl Runner {
 		self
 	}
 
+	/// Run verify leases with `backend`.
+	pub fn with_verify_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.phase_backends.verify = Some(backend);
+		self
+	}
+
 	pub(crate) fn phase_clock(&self) -> &crate::review::session::Clock {
 		&self.phase_clock
 	}
@@ -234,7 +240,7 @@ impl Runner {
 	}
 
 	/// Review phases this worker runs: survey and drilldown, each exactly
-	/// when it has a backend. Verify is not run, so never advertised.
+	/// when it has a backend. Verify leases are run but not advertised.
 	fn review_capabilities(
 		&self,
 	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
@@ -433,6 +439,10 @@ impl Runner {
 			(LeasePayload::ReviewDrilldown(_), Some(backend), Some(heartbeat)) => {
 				crate::review::drilldown::run(self, backend, env, cancel, security, heartbeat)
 					.await;
+				Ok(Executed::Reported)
+			},
+			(LeasePayload::ReviewVerify(_), Some(backend), Some(heartbeat)) => {
+				crate::review::verify::run(self, backend, env, cancel, security, heartbeat).await;
 				Ok(Executed::Reported)
 			},
 			(
@@ -1064,19 +1074,26 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_phase_backend_runs_survey_and_drilldown_and_leaves_verify_failing_closed() {
-		assert_phases_run(true, true).await;
+	async fn a_phase_without_its_backend_is_not_advertised_and_fails_closed() {
+		assert_phases_run(true, true, false).await;
+		assert_phases_run(true, false, false).await;
+		assert_phases_run(false, true, false).await;
 	}
 
 	#[tokio::test]
-	async fn a_phase_without_its_backend_is_not_advertised_and_fails_closed() {
-		assert_phases_run(true, false).await;
-		assert_phases_run(false, true).await;
+	async fn a_verify_backend_runs_verify_leases_and_no_other_phase() {
+		assert_phases_run(false, false, true).await;
 	}
 
-	/// A runner with backends for the named phases advertises and executes
-	/// those only; every other phase lease fails closed.
-	async fn assert_phases_run(survey: bool, drilldown: bool) {
+	#[tokio::test]
+	async fn three_phase_backends_run_every_phase() {
+		assert_phases_run(true, true, true).await;
+	}
+
+	/// A runner with backends for the named phases executes those only and
+	/// advertises survey and drilldown of them; every other phase lease fails
+	/// closed.
+	async fn assert_phases_run(survey: bool, drilldown: bool, verify: bool) {
 		use axum::body::Bytes;
 		use axum::extract::Json;
 		use loupe_proto::review_lease::ReviewCapability;
@@ -1116,8 +1133,11 @@ mod tests {
 			advertised.push(ReviewCapability::Survey);
 		}
 		if drilldown {
-			runner = runner.with_drilldown_backend(backend);
+			runner = runner.with_drilldown_backend(backend.clone());
 			advertised.push(ReviewCapability::Drilldown);
+		}
+		if verify {
+			runner = runner.with_verify_backend(backend);
 		}
 		assert_eq!(runner.review_capabilities().unwrap().as_slice(), advertised);
 		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
@@ -1142,7 +1162,7 @@ mod tests {
 			(
 				json!({"kind":"review_verify","provenance":provenance,"generation":generation,
 				"profile":profile,"finding":finding}),
-				None,
+				verify.then_some("hard deadline reached"),
 			),
 			(
 				json!({"kind":"review_drilldown","provenance":provenance,"generation":generation,

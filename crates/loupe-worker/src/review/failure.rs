@@ -71,6 +71,16 @@ impl FailureReason {
 			PrepareError::Phase(_) => Self::PhaseRequestFailed,
 		}
 	}
+
+	/// For a phase that works on one subject of a sealed generation. Its pin
+	/// never defers and the lease kind is checked by dispatch, so an
+	/// unsupported lease here is a server response the host refuses.
+	pub(crate) fn from_subject_prepare(error: &PrepareError) -> Self {
+		match error {
+			PrepareError::UnsupportedLease => Self::PhaseRequestFailed,
+			other => Self::from_prepare(other),
+		}
+	}
 }
 
 /// How long the one try of a failure report sent at or past the hard
@@ -156,5 +166,15 @@ mod tests {
 		assert_eq!(FailureReason::from_prepare(&denied), FailureReason::AuthorityLost);
 		let conflict = PrepareError::CheckoutConflict;
 		assert_eq!(FailureReason::from_prepare(&conflict), FailureReason::CheckoutConflict);
+	}
+
+	#[test]
+	fn only_a_survey_reports_an_unsupported_recipe() {
+		let unsupported = PrepareError::UnsupportedLease;
+		let subject = FailureReason::from_subject_prepare;
+		assert_eq!(FailureReason::from_prepare(&unsupported), FailureReason::UnsupportedRecipe);
+		assert_eq!(subject(&unsupported), FailureReason::PhaseRequestFailed);
+		let conflict = PrepareError::CheckoutConflict;
+		assert_eq!(subject(&conflict), FailureReason::CheckoutConflict);
 	}
 }
