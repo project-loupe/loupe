@@ -479,6 +479,7 @@ mod citation;
 pub use citation::fuzzing as citation_fuzzing;
 mod drilldown;
 mod drilldown_catalog;
+mod evidence_schema;
 mod ingress;
 #[cfg(test)]
 mod legacy_test_api;

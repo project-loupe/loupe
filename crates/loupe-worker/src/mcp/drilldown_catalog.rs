@@ -4,6 +4,7 @@
 
 use serde_json::{json, Value};
 
+use super::evidence_schema::{argument, finding_evidence, revalidation};
 use super::survey_catalog::{defs, source_refs, text, KEY_PATTERN};
 use super::{add_tool_protocol_version, DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION};
 
@@ -13,20 +14,6 @@ const CONTINUATIONS: [&str; 4] = [
 	"external_dependency",
 	"requires_successor",
 ];
-
-fn revalidation() -> Value {
-	json!({"type":"object","required":["current_source_refs","rationale"],
-		"additionalProperties":false,
-		"description":
-			"Only when finalizing was refused as revalidation required: the lead re-inspected \
-			 on this checkout.",
-		"properties":{"current_source_refs":source_refs(1, 16),"rationale":text(2000)}})
-}
-
-fn argument(max: usize) -> Value {
-	json!({"type":"object","required":["argument","source_refs"],"additionalProperties":false,
-		"properties":{"argument":text(max),"source_refs":source_refs(1, 16)}})
-}
 
 fn promotion() -> Value {
 	json!({"type":"object",
@@ -41,34 +28,7 @@ fn promotion() -> Value {
 			"identity_anchor":text(300),
 			"identity_instance_key":text(200),
 			"cwe":{"type":"string","pattern":"^CWE-[1-9][0-9]{0,5}$"},
-			"evidence":{"type":"object",
-				"required":["l2_argument","material_locations","counterevidence",
-					"assumptions_gaps","confidence"],
-				"additionalProperties":false,
-				"properties":{
-					"l2_argument":{"type":"object",
-						"required":["attacker_source","control","sink","reachable_path",
-							"trust_boundary"],
-						"additionalProperties":false,
-						"properties":{
-							"attacker_source":text(2000),
-							"control":text(2000),
-							"sink":text(2000),
-							"reachable_path":text(4000),
-							"trust_boundary":text(1000)}},
-					"material_locations":{"type":"array","minItems":1,"maxItems":16,
-						"items":{"type":"object","required":["role","file"],
-							"additionalProperties":false,
-							"properties":{
-								"role":{"enum":["root_control","entry_point","wrapper","sink",
-									"implementation"]},
-								"file":{"type":"string","maxLength":512},
-								"symbol":text(200),
-								"line_start":{"type":"integer","minimum":1},
-								"line_end":{"type":"integer","minimum":1}}}},
-					"counterevidence":text(4000),
-					"assumptions_gaps":text(4000),
-					"confidence":{"enum":["low","medium","high"]}}}}})
+			"evidence":finding_evidence()}})
 }
 
 /// One `oneOf` branch per disposition: the members it requires. Members of
@@ -147,7 +107,7 @@ pub(super) fn tools() -> Value {
 			"reason":text(1000),
 			"continuation":{"enum":CONTINUATIONS},
 			"retry_explanation":text(1000),
-			"revalidation":revalidation()},
+			"revalidation":revalidation("lead")},
 		"oneOf":[
 			variant("promote", &["promotion"]),
 			variant("reject", &["counterargument"]),
