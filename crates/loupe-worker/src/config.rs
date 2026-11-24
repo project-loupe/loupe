@@ -110,6 +110,7 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone)]
 pub struct AgentsConfig {
 	pub scan: JobAgent,
+	/// Selects the agent for legacy and campaign verification alike.
 	pub verify: JobAgent,
 	/// Resolved like `scan` and `verify`: with `auto`, a worker with a
 	/// ready agent runs surveys and advertises `review:survey:v1`.

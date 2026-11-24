@@ -474,8 +474,9 @@ pub fn build_scan_backend(
 /// Claude when Codex is unavailable.
 ///
 /// `mcp` (optional) attaches the loupe MCP server to the backend's
-/// per-call invocation. Required for the verify-mode tool surface
-/// (`submit_verdict` / `submit_patch` / `validate_patch`) — without
+/// per-call invocation. Required for the verify-mode tool surfaces
+/// (`submit_verdict` / `submit_patch` / `validate_patch`, and
+/// `finalize_verification` for a verify lease) — without
 /// MCP, the agent has no way to commit a verdict and the runner
 /// would receive no feedback to POST. Production callers should
 /// always pass `Some(...)`; the `None` form is kept for tests that

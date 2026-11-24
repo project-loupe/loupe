@@ -162,7 +162,7 @@ struct RunArgs {
 	/// Agent backend for LLM scan jobs: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_SCAN_AGENT", value_enum)]
 	scan_agent: Option<JobAgent>,
-	/// Agent backend for LLM verify jobs: auto, claude, or codex.
+	/// Agent backend for legacy and campaign verification: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_VERIFY_AGENT", value_enum)]
 	verify_agent: Option<JobAgent>,
 	/// Agent backend for survey leases: auto, claude, or codex.
@@ -444,9 +444,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	let drilldown_backend = phase_backend("drilldown", cfg.agents.drilldown)?;
 
 	// The helper logs which backend it picked. MCP context is required
-	// for the verify-mode tool surface (`submit_verdict` /
-	// `submit_patch` / `validate_patch`); without it, the agent has
-	// no way to commit a verdict.
+	// for the verify-mode tool surfaces (`submit_verdict` /
+	// `submit_patch` / `validate_patch`, and `finalize_verification` for a
+	// verify lease); without it, the agent has no way to commit a verdict.
 	let backend = build_verifier_backend(
 		Some(mcp_ctx),
 		cfg.agents.verify,
@@ -465,11 +465,16 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		},
 	)?;
 	credential_watches.extend(backend.credential_watch());
+	// The scanner and the verify phase share the backend, so its credential is
+	// watched once.
+	let verify_backend = backend.clone();
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
-	let mut runner =
-		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
+	let mut runner = Runner::new(client, cache, scanners)
+		.with_max_workdir_bytes(cfg.runtime.max_workdir_bytes)
+		.with_verify_backend(verify_backend);
+	tracing::info!("verify phase enabled (review:verify:v1 advertised)");
 	if let Some(backend) = survey_backend {
 		credential_watches.extend(backend.credential_watch());
 		runner = runner.with_survey_backend(backend);

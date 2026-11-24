@@ -159,6 +159,7 @@ impl PhaseBackends {
 		[
 			self.survey.as_ref().map(|_| ReviewCapability::Survey),
 			self.drilldown.as_ref().map(|_| ReviewCapability::Drilldown),
+			self.verify.as_ref().map(|_| ReviewCapability::Verify),
 		]
 		.into_iter()
 		.flatten()
@@ -239,8 +240,8 @@ impl Runner {
 		self
 	}
 
-	/// Review phases this worker runs: survey and drilldown, each exactly
-	/// when it has a backend. Verify leases are run but not advertised.
+	/// Review phases this worker runs: survey, drilldown and verify, each
+	/// exactly when it has a backend.
 	fn review_capabilities(
 		&self,
 	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
@@ -1090,9 +1091,8 @@ mod tests {
 		assert_phases_run(true, true, true).await;
 	}
 
-	/// A runner with backends for the named phases executes those only and
-	/// advertises survey and drilldown of them; every other phase lease fails
-	/// closed.
+	/// A runner with backends for the named phases advertises and executes
+	/// those only; every other phase lease fails closed.
 	async fn assert_phases_run(survey: bool, drilldown: bool, verify: bool) {
 		use axum::body::Bytes;
 		use axum::extract::Json;
@@ -1138,6 +1138,7 @@ mod tests {
 		}
 		if verify {
 			runner = runner.with_verify_backend(backend);
+			advertised.push(ReviewCapability::Verify);
 		}
 		assert_eq!(runner.review_capabilities().unwrap().as_slice(), advertised);
 		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,

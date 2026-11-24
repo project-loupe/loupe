@@ -492,7 +492,7 @@ mod tests {
 
 	/// Run one runner step against a one-shot server and return the lease
 	/// request body it sent.
-	async fn runner_lease_request(survey: bool) -> serde_json::Value {
+	async fn runner_lease_request(phases: bool) -> serde_json::Value {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
 		let task = tokio::spawn(async move {
@@ -534,12 +534,15 @@ mod tests {
 		);
 		let client = std::sync::Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
 		let mut runner = crate::runner::Runner::new(client, cache, Vec::new());
-		if survey {
+		if phases {
 			let backend =
 				std::sync::Arc::new(crate::llm::testing::StubLlmBackend::new("never-run", |_| {
-					panic!("an empty lease reached the survey agent")
+					panic!("an empty lease reached a phase agent")
 				}));
-			runner = runner.with_survey_backend(backend.clone()).with_drilldown_backend(backend);
+			runner = runner
+				.with_survey_backend(backend.clone())
+				.with_drilldown_backend(backend.clone())
+				.with_verify_backend(backend);
 		}
 		let processed = runner.step(&tokio_util::sync::CancellationToken::new()).await.unwrap();
 		assert!(!processed);
@@ -554,11 +557,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn lease_request_advertises_survey_and_drilldown_with_a_phase_backend() {
+	async fn lease_request_advertises_every_phase_with_a_backend() {
 		let request = runner_lease_request(true).await;
 		assert_eq!(
 			request["review_capabilities"],
-			serde_json::json!(["review:survey:v1", "review:drilldown:v1"])
+			serde_json::json!(["review:survey:v1", "review:drilldown:v1", "review:verify:v1"])
 		);
 		assert_eq!(request["capabilities"], serde_json::json!([]));
 	}
