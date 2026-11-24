@@ -100,6 +100,7 @@ Operation {
 	McpFinalizeSurvey => "mcp_finalize_survey",
 	McpSubmitSiblingLead => "mcp_submit_sibling_lead",
 	McpFinalizeDrilldown => "mcp_finalize_drilldown",
+	McpFinalizeVerification => "mcp_finalize_verification",
 	PinTarget => "pin_target",
 	UploadInventory => "upload_inventory",
 	SealInventory => "seal_inventory",

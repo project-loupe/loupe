@@ -99,6 +99,7 @@ fn allowed_operation(value: Operation) {
 		| Operation::McpFinalizeSurvey
 		| Operation::McpSubmitSiblingLead
 		| Operation::McpFinalizeDrilldown
+		| Operation::McpFinalizeVerification
 		| Operation::PinTarget
 		| Operation::UploadInventory
 		| Operation::SealInventory => {},
@@ -131,6 +132,7 @@ fn operation_spellings_are_closed_and_exhaustive() {
 		(Operation::McpFinalizeSurvey, "mcp_finalize_survey"),
 		(Operation::McpSubmitSiblingLead, "mcp_submit_sibling_lead"),
 		(Operation::McpFinalizeDrilldown, "mcp_finalize_drilldown"),
+		(Operation::McpFinalizeVerification, "mcp_finalize_verification"),
 		(Operation::PinTarget, "pin_target"),
 		(Operation::UploadInventory, "upload_inventory"),
 		(Operation::SealInventory, "seal_inventory"),
