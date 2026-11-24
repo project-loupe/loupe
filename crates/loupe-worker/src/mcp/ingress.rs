@@ -43,6 +43,7 @@ pub(super) enum Catalog {
 	Legacy,
 	Survey,
 	Drilldown,
+	Verify,
 }
 pub(super) struct DecodedRequest {
 	pub(super) id: Option<SandboxReplyId>,
@@ -97,6 +98,7 @@ pub(super) enum ToolName {
 	Finalize,
 	SiblingLead,
 	FinalizeDrilldown,
+	FinalizeVerification,
 	Unknown(String),
 }
 impl ToolName {
@@ -121,6 +123,8 @@ impl ToolName {
 			(Catalog::Drilldown, "query_same_project_lead_candidates") => Self::Candidates,
 			(Catalog::Drilldown, "submit_sibling_lead") => Self::SiblingLead,
 			(Catalog::Drilldown, "finalize_drilldown") => Self::FinalizeDrilldown,
+			(Catalog::Verify, "get_job_limits") => Self::JobLimits,
+			(Catalog::Verify, "finalize_verification") => Self::FinalizeVerification,
 			_ => Self::Unknown(name),
 		}
 	}
@@ -141,6 +145,7 @@ impl ToolName {
 			Self::Finalize => Operation::McpFinalizeSurvey,
 			Self::SiblingLead => Operation::McpSubmitSiblingLead,
 			Self::FinalizeDrilldown => Operation::McpFinalizeDrilldown,
+			Self::FinalizeVerification => Operation::McpFinalizeVerification,
 			Self::Get | Self::Unknown(_) => Operation::ReadFinding,
 		}
 	}
@@ -163,6 +168,7 @@ impl ToolName {
 			Self::Finalize => "finalize_survey",
 			Self::SiblingLead => "submit_sibling_lead",
 			Self::FinalizeDrilldown => "finalize_drilldown",
+			Self::FinalizeVerification => "finalize_verification",
 			Self::Unknown(_) => "unknown",
 		}
 	}
@@ -186,6 +192,7 @@ pub(super) enum Arguments {
 	Finalize(Box<loupe_core::review_payload::SurveyTerminalV1<Agent>>),
 	SiblingLead(Box<LeadArgs>),
 	FinalizeDrilldown(Box<loupe_core::review_payload::DrilldownTerminalV1<Agent>>),
+	FinalizeVerification(Box<loupe_core::review_payload::VerificationTerminalV1<Agent>>),
 }
 pub(super) struct DecodedQueryArgs {
 	pub(super) query: BoundedText<QueryText, Agent>,
@@ -328,6 +335,7 @@ macro_rules! carry {
 mod drilldown;
 mod phase;
 mod survey;
+mod verify;
 pub(super) use phase::LeadArgs;
 pub(super) use survey::{DispositionArgs, UnitResultArgs};
 
@@ -422,6 +430,7 @@ fn arguments(
 		ToolName::SiblingLead | ToolName::FinalizeDrilldown => {
 			return drilldown::arguments(u, name, &fields);
 		},
+		ToolName::FinalizeVerification => return verify::arguments(u, &fields),
 		_ => return survey::arguments(u, name, &fields),
 	})
 }
