@@ -41,9 +41,13 @@ agent_output = false
 [agents]
 scan = "auto"
 verify = "auto"
-# Runs review surveys and drilldowns and advertises `review:survey:v1` and
-# `review:drilldown:v1` when this agent is ready.
+# Runs review surveys and advertises `review:survey:v1` when this agent is
+# ready.
 survey = "auto"
+# Runs review drilldowns and advertises `review:drilldown:v1` when this agent
+# is ready. These keys choose a backend; the model is configured once per
+# backend below, and nothing enforces a difference between phases.
+drilldown = "auto"
 
 [agents.claude]
 model = "claude-opus-4-7"

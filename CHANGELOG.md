@@ -21,7 +21,7 @@
 - Reject non-string encodings of closed review evidence values.
 - Reject the array form of review phase request, phase lease and generation reset objects.
 - Run review surveys on workers: a worker with a ready survey agent (`[agents] survey`, `--survey-agent` or `LOUPE_SURVEY_AGENT`, default `auto` like `scan` and `verify`) advertises `review:survey:v1`, pins and inventories the generation's tree, and drives the agent through the survey tool catalog until it finalizes.
-- Run review drilldowns on workers: the agent selected by `[agents] survey` also investigates leads, and a worker with it advertises `review:drilldown:v1` beside `review:survey:v1`. Each drilldown pins the generation commit, may record sibling leads, and ends by promoting, rejecting, deduplicating, marking as hardening or deferring its lead through `finalize_drilldown`.
+- Run review drilldowns on workers: a worker with a ready drilldown agent (`[agents] drilldown`, `--drilldown-agent` or `LOUPE_DRILLDOWN_AGENT`, default `auto`, independent of `survey`) investigates leads and advertises `review:drilldown:v1`. Each drilldown pins the generation commit, may record sibling leads, and ends by promoting, rejecting, deduplicating, marking as hardening or deferring its lead through `finalize_drilldown`.
 - Decode worker-side review responses strictly, rejecting malformed or unexpected server replies instead of ignoring them.
 
 ## v0.1 — 2026-09-07

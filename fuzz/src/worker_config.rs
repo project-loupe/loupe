@@ -86,7 +86,7 @@ fn section_fields<'a>(
 		"runtime" => &["max_workdir_gb", "disable_sandbox"],
 		"sandbox" => &["network", "allowlist"],
 		"logging" => &["level", "json", "agent_output"],
-		"agents" => &["scan", "verify", "claude", "codex", "survey"],
+		"agents" => &["scan", "verify", "claude", "codex", "survey", "drilldown"],
 		"agent" => &["model", "effort"],
 		"codex" => &["model", "effort", "daybreak"],
 		"scanner_defaults" => {
@@ -150,7 +150,9 @@ fn legacy_shape(value: &toml::Value) -> bool {
 				_ => false,
 			}),
 			"agents" => fields.into_iter().all(|(key, v)| match key {
-				"scan" | "verify" | "survey" => unit_variant(v, &["auto", "claude", "codex"]),
+				"scan" | "verify" | "survey" | "drilldown" => {
+					unit_variant(v, &["auto", "claude", "codex"])
+				},
 				"claude" => section_fields("agent", v).is_some_and(|items| {
 					items
 						.into_iter()
@@ -344,7 +346,14 @@ mod tests {
 			("logging", vec!["'debug'", "true", "false"]),
 			(
 				"agents",
-				vec!["'claude'", "'codex'", "['Model-A', 'high']", "['Model-B', 'low']", "'auto'"],
+				vec![
+					"'claude'",
+					"'codex'",
+					"['Model-A', 'high']",
+					"['Model-B', 'low']",
+					"'auto'",
+					"'codex'",
+				],
 			),
 			("scanner_defaults", vec!["3", "23", "29"]),
 			("bkb", vec!["'https://example.invalid/api'"]),

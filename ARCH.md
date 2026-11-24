@@ -420,8 +420,9 @@ outside that guarantee; a redacted holder does not erase those allocations.
 ## Storage layout for the review harness
 
 Schema v7 and the B4 server support the pre-proof review API: prepared surveys,
-assigned-lead drilldowns and canonical-finding verification. A worker with a
-survey agent advertises `review:survey:v1` and `review:drilldown:v1` (see
+assigned-lead drilldowns and canonical-finding verification. A worker
+advertises `review:survey:v1` with a survey agent and `review:drilldown:v1`
+with a drilldown agent (see
 [Survey worker](#survey-worker) and [Drilldown worker](#drilldown-worker));
 verify execution arrives in B7 and is not advertised, and production
 triggers remain legacy until cutover. Explicit phase
@@ -446,14 +447,17 @@ remains Stage C. The startup guard rejects persisted kinds absent from
 ### Survey worker
 
 `[agents] survey` (or `--survey-agent` / `LOUPE_SURVEY_AGENT`) selects the
-agent for survey and drilldown leases as `scan` and `verify` are selected,
-with the same default `auto`, which prefers Codex, then Claude. A worker
-with no ready survey agent runs neither phase and sends an empty
-`review_capabilities` list. With that backend the runner sends exactly
-`["review:survey:v1","review:drilldown:v1"]` beside its legacy scanner
-tags; verify is not advertised. The runner dispatches a lease by payload,
+agent for survey leases as `scan` and `verify` are selected, with the same
+default `auto`, which prefers Codex, then Claude. `[agents] drilldown` (or
+`--drilldown-agent` / `LOUPE_DRILLDOWN_AGENT`) selects the agent for
+drilldown leases in the same way. The keys choose a backend; the model is
+configured once per backend, and nothing enforces a difference between
+phases, so on `auto` both resolve to the same backend. The runner holds one
+backend per phase and sends in `review_capabilities`, beside its legacy
+scanner tags, `review:survey:v1` and `review:drilldown:v1` for the phases
+that have one; verify is not advertised. The runner dispatches a lease by payload,
 so legacy jobs never reach phase code and unsupported phase payloads
-(verify, or any phase without a backend) fail closed.
+(verify, or a phase without its backend) fail closed.
 
 A survey lease (`crates/loupe-worker/src/review/`) runs in three steps:
 
