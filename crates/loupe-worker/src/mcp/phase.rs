@@ -52,10 +52,6 @@ impl PhaseTools {
 /// its tools.
 pub(super) struct PhaseTexts {
 	pub authority_lost: &'static str,
-	/// A 403 while `/limits` still answers: a reference outside the job's
-	/// scope. `None` for a phase whose calls carry no such reference, where
-	/// every 403 is lost authority.
-	pub reference_refused: Option<&'static str>,
 	pub exhausted: &'static str,
 	pub state_refused: &'static str,
 	pub terminal_conflict: &'static str,
@@ -89,12 +85,15 @@ pub(super) trait PhaseCalls {
 	const TEXTS: PhaseTexts;
 
 	fn phase(&self) -> &PhaseSession;
-	/// Whether a rejection with `code` exhausts the capacity `tool` uses.
-	fn exhausts(code: ReviewErrorCode) -> bool;
-	fn record_exhausted(&self, tool: Self::Tool);
-	fn record_limits(&self, limits: &PhaseLimitsResponse);
-	/// Whether `tool` is the `/limits` call itself.
-	fn limits_call(tool: Self::Tool) -> bool;
+	/// The text for a 403 to `tool` while `/limits` still answers: a reference
+	/// outside the job's scope. `None` for a call that carries no such
+	/// reference, whose every 403 is lost authority.
+	fn reference_refused(tool: Self::Tool) -> Option<&'static str>;
+	/// `tool` was rejected with `code`, which may exhaust the capacity it uses.
+	fn record_exhausted(&self, _tool: Self::Tool, _code: ReviewErrorCode) {}
+	fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		self.phase().record_limits(limits);
+	}
 	/// The call's own text for a server that could not be reached.
 	fn unreachable(tool: Self::Tool) -> &'static str;
 	/// The phase's own text for a non-403 error, ahead of the shared table.
@@ -116,8 +115,8 @@ pub(super) async fn settle<P: PhaseCalls, T>(
 /// The fixed text for a failed phase call. The server answers 403 both
 /// for lost authority and for a reference outside the job's scope, so a
 /// 403 is told apart by reading `/limits` under the same capability and
-/// the session records that read. A failed `/limits` call itself, or a
-/// phase without references, needs no probe.
+/// the session records that read. A call that carries no reference needs no
+/// probe.
 pub(super) async fn phase_error<P: PhaseCalls>(
 	client: &ServerClient, session: &P, tool: P::Tool, error: PhaseError,
 ) -> String {
@@ -125,12 +124,9 @@ pub(super) async fn phase_error<P: PhaseCalls>(
 	let texts = &P::TEXTS;
 	let unreachable = P::unreachable(tool);
 	if forbidden(&error) {
-		let reference_refused = match texts.reference_refused {
-			Some(text) if !P::limits_call(tool) => text,
-			_ => {
-				phase.record_authority_lost();
-				return texts.authority_lost.to_owned();
-			},
+		let Some(reference_refused) = P::reference_refused(tool) else {
+			phase.record_authority_lost();
+			return texts.authority_lost.to_owned();
 		};
 		return match client.limits(&phase.phase_job()).await {
 			Ok(limits) => {
@@ -145,10 +141,8 @@ pub(super) async fn phase_error<P: PhaseCalls>(
 		}
 		.to_owned();
 	}
-	if let PhaseError::Rejected { code, .. } = &error
-		&& P::exhausts(*code)
-	{
-		session.record_exhausted(tool);
+	if let PhaseError::Rejected { code, .. } = &error {
+		session.record_exhausted(tool, *code);
 	}
 	if let Some(text) = P::own_text(tool, &error) {
 		return text.to_owned();

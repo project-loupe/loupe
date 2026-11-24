@@ -23,9 +23,10 @@ pub(super) fn tool(name: &ingress::ToolName) -> Option<DrilldownTool> {
 	})
 }
 
+const REFERENCE_REFUSED: &str = "the server refused a referenced lead or finding for this job: a duplicate target must be a lead or finding returned by this job's own query_same_project_lead_candidates calls, and never the lead under investigation; a duplicate_of_lead_id must name a lead the server knows for this job; correct the reference and call again";
+
 const TEXTS: PhaseTexts = PhaseTexts {
 	authority_lost: "this drilldown attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session",
-	reference_refused: Some("the server refused a referenced lead or finding for this job: a duplicate target must be a lead or finding returned by this job's own query_same_project_lead_candidates calls, and never the lead under investigation; a duplicate_of_lead_id must name a lead the server knows for this job; correct the reference and call again"),
 	exhausted: SIBLINGS_EXHAUSTED,
 	state_refused: "the server rejected the request in the drilldown's current state",
 	terminal_conflict: "the drilldown is already finalized with a different payload; it cannot be finalized again; end the session",
@@ -75,20 +76,18 @@ impl phase::PhaseCalls for DrilldownSession {
 		DrilldownSession::phase(self)
 	}
 
-	fn exhausts(code: ReviewErrorCode) -> bool {
-		code == ReviewErrorCode::CheckpointLimit
+	fn reference_refused(tool: DrilldownTool) -> Option<&'static str> {
+		(tool != DrilldownTool::JobLimits).then_some(REFERENCE_REFUSED)
 	}
 
-	fn record_exhausted(&self, tool: DrilldownTool) {
-		DrilldownSession::record_exhausted(self, tool);
+	fn record_exhausted(&self, tool: DrilldownTool, code: ReviewErrorCode) {
+		if code == ReviewErrorCode::CheckpointLimit {
+			DrilldownSession::record_exhausted(self, tool);
+		}
 	}
 
 	fn record_limits(&self, limits: &PhaseLimitsResponse) {
 		DrilldownSession::record_limits(self, limits);
-	}
-
-	fn limits_call(tool: DrilldownTool) -> bool {
-		tool == DrilldownTool::JobLimits
 	}
 
 	fn unreachable(tool: DrilldownTool) -> &'static str {

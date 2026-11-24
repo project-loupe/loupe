@@ -36,9 +36,10 @@ pub(super) fn tool(name: &ingress::ToolName) -> Option<SurveyTool> {
 const UNKNOWN_UNIT: &str =
 	"review_unit_id is not a unit assigned to or proposed by this survey; use an id from the job context or a propose_review_unit result";
 
+const REFERENCE_REFUSED: &str = "the server refused a referenced unit, lead or path for this job; check the ids you used — units must be ones this job proposed or was assigned";
+
 const TEXTS: PhaseTexts = PhaseTexts {
 	authority_lost: "this survey attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session",
-	reference_refused: Some("the server refused a referenced unit, lead or path for this job; check the ids you used — units must be ones this job proposed or was assigned"),
 	exhausted: "capacity for this kind of checkpoint is exhausted; record what remains elsewhere and call finalize_survey",
 	state_refused: "the server rejected the request in the survey's current state",
 	terminal_conflict: "the survey is already finalized with a different payload; it cannot be finalized again",
@@ -72,20 +73,18 @@ impl phase::PhaseCalls for SurveySession {
 		SurveySession::phase(self)
 	}
 
-	fn exhausts(code: ReviewErrorCode) -> bool {
-		matches!(code, ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit)
+	fn reference_refused(tool: SurveyTool) -> Option<&'static str> {
+		(tool != SurveyTool::JobLimits).then_some(REFERENCE_REFUSED)
 	}
 
-	fn record_exhausted(&self, tool: SurveyTool) {
-		SurveySession::record_exhausted(self, tool);
+	fn record_exhausted(&self, tool: SurveyTool, code: ReviewErrorCode) {
+		if matches!(code, ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit) {
+			SurveySession::record_exhausted(self, tool);
+		}
 	}
 
 	fn record_limits(&self, limits: &PhaseLimitsResponse) {
 		SurveySession::record_limits(self, limits);
-	}
-
-	fn limits_call(tool: SurveyTool) -> bool {
-		tool == SurveyTool::JobLimits
 	}
 
 	fn unreachable(tool: SurveyTool) -> &'static str {

@@ -6,7 +6,7 @@
 //! the server decides a finalize replay, so a verify call has no admission
 //! gate.
 
-use loupe_proto::review_api::{PhaseLimitsResponse, ReviewErrorCode, ReviewProtocol};
+use loupe_proto::review_api::{ReviewErrorCode, ReviewProtocol};
 use loupe_proto::review_verification::FinalizeVerificationRequest;
 
 use super::phase::{settle, PhaseTexts};
@@ -35,7 +35,6 @@ const STATE_REFUSED: &str = "the server rejected the request in the finding's cu
 
 const TEXTS: PhaseTexts = PhaseTexts {
 	authority_lost: "this verification attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session",
-	reference_refused: None,
 	exhausted: STATE_REFUSED,
 	state_refused: STATE_REFUSED,
 	terminal_conflict: "the verification is already finalized with a different payload; it cannot be finalized again; end the session",
@@ -60,18 +59,8 @@ impl phase::PhaseCalls for VerifySession {
 		VerifySession::phase(self)
 	}
 
-	fn exhausts(_code: ReviewErrorCode) -> bool {
-		false
-	}
-
-	fn record_exhausted(&self, _tool: VerifyTool) {}
-
-	fn record_limits(&self, limits: &PhaseLimitsResponse) {
-		VerifySession::phase(self).record_limits(limits);
-	}
-
-	fn limits_call(tool: VerifyTool) -> bool {
-		tool == VerifyTool::JobLimits
+	fn reference_refused(_tool: VerifyTool) -> Option<&'static str> {
+		None
 	}
 
 	fn unreachable(tool: VerifyTool) -> &'static str {
