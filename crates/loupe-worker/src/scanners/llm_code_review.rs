@@ -252,8 +252,7 @@ async fn run_one(
 		timeout: cfg.per_request_timeout,
 		cancel,
 		repo_id: Some(repo_id),
-		mcp_mode: crate::mcp::McpMode::LegacyDiscovery { job_id: Some(job_id) },
-		survey: None,
+		mcp_scope: crate::mcp::McpScope::LegacyDiscovery { job_id: Some(job_id) },
 		token_budget: None,
 		job_capability: Some(job_capability),
 	};

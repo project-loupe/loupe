@@ -70,7 +70,6 @@ checked_struct!(LeadEvidenceV1, "LeadEvidenceV1", canonical_bytes {
 	duplicate_hint: Option<DuplicateLeadHint<S>>,
 });
 impl<S: Source> LeadEvidenceV1<S> {
-	pub const FORMAT: &'static str = "loupe.lead_evidence";
 	fn validate(&self) -> Result<(), Error> {
 		match (self.review_unit_id, self.assignment_epoch) {
 			(None, None) => {},
@@ -250,7 +249,6 @@ impl<S: Source> decode::Field<S> for UnitResultPayloadV1<S> {
 }
 checked_serde!(UnitResultPayloadV1, canonical_bytes);
 impl<S: Source> UnitResultPayloadV1<S> {
-	pub const FORMAT: &'static str = "loupe.unit_result";
 	fn validate(&self) -> Result<(), Error> {
 		if self.review_unit_id <= 0 || self.assignment_epoch < 0 {
 			return Err(invalid(

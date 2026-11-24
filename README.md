@@ -403,9 +403,10 @@ which LLM agent is used for each job kind:
   require that exact authenticated CLI and fail startup if it is not
   ready.
 - `survey = "auto"` (the default) → the worker advertises
-  `review:survey:v1` and runs survey leases with Codex preferred and
-  Claude as the fallback; with neither ready it runs no surveys.
-  `survey = "claude" | "codex"` requires that CLI as above.
+  `review:survey:v1` and `review:drilldown:v1` and runs survey and
+  drilldown leases with Codex preferred and Claude as the fallback; with
+  neither ready it runs neither phase. `survey = "claude" | "codex"`
+  requires that CLI as above.
 - CLI/env overrides are `--scan-agent` / `LOUPE_SCAN_AGENT`,
   `--verify-agent` / `LOUPE_VERIFY_AGENT` and `--survey-agent` /
   `LOUPE_SURVEY_AGENT`.

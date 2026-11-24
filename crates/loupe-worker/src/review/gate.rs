@@ -1,5 +1,6 @@
-//! Admission of survey tool calls from the attempt's host state. One pure
-//! decision, so the broker, its tests and the Kani harness share it.
+//! Admission of review-phase tool calls from the attempt's host state. One
+//! pure decision per phase, so the broker, its tests and the Kani harnesses
+//! share it.
 
 /// The survey catalog's tools.
 // debug-ok: closed tool names only.
@@ -46,6 +47,22 @@ impl SurveyTool {
 	}
 }
 
+/// The drilldown catalog's tools.
+// debug-ok: closed tool names only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrilldownTool {
+	JobLimits,
+	Candidates,
+	SiblingLead,
+	Finalize,
+}
+
+impl DrilldownTool {
+	#[cfg(any(test, kani))]
+	pub(crate) const ALL: [Self; 4] =
+		[Self::JobLimits, Self::Candidates, Self::SiblingLead, Self::Finalize];
+}
+
 /// Which survey recipe family the attempt runs.
 // debug-ok: closed recipe class only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +87,8 @@ pub(crate) enum Denial {
 	AlreadyPublished,
 	ProfileFirst,
 	SoftStop,
+	DrilldownSealed,
+	SiblingSoftStop,
 }
 
 impl Denial {
@@ -80,6 +99,8 @@ impl Denial {
 			Self::AlreadyPublished => ALREADY_PUBLISHED,
 			Self::ProfileFirst => PROFILE_FIRST,
 			Self::SoftStop => SOFT_STOP,
+			Self::DrilldownSealed => DRILLDOWN_SEALED,
+			Self::SiblingSoftStop => SIBLING_SOFT_STOP,
 		}
 	}
 }
@@ -94,6 +115,29 @@ pub(crate) const PROFILE_FIRST: &str =
 	"publish the repository profile with publish_profile before this call";
 pub(crate) const SOFT_STOP: &str =
 	"soft stop reached: submit_by has passed, so no new review units or candidate queries; record remaining leads, results and dispositions, then call finalize_survey";
+
+pub(crate) const DRILLDOWN_SEALED: &str =
+	"the drilldown is already finalized; only get_job_limits and an identical finalize_drilldown replay are accepted; end the session";
+pub(crate) const SIBLING_SOFT_STOP: &str =
+	"soft stop reached: submit_by has passed, so submit_sibling_lead is closed; finalize now with finalize_drilldown (an unfinished investigation is finalized as defer with continuation source_analysis_remaining)";
+
+/// Drilldown admission: a sealed receipt leaves only `get_job_limits` and
+/// an identical finalize replay; `submit_by` closes only sibling leads, as
+/// a `duplicate` finalize depends on the candidate query.
+pub(crate) fn admit_drilldown(
+	tool: DrilldownTool, past_submit_by: bool, receipt_sealed: bool,
+) -> Admission {
+	if receipt_sealed {
+		return match tool {
+			DrilldownTool::JobLimits | DrilldownTool::Finalize => Admission::Allow,
+			_ => Admission::Deny(Denial::DrilldownSealed),
+		};
+	}
+	if past_submit_by && tool == DrilldownTool::SiblingLead {
+		return Admission::Deny(Denial::SiblingSoftStop);
+	}
+	Admission::Allow
+}
 
 pub(crate) fn admit(
 	tool: SurveyTool, recipe: RecipeClass, profile_published: bool, past_submit_by: bool,
@@ -198,6 +242,43 @@ mod tests {
 				assert!(allowed(tool, recipe, true, true), "{tool:?}");
 			}
 		}
+	}
+
+	#[test]
+	fn a_sealed_drilldown_admits_only_limits_and_finalize() {
+		for tool in DrilldownTool::ALL {
+			for late in [false, true] {
+				let expected = if matches!(tool, DrilldownTool::JobLimits | DrilldownTool::Finalize)
+				{
+					Admission::Allow
+				} else {
+					Admission::Deny(Denial::DrilldownSealed)
+				};
+				assert_eq!(admit_drilldown(tool, late, true), expected, "{tool:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn drilldown_soft_stop_closes_only_sibling_leads() {
+		for tool in DrilldownTool::ALL {
+			assert_eq!(admit_drilldown(tool, false, false), Admission::Allow, "{tool:?}");
+			let expected = if tool == DrilldownTool::SiblingLead {
+				Admission::Deny(Denial::SiblingSoftStop)
+			} else {
+				Admission::Allow
+			};
+			assert_eq!(admit_drilldown(tool, true, false), expected, "{tool:?}");
+		}
+	}
+
+	#[test]
+	fn drilldown_denials_point_at_finalize_drilldown() {
+		assert!(Denial::DrilldownSealed.text().contains("finalize_drilldown"));
+		assert!(Denial::DrilldownSealed.text().contains("get_job_limits"));
+		let soft = Denial::SiblingSoftStop.text();
+		assert!(soft.contains("submit_sibling_lead") && soft.contains("finalize_drilldown"));
+		assert!(soft.contains("source_analysis_remaining"));
 	}
 
 	#[test]

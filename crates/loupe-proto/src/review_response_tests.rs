@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::review_api::*;
+use crate::review_drilldown::DrilldownTerminalResponseDecoder;
 use crate::review_evidence::{LeadCheckpointResponseDecoder, UnitResultCheckpointResponseDecoder};
 use crate::review_inventory::InventoryDispositionResponseDecoder;
 use crate::review_lifecycle::PhaseControlResponseDecoder;
@@ -277,5 +278,77 @@ fn error_envelope_classifies_known_and_unknown_codes() {
 	] {
 		let error = decode(raw).expect_err(raw);
 		assert!(!format!("{error:?} {error}").contains("private"));
+	}
+}
+
+fn drilldown(summary: Value) -> Value {
+	json!({"protocol_version":3,"receipt":{"receipt_id":2,"job_id":8,"commit_sha":SHA,
+		"result_digest":DIGEST,"summary":summary}})
+}
+
+#[test]
+fn drilldown_receipts_round_trip_for_every_summary_shape() {
+	let decode = |raw: &str| plain(DrilldownTerminalResponseDecoder, raw);
+	check(
+		&decode,
+		drilldown(json!({"version":1,"lead_id":4,"disposition":"promoted",
+			"promoted_finding_id":11})),
+	);
+	check(
+		&decode,
+		drilldown(json!({"version":1,"lead_id":4,"disposition":"deferred","continuation":{
+			"state":"pending","class":"source_analysis_remaining","revision":1,
+			"logical_sequence":2,"not_before":60}})),
+	);
+	check(
+		&decode,
+		drilldown(json!({"version":1,"lead_id":4,"disposition":"deferred","continuation":{
+			"state":"blocked","class":"external_dependency","revision":1,"logical_sequence":1,
+			"reason":"external_dependency"}})),
+	);
+	for disposition in ["rejected", "duplicate", "hardening"] {
+		check(&decode, drilldown(json!({"version":1,"lead_id":4,"disposition":disposition})));
+	}
+}
+
+#[test]
+fn drilldown_receipts_refuse_malformed_summaries_and_metadata() {
+	let decode = |value: Value| plain(DrilldownTerminalResponseDecoder, &value.to_string());
+	let summary = json!({"version":1,"lead_id":4,"disposition":"rejected"});
+	assert!(decode(drilldown(summary.clone())).is_ok());
+	let mut bad = vec![];
+	for (key, value) in [
+		("unexpected", json!(0)),
+		("version", json!(2)),
+		("disposition", json!("reject")),
+		("disposition", json!("promote")),
+		("promoted_finding_id", json!("11")),
+		("continuation", json!({"state":"pending"})),
+		(
+			"continuation",
+			json!({"state":"blocked","class":"external_dependency","revision":1,
+			"logical_sequence":1,"reason":"source_analysis_remaining"}),
+		),
+	] {
+		let mut changed = summary.clone();
+		changed[key] = value;
+		bad.push(drilldown(changed));
+	}
+	for (key, value) in [
+		("commit_sha", json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")),
+		("commit_sha", json!("aaaa")),
+		("result_digest", json!(SHA)),
+		("receipt_id", json!(-1)),
+		("terminal_reason", json!("completed")),
+	] {
+		let mut changed = drilldown(summary.clone());
+		changed["receipt"][key] = value;
+		bad.push(changed);
+	}
+	let mut wrong_protocol = drilldown(summary.clone());
+	wrong_protocol["protocol_version"] = json!(4);
+	bad.push(wrong_protocol);
+	for value in bad {
+		assert!(decode(value.clone()).is_err(), "accepted {value}");
 	}
 }

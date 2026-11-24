@@ -490,7 +490,9 @@ impl Serialize for Summary<'_> {
 #[path = "prompt_tests.rs"]
 mod tests;
 
+mod drilldown;
 mod survey;
+pub(crate) use drilldown::DrilldownJobContext;
 pub(crate) use survey::SurveyJobContext;
 
 #[cfg(any(test, fuzzing))]

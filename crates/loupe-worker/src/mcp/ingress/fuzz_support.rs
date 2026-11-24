@@ -113,6 +113,16 @@ pub(crate) fn survey_arguments_fixture(name: &str, args: &Value) -> Result<Argum
 	catalog_fixture(Catalog::Survey, super::super::SURVEY_LOUPE_MCP_PROTOCOL_VERSION, name, args)
 }
 
+#[cfg(test)]
+pub(crate) fn drilldown_arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
+	catalog_fixture(
+		Catalog::Drilldown,
+		super::super::DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION,
+		name,
+		args,
+	)
+}
+
 #[allow(unsafe_code)]
 fn catalog_fixture(
 	catalog: Catalog, protocol_version: u16, name: &str, args: &Value,
@@ -140,9 +150,9 @@ pub(crate) fn finding_fixture(
 	args.into_submission(workdir)
 }
 
-// debug-ok: Cfg-only synthetic observation of one survey record; values are fuzz assertions only.
+// debug-ok: Cfg-only synthetic observation of one phase record; values are fuzz assertions only.
 #[derive(Debug)]
-pub struct SurveyObservation {
+pub struct PhaseObservation {
 	/// The decoded tool label and, for accepted arguments, the exact request
 	/// bytes the host would send (with placeholder host fields).
 	pub decoded: Option<(String, Result<Vec<u8>, String>)>,
@@ -150,15 +160,34 @@ pub struct SurveyObservation {
 }
 
 /// One original record through the survey-catalog decoder.
+pub fn observe_survey_record(record: &[u8]) -> PhaseObservation {
+	observe_phase_record(
+		record,
+		Catalog::Survey,
+		super::super::SURVEY_LOUPE_MCP_PROTOCOL_VERSION,
+		survey_bytes,
+	)
+}
+
+/// One original record through the drilldown-catalog decoder.
+pub fn observe_drilldown_record(record: &[u8]) -> PhaseObservation {
+	observe_phase_record(
+		record,
+		Catalog::Drilldown,
+		super::super::DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION,
+		drilldown_bytes,
+	)
+}
+
 #[allow(unsafe_code)]
-pub fn observe_survey_record(record: &[u8]) -> SurveyObservation {
+fn observe_phase_record(
+	record: &[u8], catalog: Catalog, protocol_version: u16, bytes: fn(Arguments) -> Vec<u8>,
+) -> PhaseObservation {
 	let scope = crate::ingress_text::observe::Scope::begin();
 	// SAFETY: cfg-only fixture is one complete original record.
 	let original = Untrusted::new(record.to_vec(), unsafe { Ingress::<Sandbox>::new() });
-	let parsed = original.as_bytes().validate_carrying(McpRequestDecoder {
-		protocol_version: super::super::SURVEY_LOUPE_MCP_PROTOCOL_VERSION,
-		catalog: Catalog::Survey,
-	});
+	let parsed =
+		original.as_bytes().validate_carrying(McpRequestDecoder { protocol_version, catalog });
 	let agent_spans = scope.finish();
 	let decoded = match parsed {
 		Ok(Some(request)) => {
@@ -166,11 +195,11 @@ pub fn observe_survey_record(record: &[u8]) -> SurveyObservation {
 				ToolName::Unknown(_) => "unknown".to_owned(),
 				known => known.log_label().to_owned(),
 			};
-			Some((tool, request.call.arguments.map(survey_bytes).map_err(|e| format!("{e:#}"))))
+			Some((tool, request.call.arguments.map(bytes).map_err(|e| format!("{e:#}"))))
 		},
 		_ => None,
 	};
-	SurveyObservation { decoded, agent_spans }
+	PhaseObservation { decoded, agent_spans }
 }
 
 fn survey_bytes(arguments: Arguments) -> Vec<u8> {
@@ -235,6 +264,29 @@ fn survey_bytes(arguments: Arguments) -> Vec<u8> {
 			})
 		},
 		_ => panic!("survey catalog decoded a legacy tool"),
+	};
+	encoded.unwrap_or_else(|_| panic!("decoder admitted arguments that do not serialize"))
+}
+
+fn drilldown_bytes(arguments: Arguments) -> Vec<u8> {
+	use loupe_proto::review_api::ReviewProtocol;
+	let encoded = match arguments {
+		Arguments::JobLimits | Arguments::Candidates(_) => return survey_bytes(arguments),
+		Arguments::SiblingLead(args) => {
+			assert!(args.review_unit_id.is_none(), "a sibling lead named a review unit");
+			serde_json::to_vec(&loupe_proto::review_evidence::LeadCheckpointRequest {
+				protocol_version: ReviewProtocol,
+				client_lead_key: args.key,
+				evidence: args.evidence,
+			})
+		},
+		Arguments::FinalizeDrilldown(terminal) => {
+			serde_json::to_vec(&loupe_proto::review_drilldown::FinalizeDrilldownRequest {
+				protocol_version: ReviewProtocol,
+				payload: *terminal,
+			})
+		},
+		_ => panic!("drilldown catalog decoded another catalog's tool"),
 	};
 	encoded.unwrap_or_else(|_| panic!("decoder admitted arguments that do not serialize"))
 }
