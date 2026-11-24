@@ -58,6 +58,7 @@ pub(crate) fn limits(payload: &LeasePayload<Agent, Server>) -> Option<&ReviewLim
 	match payload {
 		LeasePayload::ReviewSurvey(lease) => Some(&lease.provenance.limits),
 		LeasePayload::ReviewDrilldown(lease) => Some(&lease.provenance.limits),
+		LeasePayload::ReviewVerify(lease) => Some(&lease.provenance.limits),
 		_ => None,
 	}
 }
