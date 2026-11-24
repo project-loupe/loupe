@@ -6,7 +6,7 @@ use loupe_proto::review_api::{PhaseLimitsResponse, ReviewErrorCode, ReviewProtoc
 use loupe_proto::review_drilldown::FinalizeDrilldownRequest;
 use loupe_proto::review_evidence::{LeadCheckpointRequest, LeadOutcome};
 
-use super::phase::{forbidden, PhaseTexts};
+use super::phase::{refuse, settle, PhaseTexts};
 use super::*;
 use crate::client::PhaseError;
 use crate::review::gate::{Admission, DrilldownTool};
@@ -23,19 +23,9 @@ pub(super) fn tool(name: &ingress::ToolName) -> Option<DrilldownTool> {
 	})
 }
 
-/// A refusal or failure shown to the model as fixed host text.
-// debug-ok: fixed host text only.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct DrilldownRefusal(String);
-
-fn refuse(text: impl Into<String>) -> anyhow::Error {
-	DrilldownRefusal(text.into()).into()
-}
-
 const TEXTS: PhaseTexts = PhaseTexts {
 	authority_lost: "this drilldown attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session",
-	reference_refused: "the server refused a referenced lead or finding for this job: a duplicate target must be a lead or finding returned by this job's own query_same_project_lead_candidates calls, and never the lead under investigation; a duplicate_of_lead_id must name a lead the server knows for this job; correct the reference and call again",
+	reference_refused: Some("the server refused a referenced lead or finding for this job: a duplicate target must be a lead or finding returned by this job's own query_same_project_lead_candidates calls, and never the lead under investigation; a duplicate_of_lead_id must name a lead the server knows for this job; correct the reference and call again"),
 	exhausted: SIBLINGS_EXHAUSTED,
 	state_refused: "the server rejected the request in the drilldown's current state",
 	terminal_conflict: "the drilldown is already finalized with a different payload; it cannot be finalized again; end the session",
@@ -65,9 +55,6 @@ pub(super) const INVALID: &str =
 /// everything else goes through the shared table.
 fn own_text(tool: DrilldownTool, error: &PhaseError) -> Option<&'static str> {
 	let PhaseError::Rejected { code, .. } = error else { return None };
-	if forbidden(error) {
-		return None;
-	}
 	Some(match code {
 		ReviewErrorCode::CheckpointLimit if tool == DrilldownTool::Candidates => QUERIES_EXHAUSTED,
 		ReviewErrorCode::RevalidationRequired => REVALIDATION_REQUIRED,
@@ -114,16 +101,6 @@ impl phase::PhaseCalls for DrilldownSession {
 
 	fn own_text(tool: DrilldownTool, error: &PhaseError) -> Option<&'static str> {
 		own_text(tool, error)
-	}
-}
-
-async fn settle<T>(
-	client: &ServerClient, drilldown: &DrilldownSession, tool: DrilldownTool,
-	result: Result<T, PhaseError>,
-) -> Result<T> {
-	match result {
-		Ok(value) => Ok(value),
-		Err(error) => Err(refuse(phase::phase_error(client, drilldown, tool, error).await)),
 	}
 }
 

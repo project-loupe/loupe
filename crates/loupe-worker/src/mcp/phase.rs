@@ -49,8 +49,9 @@ impl PhaseTools {
 pub(super) struct PhaseTexts {
 	pub authority_lost: &'static str,
 	/// A 403 while `/limits` still answers: a reference outside the job's
-	/// scope.
-	pub reference_refused: &'static str,
+	/// scope. `None` for a phase whose calls carry no such reference, where
+	/// every 403 is lost authority.
+	pub reference_refused: Option<&'static str>,
 	pub exhausted: &'static str,
 	pub state_refused: &'static str,
 	pub terminal_conflict: &'static str,
@@ -64,8 +65,18 @@ pub(super) const READ_UNREACHABLE: &str =
 const INVALID: &str =
 	"the server rejected the request as invalid; check the arguments against the tool schema";
 
-pub(super) fn forbidden(error: &PhaseError) -> bool {
+fn forbidden(error: &PhaseError) -> bool {
 	matches!(error, PhaseError::Rejected { status: 403, .. } | PhaseError::Status { status: 403 })
+}
+
+/// A refusal or failure shown to the model as fixed host text.
+// debug-ok: fixed host text only.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct PhaseRefusal(String);
+
+pub(super) fn refuse(text: impl Into<String>) -> anyhow::Error {
+	PhaseRefusal(text.into()).into()
 }
 
 /// What the shared failure text needs from one phase's session.
@@ -88,36 +99,39 @@ pub(super) trait PhaseCalls {
 	}
 }
 
+/// A phase call's result, with a failure turned into fixed model text.
+pub(super) async fn settle<P: PhaseCalls, T>(
+	client: &ServerClient, session: &P, tool: P::Tool, result: Result<T, PhaseError>,
+) -> anyhow::Result<T> {
+	match result {
+		Ok(value) => Ok(value),
+		Err(error) => Err(refuse(phase_error(client, session, tool, error).await)),
+	}
+}
+
 /// The fixed text for a failed phase call. The server answers 403 both
 /// for lost authority and for a reference outside the job's scope, so a
 /// 403 is told apart by reading `/limits` under the same capability and
-/// the session records that read. A failed `/limits` call itself needs no
-/// probe.
+/// the session records that read. A failed `/limits` call itself, or a
+/// phase without references, needs no probe.
 pub(super) async fn phase_error<P: PhaseCalls>(
 	client: &ServerClient, session: &P, tool: P::Tool, error: PhaseError,
 ) -> String {
-	if !forbidden(&error)
-		&& let PhaseError::Rejected { code, .. } = &error
-		&& P::exhausts(*code)
-	{
-		session.record_exhausted(tool);
-	}
-	if let Some(text) = P::own_text(tool, &error) {
-		return text.to_owned();
-	}
 	let phase = session.phase();
 	let texts = &P::TEXTS;
-	let limits_call = P::limits_call(tool);
 	let unreachable = P::unreachable(tool);
 	if forbidden(&error) {
-		if limits_call {
-			phase.record_authority_lost();
-			return texts.authority_lost.to_owned();
-		}
+		let reference_refused = match texts.reference_refused {
+			Some(text) if !P::limits_call(tool) => text,
+			_ => {
+				phase.record_authority_lost();
+				return texts.authority_lost.to_owned();
+			},
+		};
 		return match client.limits(&phase.phase_job()).await {
 			Ok(limits) => {
 				session.record_limits(&limits);
-				texts.reference_refused
+				reference_refused
 			},
 			Err(probe) if forbidden(&probe) => {
 				phase.record_authority_lost();
@@ -126,6 +140,14 @@ pub(super) async fn phase_error<P: PhaseCalls>(
 			Err(_) => unreachable,
 		}
 		.to_owned();
+	}
+	if let PhaseError::Rejected { code, .. } = &error
+		&& P::exhausts(*code)
+	{
+		session.record_exhausted(tool);
+	}
+	if let Some(text) = P::own_text(tool, &error) {
+		return text.to_owned();
 	}
 	let text = match &error {
 		PhaseError::Rejected { code, current_revision, .. } => match code {

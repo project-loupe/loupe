@@ -1,9 +1,16 @@
-//! Schemas of the evidence objects the drilldown and verification terminal
-//! payloads share.
+//! Schemas of the evidence objects and closed values the drilldown and
+//! verification terminal payloads share.
 
 use serde_json::{json, Value};
 
 use super::survey_catalog::{source_refs, text};
+
+pub(super) const CONTINUATIONS: [&str; 4] = [
+	"source_analysis_remaining",
+	"awaiting_proof_infrastructure",
+	"external_dependency",
+	"requires_successor",
+];
 
 /// `subject` is what the job re-inspects, as its description names it.
 pub(super) fn revalidation(subject: &str) -> Value {

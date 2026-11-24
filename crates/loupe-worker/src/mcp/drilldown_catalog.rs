@@ -4,16 +4,9 @@
 
 use serde_json::{json, Value};
 
-use super::evidence_schema::{argument, finding_evidence, revalidation};
+use super::evidence_schema::{argument, finding_evidence, revalidation, CONTINUATIONS};
 use super::survey_catalog::{defs, source_refs, text, KEY_PATTERN};
 use super::{add_tool_protocol_version, DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION};
-
-const CONTINUATIONS: [&str; 4] = [
-	"source_analysis_remaining",
-	"awaiting_proof_infrastructure",
-	"external_dependency",
-	"requires_successor",
-];
 
 fn promotion() -> Value {
 	json!({"type":"object",
