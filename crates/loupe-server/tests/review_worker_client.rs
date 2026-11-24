@@ -259,13 +259,19 @@ async fn phase_client_reports_failure_and_typed_rejections() {
 	assert!(matches!(control.state, PhaseControlState::Queued | PhaseControlState::Failed));
 }
 
-#[tokio::test]
-async fn phase_client_drives_a_drilldown_through_the_router() {
+fn lead(key: &str, anchor: &str) -> Vec<u8> {
+	request(json!({"protocol_version":3,"client_lead_key":key,"evidence":{
+		"format":"loupe.lead_evidence","version":1,"identity_family":"allocation",
+		"identity_anchor":anchor,"hypothesis":"Length reaches allocation",
+		"source_refs":[{"path":"z.rs"}],"next_proof_step":"Inspect callers",
+		"counterevidence":"No dominating check","proof_gaps":"Independent verification"}}))
+}
+
+/// A finalized bootstrap survey that left one lead, whose drilldown can be
+/// claimed next.
+async fn surveyed(f: &Fixture, client: &ServerClient, deadline: SystemTime) {
 	use common::marked::worker_request as worker;
-	let f = fixture();
-	let (survey_id, survey_capability) = claim(&f).await;
-	let client = serve(&f).await;
-	let deadline = SystemTime::now() + Duration::from_secs(60);
+	let (survey_id, survey_capability) = claim(f).await;
 	let survey = PhaseJob { job_id: survey_id, capability: &survey_capability, deadline };
 	let pin = request(json!({"protocol_version":3,"commit_sha":SHA}));
 	let pin = worker(&pin).validate(PinTargetRequestDecoder).unwrap();
@@ -279,13 +285,6 @@ async fn phase_client_drives_a_drilldown_through_the_router() {
 	let profile = request(json!({"protocol_version":3,"profile":{"scope":"worker client"}}));
 	let profile = worker(&profile).validate_carrying(PublishProfileRequestDecoder).unwrap();
 	client.publish_profile(&survey, &profile).await.unwrap();
-	let lead = |key: &str, anchor: &str| {
-		request(json!({"protocol_version":3,"client_lead_key":key,"evidence":{
-			"format":"loupe.lead_evidence","version":1,"identity_family":"allocation",
-			"identity_anchor":anchor,"hypothesis":"Length reaches allocation",
-			"source_refs":[{"path":"z.rs"}],"next_proof_step":"Inspect callers",
-			"counterevidence":"No dominating check","proof_gaps":"Independent verification"}}))
-	};
 	let assigned = lead("allocator", "allocator");
 	let assigned = worker(&assigned).validate_carrying(LeadCheckpointRequestDecoder).unwrap();
 	client.lead(&survey, &assigned).await.unwrap();
@@ -293,9 +292,20 @@ async fn phase_client_drives_a_drilldown_through_the_router() {
 		"terminal_reason":"completed","security_model_notes":"Public source boundary"}}));
 	let terminal = worker(&terminal).validate_carrying(FinalizeSurveyRequestDecoder).unwrap();
 	client.finalize_survey(&survey, &terminal).await.unwrap();
+}
+
+#[tokio::test]
+async fn phase_client_drives_a_drilldown_through_the_router() {
+	use common::marked::worker_request as worker;
+	let f = fixture();
+	let client = serve(&f).await;
+	let deadline = SystemTime::now() + Duration::from_secs(60);
+	surveyed(&f, &client, deadline).await;
 
 	let (job_id, capability) = claim_kind(&f, "review:drilldown:v1", "review_drilldown").await;
 	let job = PhaseJob { job_id, capability: &capability, deadline };
+	let pin = request(json!({"protocol_version":3,"commit_sha":SHA}));
+	let pin = worker(&pin).validate(PinTargetRequestDecoder).unwrap();
 	client.pin_target(&job, &pin).await.unwrap();
 	let sibling = lead("sibling", "reallocator");
 	let sibling = worker(&sibling).validate_carrying(LeadCheckpointRequestDecoder).unwrap();
