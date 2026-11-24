@@ -20,6 +20,7 @@ use loupe_proto::review_inventory::InventoryDispositionRequestDecoder;
 use loupe_proto::review_lifecycle::{PhaseControlState, PhaseFailureRequestDecoder};
 use loupe_proto::review_terminal::FinalizeSurveyRequestDecoder;
 use loupe_proto::review_units::ReviewUnitRequestDecoder;
+use loupe_proto::review_verification::{FinalizeVerificationRequestDecoder, VerificationVerdict};
 use loupe_proto::{JobCapability, PROTOCOL_VERSION_HEADER};
 use loupe_server::review::campaign;
 use loupe_server::review::policy::ReviewPolicy;
@@ -329,6 +330,61 @@ async fn phase_client_drives_a_drilldown_through_the_router() {
 	let other = worker(&other).validate_carrying(FinalizeDrilldownRequestDecoder).unwrap();
 	assert!(matches!(
 		client.finalize_drilldown(&job, &other).await.unwrap_err(),
+		PhaseError::Rejected { status: 409, code: ReviewErrorCode::TerminalConflict, .. }
+	));
+}
+
+#[tokio::test]
+async fn phase_client_finalizes_a_verification_through_the_router() {
+	use common::marked::worker_request as worker;
+	let f = fixture();
+	let client = serve(&f).await;
+	let deadline = SystemTime::now() + Duration::from_secs(60);
+	surveyed(&f, &client, deadline).await;
+	let pin = request(json!({"protocol_version":3,"commit_sha":SHA}));
+	let pin = worker(&pin).validate(PinTargetRequestDecoder).unwrap();
+
+	let (job_id, capability) = claim_kind(&f, "review:drilldown:v1", "review_drilldown").await;
+	let job = PhaseJob { job_id, capability: &capability, deadline };
+	client.pin_target(&job, &pin).await.unwrap();
+	let promote = request(json!({"protocol_version":3,"payload":{"version":1,
+		"disposition":"promote","promotion":{"version":1,"severity":"high",
+		"title":"Unbounded allocation","description":"Length reaches allocation.",
+		"identity_family":"allocation","identity_anchor":"allocator",
+		"evidence":{"version":1,"l2_argument":{"attacker_source":"Request body",
+		"control":"Length","sink":"allocation","reachable_path":"main to parse",
+		"trust_boundary":"network"},"material_locations":[{"role":"sink","file":"z.rs"}],
+		"counterevidence":"No bound.","assumptions_gaps":"Defaults.","confidence":"medium"}}}}));
+	let promote = worker(&promote).validate_carrying(FinalizeDrilldownRequestDecoder).unwrap();
+	let promoted = client.finalize_drilldown(&job, &promote).await.unwrap();
+	let finding = promoted.receipt.summary.promoted_finding_id.unwrap();
+
+	let (job_id, capability) = claim_kind(&f, "review:verify:v1", "review_verify").await;
+	let job = PhaseJob { job_id, capability: &capability, deadline };
+	let finalize = |argument: &str| {
+		request(json!({"protocol_version":3,"payload":{"version":1,"verdict":"rejected",
+			"counterargument":{"argument":argument,"source_refs":[{"path":"z.rs"}]}}}))
+	};
+	let rejected = finalize("The bound is checked.");
+	let rejected = worker(&rejected).validate_carrying(FinalizeVerificationRequestDecoder).unwrap();
+	assert!(matches!(
+		client.finalize_verification(&job, &rejected).await.unwrap_err(),
+		PhaseError::Rejected { status: 403, code: ReviewErrorCode::Denied, .. }
+	));
+	client.pin_target(&job, &pin).await.unwrap();
+	let receipt = client.finalize_verification(&job, &rejected).await.unwrap();
+	assert_eq!(i64::from(receipt.receipt.job_id), job_id);
+	let summary = &receipt.receipt.summary;
+	assert_eq!(summary.finding_id, finding);
+	assert_eq!(summary.verdict, VerificationVerdict::Rejected);
+	assert_eq!(summary.finding_state, loupe_core::FindingState::Dismissed);
+	let replay = client.finalize_verification(&job, &rejected).await.unwrap();
+	assert_eq!(replay, receipt, "exact replay is free");
+
+	let other = finalize("Another guard dominates the call.");
+	let other = worker(&other).validate_carrying(FinalizeVerificationRequestDecoder).unwrap();
+	assert!(matches!(
+		client.finalize_verification(&job, &other).await.unwrap_err(),
 		PhaseError::Rejected { status: 409, code: ReviewErrorCode::TerminalConflict, .. }
 	));
 }
