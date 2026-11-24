@@ -147,12 +147,13 @@ async fn only_a_worker_with_the_phase_backend_is_leased_a_drilldown() {
 	assert!(drilldowns(&f).is_empty(), "no drilldown job without a claim");
 	assert!(f.log.take().is_empty(), "the phase-less worker touched no job route");
 
-	let worker = Runner::new(f.client.clone(), cache, Vec::new()).with_phase_backend(Arc::new(
-		ScriptedMcpBackend::new(f.client.clone(), |mut agent| async move {
-			sealed(&agent.call("finalize_drilldown", reject()).await?);
-			Ok(())
-		}),
-	));
+	let backend = Arc::new(ScriptedMcpBackend::new(f.client.clone(), |mut agent| async move {
+		sealed(&agent.call("finalize_drilldown", reject()).await?);
+		Ok(())
+	}));
+	let worker = Runner::new(f.client.clone(), cache, Vec::new())
+		.with_survey_backend(backend.clone())
+		.with_drilldown_backend(backend);
 	assert!(worker.step(&CancellationToken::new()).await.unwrap());
 	assert_eq!(drilldowns(&f), [("succeeded".to_owned(), None)]);
 }

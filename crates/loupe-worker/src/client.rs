@@ -535,11 +535,11 @@ mod tests {
 		let client = std::sync::Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
 		let mut runner = crate::runner::Runner::new(client, cache, Vec::new());
 		if survey {
-			runner = runner.with_phase_backend(std::sync::Arc::new(
-				crate::llm::testing::StubLlmBackend::new("never-run", |_| {
+			let backend =
+				std::sync::Arc::new(crate::llm::testing::StubLlmBackend::new("never-run", |_| {
 					panic!("an empty lease reached the survey agent")
-				}),
-			));
+				}));
+			runner = runner.with_survey_backend(backend.clone()).with_drilldown_backend(backend);
 		}
 		let processed = runner.step(&tokio_util::sync::CancellationToken::new()).await.unwrap();
 		assert!(!processed);

@@ -65,8 +65,10 @@ async fn only_a_worker_with_a_survey_backend_is_leased_a_survey() {
 	assert_eq!(f.jobs(), [("queued".to_owned(), None)]);
 	assert_eq!(f.scalar("SELECT COUNT(*) FROM jobs WHERE worker_id IS NOT NULL"), 0);
 
+	let backend = Arc::new(ScriptedMcpBackend::new(f.client.clone(), full_bootstrap));
 	let surveyor = Runner::new(f.client.clone(), cache, Vec::new())
-		.with_phase_backend(Arc::new(ScriptedMcpBackend::new(f.client.clone(), full_bootstrap)));
+		.with_survey_backend(backend.clone())
+		.with_drilldown_backend(backend);
 	assert!(surveyor.step(&CancellationToken::new()).await.unwrap());
 	assert_eq!(f.jobs(), [("succeeded".to_owned(), None)]);
 }

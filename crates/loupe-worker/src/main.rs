@@ -463,7 +463,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
 	if let Some(backend) = phase_backend {
 		credential_watches.extend(backend.credential_watch());
-		runner = runner.with_phase_backend(backend);
+		runner = runner.with_survey_backend(backend.clone()).with_drilldown_backend(backend);
 		tracing::info!(
 			"phase runner enabled (review:survey:v1 and review:drilldown:v1 advertised)"
 		);

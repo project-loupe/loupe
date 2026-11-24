@@ -218,8 +218,10 @@ impl Fixture {
 	{
 		let cache = Arc::new(RepoCache::new(self.cache.path().to_owned(), u64::MAX, None).unwrap());
 		let offset = self.offset.clone();
+		let backend = Arc::new(ScriptedMcpBackend::new(self.client.clone(), script));
 		let runner = Runner::new(self.client.clone(), cache, Vec::new())
-			.with_phase_backend(Arc::new(ScriptedMcpBackend::new(self.client.clone(), script)))
+			.with_survey_backend(backend.clone())
+			.with_drilldown_backend(backend)
 			.with_phase_clock(Arc::new(move || {
 				let ahead = offset.load(Ordering::SeqCst);
 				SystemTime::now() + Duration::from_secs(u64::try_from(ahead).unwrap())
