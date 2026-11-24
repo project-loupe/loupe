@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use loupe_worker::llm::testing::{ScriptedAgent, ScriptedMcpBackend, ToolResult};
+use loupe_worker::llm::testing::ScriptedMcpBackend;
 use loupe_worker::{RepoCache, Runner};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 mod common;
 
+use common::phase_promotion::*;
 use common::phase_worker::*;
 
 /// Past a drilldown's `submit_by` (deadline − 420 s) but well before its
@@ -21,46 +22,8 @@ const DRILLDOWN_PAST_SUBMIT_BY: i64 = 2300;
 /// Within the kill margin of a drilldown's hard deadline.
 const DRILLDOWN_PAST_LAUNCH: i64 = 2690;
 
-fn lead_at(key: &str, anchor: &str) -> Value {
-	json!({"client_lead_key": key, "identity_family": "memory-safety",
-		"identity_anchor": anchor, "hypothesis": "The parser trusts the input length.",
-		"source_refs": [{"path": "src/lib.rs"}], "next_proof_step": "Write a harness.",
-		"counterevidence": "Length is only read.", "proof_gaps": "Reachability."})
-}
-
 fn sibling(key: &str, anchor: &str) -> Value {
 	lead_at(key, anchor)
-}
-
-/// A bootstrap survey that publishes the profile, leaves one lead per
-/// anchor and finalizes.
-type Played = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
-
-fn bootstrap(
-	anchors: &'static [&'static str],
-) -> impl Fn(ScriptedAgent) -> Played + Send + Sync + 'static {
-	move |mut agent: ScriptedAgent| {
-		Box::pin(async move {
-			ok(&agent.call("publish_profile", profile()).await?);
-			for (index, anchor) in anchors.iter().enumerate() {
-				ok(&agent.call("submit_lead", lead_at(&format!("lead-{index}"), anchor)).await?);
-			}
-			ok(&agent.call("finalize_survey", finalize("completed")).await?);
-			Ok(())
-		})
-	}
-}
-
-fn promote(anchor: &str) -> Value {
-	json!({"disposition": "promote", "promotion": {"severity": "high",
-		"title": "Unbounded allocation", "description": "Length reaches allocation.",
-		"identity_family": "memory-safety", "identity_anchor": anchor,
-		"evidence": {"l2_argument": {"attacker_source": "Request body", "control": "Length",
-			"sink": "allocation", "reachable_path": "main to parse",
-			"trust_boundary": "network"},
-		"material_locations": [{"role": "sink", "file": "src/lib.rs", "line_start": 1}],
-		"counterevidence": "No bound.", "assumptions_gaps": "Defaults.",
-		"confidence": "medium"}}})
 }
 
 fn reject_at(path: &str) -> Value {
@@ -87,12 +50,6 @@ fn duplicate(kind: &str, id: i64) -> Value {
 		"rationale": "Same source-controlled cause."})
 }
 
-fn sealed(result: &ToolResult) -> &str {
-	let text = ok(result);
-	assert!(text.starts_with("drilldown finalized as "), "{text}");
-	text
-}
-
 fn lead_id(f: &Fixture, anchor: &str) -> i64 {
 	f.scalar(&format!("SELECT lead_id FROM leads WHERE identity_anchor='{anchor}'"))
 }
@@ -106,34 +63,6 @@ fn prompted_lead(prompt: &str) -> i64 {
 
 fn drilldowns(f: &Fixture) -> Vec<(String, Option<String>)> {
 	f.jobs_of("drilldown")
-}
-
-/// Run one step whose script only finalizes with `arguments`; returns the
-/// prompt and the finalize result.
-async fn finalize_once(f: &Fixture, arguments: Value) -> (String, ToolResult) {
-	let observed = Arc::new(Mutex::new(None));
-	let seen = observed.clone();
-	assert!(
-		f.step(move |mut agent| {
-			let (seen, arguments) = (seen.clone(), arguments.clone());
-			async move {
-				let result = agent.call("finalize_drilldown", arguments).await?;
-				*seen.lock().unwrap() = Some((agent.prompt.clone(), result));
-				Ok(())
-			}
-		})
-		.await
-	);
-	let finished = observed.lock().unwrap().take();
-	finished.expect("script ran")
-}
-
-async fn bootstrapped(anchors: &'static [&'static str]) -> Fixture {
-	let f = fixture().await;
-	assert!(f.step(bootstrap(anchors)).await);
-	assert_eq!(f.jobs(), [("succeeded".to_owned(), None)]);
-	f.log.take();
-	f
 }
 
 #[tokio::test]
@@ -327,10 +256,7 @@ async fn a_duplicate_target_never_queried_is_refused_and_the_session_continues()
 #[tokio::test]
 async fn an_identity_conflict_is_resolved_as_a_duplicate_of_the_finding() {
 	let f = bootstrapped(&["parse length", "parse header"]).await;
-	let (_, first) = finalize_once(&f, promote("parse allocation")).await;
-	sealed(&first);
-	let finding = f.scalar("SELECT id FROM findings");
-	f.log.take();
+	let finding = promoted(&f, "parse allocation").await;
 
 	let observed = Arc::new(Mutex::new(None));
 	let seen = observed.clone();

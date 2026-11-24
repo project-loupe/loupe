@@ -124,7 +124,7 @@ pub fn policy() -> ReviewPolicy {
 
 pub struct Fixture {
 	pub state: AppState,
-	pub offline: super::offline::OfflineDatabase,
+	pub offline: Arc<super::offline::OfflineDatabase>,
 	pub origin: Origin,
 	pub client: Arc<ServerClient>,
 	pub log: Arc<Log>,
@@ -134,9 +134,18 @@ pub struct Fixture {
 }
 
 pub async fn fixture() -> Fixture {
+	fixture_with(async |_, _| {}).await.0
+}
+
+/// A fixture whose server state `configure` adjusts before the router is
+/// built; whatever it returns is handed back with the fixture.
+pub async fn fixture_with<T>(
+	configure: impl AsyncFnOnce(&mut AppState, Arc<super::offline::OfflineDatabase>) -> T,
+) -> (Fixture, T) {
 	let origin = Origin::new();
 	let mut offline = super::offline::OfflineDatabase::new();
 	let db = offline.open();
+	let offline = Arc::new(offline);
 	let ca = Arc::new(Ca::new("worker-survey").unwrap());
 	let bundle = ca.mint_client("worker").unwrap();
 	let peer = PeerCert(
@@ -154,10 +163,11 @@ pub async fn fixture() -> Fixture {
 	)
 	.unwrap();
 	open_campaign(&db, None);
-	let state =
+	let mut state =
 		AppState::new(db, ca, Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()))
 			.with_review_policy(policy())
 			.unwrap();
+	let configured = configure(&mut state, offline.clone()).await;
 	let log = Arc::new(Log::default());
 	let observed = log.clone();
 	let app = router(state.clone())
@@ -169,7 +179,7 @@ pub async fn fixture() -> Fixture {
 	let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
 	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 	let client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
-	Fixture {
+	let fixture = Fixture {
 		state,
 		offline,
 		origin,
@@ -177,7 +187,8 @@ pub async fn fixture() -> Fixture {
 		log,
 		offset: Arc::new(AtomicI64::new(0)),
 		cache: tempfile::tempdir().unwrap(),
-	}
+	};
+	(fixture, configured)
 }
 
 pub fn open_campaign(db: &loupe_storage::Db, base_sha: Option<&str>) {
