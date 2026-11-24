@@ -1,8 +1,9 @@
 //! Arbitrary original Server bytes enter the actual owner before rendering.
 //! The entire input is the description, so the canonical raw corpus is also
 //! useful to unit tests. Both modes and closed/text projections run each time,
-//! and the same bytes enter a survey prompt as assignment and profile text and
-//! a drilldown prompt as lead hypothesis and profile text.
+//! and the same bytes enter a survey prompt as assignment and profile text,
+//! a drilldown prompt as lead hypothesis and profile text and a verify prompt
+//! as finding and profile text.
 
 use loupe_worker::llm::prompt::{
 	fuzz_support, DataMode, PromptError, MAX_RENDERED_PROMPT_BYTES, PREAMBLE,
@@ -20,6 +21,7 @@ pub fn do_test(data: &[u8]) {
 		for mode in [DataMode::Delimited, DataMode::Marked] {
 			check_phase(data, candidates, mode, Phase::Survey);
 			check_phase(data, candidates, mode, Phase::Drilldown);
+			check_phase(data, candidates, mode, Phase::Verify);
 			for projection in [false, true] {
 				let Some(result) = fuzz_support::render(data, mode, projection, candidates) else {
 					continue; // Original UTF-8/policy admission rejected these bytes.
@@ -141,15 +143,17 @@ fn decode_payload(payload: &str, mode: DataMode) -> String {
 enum Phase {
 	Survey,
 	Drilldown,
+	Verify,
 }
 
 /// The phase projections: host scalars under `server`, the same agent text
-/// in the assignment (`assignments` or `lead`) and `profile` parts, one
+/// in the assignment (`assignments`, `lead` or `finding`) and `profile` parts, one
 /// boundary for all three.
 fn check_phase(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode, phase: Phase) {
 	let rendered = match phase {
 		Phase::Survey => fuzz_support::render_survey(data, mode, candidates),
 		Phase::Drilldown => fuzz_support::render_drilldown(data, mode, candidates),
+		Phase::Verify => fuzz_support::render_verify(data, mode, candidates),
 	};
 	let Some(fuzz_support::PhaseRender { prompt, spans, commit, admitted }) = rendered else {
 		return; // The lease owner rejected these bytes as agent text.
@@ -170,6 +174,7 @@ fn check_phase(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode, phase: Ph
 	let (assigned, phase_name, terminal) = match phase {
 		Phase::Survey => ("assignments", "survey", "finalize_survey"),
 		Phase::Drilldown => ("lead", "drilldown", "finalize_drilldown"),
+		Phase::Verify => ("finding", "verify", "finalize_verification"),
 	};
 	let [context, assignment, profile] = &spans;
 	let parts = decode_labelled(
@@ -205,6 +210,14 @@ fn check_phase(data: &[u8], candidates: [[u8; 16]; 3], mode: DataMode, phase: Ph
 			assert_eq!(context["capacity"]["siblings"]["remaining"], 0);
 			assert_eq!(assignment["hypothesis"], raw);
 			assert_eq!(assignment["identity_family"], "memory-safety");
+		},
+		Phase::Verify => {
+			assert_eq!(context["finding_id"], 5);
+			assert_eq!(context["producer_commit"], commit.as_str());
+			assert_eq!(context["capacity"]["campaign"]["verification_remaining"], 2);
+			assert_eq!(assignment["description"], raw);
+			assert_eq!(assignment["evidence"]["l2_argument"]["reachable_path"], raw);
+			assert_eq!(assignment["evidence"]["material_locations"][0]["file"], "src/lib.rs");
 		},
 	}
 	assert_eq!(parse(&parts[2])["note"], raw);

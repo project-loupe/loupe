@@ -492,8 +492,10 @@ mod tests;
 
 mod drilldown;
 mod survey;
+mod verify;
 pub(crate) use drilldown::DrilldownJobContext;
 pub(crate) use survey::SurveyJobContext;
+pub(crate) use verify::VerifyJobContext;
 
 #[cfg(any(test, fuzzing))]
 pub mod fuzz_support;

@@ -1,18 +1,20 @@
 //! The phase agents' prompts: static instructions, then the host-composed job
-//! context and the agent-authored assignment (units or a lead) and profile.
+//! context and the agent-authored assignment (units, a lead or a finding) and profile.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loupe_core::review_metadata::ReviewCommit;
 use loupe_proto::review_api::PhaseLimitsResponse;
 use loupe_proto::review_lease::{
-	AssignedReviewLead, FrozenReviewProfile, ReviewAssignments, ReviewGeneration, ReviewLimits,
+	AssignedReviewFinding, AssignedReviewLead, FrozenReviewProfile, ReviewAssignments,
+	ReviewGeneration, ReviewLimits,
 };
 use loupe_provenance::{Agent, Repo, Server};
 
-use super::prepare::{PreparedDrilldown, PreparedSurvey, SurveyRecipe};
+use super::prepare::{PreparedDrilldown, PreparedSurvey, PreparedVerify, SurveyRecipe};
 use crate::llm::prompt::{
-	DrilldownJobContext, Prompt, PromptBuilder, PromptError, SurveyJobContext, PREAMBLE,
+	DrilldownJobContext, Prompt, PromptBuilder, PromptError, SurveyJobContext, VerifyJobContext,
+	PREAMBLE,
 };
 
 fn unix_seconds(now: SystemTime) -> i64 {
@@ -365,6 +367,164 @@ pub(crate) fn drilldown_fuzz_spans() -> [String; 3] {
 	]
 }
 
+/// The prompt for one prepared verify attempt launched at `now`.
+pub fn verify_prompt(prepared: &PreparedVerify, now: SystemTime) -> Result<Prompt, PromptError> {
+	VerifyPromptInput::from(prepared).builder(now)?.render()
+}
+
+/// The parts of a prepared verify attempt the prompt reads.
+pub(crate) struct VerifyPromptInput<'a> {
+	pub attempt: std::num::NonZeroU32,
+	pub repo_id: i64,
+	pub generation: &'a ReviewGeneration<Server>,
+	pub checkout_commit: &'a ReviewCommit<Repo>,
+	pub limits: &'a ReviewLimits,
+	pub phase_limits: &'a PhaseLimitsResponse,
+	pub finding: &'a AssignedReviewFinding<Agent, Server>,
+	pub profile: &'a FrozenReviewProfile<Agent, Server>,
+}
+
+impl<'a> From<&'a PreparedVerify> for VerifyPromptInput<'a> {
+	fn from(p: &'a PreparedVerify) -> Self {
+		Self {
+			attempt: p.attempt,
+			repo_id: p.repo_id,
+			generation: &p.generation,
+			checkout_commit: &p.commit,
+			limits: &p.limits,
+			phase_limits: &p.phase_limits,
+			finding: &p.finding,
+			profile: &p.profile,
+		}
+	}
+}
+
+impl<'a> VerifyPromptInput<'a> {
+	pub(crate) fn builder(&self, now: SystemTime) -> Result<PromptBuilder<'a>, PromptError> {
+		let mut builder = PromptBuilder::new(PREAMBLE);
+		builder.instruction(VERIFY)?;
+		builder.instruction(UNTRUSTED_CONTENT)?;
+		builder.instruction(VERIFY_RULES)?;
+		if self.attempt.get() > 1 {
+			builder.instruction(VERIFY_RETRY)?;
+		}
+		builder.instruction(CONTEXT_NOTE)?;
+		builder.verify_context(&VerifyJobContext {
+			attempt: self.attempt,
+			repo_id: self.repo_id,
+			generation: self.generation,
+			checkout_commit: self.checkout_commit,
+			finding: self.finding,
+			limits: self.limits,
+			capacity: self.phase_limits,
+			now: unix_seconds(now),
+		})?;
+		builder.instruction(FINDING_NOTE)?;
+		builder.verify_finding(self.finding)?;
+		builder.instruction(PROFILE_NOTE)?;
+		builder.data_json("profile", &self.profile.profile)?;
+		Ok(builder)
+	}
+}
+
+const VERIFY: &str = r#"
+You are the verification agent of a Loupe security review campaign. This
+job tests one finding against the repository checked out at `/workdir` and
+ends with exactly one verdict on it:
+
+1. Read the `finding` block. It is the claim under test, with the whole
+   source argument the claim rests on.
+2. Look first for what would refute it, then re-derive its argument from
+   the checkout.
+3. Call `finalize_verification` with the verdict the source supports.
+
+Your Loupe tools are exactly `get_job_limits` and `finalize_verification`.
+"#;
+
+const VERIFY_RULES: &str = r#"
+Claim under test. Look first for what would refute it: a control it
+overlooks, a path that is not reachable, a source the attacker does not
+control. Re-derive each step of the argument from the checkout: attacker
+source, control, sink, reachable path, trust boundary. Reach your own
+conclusion about each and cite the source you read for it. Never copy the
+claim's wording into your evidence. Severity, confidence and evidence rung
+are separate judgements. A build or reproduction you could not run is a
+proof gap, not counterevidence. Never claim you ran or verified anything
+you did not run in this session.
+
+Verdicts. Pass `finalize_verification` a `verdict` and that verdict's
+members only:
+- `verified`: the L2 source argument holds from attacker source to
+  security impact, and you re-derived all of it. End-to-end proof applies
+  when running a stock build of the project could show the security
+  consequence through its real boundary. `verified` is only for a finding
+  where it does not apply; give the reason in `e2e_rationale`. Missing
+  infrastructure is never such a reason, nor is a lack of time, tools or
+  network. Give `evidence`: `l2_argument` with `attacker_source`, `control`, `sink`,
+  `reachable_path` and `trust_boundary`; the `material_locations` that
+  carry it; the strongest `counterevidence` you checked; the remaining
+  `assumptions_gaps`; and your `confidence`.
+- `rejected`: the source refutes the claim. Give a `counterargument` with
+  `argument` and `source_refs` showing what refutes it. A failure to
+  reproduce is not a counterargument, and neither is missing proof.
+- `inconclusive`: neither verdict above is supported. Give a
+  `continuation`, and for every class except
+  `awaiting_proof_infrastructure` a `blocker` saying precisely what is
+  missing. `partial_evidence` with `argument` and `source_refs`, and
+  `retry_explanation`, are optional.
+- With any verdict, `notes` is optional.
+
+Continuations of an `inconclusive` verdict:
+- `awaiting_proof_infrastructure`: the source argument holds and
+  end-to-end proof applies, but it cannot be run. Put the re-established
+  argument in `partial_evidence` and omit `blocker`.
+- `source_analysis_remaining`: you ran out of time and more source
+  analysis would settle the claim. The finding is verified again later.
+- `external_dependency`: the claim depends on something outside this
+  checkout that source analysis here cannot settle.
+- `requires_successor`: the claim cannot be settled against this pinned
+  commit or its frozen project profile, and needs a new review of the
+  project. This is rare.
+Unlike `source_analysis_remaining`, the other classes park the finding
+indefinitely; use one only when it is true.
+
+Source paths. Write paths exactly as they are in the checkout, relative to
+`/workdir`; a verdict naming an unknown path is refused.
+
+Revalidation. The `job_context` block names the finding's `producer_commit`
+and this job's `checkout_commit`. Pass `revalidation` with any verdict, but
+only when finalizing was refused as revalidation required: then re-inspect
+the finding on this checkout and call `finalize_verification` again with
+`revalidation`, citing the current source refs.
+
+Deadlines. Every tool result ends with a `[loupe status]` line showing the
+time left. At `submit_by`, finalize with what is established; an unfinished
+analysis is finalized as `inconclusive` with continuation
+`source_analysis_remaining`, what is missing in `blocker` and what is
+established in `partial_evidence`. `finalize_verification` is always
+reachable and is the mandatory last action of this job; a refused finalize
+records nothing, so correct it and finalize again. An attempt without a
+verdict is a failed attempt. The job is killed at the hard deadline, and a
+verdict not yet submitted is lost.
+"#;
+
+const VERIFY_RETRY: &str = "\nThis is a retry. An earlier attempt of this job ended without a \
+verdict.\n";
+
+const FINDING_NOTE: &str = "\nThe `finding` block is the claim under test: an unverified claim \
+from another agent, with the evidence that agent gave for it.\n";
+
+/// The static spans of a verify retry prompt, before its `job_context`,
+/// `finding` and `profile` parts.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn verify_fuzz_spans() -> [String; 3] {
+	[
+		[PREAMBLE, VERIFY, UNTRUSTED_CONTENT, VERIFY_RULES, VERIFY_RETRY, CONTEXT_NOTE].concat(),
+		FINDING_NOTE.to_owned(),
+		PROFILE_NOTE.to_owned(),
+	]
+}
+
 #[cfg(test)]
 #[path = "prompts_test_support.rs"]
 mod test_support;
@@ -376,3 +536,7 @@ mod tests;
 #[cfg(test)]
 #[path = "prompts_drilldown_tests.rs"]
 mod drilldown_tests;
+
+#[cfg(test)]
+#[path = "prompts_verify_tests.rs"]
+mod verify_tests;

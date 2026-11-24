@@ -357,7 +357,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_mcp_verify_ingress` | Actual verify-catalog decoder over original Sandbox records, two tools plus foreign names: Agent carries stay inside the record, rejections never echo content, fields the host supplies are refused as arguments and fixed in the request, admitted arguments serialize as valid phase requests |
 | `worker_network_host` | RFC 1123 hostname boundaries, IPv4 acceptance and complete allowlist/public nft rule templates |
 | `worker_network_parsers` | Actual PID, uid_map, route and address parsers, typed-serde PID forms, identity-pair and complete-set checks |
-| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits; the same bytes as survey assignment, drilldown lead hypothesis and profile text under host-authored phase context |
+| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits; the same bytes as survey assignment, drilldown lead hypothesis, verify finding and profile text under host-authored phase context |
 | `worker_regex_secrets` | Actual scanner walk and Repo finding observation, native path admission with legitimate siblings, independent matches/lines/hash and redacted Debug |
 | `worker_repo_cache` | Actual Repo cursor decoder and file reads, independent exact policy and caps, plus git origin status/UTF-8/whitespace behavior |
 | `worker_repo_observations` | Six actual private Repo validators: native paths, file bytes, fingerprint windows, Git diagnostics, binary OIDs and gitlink bytes |

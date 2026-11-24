@@ -226,3 +226,54 @@ pub fn render_drilldown(
 		admitted,
 	})
 }
+
+/// A verify prompt whose finding description, reachable path and profile note
+/// are `raw`.
+pub fn render_verify(raw: &[u8], mode: DataMode, candidates: [[u8; 16]; 3]) -> Option<PhaseRender> {
+	use loupe_proto::review_lease::ReviewVerifyLease;
+
+	use crate::review::prompts::{self, VerifyPromptInput};
+
+	let text = std::str::from_utf8(raw).ok()?;
+	let (_, commit) = fixture_commit();
+	let sha = commit.expose();
+	let payload = serde_json::json!({
+		"generation":{"generation_id":3,"commit_sha":sha},
+		"profile":{"profile_version":1,"profile_digest":"b".repeat(64),"profile":{"note":text}},
+		"finding":{"finding_id":5,"reviewed_commit_sha":sha,"severity":"high",
+			"title":"Unbounded allocation","description":text,
+			"identity_family":"memory-safety","identity_anchor":"request allocation",
+			"evidence":{"version":1,"l2_argument":{"attacker_source":"Remote request",
+				"control":"None","sink":"Allocation","reachable_path":text,
+				"trust_boundary":"Request to memory"},
+				"material_locations":[{"role":"sink","file":"src/lib.rs"}],
+				"counterevidence":"None found","assumptions_gaps":"Defaults",
+				"confidence":"medium"}}
+	});
+	let loupe_proto::LeasePayload::ReviewVerify(lease) = phase_lease("review_verify", payload)?
+	else {
+		return None;
+	};
+	let ReviewVerifyLease { provenance, generation, profile, finding } = *lease;
+	let phase_limits = phase_limits([(0, 0); 4]);
+	let admitted = finding.evidence.l2_argument.reachable_path.expose().to_owned();
+	let input = VerifyPromptInput {
+		attempt: provenance.attempt,
+		repo_id: 17,
+		generation: &generation,
+		checkout_commit: commit,
+		limits: &provenance.limits,
+		phase_limits: &phase_limits,
+		finding: &finding,
+		profile: &profile,
+	};
+	let prompt = input
+		.builder(at_launch())
+		.and_then(|builder| render_drawing(builder.mode(mode), candidates));
+	Some(PhaseRender {
+		prompt,
+		spans: prompts::verify_fuzz_spans(),
+		commit: sha.to_owned(),
+		admitted,
+	})
+}
