@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use loupe_proto::review_api::PhaseLimitsResponse;
 use loupe_proto::review_drilldown::DrilldownTerminalResponse;
+use loupe_proto::review_lease::ReviewLimits;
 use loupe_proto::review_terminal::SurveyTerminalResponse;
 use loupe_proto::JobCapability;
 use loupe_provenance::Server;
@@ -98,6 +99,21 @@ impl PhaseSession {
 		}
 	}
 
+	/// The phase core of a prepared attempt, under its lease's deadlines.
+	fn from_lease(
+		job_id: i64, capability: &JobCapability, limits: &ReviewLimits, clock: Clock,
+		cancel: CancellationToken,
+	) -> Self {
+		Self::new(
+			job_id,
+			capability.clone(),
+			at(limits.submit_by),
+			at(limits.hard_deadline_at),
+			clock,
+			cancel,
+		)
+	}
+
 	pub fn job_id(&self) -> i64 {
 		self.job_id
 	}
@@ -154,14 +170,18 @@ impl PhaseSession {
 		self.limits.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 	}
 
-	/// The host-authored status line: the shared deadline part followed by
-	/// the phase's `capacity` part.
-	pub fn status_line(&self, now: SystemTime, capacity: &str) -> String {
-		format!(
-			"[loupe status] submit_by: {}; hard deadline: {}; {capacity}",
+	/// The host-authored status line: the shared deadline part, followed by
+	/// the `capacity` part of a phase that has one.
+	pub fn status_line(&self, now: SystemTime, capacity: Option<&str>) -> String {
+		let deadlines = format!(
+			"[loupe status] submit_by: {}; hard deadline: {}",
 			remaining(now, self.submit_by),
 			remaining(now, self.hard_deadline),
-		)
+		);
+		match capacity {
+			Some(capacity) => format!("{deadlines}; {capacity}"),
+			None => deadlines,
+		}
 	}
 }
 
@@ -345,7 +365,7 @@ impl SurveySession {
 			count(state.units_remaining),
 			count(state.leads_remaining),
 		);
-		self.phase.status_line(now, &capacity)
+		self.phase.status_line(now, Some(&capacity))
 	}
 }
 
@@ -391,11 +411,10 @@ impl DrilldownSession {
 	pub fn from_prepared(
 		prepared: &PreparedDrilldown, clock: Clock, cancel: CancellationToken,
 	) -> Self {
-		let phase = PhaseSession::new(
+		let phase = PhaseSession::from_lease(
 			prepared.job_id,
-			prepared.job_capability.clone(),
-			at(prepared.limits.submit_by),
-			at(prepared.limits.hard_deadline_at),
+			&prepared.job_capability,
+			&prepared.limits,
 			clock,
 			cancel,
 		);
@@ -478,7 +497,7 @@ impl DrilldownSession {
 			count(state.siblings_remaining),
 			count(state.queries_remaining),
 		);
-		self.phase.status_line(now, &capacity)
+		self.phase.status_line(now, Some(&capacity))
 	}
 }
 
@@ -516,6 +535,18 @@ mod tests {
 		}
 	}
 
+	fn phase(cancel: CancellationToken) -> PhaseSession {
+		let now = SystemTime::now();
+		PhaseSession::new(
+			7,
+			JobCapability::from_secret("session-capability"),
+			now + std::time::Duration::from_secs(60),
+			now + std::time::Duration::from_secs(120),
+			Arc::new(SystemTime::now),
+			cancel,
+		)
+	}
+
 	#[test]
 	fn losing_authority_cancels_the_agent() {
 		let cancel = CancellationToken::new();
@@ -549,15 +580,7 @@ mod tests {
 	#[test]
 	fn sealing_a_drilldown_stops_the_heartbeat_and_closes_its_tools() {
 		let (cancel, heartbeat) = (CancellationToken::new(), CancellationToken::new());
-		let now = SystemTime::now();
-		let phase = PhaseSession::new(
-			7,
-			JobCapability::from_secret("session-capability"),
-			now + std::time::Duration::from_secs(60),
-			now + std::time::Duration::from_secs(120),
-			Arc::new(SystemTime::now),
-			cancel.clone(),
-		);
+		let phase = phase(cancel.clone());
 		let session = DrilldownSession::new(phase, 4, None).with_heartbeat(heartbeat.clone());
 		assert_eq!(session.admission(DrilldownTool::SiblingLead), Admission::Allow);
 		assert!(session

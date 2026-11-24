@@ -277,12 +277,8 @@ pub async fn prepare_drilldown(
 		branch: head_branch.as_ref().map(|branch| branch.expose()),
 		revision: Some(leased.commit_sha.expose()),
 	};
-	let Pinned { worktree, commit, response, .. } =
-		checkout_and_pin(runner, &job, source, Observe::Commit, security, cancel).await?;
-	let PinTargetResponse::Prepared { generation, profile: pinned, .. } = response else {
-		return Err(PrepareError::UnsupportedLease);
-	};
-	let phase_limits = runner.client().limits(&job).await?;
+	let SealedGeneration { worktree, commit, generation, profile, phase_limits } =
+		prepare_generation(runner, &job, source, profile, security, cancel).await?;
 	Ok(PreparedDrilldown {
 		job_id,
 		job_capability: job_capability.clone(),
@@ -293,9 +289,42 @@ pub async fn prepare_drilldown(
 		lead,
 		generation,
 		commit,
-		profile: pinned.unwrap_or(profile),
+		profile,
 		phase_limits,
 		worktree,
+	})
+}
+
+/// A sealed generation's checkout, prepared for a job that works on one
+/// subject of it.
+struct SealedGeneration {
+	worktree: CheckedOutWorktree,
+	commit: ReviewCommit<Repo>,
+	generation: ReviewGeneration<Server>,
+	/// The pin response's profile, else the lease's.
+	profile: FrozenReviewProfile<Agent, Server>,
+	/// Remaining capacity read after the pin.
+	phase_limits: PhaseLimitsResponse,
+}
+
+/// Check out and pin the sealed generation `source` names, then read the
+/// limits. No inventory is taken.
+async fn prepare_generation(
+	runner: &Runner, job: &PhaseJob<'_>, source: CheckoutSource<'_>,
+	leased: FrozenReviewProfile<Agent, Server>, security: &JobSecurity, cancel: &CancellationToken,
+) -> Result<SealedGeneration, PrepareError> {
+	let Pinned { worktree, commit, response, .. } =
+		checkout_and_pin(runner, job, source, Observe::Commit, security, cancel).await?;
+	let PinTargetResponse::Prepared { generation, profile: pinned, .. } = response else {
+		return Err(PrepareError::UnsupportedLease);
+	};
+	let phase_limits = runner.client().limits(job).await?;
+	Ok(SealedGeneration {
+		worktree,
+		commit,
+		generation,
+		profile: pinned.unwrap_or(leased),
+		phase_limits,
 	})
 }
 
@@ -627,30 +656,40 @@ mod tests {
 		assert!(matches!(cached, Ok(0) | Err(_)), "repository cache was touched");
 	}
 
-	fn drilldown_lease(
-		hard_deadline_at: i64, clone_url: &str, commit: &str,
+	/// A lease on `subject` of the generation at `commit`.
+	fn subject_lease(
+		kind: &str, subject: (&str, serde_json::Value), hard_deadline_at: i64, clone_url: &str,
+		commit: &str,
 	) -> LeaseEnvelope<Agent, Server> {
-		let body = json!({"kind":"lease","protocol_version":3,"job_id":1,
-			"job_capability":"test-capability","repo_id":1,
-			"repo":{"host":"invalid.test","owner":"test","repo":"test","clone_url":clone_url},
-			"head_branch":null,"lease_expires_at":200,"scanner_config":null,
-			"payload":{"kind":"review_drilldown","provenance":{"workflow_contract_version":1,
+		let mut payload = json!({"kind":kind,"provenance":{"workflow_contract_version":1,
 				"campaign_id":2,"attempt":2,"limits":{"soft_deadline_at":100,"submit_by":100,
 				"hard_deadline_at":hard_deadline_at,"token_budget":null,"new_unit_limit":0,
 				"lead_limit":0,"sibling_limit":4}},
 			"generation":{"generation_id":3,"commit_sha":commit},
 			"profile":{"profile_version":1,"profile_digest":"b".repeat(64),
-				"profile":{"purpose":"lease profile"}},
-			"lead":{"lead_id":4,"producer_commit_sha":commit,"identity_family":"memory-safety",
-				"identity_anchor":"request allocation","hypothesis":"Unbounded allocation",
-				"source_refs":[{"path":"main.rs"}],"next_proof_step":"Trace allocation",
-				"counterevidence":"Authentication","proof_gaps":"No reproducer"}}});
+				"profile":{"purpose":"lease profile"}}});
+		payload[subject.0] = subject.1;
+		let body = json!({"kind":"lease","protocol_version":3,"job_id":1,
+			"job_capability":"test-capability","repo_id":1,
+			"repo":{"host":"invalid.test","owner":"test","repo":"test","clone_url":clone_url},
+			"head_branch":null,"lease_expires_at":200,"scanner_config":null,"payload":payload});
 		let LeaseResponse::Lease(env) =
 			crate::client::test_lease(body.to_string().as_bytes()).response
 		else {
-			panic!("drilldown lease fixture")
+			panic!("subject lease fixture")
 		};
 		*env
+	}
+
+	fn drilldown_lease(
+		hard_deadline_at: i64, clone_url: &str, commit: &str,
+	) -> LeaseEnvelope<Agent, Server> {
+		let lead = json!({"lead_id":4,"producer_commit_sha":commit,
+			"identity_family":"memory-safety","identity_anchor":"request allocation",
+			"hypothesis":"Unbounded allocation","source_refs":[{"path":"main.rs"}],
+			"next_proof_step":"Trace allocation","counterevidence":"Authentication",
+			"proof_gaps":"No reproducer"});
+		subject_lease("review_drilldown", ("lead", lead), hard_deadline_at, clone_url, commit)
 	}
 
 	fn head(url: &str) -> String {
