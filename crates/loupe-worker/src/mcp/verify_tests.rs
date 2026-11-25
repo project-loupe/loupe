@@ -204,8 +204,8 @@ async fn the_catalog_has_two_closed_tools_at_protocol_version_2() {
 /// Model tool APIs may refuse a schema with one of these at its root.
 #[test]
 fn no_tool_schema_has_a_combinator_at_its_root() {
-	let catalog = verify_catalog::tools();
-	for tool in catalog.as_array().unwrap() {
+	let catalogs = [drilldown_catalog::tools(), verify_catalog::tools()];
+	for tool in catalogs.iter().flat_map(|catalog| catalog.as_array().unwrap()) {
 		let schema = tool["inputSchema"].as_object().unwrap();
 		assert_eq!(schema["type"], json!("object"));
 		for combinator in ["oneOf", "anyOf", "allOf", "not"] {

@@ -143,7 +143,31 @@ async fn the_catalog_has_four_tools_at_protocol_version_2() {
 		finalize["properties"]["disposition"]["enum"],
 		json!(["promote", "reject", "duplicate", "hardening", "defer"])
 	);
-	assert_eq!(finalize["oneOf"].as_array().unwrap().len(), 5);
+	assert_eq!(finalize["required"], json!(["disposition"]));
+	assert_eq!(finalize["additionalProperties"], json!(false));
+	let described =
+		|name: &str| finalize["properties"][name]["description"].as_str().unwrap_or_default();
+	for rule in [
+		"promote requires promotion",
+		"reject requires counterargument",
+		"duplicate requires target and rationale",
+		"hardening requires explanation",
+		"defer requires reason and continuation",
+	] {
+		assert!(described("disposition").contains(rule), "{rule}");
+	}
+	for (name, disposition) in [
+		("promotion", "promote"),
+		("counterargument", "reject"),
+		("target", "duplicate"),
+		("rationale", "duplicate"),
+		("explanation", "hardening"),
+		("reason", "defer"),
+		("continuation", "defer"),
+		("retry_explanation", "defer"),
+	] {
+		assert!(described(name).contains(&format!("disposition {disposition} only")), "{name}");
+	}
 	let evidence = &finalize["properties"]["promotion"]["properties"]["evidence"];
 	assert!(evidence["properties"]["l2_argument"]["properties"]["trust_boundary"].is_object());
 	// The host supplies every `version`; the agent is never asked for one.

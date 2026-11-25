@@ -6,17 +6,12 @@
 
 use serde_json::{json, Value};
 
-use super::evidence_schema::{argument, finding_evidence, revalidation, CONTINUATIONS};
+use super::evidence_schema::{argument, described, finding_evidence, revalidation, CONTINUATIONS};
 use super::survey_catalog::{defs, text};
 use super::{add_tool_protocol_version, VERIFY_LOUPE_MCP_PROTOCOL_VERSION};
 
 /// The continuation class whose blocker the host supplies.
 pub(super) const HOST_BLOCKED: &str = "awaiting_proof_infrastructure";
-
-fn described(mut schema: Value, description: String) -> Value {
-	schema["description"] = json!(description);
-	schema
-}
 
 /// A member that only `verdict` takes.
 fn member(verdict: &str, schema: Value) -> Value {

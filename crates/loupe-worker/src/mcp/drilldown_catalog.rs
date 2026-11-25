@@ -1,10 +1,12 @@
 //! The drilldown tool catalog (Loupe MCP protocol 2), SPEC-02 §3. The
 //! `finalize_drilldown` schema is the server's tagged terminal payload
-//! without its `version` fields, which the host supplies.
+//! without its `version` fields, which the host supplies. Model tool APIs
+//! may refuse a combinator at a schema's root, so descriptions state what
+//! each disposition requires, and the host enforces it.
 
 use serde_json::{json, Value};
 
-use super::evidence_schema::{argument, finding_evidence, revalidation, CONTINUATIONS};
+use super::evidence_schema::{argument, described, finding_evidence, revalidation, CONTINUATIONS};
 use super::survey_catalog::{defs, source_refs, text, KEY_PATTERN};
 use super::{add_tool_protocol_version, DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION};
 
@@ -24,12 +26,9 @@ fn promotion() -> Value {
 			"evidence":finding_evidence()}})
 }
 
-/// One `oneOf` branch per disposition: the members it requires. Members of
-/// other dispositions are refused by the host.
-fn variant(disposition: &str, required: &[&str]) -> Value {
-	let mut all = vec!["disposition"];
-	all.extend_from_slice(required);
-	json!({"required":all,"properties":{"disposition":{"const":disposition}}})
+/// A member that only `disposition` takes.
+fn member(disposition: &str, schema: Value) -> Value {
+	described(schema, format!("With disposition {disposition} only."))
 }
 
 pub(super) fn tools() -> Value {
@@ -87,27 +86,31 @@ pub(super) fn tools() -> Value {
 	let finalize = json!({
 		"type":"object",
 		"required":["disposition"],
+		"additionalProperties":false,
 		"$defs": defs(),
 		"properties":{
-			"disposition":{"enum":["promote","reject","duplicate","hardening","defer"]},
-			"promotion":promotion(),
-			"counterargument":argument(8000),
-			"target":{"type":"object","required":["kind","id"],"additionalProperties":false,
-				"properties":{"kind":{"enum":["lead","finding"]},
-					"id":{"type":"integer","minimum":1}}},
-			"rationale":text(1000),
-			"explanation":argument(8000),
-			"reason":text(1000),
-			"continuation":{"enum":CONTINUATIONS},
-			"retry_explanation":text(1000),
+			"disposition":described(
+				json!({"enum":["promote","reject","duplicate","hardening","defer"]}),
+				"promote requires promotion. reject requires counterargument. duplicate requires \
+				 target and rationale. hardening requires explanation. defer requires reason and \
+				 continuation; retry_explanation is optional with it. A member of another \
+				 disposition is refused; revalidation is optional with every disposition."
+					.to_owned(),
+			),
+			"promotion":member("promote", promotion()),
+			"counterargument":member("reject", argument(8000)),
+			"target":member(
+				"duplicate",
+				json!({"type":"object","required":["kind","id"],"additionalProperties":false,
+					"properties":{"kind":{"enum":["lead","finding"]},
+						"id":{"type":"integer","minimum":1}}}),
+			),
+			"rationale":member("duplicate", text(1000)),
+			"explanation":member("hardening", argument(8000)),
+			"reason":member("defer", text(1000)),
+			"continuation":member("defer", json!({"enum":CONTINUATIONS})),
+			"retry_explanation":member("defer", text(1000)),
 			"revalidation":revalidation("lead")},
-		"oneOf":[
-			variant("promote", &["promotion"]),
-			variant("reject", &["counterargument"]),
-			variant("duplicate", &["target", "rationale"]),
-			variant("hardening", &["explanation"]),
-			variant("defer", &["reason", "continuation"]),
-		],
 	});
 	tools.push(json!({
 		"name": "finalize_drilldown",

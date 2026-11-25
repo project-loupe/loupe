@@ -12,6 +12,11 @@ pub(super) const CONTINUATIONS: [&str; 4] = [
 	"requires_successor",
 ];
 
+pub(super) fn described(mut schema: Value, description: String) -> Value {
+	schema["description"] = json!(description);
+	schema
+}
+
 /// `subject` is what the job re-inspects, as its description names it.
 pub(super) fn revalidation(subject: &str) -> Value {
 	json!({"type":"object","required":["current_source_refs","rationale"],
