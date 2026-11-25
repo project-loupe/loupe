@@ -2,8 +2,8 @@
 //! The fuzz harness supplies an HTTP stub and a worktree with `fuzz-git`.
 
 pub use super::ingress::fuzz_support::{
-	observe_drilldown_record, observe_records, observe_survey_record, PhaseObservation,
-	RecordObservation, RequestObservation,
+	observe_drilldown_record, observe_records, observe_survey_record, observe_verify_record,
+	PhaseObservation, RecordObservation, RequestObservation,
 };
 pub use super::repo_ingress::fuzz_support::{observe_repo, RepoCase, RepoObservation};
 use super::*;

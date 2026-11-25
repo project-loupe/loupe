@@ -31,6 +31,9 @@ use loupe_proto::review_terminal::{
 	FinalizeSurveyRequest, SurveyTerminalResponse, SurveyTerminalResponseDecoder,
 };
 use loupe_proto::review_units::{ReviewUnitRequest, ReviewUnitResponse, ReviewUnitResponseDecoder};
+use loupe_proto::review_verification::{
+	FinalizeVerificationRequest, VerificationTerminalResponse, VerificationTerminalResponseDecoder,
+};
 use loupe_proto::{HeartbeatResponse, JobCapability, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use loupe_provenance::{Agent, Server, Source, Untrusted};
 use reqwest::header::CONTENT_TYPE;
@@ -160,6 +163,13 @@ impl ServerClient {
 	) -> Result<DrilldownTerminalResponse<Server>, PhaseError> {
 		let body = self.post_phase(job, "finalize-drilldown", req).await?;
 		Ok(body.as_bytes().validate(DrilldownTerminalResponseDecoder)?)
+	}
+
+	pub async fn finalize_verification<S: Source>(
+		&self, job: &PhaseJob<'_>, req: &FinalizeVerificationRequest<S>,
+	) -> Result<VerificationTerminalResponse<Server>, PhaseError> {
+		let body = self.post_phase(job, "finalize-verification", req).await?;
+		Ok(body.as_bytes().validate(VerificationTerminalResponseDecoder)?)
 	}
 
 	pub async fn phase_heartbeat(

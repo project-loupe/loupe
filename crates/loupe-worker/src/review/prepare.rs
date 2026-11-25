@@ -13,9 +13,9 @@ use loupe_proto::review_api::{
 	ReviewProtocol,
 };
 use loupe_proto::review_lease::{
-	AssignedReviewLead, BootstrapTarget, FrozenReviewProfile, OrdinarySurveyRecipe,
-	ReviewAssignments, ReviewDrilldownLease, ReviewGeneration, ReviewLimits, ReviewSurveyContext,
-	ReviewSurveyLease,
+	AssignedReviewFinding, AssignedReviewLead, BootstrapTarget, FrozenReviewProfile,
+	OrdinarySurveyRecipe, ReviewAssignments, ReviewDrilldownLease, ReviewGeneration, ReviewLimits,
+	ReviewProvenance, ReviewSurveyContext, ReviewSurveyLease, ReviewVerifyLease,
 };
 use loupe_proto::{JobCapability, LeaseEnvelope, LeasePayload};
 use loupe_provenance::{Agent, Repo, Secret, Server};
@@ -35,6 +35,10 @@ use crate::runner::{
 pub enum PrepareError {
 	#[error("lease is not a survey this worker runs")]
 	UnsupportedLease,
+	/// A lease on one subject of a sealed generation carried another payload,
+	/// or its pin was deferred.
+	#[error("unexpected lease payload or pin outcome")]
+	UnexpectedSubject,
 	#[error("hard deadline reached")]
 	HardDeadline,
 	#[error("repository checkout failed")]
@@ -207,8 +211,9 @@ pub async fn prepare(
 	})))
 }
 
-/// Everything later stages of a drilldown attempt need.
-pub struct PreparedDrilldown {
+/// Everything later stages of an attempt on one subject of a sealed
+/// generation need: a drilldown's lead or a verification's finding.
+pub struct PreparedSubject<T> {
 	pub job_id: i64,
 	pub job_capability: JobCapability,
 	pub repo_id: i64,
@@ -216,26 +221,26 @@ pub struct PreparedDrilldown {
 	pub campaign_id: i64,
 	/// The lease's deadlines and quotas.
 	pub limits: ReviewLimits,
-	/// The lead this job investigates, as claimed.
-	pub lead: AssignedReviewLead<Agent, Server>,
+	/// What this job works on, as claimed.
+	pub subject: T,
 	/// The generation the pin prepared, and the commit checked out for it.
 	pub generation: ReviewGeneration<Server>,
 	pub commit: ReviewCommit<Repo>,
 	/// The pin response's profile, else the lease's.
 	pub profile: FrozenReviewProfile<Agent, Server>,
-	/// Remaining capacity read after the pin.
+	/// Deadlines and remaining capacity read after the pin.
 	pub phase_limits: PhaseLimitsResponse,
 	/// The pinned checkout the agent reads.
 	pub worktree: CheckedOutWorktree,
 }
 
-impl std::fmt::Debug for PreparedDrilldown {
+impl<T> std::fmt::Debug for PreparedSubject<T> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("PreparedDrilldown([redacted])")
+		f.write_str("PreparedSubject([redacted])")
 	}
 }
 
-impl PreparedDrilldown {
+impl<T> PreparedSubject<T> {
 	/// The phase-call context of this attempt, bounded by its hard deadline.
 	pub fn phase_job(&self) -> PhaseJob<'_> {
 		PhaseJob {
@@ -246,14 +251,53 @@ impl PreparedDrilldown {
 	}
 }
 
-/// Prepare one drilldown attempt for `env`: check out and pin the
-/// generation commit, then read the remaining capacity. The generation is
-/// already sealed, so no inventory is taken. Leases past their hard
-/// deadline fail closed before any repository access.
+/// Prepare one drilldown attempt for `env`.
 pub async fn prepare_drilldown(
 	runner: &Runner, env: LeaseEnvelope<Agent, Server>, security: &JobSecurity,
 	cancel: &CancellationToken,
-) -> Result<PreparedDrilldown, PrepareError> {
+) -> Result<PreparedSubject<AssignedReviewLead<Agent, Server>>, PrepareError> {
+	let open = |payload| match payload {
+		LeasePayload::ReviewDrilldown(lease) => {
+			let ReviewDrilldownLease { provenance, generation, profile, lead } = *lease;
+			Some(SubjectLease { provenance, generation, profile, subject: lead })
+		},
+		_ => None,
+	};
+	prepare_subject(runner, env, open, security, cancel).await
+}
+
+/// Prepare one verify attempt for `env`.
+pub async fn prepare_verify(
+	runner: &Runner, env: LeaseEnvelope<Agent, Server>, security: &JobSecurity,
+	cancel: &CancellationToken,
+) -> Result<PreparedSubject<AssignedReviewFinding<Agent, Server>>, PrepareError> {
+	let open = |payload| match payload {
+		LeasePayload::ReviewVerify(lease) => {
+			let ReviewVerifyLease { provenance, generation, profile, finding } = *lease;
+			Some(SubjectLease { provenance, generation, profile, subject: finding })
+		},
+		_ => None,
+	};
+	prepare_subject(runner, env, open, security, cancel).await
+}
+
+/// The payload of a lease on one subject of a sealed generation.
+struct SubjectLease<T> {
+	provenance: ReviewProvenance,
+	generation: ReviewGeneration<Server>,
+	profile: FrozenReviewProfile<Agent, Server>,
+	subject: T,
+}
+
+/// Check out and pin the generation commit of the lease `open` reads, then
+/// read the limits. The generation is already sealed, so no inventory is
+/// taken. Leases past their hard deadline fail closed before any repository
+/// access.
+async fn prepare_subject<T>(
+	runner: &Runner, env: LeaseEnvelope<Agent, Server>,
+	open: impl FnOnce(LeasePayload<Agent, Server>) -> Option<SubjectLease<T>>,
+	security: &JobSecurity, cancel: &CancellationToken,
+) -> Result<PreparedSubject<T>, PrepareError> {
 	let LeaseEnvelope {
 		job_id,
 		job_capability,
@@ -264,10 +308,8 @@ pub async fn prepare_drilldown(
 		payload,
 		..
 	} = env;
-	let LeasePayload::ReviewDrilldown(lease) = payload else {
-		return Err(PrepareError::UnsupportedLease);
-	};
-	let ReviewDrilldownLease { provenance, generation: leased, profile, lead } = *lease;
+	let SubjectLease { provenance, generation: leased, profile, subject } =
+		open(payload).ok_or(PrepareError::UnexpectedSubject)?;
 	let limits = provenance.limits;
 	let job =
 		PhaseJob { job_id, capability: &job_capability, deadline: at(limits.hard_deadline_at) };
@@ -280,17 +322,17 @@ pub async fn prepare_drilldown(
 	let Pinned { worktree, commit, response, .. } =
 		checkout_and_pin(runner, &job, source, Observe::Commit, security, cancel).await?;
 	let PinTargetResponse::Prepared { generation, profile: pinned, .. } = response else {
-		return Err(PrepareError::UnsupportedLease);
+		return Err(PrepareError::UnexpectedSubject);
 	};
 	let phase_limits = runner.client().limits(&job).await?;
-	Ok(PreparedDrilldown {
+	Ok(PreparedSubject {
 		job_id,
 		job_capability: job_capability.clone(),
 		repo_id,
 		attempt: provenance.attempt,
 		campaign_id: provenance.campaign_id.into(),
 		limits,
-		lead,
+		subject,
 		generation,
 		commit,
 		profile: pinned.unwrap_or(profile),
@@ -627,30 +669,40 @@ mod tests {
 		assert!(matches!(cached, Ok(0) | Err(_)), "repository cache was touched");
 	}
 
-	fn drilldown_lease(
-		hard_deadline_at: i64, clone_url: &str, commit: &str,
+	/// A lease on `subject` of the generation at `commit`.
+	fn subject_lease(
+		kind: &str, subject: (&str, serde_json::Value), hard_deadline_at: i64, clone_url: &str,
+		commit: &str,
 	) -> LeaseEnvelope<Agent, Server> {
-		let body = json!({"kind":"lease","protocol_version":3,"job_id":1,
-			"job_capability":"test-capability","repo_id":1,
-			"repo":{"host":"invalid.test","owner":"test","repo":"test","clone_url":clone_url},
-			"head_branch":null,"lease_expires_at":200,"scanner_config":null,
-			"payload":{"kind":"review_drilldown","provenance":{"workflow_contract_version":1,
+		let mut payload = json!({"kind":kind,"provenance":{"workflow_contract_version":1,
 				"campaign_id":2,"attempt":2,"limits":{"soft_deadline_at":100,"submit_by":100,
 				"hard_deadline_at":hard_deadline_at,"token_budget":null,"new_unit_limit":0,
 				"lead_limit":0,"sibling_limit":4}},
 			"generation":{"generation_id":3,"commit_sha":commit},
 			"profile":{"profile_version":1,"profile_digest":"b".repeat(64),
-				"profile":{"purpose":"lease profile"}},
-			"lead":{"lead_id":4,"producer_commit_sha":commit,"identity_family":"memory-safety",
-				"identity_anchor":"request allocation","hypothesis":"Unbounded allocation",
-				"source_refs":[{"path":"main.rs"}],"next_proof_step":"Trace allocation",
-				"counterevidence":"Authentication","proof_gaps":"No reproducer"}}});
+				"profile":{"purpose":"lease profile"}}});
+		payload[subject.0] = subject.1;
+		let body = json!({"kind":"lease","protocol_version":3,"job_id":1,
+			"job_capability":"test-capability","repo_id":1,
+			"repo":{"host":"invalid.test","owner":"test","repo":"test","clone_url":clone_url},
+			"head_branch":null,"lease_expires_at":200,"scanner_config":null,"payload":payload});
 		let LeaseResponse::Lease(env) =
 			crate::client::test_lease(body.to_string().as_bytes()).response
 		else {
-			panic!("drilldown lease fixture")
+			panic!("subject lease fixture")
 		};
 		*env
+	}
+
+	fn drilldown_lease(
+		hard_deadline_at: i64, clone_url: &str, commit: &str,
+	) -> LeaseEnvelope<Agent, Server> {
+		let lead = json!({"lead_id":4,"producer_commit_sha":commit,
+			"identity_family":"memory-safety","identity_anchor":"request allocation",
+			"hypothesis":"Unbounded allocation","source_refs":[{"path":"main.rs"}],
+			"next_proof_step":"Trace allocation","counterevidence":"Authentication",
+			"proof_gaps":"No reproducer"});
+		subject_lease("review_drilldown", ("lead", lead), hard_deadline_at, clone_url, commit)
 	}
 
 	fn head(url: &str) -> String {
@@ -695,7 +747,7 @@ mod tests {
 		let error = prepare_drilldown(&runner, lease, &security, &CancellationToken::new())
 			.await
 			.unwrap_err();
-		assert!(matches!(error, PrepareError::UnsupportedLease), "{error}");
+		assert!(matches!(error, PrepareError::UnexpectedSubject), "{error}");
 		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 	}
 
@@ -797,11 +849,135 @@ mod tests {
 			);
 			assert_eq!(prepared.commit.expose(), commit);
 			assert_eq!(prepared.generation.commit_sha.expose(), commit);
-			assert_eq!(i64::from(prepared.lead.lead_id), 4);
+			assert_eq!(i64::from(prepared.subject.lead_id), 4);
 			assert_eq!(prepared.attempt.get(), 2);
 			assert_eq!(prepared.profile.profile_version.get(), version);
 			assert_eq!(prepared.phase_limits.siblings.remaining, 3);
 			assert_eq!(prepared.phase_job().deadline, at(i64::MAX / 2));
+		}
+	}
+
+	fn verify_lease(
+		hard_deadline_at: i64, clone_url: &str, commit: &str,
+	) -> LeaseEnvelope<Agent, Server> {
+		let evidence = json!({"version":1,"l2_argument":{"attacker_source":"Remote request",
+			"control":"Request length","sink":"Allocation",
+			"reachable_path":"Handler calls allocator","trust_boundary":"Request to memory"},
+			"material_locations":[{"role":"sink","file":"main.rs"}],
+			"counterevidence":"Authentication","assumptions_gaps":"Defaults",
+			"confidence":"medium"});
+		let finding = json!({"finding_id":5,"reviewed_commit_sha":commit,"severity":"high",
+			"title":"Unbounded allocation","description":"Requests allocate without a limit",
+			"identity_family":"memory-safety","identity_anchor":"request allocation",
+			"evidence":evidence});
+		subject_lease("review_verify", ("finding", finding), hard_deadline_at, clone_url, commit)
+	}
+
+	#[tokio::test]
+	async fn expired_and_cancelled_verifications_never_touch_the_repository() {
+		let (_origin, url) = origin();
+		let (base, requests) = server(500, String::new()).await;
+		let cache = tempfile::tempdir().unwrap();
+		let runner = runner(base, &cache.path().join("cache"));
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let commit = head(&url);
+		let lease = verify_lease(1, &url, &commit);
+		let error =
+			prepare_verify(&runner, lease, &security, &CancellationToken::new()).await.unwrap_err();
+		assert!(matches!(error, PrepareError::HardDeadline), "{error}");
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let lease = verify_lease(i64::MAX / 2, &url, &commit);
+		let error = prepare_verify(&runner, lease, &security, &cancel).await.unwrap_err();
+		assert!(matches!(error, PrepareError::Cancelled), "{error}");
+		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+		let cached = std::fs::read_dir(cache.path().join("cache")).map(|dir| dir.count());
+		assert!(matches!(cached, Ok(0) | Err(_)), "repository cache was touched");
+	}
+
+	#[tokio::test]
+	async fn only_a_verify_lease_prepares_a_verification() {
+		let (_origin, url) = origin();
+		let (base, requests) = server(500, String::new()).await;
+		let cache = tempfile::tempdir().unwrap();
+		let runner = runner(base, cache.path());
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let cancel = CancellationToken::new();
+		let commit = head(&url);
+		let lease = drilldown_lease(i64::MAX / 2, &url, &commit);
+		let error = prepare_verify(&runner, lease, &security, &cancel).await.unwrap_err();
+		assert!(matches!(error, PrepareError::UnexpectedSubject), "{error}");
+		let lease = verify_lease(i64::MAX / 2, &url, &commit);
+		let error = prepare_drilldown(&runner, lease, &security, &cancel).await.unwrap_err();
+		assert!(matches!(error, PrepareError::UnexpectedSubject), "{error}");
+		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn a_verify_pin_conflict_is_a_checkout_conflict() {
+		let (_origin, url) = origin();
+		let conflict =
+			r#"{"protocol_version":3,"error":{"code":"checkout_conflict","detail":null}}"#;
+		let (base, requests) = server(409, conflict.to_owned()).await;
+		let cache = tempfile::tempdir().unwrap();
+		let runner = runner(base, cache.path());
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let lease = verify_lease(i64::MAX / 2, &url, &head(&url));
+		let error =
+			prepare_verify(&runner, lease, &security, &CancellationToken::new()).await.unwrap_err();
+		assert!(matches!(error, PrepareError::CheckoutConflict), "{error}");
+		assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1, "only the pin was sent");
+	}
+
+	#[tokio::test]
+	async fn a_verification_pins_the_generation_commit_then_reads_limits() {
+		let (_origin, url) = origin();
+		let commit = head(&url);
+		let security = JobSecurity::new(Default::default(), vec![]).unwrap();
+		let pinned = json!({"profile_version":2,"profile_digest":"c".repeat(64),
+			"profile":{"purpose":"pinned profile"}});
+		for (profile, version) in [(serde_json::Value::Null, 1), (pinned, 2)] {
+			let pin = json!({"outcome":"prepared","protocol_version":3,
+				"generation":{"generation_id":3,"commit_sha":commit},
+				"profile":profile,"assignments":null});
+			let (base, heads) = routed(pin.to_string(), limits()).await;
+			let cache = tempfile::tempdir().unwrap();
+			let runner = runner(base, cache.path());
+			let lease = verify_lease(i64::MAX / 2, &url, &commit);
+			let leased = crate::review::phase::limits(&lease.payload).cloned().unwrap();
+			assert_eq!(leased.hard_deadline_at, i64::MAX / 2);
+			let prepared =
+				prepare_verify(&runner, lease, &security, &CancellationToken::new()).await.unwrap();
+			assert_eq!(
+				*heads.lock().unwrap(),
+				["post /v1/jobs/1/pin-target http/1.1", "get /v1/jobs/1/limits http/1.1"]
+			);
+			assert_eq!(prepared.limits, leased);
+			assert_eq!(prepared.commit.expose(), commit);
+			assert_eq!(prepared.generation.commit_sha.expose(), commit);
+			assert_eq!(i64::from(prepared.subject.finding_id), 5);
+			assert_eq!((prepared.job_id, prepared.repo_id, prepared.campaign_id), (1, 1, 2));
+			assert_eq!(prepared.attempt.get(), 2);
+			assert_eq!(prepared.profile.profile_version.get(), version);
+			assert_eq!(prepared.phase_limits.campaign_verification_remaining, 2);
+			assert!(prepared.worktree.path().join("main.rs").is_file());
+
+			let session = crate::review::session::VerifySession::from_prepared(
+				&prepared,
+				Arc::new(|| at(40)),
+				CancellationToken::new(),
+			);
+			assert_eq!((session.phase().job_id(), session.finding_id()), (1, 5));
+			assert_eq!(session.phase().phase_job().deadline, at(i64::MAX / 2));
+			assert!(session.phase().limits().is_some());
+			let far = i64::MAX / 2;
+			assert_eq!(
+				session.status_line(),
+				format!(
+					"[loupe status] submit_by: 60s left (at 100); hard deadline: {}s left (at {far})",
+					far - 40
+				)
+			);
 		}
 	}
 }

@@ -3,19 +3,15 @@
 //! every level; each nested object admits only its own members.
 
 use loupe_core::review_payload::{
-	Confidence, ContinuationClass, DrilldownTerminalV1, DuplicateTarget, FindingEvidenceV1,
-	L2Argument, LocationRole, MaterialLocation, PromotionV1, Revalidation, SourceCounterargument,
-	SourceHardening, Version1,
+	ContinuationClass, DrilldownTerminalV1, DuplicateTarget, PromotionV1, SourceHardening, Version1,
 };
 use loupe_core::text::policy::{
-	AnchorText, AssumptionsGaps, AttackerControl, AttackerSource, Cwe, DeferReason,
-	DuplicateRationale, EvidenceCounterevidence, EvidenceSink, Family, HardeningArgument,
-	InstanceKey, MaterialSymbol, ReachablePath, RejectionArgument, RetryExplanation,
-	RevalidationRationale, ReviewFindingDescription, ReviewFindingTitle, TrustBoundary,
+	AnchorText, Cwe, DeferReason, DuplicateRationale, Family, HardeningArgument, InstanceKey,
+	RetryExplanation, ReviewFindingDescription, ReviewFindingTitle,
 };
 use loupe_core::text::{Anchor, Identifier};
 
-use super::phase::{lead, payload, Args};
+use super::phase::{counterargument, finding_evidence, lead, payload, revalidation, Args};
 use super::*;
 
 pub(super) fn arguments(
@@ -55,18 +51,7 @@ fn terminal(args: &Args<'_, '_, '_, '_, '_>) -> Result<DrilldownTerminalV1<Agent
 		},
 	};
 	args.only(allowed)?;
-	let revalidation = match args.optional_object("revalidation")? {
-		Some(fields) => {
-			let nested = args.nested(&fields);
-			nested.only(&["current_source_refs", "rationale"])?;
-			Some(Revalidation {
-				current_source_refs: nested.list("current_source_refs", 1, 16)?,
-				rationale: nested
-					.required::<BoundedText<RevalidationRationale, Agent>>("rationale")?,
-			})
-		},
-		None => None,
-	};
+	let revalidation = revalidation(args)?;
 	Ok(match disposition {
 		Disposition::Promote => {
 			let fields = args.object("promotion")?;
@@ -76,19 +61,10 @@ fn terminal(args: &Args<'_, '_, '_, '_, '_>) -> Result<DrilldownTerminalV1<Agent
 				revalidation,
 			}
 		},
-		Disposition::Reject => {
-			let fields = args.object("counterargument")?;
-			let nested = args.nested(&fields);
-			nested.only(&["argument", "source_refs"])?;
-			DrilldownTerminalV1::Reject {
-				version: Version1,
-				counterargument: SourceCounterargument {
-					argument: nested
-						.required::<BoundedText<RejectionArgument, Agent>>("argument")?,
-					source_refs: nested.list("source_refs", 1, 16)?,
-				},
-				revalidation,
-			}
+		Disposition::Reject => DrilldownTerminalV1::Reject {
+			version: Version1,
+			counterargument: counterargument(args)?,
+			revalidation,
 		},
 		Disposition::Duplicate => DrilldownTerminalV1::Duplicate {
 			version: Version1,
@@ -145,66 +121,5 @@ fn promotion(args: &Args<'_, '_, '_, '_, '_>) -> Result<PromotionV1<Agent>> {
 			.optional::<Anchor<InstanceKey, Agent>>("identity_instance_key")?,
 		evidence: finding_evidence(&args.nested(&evidence))?,
 		cwe: args.optional::<Identifier<Cwe, Agent>>("cwe")?,
-	})
-}
-
-fn finding_evidence(args: &Args<'_, '_, '_, '_, '_>) -> Result<FindingEvidenceV1<Agent>> {
-	args.only(&[
-		"l2_argument",
-		"material_locations",
-		"counterevidence",
-		"assumptions_gaps",
-		"confidence",
-	])?;
-	let l2 = args.object("l2_argument")?;
-	let l2 = args.nested(&l2);
-	l2.only(&["attacker_source", "control", "sink", "reachable_path", "trust_boundary"])?;
-	let mut material_locations = Vec::new();
-	for raw in args.tokens("material_locations", 1, 16)? {
-		let fields: Fields<'_> = raw
-			.get()
-			.starts_with('{')
-			.then(|| serde_json::from_str(raw.get()).ok())
-			.flatten()
-			.context("`material_locations` entries must be objects")?;
-		material_locations.push(material_location(&args.nested(&fields))?);
-	}
-	Ok(FindingEvidenceV1 {
-		version: Version1,
-		l2_argument: L2Argument {
-			attacker_source: l2
-				.required::<BoundedText<AttackerSource, Agent>>("attacker_source")?,
-			control: l2.required::<BoundedText<AttackerControl, Agent>>("control")?,
-			sink: l2.required::<BoundedText<EvidenceSink, Agent>>("sink")?,
-			reachable_path: l2.required::<BoundedText<ReachablePath, Agent>>("reachable_path")?,
-			trust_boundary: l2.required::<BoundedText<TrustBoundary, Agent>>("trust_boundary")?,
-		},
-		material_locations,
-		counterevidence: args
-			.required::<BoundedText<EvidenceCounterevidence, Agent>>("counterevidence")?,
-		assumptions_gaps: args
-			.required::<BoundedText<AssumptionsGaps, Agent>>("assumptions_gaps")?,
-		confidence: args.required_closed::<Confidence>("confidence")?,
-	})
-}
-
-fn material_location(args: &Args<'_, '_, '_, '_, '_>) -> Result<MaterialLocation<Agent>> {
-	args.only(&["role", "file", "symbol", "line_start", "line_end"])?;
-	let line = |name: &'static str| {
-		args.present(name)
-			.map(|raw| {
-				serde_json::from_str::<u32>(raw.get())
-					.ok()
-					.filter(|line| *line > 0)
-					.with_context(|| format!("`{name}` must be a positive integer"))
-			})
-			.transpose()
-	};
-	Ok(MaterialLocation {
-		role: args.required_closed::<LocationRole>("role")?,
-		file: args.required("file")?,
-		symbol: args.optional::<BoundedText<MaterialSymbol, Agent>>("symbol")?,
-		line_start: line("line_start")?,
-		line_end: line("line_end")?,
 	})
 }

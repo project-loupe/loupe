@@ -1,10 +1,11 @@
 # Upgrading to schema v7
 
 Schema v7 adds lossless inventory identity, retained typed review evidence and
-the storage layout for preparation and admission. The B4 server implements
-the pre-proof phase API, but production triggers and current workers still
-use the legacy pipeline. Explicit phase advertisements are separate from
-legacy verification tags; schema migration does not enable worker execution.
+the storage layout for preparation and admission. The server implements the
+pre-proof phase API, and current workers advertise each review phase they have
+an agent for. Those advertisements are separate from legacy verification tags.
+Schema migration opens no campaign and production triggers remain legacy, so
+workers are leased only legacy jobs until the later cutover.
 
 The new server applies pending migrations automatically when opening the
 database. This branch also requires the coordinated
@@ -31,7 +32,9 @@ web together; there is no protocol-2/3 mixed-version window.
    indexes, admission validation and the journal/WAL.
 4. Start the new server with the existing database and key. Confirm successful
    startup, schema version 7 and protocol 3 before restarting matching workers
-   and web/CLI clients. Keep review advertisements and campaign triggers off.
+   and web/CLI clients. Keep production campaign triggers disabled; workers'
+   review advertisements need no change, as without a campaign no review phase
+   is leased.
 5. Inspect existing findings and verification history. Smoke-test queued
    legacy scan and verification work and CLI/web access before resuming
    submissions.

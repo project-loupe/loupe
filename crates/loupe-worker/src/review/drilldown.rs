@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::failure::FailureReason;
 use super::phase::{self, Ended, Launch, Lease};
-use super::prepare::{prepare_drilldown, PrepareError};
+use super::prepare::prepare_drilldown;
 use super::prompts::drilldown_prompt;
 use super::session::DrilldownSession;
 use crate::canary::JobSecurity;
@@ -28,21 +28,13 @@ pub(crate) async fn run(
 	phase::run(runner, "drilldown", lease, attempt, &cancel, &security, &heartbeat).await;
 }
 
-/// A drilldown pin never defers and the lease kind is checked by dispatch,
-/// so an unsupported lease here is a server response the host refuses.
-fn from_prepare(error: &PrepareError) -> FailureReason {
-	match error {
-		PrepareError::UnsupportedLease => FailureReason::PhaseRequestFailed,
-		other => FailureReason::from_prepare(other),
-	}
-}
-
 async fn attempt(
 	runner: &Runner, backend: &Arc<dyn LlmBackend>, env: LeaseEnvelope<Agent, Server>,
 	cancel: &CancellationToken, security: &Arc<JobSecurity>, heartbeat: &PhaseHeartbeat,
 ) -> Result<Ended, FailureReason> {
-	let prepared =
-		prepare_drilldown(runner, env, security, cancel).await.map_err(|e| from_prepare(&e))?;
+	let prepared = prepare_drilldown(runner, env, security, cancel)
+		.await
+		.map_err(|e| FailureReason::from_prepare(&e))?;
 	let agent_cancel = cancel.child_token();
 	let session = Arc::new(
 		DrilldownSession::from_prepared(

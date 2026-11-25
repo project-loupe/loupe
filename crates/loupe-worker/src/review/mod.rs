@@ -11,3 +11,4 @@ pub mod prompts;
 pub(crate) mod retry;
 pub mod session;
 pub mod survey;
+pub mod verify;

@@ -35,10 +35,6 @@ pub(super) fn arguments(
 ) -> Result<Arguments> {
 	let args = Args { u, fields, top_level: true };
 	Ok(match name {
-		ToolName::JobLimits => {
-			args.only(&[])?;
-			Arguments::JobLimits
-		},
 		ToolName::PublishProfile => {
 			args.only(&["profile"])?;
 			Arguments::PublishProfile(args.required::<GeneratedProfile<Agent>>("profile")?)

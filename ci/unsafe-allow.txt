@@ -52,6 +52,7 @@ fuzz/src/core_text_repo_path.rs fuzz entry point: the C entry point takes a raw 
 fuzz/src/worker_mcp_submission.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_drilldown_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_mcp_survey_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/worker_mcp_verify_ingress.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_extract_json.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_broker_policy.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_broker_usage.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
@@ -131,4 +132,5 @@ fuzz/src/proto_review_compatibility.rs fuzz entry point: the C entry point takes
 fuzz/src/proto_review_responses_host.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_responses_checkpoints.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/proto_review_responses_drilldown.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
+fuzz/src/proto_review_responses_verification.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer
 fuzz/src/worker_inventory_chunks.rs fuzz entry point: the C entry point takes a raw pointer from the fuzzer

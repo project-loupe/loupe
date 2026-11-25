@@ -101,6 +101,8 @@ pub struct AgentsSection {
 	pub codex: CodexAgentSection,
 	#[serde(default)]
 	pub survey: Option<JobAgent>,
+	#[serde(default)]
+	pub drilldown: Option<JobAgent>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

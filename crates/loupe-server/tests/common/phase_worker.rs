@@ -1,4 +1,4 @@
-//! End-to-end fixture for phase leases (survey, drilldown): the actual
+//! End-to-end fixture for phase leases (survey, drilldown, verify): the actual
 //! router, a git fixture repository and `Runner` with the scripted MCP
 //! agent. Requests reach the router through a plain listener with the
 //! worker's `PeerCert` injected, so a layer can record and fault responses.
@@ -88,6 +88,10 @@ pub struct Log {
 	pub calls: Mutex<Vec<(String, u16)>>,
 	/// Run the next request to this route, then answer 502 instead.
 	pub drop_response: Mutex<Option<&'static str>>,
+	/// Run every request to this route, then answer 502 instead.
+	pub drop_responses: Mutex<Option<&'static str>>,
+	/// The reason of every reported failure.
+	pub failures: Mutex<Vec<String>>,
 }
 impl Log {
 	pub fn take(&self) -> Vec<(String, u16)> {
@@ -110,7 +114,18 @@ pub async fn observe(log: Arc<Log>, request: Request, next: Next) -> Response {
 		if hit {
 			*target = None;
 		}
-		hit
+		hit || log.drop_responses.lock().unwrap().is_some_and(|target| target == route)
+	};
+	let request = if route == "complete" {
+		let (parts, body) = request.into_parts();
+		let body = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+		let report: Value = serde_json::from_slice(&body).unwrap();
+		if let Some(reason) = report["error"].as_str() {
+			log.failures.lock().unwrap().push(reason.to_owned());
+		}
+		Request::from_parts(parts, axum::body::Body::from(body))
+	} else {
+		request
 	};
 	let response = next.run(request).await;
 	let response = if drop { StatusCode::BAD_GATEWAY.into_response() } else { response };
@@ -124,19 +139,28 @@ pub fn policy() -> ReviewPolicy {
 
 pub struct Fixture {
 	pub state: AppState,
-	pub offline: super::offline::OfflineDatabase,
+	pub offline: Arc<super::offline::OfflineDatabase>,
 	pub origin: Origin,
 	pub client: Arc<ServerClient>,
 	pub log: Arc<Log>,
-	/// Seconds the survey clock runs ahead of the wall clock.
+	/// Seconds the phase clock runs ahead of the wall clock.
 	pub offset: Arc<AtomicI64>,
 	pub cache: tempfile::TempDir,
 }
 
 pub async fn fixture() -> Fixture {
+	fixture_with(async |_, _| {}).await.0
+}
+
+/// A fixture whose server state `configure` adjusts before the router is
+/// built; whatever it returns is handed back with the fixture.
+pub async fn fixture_with<T>(
+	configure: impl AsyncFnOnce(&mut AppState, Arc<super::offline::OfflineDatabase>) -> T,
+) -> (Fixture, T) {
 	let origin = Origin::new();
 	let mut offline = super::offline::OfflineDatabase::new();
 	let db = offline.open();
+	let offline = Arc::new(offline);
 	let ca = Arc::new(Ca::new("worker-survey").unwrap());
 	let bundle = ca.mint_client("worker").unwrap();
 	let peer = PeerCert(
@@ -154,10 +178,11 @@ pub async fn fixture() -> Fixture {
 	)
 	.unwrap();
 	open_campaign(&db, None);
-	let state =
+	let mut state =
 		AppState::new(db, ca, Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()))
 			.with_review_policy(policy())
 			.unwrap();
+	let configured = configure(&mut state, offline.clone()).await;
 	let log = Arc::new(Log::default());
 	let observed = log.clone();
 	let app = router(state.clone())
@@ -169,7 +194,7 @@ pub async fn fixture() -> Fixture {
 	let base = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
 	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 	let client = Arc::new(ServerClient::from_parts(reqwest::Client::new(), base));
-	Fixture {
+	let fixture = Fixture {
 		state,
 		offline,
 		origin,
@@ -177,7 +202,8 @@ pub async fn fixture() -> Fixture {
 		log,
 		offset: Arc::new(AtomicI64::new(0)),
 		cache: tempfile::tempdir().unwrap(),
-	}
+	};
+	(fixture, configured)
 }
 
 pub fn open_campaign(db: &loupe_storage::Db, base_sha: Option<&str>) {
@@ -210,20 +236,36 @@ pub fn cancel_campaign(db: &loupe_storage::Db) {
 }
 
 impl Fixture {
-	/// Claim and run one phase lease with `script` as the agent.
+	/// A runner without phase backends on this fixture's cache and clock.
+	pub fn runner(&self) -> Runner {
+		let cache = Arc::new(RepoCache::new(self.cache.path().to_owned(), u64::MAX, None).unwrap());
+		let offset = self.offset.clone();
+		Runner::new(self.client.clone(), cache, Vec::new()).with_phase_clock(Arc::new(move || {
+			let ahead = offset.load(Ordering::SeqCst);
+			SystemTime::now() + Duration::from_secs(u64::try_from(ahead).unwrap())
+		}))
+	}
+
+	/// Claim and run one survey or drilldown lease with `script` as the agent.
 	pub async fn step<F, Fut>(&self, script: F) -> bool
 	where
 		F: Fn(ScriptedAgent) -> Fut + Send + Sync + 'static,
 		Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 	{
-		let cache = Arc::new(RepoCache::new(self.cache.path().to_owned(), u64::MAX, None).unwrap());
-		let offset = self.offset.clone();
-		let runner = Runner::new(self.client.clone(), cache, Vec::new())
-			.with_phase_backend(Arc::new(ScriptedMcpBackend::new(self.client.clone(), script)))
-			.with_phase_clock(Arc::new(move || {
-				let ahead = offset.load(Ordering::SeqCst);
-				SystemTime::now() + Duration::from_secs(u64::try_from(ahead).unwrap())
-			}));
+		let backend = Arc::new(ScriptedMcpBackend::new(self.client.clone(), script));
+		let runner =
+			self.runner().with_survey_backend(backend.clone()).with_drilldown_backend(backend);
+		runner.step(&CancellationToken::new()).await.unwrap()
+	}
+
+	/// Claim and run one verify lease with `script` as the agent.
+	pub async fn verify_step<F, Fut>(&self, script: F) -> bool
+	where
+		F: Fn(ScriptedAgent) -> Fut + Send + Sync + 'static,
+		Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+	{
+		let backend = Arc::new(ScriptedMcpBackend::new(self.client.clone(), script));
+		let runner = self.runner().with_verify_backend(backend);
 		runner.step(&CancellationToken::new()).await.unwrap()
 	}
 

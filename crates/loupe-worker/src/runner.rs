@@ -134,6 +134,39 @@ impl LeaseRepo {
 	}
 }
 
+/// The agent backend of each review phase this worker runs.
+#[derive(Default)]
+struct PhaseBackends {
+	survey: Option<Arc<dyn crate::llm::LlmBackend>>,
+	drilldown: Option<Arc<dyn crate::llm::LlmBackend>>,
+	verify: Option<Arc<dyn crate::llm::LlmBackend>>,
+}
+
+impl PhaseBackends {
+	fn for_payload(
+		&self, payload: &LeasePayload<Agent, Server>,
+	) -> Option<&Arc<dyn crate::llm::LlmBackend>> {
+		match payload {
+			LeasePayload::ReviewSurvey(_) => self.survey.as_ref(),
+			LeasePayload::ReviewDrilldown(_) => self.drilldown.as_ref(),
+			LeasePayload::ReviewVerify(_) => self.verify.as_ref(),
+			LeasePayload::Scan { .. } | LeasePayload::Verify { .. } => None,
+		}
+	}
+
+	fn capabilities(&self) -> Vec<loupe_proto::review_lease::ReviewCapability> {
+		use loupe_proto::review_lease::ReviewCapability;
+		[
+			self.survey.as_ref().map(|_| ReviewCapability::Survey),
+			self.drilldown.as_ref().map(|_| ReviewCapability::Drilldown),
+			self.verify.as_ref().map(|_| ReviewCapability::Verify),
+		]
+		.into_iter()
+		.flatten()
+		.collect()
+	}
+}
+
 pub struct Runner {
 	client: Arc<ServerClient>,
 	cache: Arc<RepoCache>,
@@ -141,9 +174,9 @@ pub struct Runner {
 	capabilities: Vec<&'static str>,
 	max_workdir_bytes: u64,
 	credential_watches: Vec<crate::llm::model_broker::CredentialWatch>,
-	/// The agent that runs survey and drilldown leases; without one they
-	/// fail closed.
-	phase_backend: Option<Arc<dyn crate::llm::LlmBackend>>,
+	/// A phase without its backend is not advertised, and its leases fail
+	/// closed.
+	phase_backends: PhaseBackends,
 	phase_clock: crate::review::session::Clock,
 }
 
@@ -160,14 +193,26 @@ impl Runner {
 			capabilities,
 			max_workdir_bytes: DEFAULT_MAX_WORKDIR_BYTES,
 			credential_watches: Vec::new(),
-			phase_backend: None,
+			phase_backends: PhaseBackends::default(),
 			phase_clock: Arc::new(std::time::SystemTime::now),
 		}
 	}
 
-	/// Run survey and drilldown leases with `backend`.
-	pub fn with_phase_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
-		self.phase_backend = Some(backend);
+	/// Run survey leases with `backend`.
+	pub fn with_survey_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.phase_backends.survey = Some(backend);
+		self
+	}
+
+	/// Run drilldown leases with `backend`.
+	pub fn with_drilldown_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.phase_backends.drilldown = Some(backend);
+		self
+	}
+
+	/// Run verify leases with `backend`.
+	pub fn with_verify_backend(mut self, backend: Arc<dyn crate::llm::LlmBackend>) -> Self {
+		self.phase_backends.verify = Some(backend);
 		self
 	}
 
@@ -195,18 +240,14 @@ impl Runner {
 		self
 	}
 
-	/// Review phases this worker runs: survey and drilldown exactly when it
-	/// has a phase backend. Verify is not run, so never advertised.
+	/// Review phases this worker runs: survey, drilldown and verify, each
+	/// exactly when it has a backend.
 	fn review_capabilities(
 		&self,
 	) -> Result<loupe_proto::review_lease::LeaseList<loupe_proto::review_lease::ReviewCapability, 3>>
 	{
-		use loupe_proto::review_lease::{LeaseList, ReviewCapability};
-		let phases = match self.phase_backend {
-			Some(_) => vec![ReviewCapability::Survey, ReviewCapability::Drilldown],
-			None => Vec::new(),
-		};
-		LeaseList::new(phases).map_err(|error| anyhow::anyhow!(error))
+		loupe_proto::review_lease::LeaseList::new(self.phase_backends.capabilities())
+			.map_err(|error| anyhow::anyhow!(error))
 	}
 
 	pub(crate) fn client(&self) -> &ServerClient {
@@ -391,7 +432,7 @@ impl Runner {
 		heartbeat: Option<PhaseHeartbeat>,
 	) -> Result<Executed> {
 		anyhow::ensure!(!cancel.is_cancelled(), "job cancelled");
-		match (&env.payload, &self.phase_backend, heartbeat) {
+		match (&env.payload, self.phase_backends.for_payload(&env.payload), heartbeat) {
 			(LeasePayload::ReviewSurvey(_), Some(backend), Some(heartbeat)) => {
 				crate::review::survey::run(self, backend, env, cancel, security, heartbeat).await;
 				Ok(Executed::Reported)
@@ -399,6 +440,10 @@ impl Runner {
 			(LeasePayload::ReviewDrilldown(_), Some(backend), Some(heartbeat)) => {
 				crate::review::drilldown::run(self, backend, env, cancel, security, heartbeat)
 					.await;
+				Ok(Executed::Reported)
+			},
+			(LeasePayload::ReviewVerify(_), Some(backend), Some(heartbeat)) => {
+				crate::review::verify::run(self, backend, env, cancel, security, heartbeat).await;
 				Ok(Executed::Reported)
 			},
 			(
@@ -415,9 +460,9 @@ impl Runner {
 		}
 	}
 
-	/// The hard deadline of a survey or drilldown lease this runner executes.
+	/// The hard deadline of a phase lease this runner executes.
 	fn phase_hard_deadline(&self, env: &LeaseEnvelope<Agent, Server>) -> Option<SystemTime> {
-		self.phase_backend.as_ref()?;
+		self.phase_backends.for_payload(&env.payload)?;
 		let limits = crate::review::phase::limits(&env.payload)?;
 		Some(crate::review::prepare::at(limits.hard_deadline_at))
 	}
@@ -1030,9 +1075,28 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_phase_backend_runs_survey_and_drilldown_and_leaves_verify_failing_closed() {
+	async fn a_phase_without_its_backend_is_not_advertised_and_fails_closed() {
+		assert_phases_run(true, true, false).await;
+		assert_phases_run(true, false, false).await;
+		assert_phases_run(false, true, false).await;
+	}
+
+	#[tokio::test]
+	async fn a_verify_backend_runs_verify_leases_and_no_other_phase() {
+		assert_phases_run(false, false, true).await;
+	}
+
+	#[tokio::test]
+	async fn three_phase_backends_run_every_phase() {
+		assert_phases_run(true, true, true).await;
+	}
+
+	/// A runner with backends for the named phases advertises and executes
+	/// those only; every other phase lease fails closed.
+	async fn assert_phases_run(survey: bool, drilldown: bool, verify: bool) {
 		use axum::body::Bytes;
 		use axum::extract::Json;
+		use loupe_proto::review_lease::ReviewCapability;
 		use loupe_proto::PROTOCOL_VERSION_HEADER;
 		use serde_json::json;
 
@@ -1061,7 +1125,22 @@ mod tests {
 		let backend = crate::llm::testing::StubLlmBackend::new("never-run", |_| {
 			panic!("no lease in this test may reach the phase agent")
 		});
-		let runner = Runner::new(client, cache, Vec::new()).with_phase_backend(Arc::new(backend));
+		let backend = Arc::new(backend);
+		let mut runner = Runner::new(client, cache, Vec::new());
+		let mut advertised = Vec::new();
+		if survey {
+			runner = runner.with_survey_backend(backend.clone());
+			advertised.push(ReviewCapability::Survey);
+		}
+		if drilldown {
+			runner = runner.with_drilldown_backend(backend.clone());
+			advertised.push(ReviewCapability::Drilldown);
+		}
+		if verify {
+			runner = runner.with_verify_backend(backend);
+			advertised.push(ReviewCapability::Verify);
+		}
+		assert_eq!(runner.review_capabilities().unwrap().as_slice(), advertised);
 		let provenance = json!({"workflow_contract_version":1,"campaign_id":2,"attempt":1,
 			"limits":{"soft_deadline_at":100,"submit_by":100,"hard_deadline_at":200,
 			"token_budget":null,"new_unit_limit":32,"lead_limit":16,"sibling_limit":4}});
@@ -1084,17 +1163,17 @@ mod tests {
 			(
 				json!({"kind":"review_verify","provenance":provenance,"generation":generation,
 				"profile":profile,"finding":finding}),
-				None,
+				verify.then_some("hard deadline reached"),
 			),
 			(
 				json!({"kind":"review_drilldown","provenance":provenance,"generation":generation,
 				"profile":profile,"lead":lead}),
-				Some("hard deadline reached"),
+				drilldown.then_some("hard deadline reached"),
 			),
 			(
 				json!({"kind":"review_survey","provenance":provenance,"context":{
 				"recipe":"corroboration","generation":generation,"assignments":[]}}),
-				Some("survey recipe unsupported"),
+				survey.then_some("survey recipe unsupported"),
 			),
 		];
 		for (payload, reported) in cases {
@@ -1106,6 +1185,8 @@ mod tests {
 			let receipt = crate::client::test_lease(lease.to_string().as_bytes());
 			let LeaseResponse::Lease(env) = receipt.response else { panic!("lease fixture") };
 			let security = crate::canary::JobSecurity::new(Default::default(), vec![]).unwrap();
+			let deadline = runner.phase_hard_deadline(&env);
+			assert_eq!(deadline.is_some(), reported.is_some(), "phase heartbeat");
 			let executed = runner
 				.execute(
 					*env,

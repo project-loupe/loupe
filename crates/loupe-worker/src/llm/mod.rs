@@ -474,8 +474,9 @@ pub fn build_scan_backend(
 /// Claude when Codex is unavailable.
 ///
 /// `mcp` (optional) attaches the loupe MCP server to the backend's
-/// per-call invocation. Required for the verify-mode tool surface
-/// (`submit_verdict` / `submit_patch` / `validate_patch`) — without
+/// per-call invocation. Required for the verify-mode tool surfaces
+/// (`submit_verdict` / `submit_patch` / `validate_patch`, and
+/// `finalize_verification` for a verify lease) — without
 /// MCP, the agent has no way to commit a verdict and the runner
 /// would receive no feedback to POST. Production callers should
 /// always pass `Some(...)`; the `None` form is kept for tests that
@@ -540,13 +541,14 @@ pub fn build_verifier_backend(
 	}
 }
 
-/// Build the review-phase [`LlmBackend`] that `[agents] survey` selects, as
-/// the verifier's is built: `auto` prefers
-/// Codex, then Claude. `auto` with neither ready yields `None`, and the
-/// worker then runs no review phases.
+/// Build the [`LlmBackend`] that `[agents] <job_kind>` selects for a review
+/// phase, as the verifier's is built: `auto` prefers Codex, then Claude.
+/// `auto` with neither ready yields `None`, and the worker then does not run
+/// that phase.
+#[allow(clippy::too_many_arguments)]
 pub fn build_phase_backend(
-	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,
+	job_kind: &str, mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool,
+	codex_ready: bool, codex_agent: SandboxAgentConfig, claude_agent: SandboxAgentConfig,
 	runtime: BackendRuntimeConfig,
 ) -> Result<Option<Arc<dyn LlmBackend>>> {
 	let BackendRuntimeConfig { network, launch, log_agent_output, model_broker } = runtime;
@@ -554,23 +556,23 @@ pub fn build_phase_backend(
 		JobAgent::Auto if codex_ready => true,
 		JobAgent::Auto if claude_ready => false,
 		JobAgent::Auto => {
-			tracing::info!("no survey agent ready; survey leases are not run");
+			tracing::info!("no {job_kind} agent ready; {job_kind} leases are not run");
 			return Ok(None);
 		},
 		JobAgent::Claude => {
-			require_agent_ready("survey", JobAgent::Claude, claude_ready)?;
+			require_agent_ready(job_kind, JobAgent::Claude, claude_ready)?;
 			false
 		},
 		JobAgent::Codex => {
-			require_agent_ready("survey", JobAgent::Codex, codex_ready)?;
+			require_agent_ready(job_kind, JobAgent::Codex, codex_ready)?;
 			true
 		},
 	};
 	let backend = if codex {
-		tracing::info!("survey backend: codex");
+		tracing::info!("{job_kind} backend: codex");
 		build_codex_backend(mcp, codex_agent, network, log_agent_output, model_broker, launch)?
 	} else {
-		tracing::info!("survey backend: claude");
+		tracing::info!("{job_kind} backend: claude");
 		build_claude_backend(mcp, claude_agent, network, log_agent_output, model_broker, launch)?
 	};
 	Ok(Some(backend))
@@ -925,7 +927,7 @@ mod tests {
 	}
 
 	#[test]
-	fn survey_backend_follows_the_verifier_selection() {
+	fn phase_backends_follow_the_verifier_selection() {
 		let codex = crate::test_support::sandbox_agent(
 			true,
 			CliModelConfig {
@@ -940,8 +942,9 @@ mod tests {
 				effort: crate::config::ConfiguredText::Builtin("max"),
 			},
 		);
-		let build = |selection, claude_ready, codex_ready| {
+		let build_for = |job_kind, selection, claude_ready, codex_ready| {
 			build_phase_backend(
+				job_kind,
 				None,
 				selection,
 				claude_ready,
@@ -952,6 +955,7 @@ mod tests {
 			)
 			.map(|backend| backend.map(|backend| backend.id()))
 		};
+		let build = |selection, claude, codex| build_for("survey", selection, claude, codex);
 		assert_eq!(build(JobAgent::Auto, true, true).unwrap(), Some("codex-cli"));
 		assert_eq!(build(JobAgent::Auto, true, false).unwrap(), Some("claude-cli"));
 		assert_eq!(build(JobAgent::Auto, false, false).unwrap(), None);
@@ -959,6 +963,14 @@ mod tests {
 		assert_eq!(build(JobAgent::Codex, false, true).unwrap(), Some("codex-cli"));
 		let error = build(JobAgent::Codex, true, false).unwrap_err();
 		assert!(error.to_string().contains("survey agent `codex`"), "{error}");
+
+		for (selection, id) in [(JobAgent::Claude, "claude-cli"), (JobAgent::Codex, "codex-cli")] {
+			assert_eq!(build_for("drilldown", selection, true, true).unwrap(), Some(id));
+			let error = build_for("drilldown", selection, false, false).unwrap_err();
+			let refused = format!("drilldown agent `{selection}`");
+			assert!(error.to_string().contains(&refused), "{error}");
+		}
+		assert_eq!(build_for("drilldown", JobAgent::Auto, false, false).unwrap(), None);
 	}
 
 	#[test]

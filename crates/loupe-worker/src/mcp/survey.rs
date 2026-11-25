@@ -12,7 +12,7 @@ use loupe_proto::review_inventory::{InventoryDispositionRequest, UnitMapping};
 use loupe_proto::review_lease::LeaseList;
 use loupe_proto::review_terminal::FinalizeSurveyRequest;
 
-use super::phase::PhaseTexts;
+use super::phase::{refuse, settle, PhaseTexts};
 use super::*;
 use crate::client::PhaseError;
 use crate::review::gate::{Admission, SurveyTool};
@@ -33,22 +33,13 @@ pub(super) fn tool(name: &ingress::ToolName) -> Option<SurveyTool> {
 	})
 }
 
-/// A refusal or failure shown to the model as fixed host text.
-// debug-ok: fixed host text only.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub(super) struct SurveyRefusal(pub(super) String);
-
-fn refuse(text: impl Into<String>) -> anyhow::Error {
-	SurveyRefusal(text.into()).into()
-}
-
 const UNKNOWN_UNIT: &str =
 	"review_unit_id is not a unit assigned to or proposed by this survey; use an id from the job context or a propose_review_unit result";
 
+const REFERENCE_REFUSED: &str = "the server refused a referenced unit, lead or path for this job; check the ids you used — units must be ones this job proposed or was assigned";
+
 const TEXTS: PhaseTexts = PhaseTexts {
 	authority_lost: "this survey attempt no longer has authority to write (superseded, campaign inactive or hard deadline passed); stop working and end the session",
-	reference_refused: "the server refused a referenced unit, lead or path for this job; check the ids you used — units must be ones this job proposed or was assigned",
 	exhausted: "capacity for this kind of checkpoint is exhausted; record what remains elsewhere and call finalize_survey",
 	state_refused: "the server rejected the request in the survey's current state",
 	terminal_conflict: "the survey is already finalized with a different payload; it cannot be finalized again",
@@ -82,34 +73,22 @@ impl phase::PhaseCalls for SurveySession {
 		SurveySession::phase(self)
 	}
 
-	fn exhausts(code: ReviewErrorCode) -> bool {
-		matches!(code, ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit)
+	fn reference_refused(tool: SurveyTool) -> Option<&'static str> {
+		(tool != SurveyTool::JobLimits).then_some(REFERENCE_REFUSED)
 	}
 
-	fn record_exhausted(&self, tool: SurveyTool) {
-		SurveySession::record_exhausted(self, tool);
+	fn record_exhausted(&self, tool: SurveyTool, code: ReviewErrorCode) {
+		if matches!(code, ReviewErrorCode::CheckpointLimit | ReviewErrorCode::InventoryLimit) {
+			SurveySession::record_exhausted(self, tool);
+		}
 	}
 
 	fn record_limits(&self, limits: &PhaseLimitsResponse) {
 		SurveySession::record_limits(self, limits);
 	}
 
-	fn limits_call(tool: SurveyTool) -> bool {
-		tool == SurveyTool::JobLimits
-	}
-
 	fn unreachable(tool: SurveyTool) -> &'static str {
 		unreachable(tool)
-	}
-}
-
-/// A phase call's result, with a failure turned into fixed model text.
-async fn settle<T>(
-	client: &ServerClient, survey: &SurveySession, tool: SurveyTool, result: Result<T, PhaseError>,
-) -> Result<T> {
-	match result {
-		Ok(value) => Ok(value),
-		Err(error) => Err(refuse(phase::phase_error(client, survey, tool, error).await)),
 	}
 }
 

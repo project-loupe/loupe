@@ -69,6 +69,9 @@ impl FailureReason {
 			PrepareError::Internal => Self::HostTaskFailed,
 			PrepareError::Phase(error) if denied(error) => Self::AuthorityLost,
 			PrepareError::Phase(_) => Self::PhaseRequestFailed,
+			// Dispatch checks the lease kind and a sealed generation's pin never
+			// defers, so this is a server response the host refuses.
+			PrepareError::UnexpectedSubject => Self::PhaseRequestFailed,
 		}
 	}
 }
@@ -156,5 +159,14 @@ mod tests {
 		assert_eq!(FailureReason::from_prepare(&denied), FailureReason::AuthorityLost);
 		let conflict = PrepareError::CheckoutConflict;
 		assert_eq!(FailureReason::from_prepare(&conflict), FailureReason::CheckoutConflict);
+	}
+
+	#[test]
+	fn only_a_survey_reports_an_unsupported_recipe() {
+		let reason = FailureReason::from_prepare;
+		assert_eq!(reason(&PrepareError::UnsupportedLease), FailureReason::UnsupportedRecipe);
+		assert_eq!(reason(&PrepareError::UnexpectedSubject), FailureReason::PhaseRequestFailed);
+		assert!(!PrepareError::UnexpectedSubject.to_string().contains("survey"));
+		assert_eq!(reason(&PrepareError::CheckoutConflict), FailureReason::CheckoutConflict);
 	}
 }

@@ -8,9 +8,10 @@ version. There is no protocol-2/3 compatibility window.
 The server supports the pre-proof survey, drilldown and verification API,
 including claim-time admission. Only explicit `review:survey:v1`,
 `review:drilldown:v1` and `review:verify:v1` advertisements enable those leases;
-legacy `verify:*` tags never do. Current workers advertise none and reject
-unexpected review leases before checkout or legacy handling. B5–B7 supply
-worker execution; production triggers remain legacy until the later cutover.
+legacy `verify:*` tags never do. Current workers advertise each phase they have
+an agent for and reject any other review lease before checkout or legacy
+handling. Production triggers remain legacy until the later cutover, so no
+campaign is opened outside tests.
 Reconciliation, successors and corroboration remain B8-held, and proof
 execution/attestation remains Stage C work. Server API availability is not
 end-to-end v2 activation or a deployment claim.
@@ -26,12 +27,11 @@ end-to-end v2 activation or a deployment claim.
 3. Update server, workers, CLI and web together. Do not run protocol-2 clients
    against a protocol-3 server or vice versa.
 4. Start the server and confirm its health response/header reports protocol 3.
-   Start the matching web and workers, retaining empty review advertisements.
+   Start the matching web and workers.
 5. Smoke-test a legacy scan, finding ingestion and legacy verification using
    the deployment's normal test repository. Confirm CLI/web access and that
-   no survey, drilldown or campaign verification is leased to these legacy
-   advertisements. Do not add review capabilities to a worker whose handler
-   has not been implemented and verified.
+   no survey, drilldown or campaign verification is leased: without a
+   campaign there is none.
 6. Resume legacy submissions. Keep production campaign triggers disabled
    until the later worker and cutover acceptance gates are complete.
 

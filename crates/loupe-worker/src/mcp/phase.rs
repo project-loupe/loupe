@@ -10,13 +10,14 @@ use loupe_provenance::{Agent, Server};
 
 use super::ServerClient;
 use crate::client::PhaseError;
-use crate::review::session::{DrilldownSession, PhaseSession, SurveySession};
+use crate::review::session::{DrilldownSession, PhaseSession, SurveySession, VerifySession};
 
 /// The host state of the review phase an MCP session serves.
 #[derive(Clone)]
 pub enum PhaseTools {
 	Survey(Arc<SurveySession>),
 	Drilldown(Arc<DrilldownSession>),
+	Verify(Arc<VerifySession>),
 }
 
 impl PhaseTools {
@@ -25,6 +26,7 @@ impl PhaseTools {
 		match self {
 			Self::Survey(_) => super::McpMode::Survey,
 			Self::Drilldown(_) => super::McpMode::Drilldown,
+			Self::Verify(_) => super::McpMode::Verify,
 		}
 	}
 
@@ -32,6 +34,7 @@ impl PhaseTools {
 		match self {
 			Self::Survey(survey) => survey.phase(),
 			Self::Drilldown(drilldown) => drilldown.phase(),
+			Self::Verify(verify) => verify.phase(),
 		}
 	}
 
@@ -40,6 +43,7 @@ impl PhaseTools {
 		match self {
 			Self::Survey(survey) => survey.receipt().is_some(),
 			Self::Drilldown(drilldown) => drilldown.receipt().is_some(),
+			Self::Verify(verify) => verify.receipt().is_some(),
 		}
 	}
 }
@@ -48,9 +52,6 @@ impl PhaseTools {
 /// its tools.
 pub(super) struct PhaseTexts {
 	pub authority_lost: &'static str,
-	/// A 403 while `/limits` still answers: a reference outside the job's
-	/// scope.
-	pub reference_refused: &'static str,
 	pub exhausted: &'static str,
 	pub state_refused: &'static str,
 	pub terminal_conflict: &'static str,
@@ -64,8 +65,18 @@ pub(super) const READ_UNREACHABLE: &str =
 const INVALID: &str =
 	"the server rejected the request as invalid; check the arguments against the tool schema";
 
-pub(super) fn forbidden(error: &PhaseError) -> bool {
+fn forbidden(error: &PhaseError) -> bool {
 	matches!(error, PhaseError::Rejected { status: 403, .. } | PhaseError::Status { status: 403 })
+}
+
+/// A refusal or failure shown to the model as fixed host text.
+// debug-ok: fixed host text only.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct PhaseRefusal(String);
+
+pub(super) fn refuse(text: impl Into<String>) -> anyhow::Error {
+	PhaseRefusal(text.into()).into()
 }
 
 /// What the shared failure text needs from one phase's session.
@@ -74,12 +85,15 @@ pub(super) trait PhaseCalls {
 	const TEXTS: PhaseTexts;
 
 	fn phase(&self) -> &PhaseSession;
-	/// Whether a rejection with `code` exhausts the capacity `tool` uses.
-	fn exhausts(code: ReviewErrorCode) -> bool;
-	fn record_exhausted(&self, tool: Self::Tool);
-	fn record_limits(&self, limits: &PhaseLimitsResponse);
-	/// Whether `tool` is the `/limits` call itself.
-	fn limits_call(tool: Self::Tool) -> bool;
+	/// The text for a 403 to `tool` while `/limits` still answers: a reference
+	/// outside the job's scope. `None` for a call that carries no such
+	/// reference, whose every 403 is lost authority.
+	fn reference_refused(tool: Self::Tool) -> Option<&'static str>;
+	/// `tool` was rejected with `code`, which may exhaust the capacity it uses.
+	fn record_exhausted(&self, _tool: Self::Tool, _code: ReviewErrorCode) {}
+	fn record_limits(&self, limits: &PhaseLimitsResponse) {
+		self.phase().record_limits(limits);
+	}
 	/// The call's own text for a server that could not be reached.
 	fn unreachable(tool: Self::Tool) -> &'static str;
 	/// The phase's own text for a non-403 error, ahead of the shared table.
@@ -88,36 +102,36 @@ pub(super) trait PhaseCalls {
 	}
 }
 
+/// A phase call's result, with a failure turned into fixed model text.
+pub(super) async fn settle<P: PhaseCalls, T>(
+	client: &ServerClient, session: &P, tool: P::Tool, result: Result<T, PhaseError>,
+) -> anyhow::Result<T> {
+	match result {
+		Ok(value) => Ok(value),
+		Err(error) => Err(refuse(phase_error(client, session, tool, error).await)),
+	}
+}
+
 /// The fixed text for a failed phase call. The server answers 403 both
 /// for lost authority and for a reference outside the job's scope, so a
 /// 403 is told apart by reading `/limits` under the same capability and
-/// the session records that read. A failed `/limits` call itself needs no
+/// the session records that read. A call that carries no reference needs no
 /// probe.
 pub(super) async fn phase_error<P: PhaseCalls>(
 	client: &ServerClient, session: &P, tool: P::Tool, error: PhaseError,
 ) -> String {
-	if !forbidden(&error)
-		&& let PhaseError::Rejected { code, .. } = &error
-		&& P::exhausts(*code)
-	{
-		session.record_exhausted(tool);
-	}
-	if let Some(text) = P::own_text(tool, &error) {
-		return text.to_owned();
-	}
 	let phase = session.phase();
 	let texts = &P::TEXTS;
-	let limits_call = P::limits_call(tool);
 	let unreachable = P::unreachable(tool);
 	if forbidden(&error) {
-		if limits_call {
+		let Some(reference_refused) = P::reference_refused(tool) else {
 			phase.record_authority_lost();
 			return texts.authority_lost.to_owned();
-		}
+		};
 		return match client.limits(&phase.phase_job()).await {
 			Ok(limits) => {
 				session.record_limits(&limits);
-				texts.reference_refused
+				reference_refused
 			},
 			Err(probe) if forbidden(&probe) => {
 				phase.record_authority_lost();
@@ -126,6 +140,12 @@ pub(super) async fn phase_error<P: PhaseCalls>(
 			Err(_) => unreachable,
 		}
 		.to_owned();
+	}
+	if let PhaseError::Rejected { code, .. } = &error {
+		session.record_exhausted(tool, *code);
+	}
+	if let Some(text) = P::own_text(tool, &error) {
+		return text.to_owned();
 	}
 	let text = match &error {
 		PhaseError::Rejected { code, current_revision, .. } => match code {

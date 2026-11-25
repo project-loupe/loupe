@@ -14,6 +14,7 @@
 
 pub mod marked;
 pub mod offline;
+pub mod phase_promotion;
 pub mod phase_worker;
 pub mod wire;
 
@@ -427,13 +428,13 @@ pub fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
 	reqwest::Identity::from_pem(combined.as_bytes()).expect("parse client identity PEM")
 }
 
-/// Every response of a survey or drilldown phase route must pass the worker's decoder
+/// Every response of a survey, drilldown or verify phase route must pass the worker's decoder
 /// for that route: its success type, or the error envelope.
 pub fn admit_phase_response(route: &str, status: axum::http::StatusCode, bytes: &[u8]) {
 	use loupe_proto::review_api::*;
 	use loupe_proto::{
 		review_drilldown as drilldown, review_evidence as evidence, review_inventory as inventory,
-		review_terminal as terminal, review_units as units,
+		review_terminal as terminal, review_units as units, review_verification as verification,
 	};
 	let path = route.split('?').next().unwrap();
 	if !path.starts_with("/v1/jobs/") {
@@ -458,9 +459,12 @@ pub fn admit_phase_response(route: &str, status: axum::http::StatusCode, bytes: 
 		"finalize-drilldown" => {
 			response().validate(drilldown::DrilldownTerminalResponseDecoder).is_ok()
 		},
+		"finalize-verification" => {
+			response().validate(verification::VerificationTerminalResponseDecoder).is_ok()
+		},
 		"limits" => response().validate(PhaseLimitsResponseDecoder).is_ok(),
 		"lead-candidates" => response().validate_carrying(CandidatesResponseDecoder).is_ok(),
-		// Shared legacy routes and the routes of later phases are not checked.
+		// Shared legacy routes and the routes of other phases are not checked.
 		_ => return,
 	};
 	if status == axum::http::StatusCode::OK {

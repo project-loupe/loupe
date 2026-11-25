@@ -1,16 +1,20 @@
 //! What every phase catalog's arguments share: admitting a content token
-//! as Agent text under its field caps, reading named arguments, and the
-//! lead shape `submit_lead` and `submit_sibling_lead` both take.
+//! as Agent text under its field caps, reading named arguments, the lead
+//! shape `submit_lead` and `submit_sibling_lead` both take, and the evidence
+//! the terminal payloads share.
 
 use std::marker::PhantomData;
 
 use loupe_core::review_payload::{
-	DuplicateLeadHint, GeneratedProfile, LeadEvidenceFormat, LeadEvidenceV1, PriorityProposal,
-	Version1,
+	Confidence, DuplicateLeadHint, FindingEvidenceV1, GeneratedProfile, L2Argument,
+	LeadEvidenceFormat, LeadEvidenceV1, LocationRole, MaterialLocation, PriorityProposal,
+	Revalidation, SourceCounterargument, Version1,
 };
 use loupe_core::text::policy::{
-	AnchorText, Argument, ClientKey, DuplicateRationale, Family, InstanceKey, Objective, Reason,
-	Symbol,
+	AnchorText, Argument, AssumptionsGaps, AttackerControl, AttackerSource, ClientKey,
+	DuplicateRationale, EvidenceCounterevidence, EvidenceSink, Family, InstanceKey, MaterialSymbol,
+	Objective, ReachablePath, Reason, RejectionArgument, RevalidationRationale, Symbol,
+	TrustBoundary,
 };
 use loupe_core::text::{Anchor, AnchorPolicy, BoundedJson, IdentPolicy, Identifier, SourceRef};
 use loupe_proto::review_lease::ReviewId;
@@ -270,5 +274,89 @@ pub(super) fn lead(args: &Args<'_, '_, '_, '_, '_>, with_unit: bool) -> Result<L
 		key: args.required("client_lead_key")?,
 		review_unit_id: if with_unit { args.id("review_unit_id")? } else { None },
 		evidence: payload(evidence, LeadEvidenceV1::canonical_bytes)?,
+	})
+}
+pub(super) fn revalidation(args: &Args<'_, '_, '_, '_, '_>) -> Result<Option<Revalidation<Agent>>> {
+	let Some(fields) = args.optional_object("revalidation")? else { return Ok(None) };
+	let nested = args.nested(&fields);
+	nested.only(&["current_source_refs", "rationale"])?;
+	Ok(Some(Revalidation {
+		current_source_refs: nested.list("current_source_refs", 1, 16)?,
+		rationale: nested.required::<BoundedText<RevalidationRationale, Agent>>("rationale")?,
+	}))
+}
+
+pub(super) fn counterargument(
+	args: &Args<'_, '_, '_, '_, '_>,
+) -> Result<SourceCounterargument<Agent>> {
+	let fields = args.object("counterargument")?;
+	let nested = args.nested(&fields);
+	nested.only(&["argument", "source_refs"])?;
+	Ok(SourceCounterargument {
+		argument: nested.required::<BoundedText<RejectionArgument, Agent>>("argument")?,
+		source_refs: nested.list("source_refs", 1, 16)?,
+	})
+}
+
+pub(super) fn finding_evidence(
+	args: &Args<'_, '_, '_, '_, '_>,
+) -> Result<FindingEvidenceV1<Agent>> {
+	args.only(&[
+		"l2_argument",
+		"material_locations",
+		"counterevidence",
+		"assumptions_gaps",
+		"confidence",
+	])?;
+	let l2 = args.object("l2_argument")?;
+	let l2 = args.nested(&l2);
+	l2.only(&["attacker_source", "control", "sink", "reachable_path", "trust_boundary"])?;
+	let mut material_locations = Vec::new();
+	for raw in args.tokens("material_locations", 1, 16)? {
+		let fields: Fields<'_> = raw
+			.get()
+			.starts_with('{')
+			.then(|| serde_json::from_str(raw.get()).ok())
+			.flatten()
+			.context("`material_locations` entries must be objects")?;
+		material_locations.push(material_location(&args.nested(&fields))?);
+	}
+	Ok(FindingEvidenceV1 {
+		version: Version1,
+		l2_argument: L2Argument {
+			attacker_source: l2
+				.required::<BoundedText<AttackerSource, Agent>>("attacker_source")?,
+			control: l2.required::<BoundedText<AttackerControl, Agent>>("control")?,
+			sink: l2.required::<BoundedText<EvidenceSink, Agent>>("sink")?,
+			reachable_path: l2.required::<BoundedText<ReachablePath, Agent>>("reachable_path")?,
+			trust_boundary: l2.required::<BoundedText<TrustBoundary, Agent>>("trust_boundary")?,
+		},
+		material_locations,
+		counterevidence: args
+			.required::<BoundedText<EvidenceCounterevidence, Agent>>("counterevidence")?,
+		assumptions_gaps: args
+			.required::<BoundedText<AssumptionsGaps, Agent>>("assumptions_gaps")?,
+		confidence: args.required_closed::<Confidence>("confidence")?,
+	})
+}
+
+fn material_location(args: &Args<'_, '_, '_, '_, '_>) -> Result<MaterialLocation<Agent>> {
+	args.only(&["role", "file", "symbol", "line_start", "line_end"])?;
+	let line = |name: &'static str| {
+		args.present(name)
+			.map(|raw| {
+				serde_json::from_str::<u32>(raw.get())
+					.ok()
+					.filter(|line| *line > 0)
+					.with_context(|| format!("`{name}` must be a positive integer"))
+			})
+			.transpose()
+	};
+	Ok(MaterialLocation {
+		role: args.required_closed::<LocationRole>("role")?,
+		file: args.required("file")?,
+		symbol: args.optional::<BoundedText<MaterialSymbol, Agent>>("symbol")?,
+		line_start: line("line_start")?,
+		line_end: line("line_end")?,
 	})
 }

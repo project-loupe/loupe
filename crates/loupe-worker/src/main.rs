@@ -162,12 +162,15 @@ struct RunArgs {
 	/// Agent backend for LLM scan jobs: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_SCAN_AGENT", value_enum)]
 	scan_agent: Option<JobAgent>,
-	/// Agent backend for LLM verify jobs: auto, claude, or codex.
+	/// Agent backend for legacy and campaign verification: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_VERIFY_AGENT", value_enum)]
 	verify_agent: Option<JobAgent>,
-	/// Agent backend for survey and drilldown leases: auto, claude, or codex.
+	/// Agent backend for survey leases: auto, claude, or codex.
 	#[arg(long, env = "LOUPE_SURVEY_AGENT", value_enum)]
 	survey_agent: Option<JobAgent>,
+	/// Agent backend for drilldown leases: auto, claude, or codex.
+	#[arg(long, env = "LOUPE_DRILLDOWN_AGENT", value_enum)]
+	drilldown_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
 	#[arg(long, env = "LOUPE_CLAUDE_MODEL")]
 	claude_model: Option<ConfiguredText>,
@@ -320,7 +323,8 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// LLM scanners wire through worker-local job-agent policy:
 	//
 	// - [agents].scan = "auto": use claude when ready, otherwise verify-only.
-	// - [agents].verify = "auto": prefer codex, falling back to claude.
+	// - [agents].verify, survey, drilldown = "auto": prefer codex, falling
+	//   back to claude.
 	// - explicit claude/codex selections fail startup when unavailable.
 	// - no authenticated CLI still hard-fatals at startup. Docker
 	//   images can install both CLIs, but missing credentials should fail
@@ -416,28 +420,33 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		tracing::info!("LLM code-review scanner enabled (scan:llm advertised, MCP-driven)");
 	}
 
-	// The helper logs which backend it picked. MCP context is required
-	// for the verify-mode tool surface (`submit_verdict` /
-	// `submit_patch` / `validate_patch`); without it, the agent has
-	// no way to commit a verdict.
-	let phase_backend = build_phase_backend(
-		Some(mcp_ctx.clone()),
-		cfg.agents.survey,
-		claude,
-		codex,
-		launch.codex().clone(),
-		launch.claude().clone(),
-		BackendRuntimeConfig {
-			network: launch.network().clone(),
-			launch: launch.clone(),
-			log_agent_output: cfg.logging.agent_output,
-			model_broker: Some(ModelBrokerRuntimeConfig {
-				worker_binary: sandbox_worker.clone(),
-				limits: cfg.broker,
-			}),
-		},
-	)?;
+	let phase_backend = |job_kind, selection| {
+		build_phase_backend(
+			job_kind,
+			Some(mcp_ctx.clone()),
+			selection,
+			claude,
+			codex,
+			launch.codex().clone(),
+			launch.claude().clone(),
+			BackendRuntimeConfig {
+				network: launch.network().clone(),
+				launch: launch.clone(),
+				log_agent_output: cfg.logging.agent_output,
+				model_broker: Some(ModelBrokerRuntimeConfig {
+					worker_binary: sandbox_worker.clone(),
+					limits: cfg.broker,
+				}),
+			},
+		)
+	};
+	let survey_backend = phase_backend("survey", cfg.agents.survey)?;
+	let drilldown_backend = phase_backend("drilldown", cfg.agents.drilldown)?;
 
+	// The helper logs which backend it picked. MCP context is required
+	// for the verify-mode tool surfaces (`submit_verdict` /
+	// `submit_patch` / `validate_patch`, and `finalize_verification` for a
+	// verify lease); without it, the agent has no way to commit a verdict.
 	let backend = build_verifier_backend(
 		Some(mcp_ctx),
 		cfg.agents.verify,
@@ -456,17 +465,25 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		},
 	)?;
 	credential_watches.extend(backend.credential_watch());
+	// The scanner and the verify phase share the backend, so its credential is
+	// watched once.
+	let verify_backend = backend.clone();
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
-	let mut runner =
-		Runner::new(client, cache, scanners).with_max_workdir_bytes(cfg.runtime.max_workdir_bytes);
-	if let Some(backend) = phase_backend {
+	let mut runner = Runner::new(client, cache, scanners)
+		.with_max_workdir_bytes(cfg.runtime.max_workdir_bytes)
+		.with_verify_backend(verify_backend);
+	tracing::info!("verify phase enabled (review:verify:v1 advertised)");
+	if let Some(backend) = survey_backend {
 		credential_watches.extend(backend.credential_watch());
-		runner = runner.with_phase_backend(backend);
-		tracing::info!(
-			"phase runner enabled (review:survey:v1 and review:drilldown:v1 advertised)"
-		);
+		runner = runner.with_survey_backend(backend);
+		tracing::info!("survey phase enabled (review:survey:v1 advertised)");
+	}
+	if let Some(backend) = drilldown_backend {
+		credential_watches.extend(backend.credential_watch());
+		runner = runner.with_drilldown_backend(backend);
+		tracing::info!("drilldown phase enabled (review:drilldown:v1 advertised)");
 	}
 	let runner = runner.with_credential_watches(credential_watches);
 
@@ -722,6 +739,36 @@ mod tests {
 			let parsed = Cli::try_parse_from(["loupe-worker", "--codex-daybreak", mode]);
 			assert!(parsed.is_ok(), "Codex Daybreak mode {mode} must be accepted: {parsed:?}");
 			assert!(Cli::try_parse_from(["loupe-worker", "run", "--codex-daybreak", mode]).is_ok());
+		}
+	}
+
+	#[test]
+	fn drilldown_agent_flag_and_environment_leave_the_survey_agent_alone() {
+		use std::ffi::OsStr;
+		if !test_env::in_env(
+			"tests::drilldown_agent_flag_and_environment_leave_the_survey_agent_alone",
+			"drilldown",
+			&[
+				("LOUPE_DRILLDOWN_AGENT", Some(OsStr::new("claude"))),
+				("LOUPE_SURVEY_AGENT", None),
+				("LOUPE_WORKER_CONFIG", None),
+			],
+		) {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[agents]\nsurvey = 'codex'\ndrilldown = 'auto'\n").unwrap();
+		for (flag, expected) in [(None, JobAgent::Claude), (Some("auto"), JobAgent::Auto)] {
+			let mut args =
+				vec![OsStr::new("loupe-worker"), OsStr::new("--config"), path.as_os_str()];
+			if let Some(flag) = flag {
+				args.extend([OsStr::new("--drilldown-agent"), OsStr::new(flag)]);
+			}
+			let cli = Cli::try_parse_from(args).unwrap();
+			let config = load_worker_config(&cli.run).unwrap();
+			assert_eq!(config.agents.drilldown, expected);
+			assert_eq!(config.agents.survey, JobAgent::Codex);
 		}
 	}
 

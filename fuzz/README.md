@@ -318,6 +318,7 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `proto_review_responses_checkpoints` | Worker decoders for unit, lead, result, disposition, terminal, candidate, limits and control responses and the error envelope; exact re-serialization, error code classification |
 | `proto_review_responses_drilldown` | Worker decoder for drilldown terminal receipts with every disposition and continuation shape; exact re-serialization |
 | `proto_review_responses_host` | Worker decoders for pin-target, manifest progress and published profile responses; Agent carry of profile and assignment text |
+| `proto_review_responses_verification` | Worker decoder for verification terminal receipts with every verdict and continuation shape; exact re-serialization, 16 KiB body cap |
 | `proto_review_terminal` | Survey terminal decoder and receipt response; sized payloads at the 32 KiB cap |
 | `proto_review_units` | Review unit decoder; shared request oracle |
 | `proto_review_verification` | Verification terminal decoder and receipt response; shared request oracle |
@@ -353,9 +354,10 @@ Implemented targets (each corpus includes valid and malformed inputs):
 | `worker_mcp_submission` | Actual original-record finding projection, independent lexical admission, containment, symlink rejection, unchanged ranges and snippet clamping |
 | `worker_mcp_drilldown_ingress` | Actual drilldown-catalog decoder over original Sandbox records, four tools plus foreign names: Agent carries stay inside the record, rejections never echo content, nested finalize objects admit only their own members, admitted arguments serialize as valid phase requests |
 | `worker_mcp_survey_ingress` | Actual survey-catalog decoder over original Sandbox records, all eight tools: Agent carries stay inside the record, rejections never echo content, admitted arguments serialize as valid phase requests |
+| `worker_mcp_verify_ingress` | Actual verify-catalog decoder over original Sandbox records, two tools plus foreign names: Agent carries stay inside the record, rejections never echo content, fields the host supplies are refused as arguments and fixed in the request, admitted arguments serialize as valid phase requests |
 | `worker_network_host` | RFC 1123 hostname boundaries, IPv4 acceptance and complete allowlist/public nft rule templates |
 | `worker_network_parsers` | Actual PID, uid_map, route and address parsers, typed-serde PID forms, identity-pair and complete-set checks |
-| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits; the same bytes as survey assignment, drilldown lead hypothesis and profile text under host-authored phase context |
+| `worker_prompt_render` | Actual labelled prompt renderer, independent inverse for both data modes, boundary collisions, exact bytes and output limits; the same bytes as survey assignment, drilldown lead hypothesis, verify finding and profile text under host-authored phase context |
 | `worker_regex_secrets` | Actual scanner walk and Repo finding observation, native path admission with legitimate siblings, independent matches/lines/hash and redacted Debug |
 | `worker_repo_cache` | Actual Repo cursor decoder and file reads, independent exact policy and caps, plus git origin status/UTF-8/whitespace behavior |
 | `worker_repo_observations` | Six actual private Repo validators: native paths, file bytes, fingerprint windows, Git diagnostics, binary OIDs and gitlink bytes |

@@ -123,6 +123,11 @@ pub(crate) fn drilldown_arguments_fixture(name: &str, args: &Value) -> Result<Ar
 	)
 }
 
+#[cfg(test)]
+pub(crate) fn verify_arguments_fixture(name: &str, args: &Value) -> Result<Arguments> {
+	catalog_fixture(Catalog::Verify, super::super::VERIFY_LOUPE_MCP_PROTOCOL_VERSION, name, args)
+}
+
 #[allow(unsafe_code)]
 fn catalog_fixture(
 	catalog: Catalog, protocol_version: u16, name: &str, args: &Value,
@@ -176,6 +181,16 @@ pub fn observe_drilldown_record(record: &[u8]) -> PhaseObservation {
 		Catalog::Drilldown,
 		super::super::DRILLDOWN_LOUPE_MCP_PROTOCOL_VERSION,
 		drilldown_bytes,
+	)
+}
+
+/// One original record through the verify-catalog decoder.
+pub fn observe_verify_record(record: &[u8]) -> PhaseObservation {
+	observe_phase_record(
+		record,
+		Catalog::Verify,
+		super::super::VERIFY_LOUPE_MCP_PROTOCOL_VERSION,
+		verify_bytes,
 	)
 }
 
@@ -289,4 +304,19 @@ fn drilldown_bytes(arguments: Arguments) -> Vec<u8> {
 		_ => panic!("drilldown catalog decoded another catalog's tool"),
 	};
 	encoded.unwrap_or_else(|_| panic!("decoder admitted arguments that do not serialize"))
+}
+
+fn verify_bytes(arguments: Arguments) -> Vec<u8> {
+	use loupe_proto::review_api::ReviewProtocol;
+	match arguments {
+		Arguments::JobLimits => Vec::new(),
+		Arguments::FinalizeVerification(terminal) => {
+			serde_json::to_vec(&loupe_proto::review_verification::FinalizeVerificationRequest {
+				protocol_version: ReviewProtocol,
+				payload: *terminal,
+			})
+			.unwrap_or_else(|_| panic!("decoder admitted arguments that do not serialize"))
+		},
+		_ => panic!("verify catalog decoded another catalog's tool"),
+	}
 }

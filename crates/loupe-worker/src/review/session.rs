@@ -8,13 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use loupe_proto::review_api::PhaseLimitsResponse;
 use loupe_proto::review_drilldown::DrilldownTerminalResponse;
+use loupe_proto::review_lease::{AssignedReviewFinding, AssignedReviewLead, ReviewLimits};
 use loupe_proto::review_terminal::SurveyTerminalResponse;
+use loupe_proto::review_verification::VerificationTerminalResponse;
 use loupe_proto::JobCapability;
-use loupe_provenance::Server;
+use loupe_provenance::{Agent, Server};
 use tokio_util::sync::CancellationToken;
 
 use super::gate::{admit, admit_drilldown, Admission, DrilldownTool, RecipeClass, SurveyTool};
-use super::prepare::{at, PreparedDrilldown, PreparedSurvey, SurveyRecipe};
+use super::prepare::{at, PreparedSubject, PreparedSurvey, SurveyRecipe};
 use crate::client::PhaseJob;
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
@@ -98,6 +100,21 @@ impl PhaseSession {
 		}
 	}
 
+	/// The phase core of a prepared attempt, under its lease's deadlines.
+	fn from_lease(
+		job_id: i64, capability: &JobCapability, limits: &ReviewLimits, clock: Clock,
+		cancel: CancellationToken,
+	) -> Self {
+		Self::new(
+			job_id,
+			capability.clone(),
+			at(limits.submit_by),
+			at(limits.hard_deadline_at),
+			clock,
+			cancel,
+		)
+	}
+
 	pub fn job_id(&self) -> i64 {
 		self.job_id
 	}
@@ -154,14 +171,18 @@ impl PhaseSession {
 		self.limits.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 	}
 
-	/// The host-authored status line: the shared deadline part followed by
-	/// the phase's `capacity` part.
-	pub fn status_line(&self, now: SystemTime, capacity: &str) -> String {
-		format!(
-			"[loupe status] submit_by: {}; hard deadline: {}; {capacity}",
+	/// The host-authored status line: the shared deadline part, followed by
+	/// the `capacity` part of a phase that has one.
+	pub fn status_line(&self, now: SystemTime, capacity: Option<&str>) -> String {
+		let deadlines = format!(
+			"[loupe status] submit_by: {}; hard deadline: {}",
 			remaining(now, self.submit_by),
 			remaining(now, self.hard_deadline),
-		)
+		);
+		match capacity {
+			Some(capacity) => format!("{deadlines}; {capacity}"),
+			None => deadlines,
+		}
 	}
 }
 
@@ -345,7 +366,7 @@ impl SurveySession {
 			count(state.units_remaining),
 			count(state.leads_remaining),
 		);
-		self.phase.status_line(now, &capacity)
+		self.phase.status_line(now, Some(&capacity))
 	}
 }
 
@@ -389,17 +410,17 @@ impl DrilldownSession {
 	/// The session of a prepared attempt: deadlines, lead and capacity come
 	/// from the preparation.
 	pub fn from_prepared(
-		prepared: &PreparedDrilldown, clock: Clock, cancel: CancellationToken,
+		prepared: &PreparedSubject<AssignedReviewLead<Agent, Server>>, clock: Clock,
+		cancel: CancellationToken,
 	) -> Self {
-		let phase = PhaseSession::new(
+		let phase = PhaseSession::from_lease(
 			prepared.job_id,
-			prepared.job_capability.clone(),
-			at(prepared.limits.submit_by),
-			at(prepared.limits.hard_deadline_at),
+			&prepared.job_capability,
+			&prepared.limits,
 			clock,
 			cancel,
 		);
-		Self::new(phase, i64::from(prepared.lead.lead_id), Some(&prepared.phase_limits))
+		Self::new(phase, i64::from(prepared.subject.lead_id), Some(&prepared.phase_limits))
 	}
 
 	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.
@@ -478,7 +499,82 @@ impl DrilldownSession {
 			count(state.siblings_remaining),
 			count(state.queries_remaining),
 		);
-		self.phase.status_line(now, &capacity)
+		self.phase.status_line(now, Some(&capacity))
+	}
+}
+
+/// A verify attempt's host state: its phase core, the finding it verifies
+/// and the sealed receipt.
+pub struct VerifySession {
+	phase: PhaseSession,
+	finding_id: i64,
+	receipt: Mutex<Option<VerificationTerminalResponse<Server>>>,
+}
+impl std::fmt::Debug for VerifySession {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("VerifySession")
+			.field("job_id", &self.phase.job_id)
+			.field("finding_id", &self.finding_id)
+			.finish_non_exhaustive()
+	}
+}
+
+impl VerifySession {
+	/// `limits` is the `/limits` read taken before launch, if any.
+	pub fn new(phase: PhaseSession, finding_id: i64, limits: Option<&PhaseLimitsResponse>) -> Self {
+		if let Some(limits) = limits {
+			phase.record_limits(limits);
+		}
+		Self { phase, finding_id, receipt: Mutex::default() }
+	}
+
+	/// The session of a prepared attempt: deadlines and finding come from the
+	/// preparation.
+	pub fn from_prepared(
+		prepared: &PreparedSubject<AssignedReviewFinding<Agent, Server>>, clock: Clock,
+		cancel: CancellationToken,
+	) -> Self {
+		let phase = PhaseSession::from_lease(
+			prepared.job_id,
+			&prepared.job_capability,
+			&prepared.limits,
+			clock,
+			cancel,
+		);
+		Self::new(phase, i64::from(prepared.subject.finding_id), Some(&prepared.phase_limits))
+	}
+
+	/// Stop the phase heartbeat through `heartbeat` once a receipt is sealed.
+	pub fn with_heartbeat(mut self, heartbeat: CancellationToken) -> Self {
+		self.phase.set_heartbeat(heartbeat);
+		self
+	}
+
+	pub fn phase(&self) -> &PhaseSession {
+		&self.phase
+	}
+
+	pub fn finding_id(&self) -> i64 {
+		self.finding_id
+	}
+
+	fn sealed(&self) -> MutexGuard<'_, Option<VerificationTerminalResponse<Server>>> {
+		self.receipt.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	pub fn seal(&self, receipt: VerificationTerminalResponse<Server>) {
+		self.sealed().get_or_insert(receipt);
+		self.phase.stop_heartbeat();
+	}
+
+	pub fn receipt(&self) -> Option<VerificationTerminalResponse<Server>> {
+		self.sealed().clone()
+	}
+
+	/// The host-authored line every verify tool result ends with. A verify
+	/// job has no per-job capacity.
+	pub fn status_line(&self) -> String {
+		self.phase.status_line(self.phase.now(), None)
 	}
 }
 
@@ -516,6 +612,18 @@ mod tests {
 		}
 	}
 
+	fn phase(cancel: CancellationToken) -> PhaseSession {
+		let now = SystemTime::now();
+		PhaseSession::new(
+			7,
+			JobCapability::from_secret("session-capability"),
+			now + std::time::Duration::from_secs(60),
+			now + std::time::Duration::from_secs(120),
+			Arc::new(SystemTime::now),
+			cancel,
+		)
+	}
+
 	#[test]
 	fn losing_authority_cancels_the_agent() {
 		let cancel = CancellationToken::new();
@@ -549,15 +657,7 @@ mod tests {
 	#[test]
 	fn sealing_a_drilldown_stops_the_heartbeat_and_closes_its_tools() {
 		let (cancel, heartbeat) = (CancellationToken::new(), CancellationToken::new());
-		let now = SystemTime::now();
-		let phase = PhaseSession::new(
-			7,
-			JobCapability::from_secret("session-capability"),
-			now + std::time::Duration::from_secs(60),
-			now + std::time::Duration::from_secs(120),
-			Arc::new(SystemTime::now),
-			cancel.clone(),
-		);
+		let phase = phase(cancel.clone());
 		let session = DrilldownSession::new(phase, 4, None).with_heartbeat(heartbeat.clone());
 		assert_eq!(session.admission(DrilldownTool::SiblingLead), Admission::Allow);
 		assert!(session
@@ -576,5 +676,31 @@ mod tests {
 		assert!(!cancel.is_cancelled());
 		assert_ne!(session.admission(DrilldownTool::SiblingLead), Admission::Allow);
 		assert_eq!(session.admission(DrilldownTool::Finalize), Admission::Allow);
+	}
+
+	#[test]
+	fn sealing_a_verification_keeps_its_receipt_and_stops_the_heartbeat() {
+		let (cancel, heartbeat) = (CancellationToken::new(), CancellationToken::new());
+		let session =
+			VerifySession::new(phase(cancel.clone()), 5, None).with_heartbeat(heartbeat.clone());
+		assert!(session.receipt().is_none());
+		assert!(session.phase().limits().is_none());
+		let receipt = |receipt_id: i64| {
+			let receipt = serde_json::json!({"protocol_version":3,"receipt":{
+				"receipt_id":receipt_id,"job_id":7,"commit_sha":"a".repeat(40),
+				"result_digest":"b".repeat(64),"summary":{"version":1,"finding_id":5,
+				"verification_id":9,"verdict":"rejected","finding_state":"dismissed"}}});
+			crate::client::fuzz_support::review_response(
+				loupe_proto::review_verification::VerificationTerminalResponseDecoder,
+				receipt.to_string().as_bytes(),
+			)
+			.unwrap()
+		};
+		assert!(!heartbeat.is_cancelled());
+		session.seal(receipt(31));
+		assert!(heartbeat.is_cancelled(), "a sealed attempt must not heartbeat");
+		assert!(!cancel.is_cancelled());
+		session.seal(receipt(32));
+		assert_eq!(session.receipt(), Some(receipt(31)), "the first receipt stands");
 	}
 }
