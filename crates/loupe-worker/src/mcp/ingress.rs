@@ -415,6 +415,10 @@ fn arguments(
 			Arguments::Verdict(DecodedVerdictArgs { verdict })
 		},
 		ToolName::Unknown(_) => return Err(UnknownTool.into()),
+		ToolName::JobLimits => {
+			phase::Args { u, fields: &fields, top_level: true }.only(&[])?;
+			Arguments::JobLimits
+		},
 		ToolName::SiblingLead | ToolName::FinalizeDrilldown => {
 			return drilldown::arguments(u, name, &fields);
 		},
